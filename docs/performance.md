@@ -49,9 +49,7 @@ For multiprocessing to work, the potential must implement a picklable `spawn()` 
 
 ### Performance Benefits
 
-Multiprocessing improves performance for both:
-- Batched methods (`batch_complete`, `batch_prefix`, `batch_logw_next`)
-- Unbatched methods (`complete`, `prefix`, `logw_next`)
+Multiprocessing improves performance for both batched methods (`batch_complete`, `batch_prefix`, `batch_logw_next`) and unbatched methods (`complete`, `prefix`, `logw_next`).
 
 In the batched case, requests within a batch are processed in parallel across workers. For individual method calls, requests are distributed to available worker processes and are executed asynchronously.
 

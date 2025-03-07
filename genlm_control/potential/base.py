@@ -14,7 +14,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
     A Potential is a function that maps sequences of tokens in a vocabulary to non-negative real numbers (weights).
 
-    Potentials assign weights to sequences of tokens based on whether they are complete sequences of prefixes of complete sequences.
+    Potentials assign weights to sequences of tokens based on whether they are complete sequences or prefixes of complete sequences.
 
     - `complete`: Assess the log weight of a sequence of tokens in the vocabulary as a complete sequence.
     - `prefix`: Assess the log weight of a sequence of tokens in the vocabulary as a prefix.
@@ -83,25 +83,25 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
     @abstractmethod
     async def complete(self, context):
-        """Assess the weight of `context` as a member of the language.
+        """Assess the weight of `context` as a complete sequence.
 
         Args:
             context (list): Sequence of tokens.
 
         Returns:
-            (float): Log weight of the context under the language.
+            (float): Log weight of the context as a complete sequence.
         """
         pass
 
     @abstractmethod
     async def prefix(self, context):
-        """Assess the weight of `context` as a prefix of the language.
+        """Assess the weight of `context` as a prefix sequence.
 
         Args:
             context (list): Sequence of tokens.
 
         Returns:
-            (float): Log weight of the context as a prefix of the language.
+            (float): Log weight of the context as a prefix sequence.
         """
         pass
 
@@ -144,7 +144,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
     async def batch_complete(self, contexts):
         """Batched equivalent to `complete`.
 
-        Assess the weight of each context as a complete sequence of the language.
+        Assess the weight of each context as a complete sequence.
 
         Args:
             contexts (list): List of sequences of tokens.
@@ -162,7 +162,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
     async def batch_prefix(self, contexts):
         """Batched equivalent to `prefix`.
 
-        Assess the weight of each context as a prefix of the language.
+        Assess the weight of each context as a prefix.
 
         Args:
             contexts (list): List of sequences of tokens.

@@ -13,13 +13,13 @@ class SetSampler(ABC):
     A set sampler samples a weighted set of tokens from a the vocabulary of a `target` potential.
 
     Given a context of tokens $x_1, \\ldots, x_{n-1}$ in the target potential's vocabulary and a sampled set of tokens $S \\subseteq \\textsf{target.vocab_eos}$,
-    the log-weight associated with each token $x_n$ must correspond to:
+    the log-weight associated with each token $x \in S$ must correspond to:
 
     $$
-        \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1}) - \\log \\Pr(x_n \\in S)
+        \\textsf{target.logw_next}(x | x_1, \\ldots, x_{n-1}) - \\log \\Pr(x \\in S)
     $$
 
-    where $\\Pr(x_n \\in S)$ is the probability the token was included in a sampled set.
+    where $\\Pr(x \\in S)$ is the probability the token was included in a sampled set.
 
     Attributes:
         target (Potential): The target potential with respect to which the set's weights are computed.
@@ -60,7 +60,7 @@ class TrieSetSampler(SetSampler):
     - a potential over a vocabulary of iterables (`iter_potential`) and\n
     - a potential over a vocabulary of items which are the elements of the iterables (`item_potential`).
 
-    For example, if `iter_potential` is a potential over byte sequences, then `item_potential` is a potential over bytes.
+    For example, if `iter_potential` is a potential over `bytes`, then `item_potential` is a potential over `int`s.
 
     The target potential is the product of `iter_potential` and the `item_potential` coerced to operate on the token type of `iter_potential`. Thus,
     `TrieSetSampler`s sample tokens from the `iter_potential`'s vocabulary.
