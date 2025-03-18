@@ -1,6 +1,6 @@
 import pytest
 from genlm_control import InferenceEngine
-from genlm_control.potential import PromptedLLM, BoolFSA
+from genlm_control.potential import Potential, PromptedLLM, BoolFSA
 from genlm_control.sampler import (
     direct_token_sampler,
     eager_token_sampler,
@@ -81,6 +81,41 @@ async def test_with_llm_and_critic(llm):
     engine = InferenceEngine(sampler, critic=nyc_llm)
 
     await assert_engine_run(engine, n_particles=10, max_tokens=25, ess_threshold=0.5)
+
+    await engine.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_with_llm_and_critic_no_twist(llm):
+    # When the ess_threshold is 0, the critic is only applied at the end of the generation.
+    # This is to avoid running the critic at each step for IS.
+    # We test that the critic is applied the correct number of times.
+
+    mtl_llm = llm.spawn_new_eos([b"."])
+    mtl_llm.set_prompt_from_str("Montreal is")
+
+    n_calls = 0
+
+    class MockCritic(Potential):
+        async def prefix(self, context):
+            return 0
+
+        async def complete(self, context):
+            return 0
+
+        async def score(self, context):
+            nonlocal n_calls
+            n_calls += 1
+            return 0
+
+    sampler = direct_token_sampler(mtl_llm)
+    engine = InferenceEngine(sampler, critic=MockCritic(mtl_llm.vocab))
+
+    n_particles = 10
+
+    await assert_engine_run(engine, n_particles, max_tokens=5, ess_threshold=0)
+
+    assert n_calls == n_particles
 
     await engine.cleanup()
 

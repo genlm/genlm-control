@@ -82,7 +82,8 @@ class InferenceEngine:
             ess_threshold (float): Effective sample size threshold for resampling,
                 expressed as a fraction of the number of particles. When ESS falls below
                 this value, particles are resampled according to their weights. Should be between 0 and 1.
-                Higher values lead to more frequent resampling.
+                Higher values lead to more frequent resampling. Note that when ess_threshold = 0,
+                the critic is only applied at the end of the generation (if it is provided).
             max_tokens (int): Maximum number of tokens to generate per sequence. Generation
                 may terminate earlier if all sequences reach an EOS token.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
@@ -99,13 +100,10 @@ class InferenceEngine:
         try:
             original_max_tokens = self.model.max_tokens
             original_verbosity = self.model.verbosity
+            original_twist_with_critic = self.model.twist_with_critic
             self.model.max_tokens = max_tokens
             self.model.verbosity = verbosity
-
-            original_max_tokens = self.model.max_tokens
-            original_verbosity = self.model.verbosity
-            self.model.max_tokens = max_tokens
-            self.model.verbosity = verbosity
+            self.model.twist_with_critic = ess_threshold > 0
 
             particles = await smc_standard(
                 model=self.model,
@@ -117,6 +115,7 @@ class InferenceEngine:
         finally:
             self.model.max_tokens = original_max_tokens
             self.model.verbosity = original_verbosity
+            self.model.twist_with_critic = original_twist_with_critic
 
         return Sequences(*_unpack_particles(particles))
 

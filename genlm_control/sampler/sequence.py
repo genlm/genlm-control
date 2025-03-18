@@ -108,6 +108,7 @@ class SequenceModel(Model):
         self.critic = critic
         self.logp = 0
         self.verbosity = verbosity
+        self.twist_with_critic = True  # This flag is used to avoid running the critic at each step for IS (when ess_threshold = 0)
 
     async def start(self):
         start_w = await self.unit_sampler.start_weight()
@@ -122,7 +123,7 @@ class SequenceModel(Model):
         unit = await self.call(self.unit_sampler)
         self.token_ctx.append(unit)
 
-        if self.critic:
+        if self.critic and self.twist_with_critic:
             twist_amt = await self.critic.score(self.token_ctx)
             self.twist(twist_amt)
 
@@ -133,6 +134,8 @@ class SequenceModel(Model):
         if self.max_tokens == 0 or self.token_ctx[-1] is EOS:
             self.finish()
             if self.critic:
+                if not self.twist_with_critic:
+                    twist_amt = await self.critic.score(self.token_ctx)
                 self.score(twist_amt)
             return
 
@@ -175,11 +178,6 @@ class SequenceSampler(ABC):
         self.unit_sampler = unit_sampler
         self.critic = critic
         self.model = SequenceModel(unit_sampler, critic, max_tokens)
-        self.model_no_critic = (
-            SequenceModel(unit_sampler, None, max_tokens)
-            if critic is not None
-            else self.model
-        )
 
     @property
     def max_tokens(self):
@@ -188,7 +186,6 @@ class SequenceSampler(ABC):
     @max_tokens.setter
     def max_tokens(self, value):
         self.model.max_tokens = value
-        self.model_no_critic.max_tokens = value
 
     @abstractmethod
     async def sample(self, context=None, draw=sample_dict):
@@ -210,22 +207,21 @@ class Importance(SequenceSampler):
         raise NotImplementedError("SMC does not support sampling")
 
     async def infer(self, **kwargs):
-        particles = await smc_standard(
-            model=self.model_no_critic,
-            n_particles=self.n_particles,
-            ess_threshold=0,
-            **kwargs,
-        )
+        try:
+            original_critic_condition = self.model.twist_with_critic
+            self.model.twist_with_critic = False
+
+            particles = await smc_standard(
+                model=self.model,
+                n_particles=self.n_particles,
+                ess_threshold=0,
+                **kwargs,
+            )
+        finally:
+            self.model.twist_with_critic = original_critic_condition
 
         contexts, logws, logps = _unpack_particles(particles)
         assert len(contexts) == len(logws) == len(logps)
-
-        if self.critic is not None:
-            # Since we didn't run inference with the critic,
-            # we need to add in the critic weight here.
-            twist_amts = await self.critic.batch_score(contexts)
-            for i in range(len(contexts)):
-                logws[i] += twist_amts[i]
 
         return Sequences(contexts, logws, logps)
 
@@ -261,4 +257,6 @@ class SMC(SequenceSampler):
         )
 
         contexts, logws, logps = _unpack_particles(particles)
+        assert len(contexts) == len(logws) == len(logps)
+
         return Sequences(contexts, logws, logps)
