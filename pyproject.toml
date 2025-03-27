@@ -1,10 +1,12 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=64.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
 
 [project]
 name = "genlm-control"
-version = "0.0.1"
+dynamic = ["version"]
 description = ""
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,10 +15,10 @@ authors = [
     { name = "The GenLM Team" },
 ]
 dependencies = [
-    "genlm_grammar @ git+https://github.com/chi-collective/genlm-grammar.git",
+    "genlm_grammar>=0.1.0",
     "genlm-backend>=0.0.1",
-    "hfppl @ git+https://github.com/probcomp/hfppl.git",
-    "arsenal @ git+https://github.com/timvieira/arsenal",
+    "hfppl>=0.1.0",
+    "arsenal>=3.1.2",
     "IPython",
     "numpy",
     "torch",
