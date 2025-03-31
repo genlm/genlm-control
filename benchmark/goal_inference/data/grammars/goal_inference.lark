@@ -6,5 +6,5 @@ final_pred: "(clear " obj
     | "(holding " obj
     | "(on-table " obj
 
-obj: "b" digit 
+obj: "b" digit
 digit: /[0-9]/

@@ -22,33 +22,40 @@ import string
 
 from genlm_control import InferenceEngine, PromptedLLM, BoolCFG
 
-problem_text = 'You are a PDDL expert, who writes valid PDDL code that \
+problem_text = "You are a PDDL expert, who writes valid PDDL code that \
 describes user-provided planning problems directly without further \
-explanations or texts.\n\n'
+explanations or texts.\n\n"
 
 os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "600"
+
 
 @functools.cache
 def parsable_energy_function(pddl, context):
     task_hash = hashlib.sha256(pddl.encode()).hexdigest()
-    task_filepath = f'benchmark/goal_inference/data/pddl_tasks/{task_hash}.pddl'
+    task_filepath = f"benchmark/goal_inference/data/pddl_tasks/{task_hash}.pddl"
     if not os.path.exists(task_filepath):
-        with open(task_filepath, 'w') as f:
+        with open(task_filepath, "w") as f:
             f.write(pddl)
 
-    plan_filepath = f'benchmark/goal_inference/data/pddl_plans/{task_hash}.pddl'
+    plan_filepath = f"benchmark/goal_inference/data/pddl_plans/{task_hash}.pddl"
     if not os.path.exists(plan_filepath):
         proc = subprocess.run(
-            [f'./fast-downward.sif --plan-file {plan_filepath} domain.pddl {task_filepath} --search "astar(ipdb())"'],
+            [
+                f'./fast-downward.sif --plan-file {plan_filepath} domain.pddl {task_filepath} --search "astar(ipdb())"'
+            ],
             shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
 
         if proc.returncode != 0:
-            raise ValueError(f"Planner exited with nonzero status: {proc.stderr.decode()}")
+            raise ValueError(
+                f"Planner exited with nonzero status: {proc.stderr.decode()}"
+            )
 
-    generated_pddl = re.sub('\(:goal \(and .*?\)\)\n', f'(:goal (and {context}))\n', pddl)
+    generated_pddl = re.sub(
+        "\(:goal \(and .*?\)\)\n", f"(:goal (and {context}))\n", pddl
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         task_filepath = os.path.join(tmpdir, "task.pddl")
@@ -56,7 +63,7 @@ def parsable_energy_function(pddl, context):
             f.write(generated_pddl)
 
         proc = subprocess.run(
-            [f'Validate domain.pddl {task_filepath} {plan_filepath}'],
+            [f"Validate domain.pddl {task_filepath} {plan_filepath}"],
             shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -64,18 +71,20 @@ def parsable_energy_function(pddl, context):
         if proc.returncode != 0:
             # planner exited with nonzero status
             return float("-inf")
-        return 0.
+        return 0.0
+
 
 def energy_function(masked_pddl, context):
     context = context.replace(")))\n", ")")
     context = context.replace(")))", ")")
     context = context.replace("))", ")")
-    parsable_context = context.rpartition(')')
+    parsable_context = context.rpartition(")")
     if not parsable_context[0]:
-        return 0.
+        return 0.0
     parsable_context = parsable_context[0] + ")"
 
     return parsable_energy_function(masked_pddl, parsable_context)
+
 
 class GoalInference(Potential):
     def __init__(self, pddl, grammar):
@@ -104,6 +113,7 @@ class GoalInference(Potential):
 
         return energy_function(self.pddl, string + ")")
 
+
 project_root = Path(__file__).resolve().parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -113,7 +123,9 @@ warnings.filterwarnings("once", category=RuntimeWarning)
 os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "360"
 
 
-def make_sampler(sampler_name, llm, pddl, bool_cfg, grammar, sampler_args, time_sampler=False):
+def make_sampler(
+    sampler_name, llm, pddl, bool_cfg, grammar, sampler_args, time_sampler=False
+):
     if sampler_name == "eager":
         from genlm_control.sampler import EagerSetSampler
         from benchmark.util import LoggedSetTokenSampler
@@ -128,7 +140,8 @@ def make_sampler(sampler_name, llm, pddl, bool_cfg, grammar, sampler_args, time_
 
         return GumbelMaxAdaptiveRejectionSampler(
             llm,
-            bool_cfg.coerce(llm, f=b"".join) * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
+            bool_cfg.coerce(llm, f=b"".join)
+            * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
             **sampler_args,
             log_stats=time_sampler,
         )
@@ -137,7 +150,8 @@ def make_sampler(sampler_name, llm, pddl, bool_cfg, grammar, sampler_args, time_
 
         return ClippedAdaptiveRejectionSampler(
             llm,
-            bool_cfg.coerce(llm, f=b"".join) * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
+            bool_cfg.coerce(llm, f=b"".join)
+            * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
             **sampler_args,
             log_stats=time_sampler,
         )
@@ -146,7 +160,8 @@ def make_sampler(sampler_name, llm, pddl, bool_cfg, grammar, sampler_args, time_
 
         return WithoutReplacementSampler(
             llm,
-            bool_cfg.coerce(llm, f=b"".join) * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
+            bool_cfg.coerce(llm, f=b"".join)
+            * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
             **sampler_args,
             log_stats=time_sampler,
         )
@@ -162,7 +177,8 @@ def make_sampler(sampler_name, llm, pddl, bool_cfg, grammar, sampler_args, time_
 
         return RejectionSampler(
             llm,
-            bool_cfg.coerce(llm, f=b"".join) * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
+            bool_cfg.coerce(llm, f=b"".join)
+            * GoalInference(pddl, grammar).coerce(llm, f=b"".join),
             **sampler_args,
             log_stats=time_sampler,
         )
@@ -264,6 +280,7 @@ def parse_args():
 
     return parser.parse_args()
 
+
 async def main():
     args = parse_args()
 
@@ -274,73 +291,81 @@ async def main():
     with open(arg_path, "w") as f:
         json.dump(vars(args), f, indent=4)
 
-
     df = pl.read_parquet(
-        'hf://datasets/BatsResearch/planetarium/data/train-00000-of-00001.parquet'
+        "hf://datasets/BatsResearch/planetarium/data/train-00000-of-00001.parquet"
     )
     goal_suffix = "(:goal (and [BLANK]))\n)"
 
-    df = df.filter(pl.col('problem_pddl').str.contains("(:goal (and", literal=True))
+    df = df.filter(pl.col("problem_pddl").str.contains("(:goal (and", literal=True))
     df = df.with_columns(
-        goal_pddl=pl.col('problem_pddl').str.split(by="(:goal (and ").list.last().str.replace("))\n)", "", literal=True),
-        masked_pddl=pl.concat_str(pl.col('problem_pddl').str.split(by="(:goal").list.first(), pl.lit(goal_suffix)),
-        prefix_pddl=pl.concat_str(pl.col('problem_pddl').str.split(by="(:goal (and").list.first(), pl.lit("(:goal (and")),
-        goal_natural_language=pl.concat_str(pl.lit("Your goal"), pl.col('natural_language').str.split(by="Your goal").list.last())
+        goal_pddl=pl.col("problem_pddl")
+        .str.split(by="(:goal (and ")
+        .list.last()
+        .str.replace("))\n)", "", literal=True),
+        masked_pddl=pl.concat_str(
+            pl.col("problem_pddl").str.split(by="(:goal").list.first(),
+            pl.lit(goal_suffix),
+        ),
+        prefix_pddl=pl.concat_str(
+            pl.col("problem_pddl").str.split(by="(:goal (and").list.first(),
+            pl.lit("(:goal (and"),
+        ),
+        goal_natural_language=pl.concat_str(
+            pl.lit("Your goal"),
+            pl.col("natural_language").str.split(by="Your goal").list.last(),
+        ),
     )
 
     seed = 1234
     n_examples = 500
     max_n_objects = 10
     df = df.filter(
-        (pl.col('domain') == 'blocksworld')
-        & (pl.col('num_objects') < max_n_objects)
-        & (pl.col('init_is_abstract') == 0)
-        & (pl.col('goal_is_abstract') == 0)
+        (pl.col("domain") == "blocksworld")
+        & (pl.col("num_objects") < max_n_objects)
+        & (pl.col("init_is_abstract") == 0)
+        & (pl.col("goal_is_abstract") == 0)
     )
     # Remove rows with duplicated goal_natural_language
-    df = df.unique(subset=['goal_natural_language'])
+    df = df.unique(subset=["goal_natural_language"])
 
     df = df.sample(fraction=1, shuffle=True, seed=seed)
     df = df.head(n_examples)
 
-    messages = [
-        {
-            'role': 'system',
-            'content': problem_text
-        }
-    ]
+    messages = [{"role": "system", "content": problem_text}]
 
     prompts = []
     for row in df.to_dicts():
         prompt_message = messages[:]
         prompt_message += [
             {
-                'role': 'user',
-                'content': ("Natural Language goal description: \n\n" 
-                + row['goal_natural_language'] 
-                + "\n\n"  
+                "role": "user",
+                "content": (
+                    "Natural Language goal description: \n\n"
+                    + row["goal_natural_language"]
+                    + "\n\n"
                 ),
             },
             {
-                'role': 'assistant',
-                'content': row['prefix_pddl'],
-            }
+                "role": "assistant",
+                "content": row["prefix_pddl"],
+            },
         ]
-        prompt = ''.join([m['content'] for m in prompt_message])
+        prompt = "".join([m["content"] for m in prompt_message])
         prompts.append(prompt)
-
 
     sampler_cache = {}
     llm = PromptedLLM.from_name(args.model_name, **json.loads(args.lm_args))
-    eos_tokens = [t for t in llm.vocab if b'))' in t]
+    eos_tokens = [t for t in llm.vocab if b"))" in t]
     llm = llm.spawn_new_eos(eos_tokens)
 
     pbar = tqdm(
-        enumerate(zip(prompts, df['problem_pddl'].to_list(), df['masked_pddl'].to_list())), total=len(prompts), desc="Running inference"
+        enumerate(
+            zip(prompts, df["problem_pddl"].to_list(), df["masked_pddl"].to_list())
+        ),
+        total=len(prompts),
+        desc="Running inference",
     )
-    grammar = open(
-        os.path.join(args.grammar_dir, f"goal_inference.lark"), "r"
-    ).read()
+    grammar = open(os.path.join(args.grammar_dir, f"goal_inference.lark"), "r").read()
     bool_cfg = BoolCFG.from_lark(grammar)
     critic = None
 
@@ -349,8 +374,9 @@ async def main():
             if args.sampler_name == "eager":
                 critic = GoalInference(problem_pddl, grammar).coerce(llm, f=b"".join)
             else:
-                critic = bool_cfg.coerce(llm, f=b"".join) * GoalInference(problem_pddl, grammar).coerce(llm, f=b"".join)
-
+                critic = bool_cfg.coerce(llm, f=b"".join) * GoalInference(
+                    problem_pddl, grammar
+                ).coerce(llm, f=b"".join)
 
         result_file = os.path.join(args.output_dir, f"{i}_result.pkl")
 
@@ -429,7 +455,7 @@ async def main():
 
         if hasattr(sampler, "_save_cache"):
             sampler._save_cache()
-        
+
 
 if __name__ == "__main__":
     asyncio.run(main())

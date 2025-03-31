@@ -27,9 +27,7 @@ os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "360"
 
 class PartialSMILES(Potential):
     def __init__(self):
-        super().__init__(
-            vocabulary=list(range(256))
-        )  
+        super().__init__(vocabulary=list(range(256)))
 
     @lru_cache(maxsize=None)
     def _parse(self, query):
@@ -50,7 +48,7 @@ class PartialSMILES(Potential):
     def _validate(self, smiles, partial):
         try:
             ps.ParseSmiles(smiles, partial=partial)
-            return 0.
+            return 0.0
         except Exception as e:
             return -np.inf
 
@@ -213,6 +211,7 @@ def parse_args():
 
     return parser.parse_args()
 
+
 async def main():
     args = parse_args()
 
@@ -229,34 +228,36 @@ async def main():
 
     import random
 
-    molecules = open(os.path.join(args.raw_molecules_dir, "GDB17.50000000.smi")).readlines()
+    molecules = open(
+        os.path.join(args.raw_molecules_dir, "GDB17.50000000.smi")
+    ).readlines()
 
     # %%
     prompt_format = {
-            "instruction": "You are an expert in chemistry. You are given a list of molecules in SMILES format. You are asked to write another molecule in SMILES format with similar chemical properties.\n",
-            "exemplar": lambda ex: f"Molecule: {ex}",
-            "prediction": "Molecule:",
-        }
+        "instruction": "You are an expert in chemistry. You are given a list of molecules in SMILES format. You are asked to write another molecule in SMILES format with similar chemical properties.\n",
+        "exemplar": lambda ex: f"Molecule: {ex}",
+        "prediction": "Molecule:",
+    }
 
     prompts = []
     random.seed(seed)
     for i in range(n_prompts):
         molecule_ids = random.sample(range(len(molecules)), n_molecules)
         sample_mols = [molecules[i] for i in molecule_ids]
-        prompt = prompt_format["instruction"] + "".join([prompt_format["exemplar"](m) for m in sample_mols]) + prompt_format["prediction"]
+        prompt = (
+            prompt_format["instruction"]
+            + "".join([prompt_format["exemplar"](m) for m in sample_mols])
+            + prompt_format["prediction"]
+        )
         prompts.append(prompt)
 
     sampler_cache = {}
     llm = PromptedLLM.from_name(args.model_name, **json.loads(args.lm_args))
-    eos_tokens = [t for t in llm.vocab if b'\n' in t]
+    eos_tokens = [t for t in llm.vocab if b"\n" in t]
     llm = llm.spawn_new_eos(eos_tokens)
 
-    pbar = tqdm(
-        enumerate(prompts), total=len(prompts), desc="Running inference"
-    )
-    grammar = open(
-        os.path.join(args.grammar_dir, f"smiles.lark"), "r"
-    ).read()
+    pbar = tqdm(enumerate(prompts), total=len(prompts), desc="Running inference")
+    grammar = open(os.path.join(args.grammar_dir, f"smiles.lark"), "r").read()
     bool_cfg = BoolCFG.from_lark(grammar)
     critic = None
     if args.use_critic:

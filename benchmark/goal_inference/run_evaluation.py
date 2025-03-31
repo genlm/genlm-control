@@ -17,6 +17,7 @@ project_root = Path(__file__).resolve().parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+
 @functools.cache
 def equiv(x, y):
     try:
@@ -28,6 +29,7 @@ def equiv(x, y):
         # ValueError for referencing an object not in the object list
         # VisitError for duplicate object names
         return False
+
 
 def posterior_weighted_eval(contexts, log_weights, masked_pddl, full_pddl):
     weighted_acc = 0
@@ -54,7 +56,7 @@ def posterior_weighted_eval(contexts, log_weights, masked_pddl, full_pddl):
         if np.isnan(p):
             w_acc = 0
         else:
-            full_output = masked_pddl.replace('[BLANK]', pred + ")")
+            full_output = masked_pddl.replace("[BLANK]", pred + ")")
             acc = equiv(full_pddl, full_output)
             w_acc = p * acc
 
@@ -123,8 +125,12 @@ def main():
     print(args.results_dir.split("/")[-1])
     mean, lower, upper = mean_ci([r["result"] for r in results])
     print(f"Mean accuracy: {round(mean, 4)} ({round(lower, 2)}, {round(upper, 2)})")
-    mean, lower, upper = mean_ci([datum["metadata"]["inference_time"] for datum in data])
-    print(f"Mean inference time: {round(mean, 4)} ({round(lower, 2)}, {round(upper, 2)})")
+    mean, lower, upper = mean_ci(
+        [datum["metadata"]["inference_time"] for datum in data]
+    )
+    print(
+        f"Mean inference time: {round(mean, 4)} ({round(lower, 2)}, {round(upper, 2)})"
+    )
 
     with open(args.output_pkl, "wb") as f:
         pickle.dump(results, f)

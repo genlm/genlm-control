@@ -20,6 +20,7 @@ from rdkit import Chem
 from rdkit import rdBase
 import os, sys
 
+
 class HiddenPrints:
     """Context manager to disable RDKit logs. By default all logs are disabled."""
 
@@ -43,8 +44,12 @@ class HiddenPrints:
     def _get_log_status(self):
         """Get the current log status of RDKit logs."""
         log_status = rdBase.LogStatus()
-        log_status = {st.split(":")[0]: st.split(":")[1] for st in log_status.split("\n")}
-        log_status = {k: True if v == "enabled" else False for k, v in log_status.items()}
+        log_status = {
+            st.split(":")[0]: st.split(":")[1] for st in log_status.split("\n")
+        }
+        log_status = {
+            k: True if v == "enabled" else False for k, v in log_status.items()
+        }
         return log_status
 
     def _apply_log_status(self, log_status):
@@ -61,6 +66,7 @@ class HiddenPrints:
     def __exit__(self, *args, **kwargs):
         self._apply_log_status(self.previous_status)
 
+
 # class HiddenPrints:
 #     def __enter__(self):
 #         self._original_stdout = sys.stdout
@@ -73,15 +79,18 @@ class HiddenPrints:
 
 def get_mol(smiles):
     mol = Chem.MolFromSmiles(smiles)
-    if mol is not None: Chem.Kekulize(mol)
+    if mol is not None:
+        Chem.Kekulize(mol)
     return mol
+
 
 @lru_cache
 def cached_eval(mol):
     mol = get_mol(mol)
     if mol is None:
-        return 0., 0.
-    return 1., QED.qed(mol=mol)
+        return 0.0, 0.0
+    return 1.0, QED.qed(mol=mol)
+
 
 def posterior_weighted_eval(contexts, log_weights):
     weighted_acc = 0
@@ -180,8 +189,12 @@ def main():
     print(args.results_dir.split("/")[-1])
     mean, lower, upper = mean_ci([r["result"] for r in results])
     print(f"Mean accuracy: {round(mean, 4)} ({round(lower, 2)}, {round(upper, 2)})")
-    mean, lower, upper = mean_ci([datum["metadata"]["inference_time"] for datum in data])
-    print(f"Mean inference time: {round(mean, 4)} ({round(lower, 2)}, {round(upper, 2)})")
+    mean, lower, upper = mean_ci(
+        [datum["metadata"]["inference_time"] for datum in data]
+    )
+    print(
+        f"Mean inference time: {round(mean, 4)} ({round(lower, 2)}, {round(upper, 2)})"
+    )
 
     with open(args.output_pkl, "wb") as f:
         pickle.dump(results, f)

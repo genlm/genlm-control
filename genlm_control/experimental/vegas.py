@@ -290,7 +290,14 @@ class GumbelMaxAdaptiveRejectionSampler(LasVegasTokenSampler):
 
 class ClippedAdaptiveRejectionSampler(LasVegasTokenSampler):
     def __init__(
-        self, potential, condition, top_p1=0.95, top_p2=0.99, seed=42, proper_weights=True, **kwargs
+        self,
+        potential,
+        condition,
+        top_p1=0.95,
+        top_p2=0.99,
+        seed=42,
+        proper_weights=True,
+        **kwargs,
     ):
         if not (0 < top_p1 <= 1 and 0 < top_p2 <= 1):
             raise ValueError("`top_p1` and `top_p2` must be between 0 and 1")
@@ -298,7 +305,6 @@ class ClippedAdaptiveRejectionSampler(LasVegasTokenSampler):
         self.rng = np.random.default_rng(seed=seed)
         self.top_logps = [np.log(top_p1), np.log(top_p2)]
         self.proper_weights = proper_weights
-
 
     async def _sample(self, context, verbosity=0, _sample_id=None):
         logws = await self.get_logws(context, _sample_id)
@@ -343,7 +349,7 @@ class ClippedAdaptiveRejectionSampler(LasVegasTokenSampler):
 
         if not self.proper_weights:
             return tok, 0, np.nan
-        
+
         log1mp = log1mexp(logp0s[0]) if logp0s[0] != -np.inf else 0
 
         if logp0s[0] < self.top_logps[0]:

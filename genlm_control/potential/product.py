@@ -72,15 +72,15 @@ class Product(Potential):
 
     async def prefix(self, context):
         w1 = await self.p1.prefix(context)
-        if w1 == float('-inf'):
-            return float('-inf')
+        if w1 == float("-inf"):
+            return float("-inf")
         w2 = await self.p2.prefix(context)
         return w1 + w2
 
     async def complete(self, context):
         w1 = await self.p1.complete(context)
-        if w1 == float('-inf'):
-            return float('-inf')
+        if w1 == float("-inf"):
+            return float("-inf")
         w2 = await self.p2.complete(context)
         return w1 + w2
 
