@@ -16,7 +16,7 @@ authors = [
 ]
 dependencies = [
     "genlm_grammar>=0.1.0",
-    "genlm-backend>=0.0.1",
+    "genlm-backend>=0.0.2",
     "hfppl>=0.1.0",
     "arsenal>=3.1.2",
     "IPython",
