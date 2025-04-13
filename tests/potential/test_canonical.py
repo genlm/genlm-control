@@ -92,7 +92,7 @@ async def test_example(canonical_potential):
         # Test that each valid prefix allows appropriate next tokens
         for i in range(len(token_bytes)):
             prefix = token_bytes[:i]
-            next_token = token_bytes[i] if i < len(token_bytes) else p.eos
+            next_token = token_bytes[i] if i < len(token_bytes) else canonical_potential.eos
             print(prefix)
             print(next_token)
             lazy_weights = await canonical_potential.logw_next(prefix)
