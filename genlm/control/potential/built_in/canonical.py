@@ -1,6 +1,4 @@
-import asyncio
 import numpy as np
-import torch
 from genlm.control.potential.base import Potential
 from genlm.control.constant import EOS
 

@@ -1,15 +1,8 @@
-from genlm.control import Canonical, direct_token_sampler
+from genlm.control import Canonical
 from transformers import AutoTokenizer
-from genlm.control.tokenization.bpe2 import FastCanonicalityFilterBPE
-from genlm.control import (
-    PromptedLLM, BoolFSA, AWRS
-)
 from genlm.control.constant import EOS
-import asyncio
 import pytest
-import torch
 import numpy as np
-from hypothesis import given, strategies as st, settings
 
 
 @pytest.fixture
