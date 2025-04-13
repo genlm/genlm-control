@@ -22,7 +22,6 @@ dependencies = [
     "IPython",
     "numpy",
     "torch",
-    "seaborn",
     "llist",
     "python-lsp-server",
     "json-stream",
