@@ -5,7 +5,7 @@ from .operators import PotentialOps
 from .product import Product
 from .coerce import Coerced
 
-from .built_in import PromptedLLM, WCFG, BoolCFG, WFSA, BoolFSA, JsonSchema
+from .built_in import PromptedLLM, WCFG, BoolCFG, WFSA, BoolFSA, JsonSchema, Canonical
 
 __all__ = [
     "Potential",
@@ -17,6 +17,7 @@ __all__ = [
     "BoolCFG",
     "WFSA",
     "BoolFSA",
+    "Canonical",
     "AutoBatchedPotential",
     "MultiProcPotential",
     "Coerced",
