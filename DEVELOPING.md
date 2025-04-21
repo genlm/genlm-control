@@ -3,7 +3,12 @@
 This guide describes how to complete various tasks you'll encounter when working
 on the `genlm-control` codebase.
 
-### Installation
+## Requirements
+
+- Python >= 3.11
+- The core dependencies listed in the `pyproject.toml` file of the repository.
+
+## Installation
 
 Clone the repository:
 ```bash
@@ -17,11 +22,6 @@ pip install -e ".[test,docs]"
 ```
 
 This installs the dependencies needed for testing (test) and documentation (docs).
-
-## Requirements
-
-- Python >= 3.11
-- The core dependencies listed in the `pyproject.toml` file of the repository.
 
 ## Testing
 
