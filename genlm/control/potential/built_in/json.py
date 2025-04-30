@@ -232,9 +232,6 @@ class Parser(Generic[T]):
     def __floordiv__(self, other: Generic[S]) -> "Parser[Union[T, S]]":
         return AltParser(self, other)
 
-    def __add__(self, other: Generic[S]) -> "Parser[tuple[T, S]]":
-        return CatParser(self, other)
-
     def drop_result(self) -> "Parser[None]":
         return self.map(lambda x: None)
 
@@ -309,17 +306,6 @@ class AltParser(Parser[Union[S, T]]):
         # then we can't yet try the second.
         except ParseError:
             return self.right.parse(buffer, start)
-
-
-class CatParser(Parser[tuple[S, T]]):
-    def __init__(self, left: Parser[S], right: Parser[T]):
-        self.left = left
-        self.right = right
-
-    def parse(self, buffer: str, start: int) -> Parser[Union[S, T]]:
-        next_start, result_left = self.left.parse(buffer, start)
-        end, result_right = self.right.parse(buffer, next_start)
-        return (end, (result_left, result_right))
 
 
 class RegexParser(Parser[str]):

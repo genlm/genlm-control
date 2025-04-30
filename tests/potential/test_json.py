@@ -4,6 +4,7 @@ from genlm.control.potential.built_in.json import (
     json_schema_parser,
     ARBITRARY_JSON,
     Incomplete,
+    FLOAT_PARSER,
 )
 import json
 from typing import Any
@@ -386,6 +387,9 @@ def test_parser_for_schema_always_returns_document(sad):
 def test_parser_for_schema_prefix_can_only_raise_incomplete(problem):
     parser = json_schema_parser(problem.schema)
 
+    # Just to get coverage on the repr methods.
+    repr(parser)
+
     whole_text = problem.document.decode("utf-8")
     end, result = parser.parse(whole_text, 0)
     assert end == len(whole_text)
@@ -438,3 +442,8 @@ def test_correctly_handles_fixed_object_keys(keys):
     end, result = parser.parse(s, 0)
     assert end == len(s)
     assert result == x
+
+
+def test_float_parser_incomplete_literal():
+    with pytest.raises(Incomplete):
+        FLOAT_PARSER.parse("0.", 0)
