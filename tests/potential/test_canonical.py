@@ -1,4 +1,4 @@
-from genlm.control import Canonical
+from genlm.control import CanonicalTokenization
 from transformers import AutoTokenizer
 from genlm.control.constant import EOS
 import pytest
@@ -14,13 +14,13 @@ def tokenizer():
 @pytest.fixture
 def canonical_potential(tokenizer):
     """Create a CanonicalBPEPotential for testing"""
-    return Canonical(tokenizer, "gpt2")
+    return CanonicalTokenization(tokenizer, "gpt2")
 
 
 @pytest.mark.asyncio
 async def test_init(tokenizer):
     """Test that the potential initializes properly"""
-    potential = Canonical(tokenizer, "gpt2")
+    potential = CanonicalTokenization(tokenizer, "gpt2")
     
     # Check that the potential has the correct vocabulary
     assert len(potential.vocab) == len(potential.canonicality_filter._decode)
