@@ -300,6 +300,17 @@ async def test_rejects_when_value_is_invalid_before_object_is_complete():
 
 
 @pytest.mark.asyncio
+async def test_rejects_duplicated_key():
+    potential = JsonSchema(
+        {
+            "type": "object",
+        }
+    )
+
+    assert await potential.prefix(b'{"data": 1.0, "data"') == -float("inf")
+
+
+@pytest.mark.asyncio
 async def test_rejects_string_as_invalid_integer_before_complete():
     potential = JsonSchema(
         {

@@ -241,9 +241,6 @@ class Parser(Generic[T]):
     def map(self, apply: Callable[[T], S]) -> "Parser[S]":
         return MapParser(self, apply)
 
-    def filter(self, test: Callable[[T], bool]) -> "Parser[T]":
-        return FilterParser(self, test)
-
 
 class Input:
     """Convenience wrapper to provide a stateful stream-like interface
@@ -297,21 +294,6 @@ class MapParser(Parser[T]):
 
     def __repr__(self):
         return f"{self.base}.map({self.apply})"
-
-
-class FilterParser(Parser[T]):
-    def __init__(self, base: Parser[T], test: Callable[[T], bool]):
-        self.base = base
-        self.test = test
-
-    def parse(self, buffer: str, start: int) -> tuple[int, T]:
-        end, result = self.base.parse(buffer, start)
-        if not self.test(result):
-            raise ParseError(f"{result} does not satisfy condition {self.test}")
-        return (end, result)
-
-    def __repr__(self):
-        return f"{self.base}.filter({self.test})"
 
 
 class AltParser(Parser[Union[S, T]]):
@@ -384,22 +366,6 @@ INTEGER_PARSER: Parser[float] = RegexParser(
 ).map(json.loads)
 
 
-class StringLiteralParser(Parser[str]):
-    def parse(self, buffer: str, start: int) -> tuple[int, str]:
-        input = Input(buffer, start)
-        input.expect('"')
-        while True:
-            c = input.read(1)
-            if c == "\\":
-                input.read(1)
-            elif c == '"':
-                break
-        end = input.index
-
-        return (end, json.loads(buffer[start:end]))
-
-
-# STRING_LITERAL_PARSER = StringLiteralParser()
 STRING_LITERAL_PARSER = RegexParser(r'"([^\\"]|\\"|\\[^"])*"').map(json.loads)
 
 NULL_PARSER = RegexParser("null").drop_result()
@@ -456,6 +422,7 @@ class ObjectSchemaParser(Parser[Any]):
             assert isinstance(key, str)
             if key in keys_seen:
                 raise ParseError(f"Duplicated key {repr(key)}")
+            keys_seen.add(key)
             input.skip_whitespace()
             input.expect(":")
             input.skip_whitespace()
@@ -516,7 +483,7 @@ ARBITRARY_JSON = (
 def json_schema_parser(schema):
     if "type" not in schema:
         return ARBITRARY_JSON
-    elif schema["type"] == "float":
+    elif schema["type"] == "number":
         return FLOAT_PARSER
     elif schema["type"] == "integer":
         return INTEGER_PARSER
