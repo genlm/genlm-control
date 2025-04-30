@@ -87,7 +87,8 @@ def logsumexp(arr):
     """
     arr = np.array(arr, dtype=np.float64)
     arr = arr[arr > -np.inf]
-    if len(arr) == 0: return -np.inf
+    if len(arr) == 0: 
+        return -np.inf
     vmax = arr.max()
     arr -= vmax
     np.exp(arr, out=arr)
