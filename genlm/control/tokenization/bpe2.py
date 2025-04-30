@@ -76,9 +76,9 @@ class FastCanonicalityFilterBPE:
     # efficiently. We can circle back later to figure that out.
     def _update_derivation_table(self, t):
         if isinstance(t, MyTree):
-            l, r = t
-            L = self._update_derivation_table(l)
-            R = self._update_derivation_table(r)
+            left, right = t
+            L = self._update_derivation_table(left)
+            R = self._update_derivation_table(right)
             T = self._parent[L,R]
             # sanity check: clobbering should not happen if each token has a
             # canonical derivation.
@@ -170,7 +170,8 @@ class FastCanonicalityFilterBPE:
             x = i
             while True:
                 x = left[x]
-                if x is None: break
+                if x is None: 
+                    break
                 spine.append(x)
             spine.reverse()
             left_spine[i] = spine
@@ -187,7 +188,8 @@ class FastCanonicalityFilterBPE:
             x = i
             while True:
                 x = right[x]
-                if x is None: break
+                if x is None: 
+                    break
                 spine.append(x)
             spine.reverse()
             right_spine[i] = spine
@@ -196,9 +198,9 @@ class FastCanonicalityFilterBPE:
 
     def set_overrides(self, model_name):
         if "gpt2" in model_name:
-            for (l, r) in [(198, 198), (2637, 82)]:
-                self.overrides[l].add(r)
-                print(f"adding override {self._decode[l]} <-> {self._decode[r]}")
+            for (left, right) in [(198, 198), (2637, 82)]:
+                self.overrides[left].add(right)
+                print(f"adding override {self._decode[left]} <-> {self._decode[right]}")
 
     def _vectorized_conflicting_next_tokens(self, left: int):
         spine_left = self.__right_spine[left]
