@@ -1,5 +1,5 @@
 from .constant import EOS, EOT
-from .potential import Potential, PromptedLLM, BoolCFG, BoolFSA, WFSA, WCFG, JsonSchema, Canonical
+from .potential import Potential, PromptedLLM, BoolCFG, BoolFSA, WFSA, WCFG, JsonSchema, CanonicalTokenization
 from .sampler import (
     SMC,
     direct_token_sampler,
@@ -20,7 +20,7 @@ __all__ = [
     "WFSA",
     "BoolFSA",
     "JsonSchema",
-    "Canonical",
+    "CanonicalTokenization",
     "AWRS",
     "direct_token_sampler",
     "eager_token_sampler",
