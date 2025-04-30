@@ -23,7 +23,6 @@ dependencies = [
     "numpy",
     "torch",
     "llist",
-    "python-lsp-server",
     "json-stream",
     "jsonschema[format-nongpl]",
 ]
