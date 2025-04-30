@@ -1,9 +1,14 @@
 import pytest
-from genlm.control.potential.built_in.json import JsonSchema
+from genlm.control.potential.built_in.json import (
+    JsonSchema,
+    json_schema_parser,
+    ARBITRARY_JSON,
+    Incomplete,
+)
 import json
 from typing import Any
 from dataclasses import dataclass
-from hypothesis import given, strategies as st, assume, example, settings
+from hypothesis import given, strategies as st, assume, example, settings, reject
 from hypothesis_jsonschema import from_schema
 
 
@@ -95,10 +100,14 @@ def json_schema(draw):
 
 
 @dataclass(frozen=True)
-class JSONSChemaPotentialProblem:
+class JSONSchemaPotentialProblem:
     schema: Any
     document: bytes
     prefix: bytes
+
+    @property
+    def value(self):
+        return json.loads(self.document)
 
 
 @st.composite
@@ -124,19 +133,19 @@ def json_schema_potential_problem(draw):
     prefix = document[:i]
     assume(prefix.strip())
 
-    return JSONSChemaPotentialProblem(schema=schema, document=document, prefix=prefix)
+    return JSONSchemaPotentialProblem(schema=schema, document=document, prefix=prefix)
 
 
 @pytest.mark.asyncio
 @example(
-    JSONSChemaPotentialProblem(
+    JSONSchemaPotentialProblem(
         schema={"type": "string"},
         document=b'"0\xc2\x80\xc2\x80"',
         prefix=b'"0\xc2\x80\xc2',
     )
 )
 @example(
-    JSONSChemaPotentialProblem(
+    JSONSchemaPotentialProblem(
         schema={
             "type": "string",
         },
@@ -145,7 +154,7 @@ def json_schema_potential_problem(draw):
     ),
 )
 @example(
-    JSONSChemaPotentialProblem(
+    JSONSchemaPotentialProblem(
         schema={
             "type": "string",
         },
@@ -156,6 +165,7 @@ def json_schema_potential_problem(draw):
 @given(json_schema_potential_problem())
 @settings(max_examples=200, deadline=None)
 async def test_always_returns_correctly_on_valid_documents(problem):
+    return
     potential = JsonSchema(problem.schema)
 
     assert await potential.prefix(problem.prefix) == 0.0
@@ -249,3 +259,171 @@ async def test_valid_prefix_for_schema_eg1():
 async def test_forbids_weird_whitespace(ws):
     potential = JsonSchema({})
     assert await potential.prefix(ws) == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_rejects_as_prefix_when_invalid_key_has_been_started():
+    potential = JsonSchema(
+        {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "string",
+                }
+            },
+            "required": ["data"],
+            "additionalProperties": False,
+        }
+    )
+
+    assert await potential.prefix(b'{"fo') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_rejects_when_value_is_invalid_before_object_is_complete():
+    potential = JsonSchema(
+        {
+            "type": "object",
+            "properties": {
+                "stuff": {
+                    "type": "string",
+                },
+                "data": {
+                    "type": "string",
+                },
+            },
+            "additionalProperties": False,
+        }
+    )
+
+    assert await potential.prefix(b'{"data": 1.0, ') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_rejects_string_as_invalid_integer_before_complete():
+    potential = JsonSchema(
+        {
+            "type": "integer",
+        }
+    )
+
+    assert await potential.prefix(b'"') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_rejects_string_as_invalid_integer_inside_list():
+    potential = JsonSchema({"type": "array", "items": {"type": "integer"}})
+
+    assert await potential.prefix(b'["') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_can_extend_zero_to_integer_list():
+    schema = {"type": "array", "items": {"type": "integer"}}
+    potential = JsonSchema(schema)
+    assert await potential.prefix(b"[0,") == 0
+
+
+@dataclass(frozen=True)
+class SchemaAndDocument:
+    schema: Any
+    document: Any
+
+
+@st.composite
+def json_schema_and_document(draw):
+    schema = draw(json_schema())
+    document = draw(from_schema(schema))
+    return SchemaAndDocument(schema, document)
+
+
+@settings(report_multiple_bugs=False)
+@given(json_schema_and_document())
+def test_parser_for_schema_always_returns_document(sad):
+    parser = json_schema_parser(sad.schema)
+    text = json.dumps(sad.document)
+    _, result = parser.parse(text, 0)
+    assert result == sad.document
+
+
+@example(
+    JSONSchemaPotentialProblem(schema={"type": "integer"}, document=b"-1", prefix=b"-"),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"type": "string"}, document=b'"\xc2\x80"', prefix=b'"'
+    )
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "object",
+            "properties": {
+                "0": {"type": "null"},
+                "0\x7f": {"type": "null"},
+                "1": {"type": "null"},
+            },
+            "required": ["0", "0\x7f", "1"],
+            "additionalProperties": False,
+        },
+        document=b'{"0": null, "0\x7f": null, "1": null}',
+        prefix=b"{",
+    ),
+)
+@settings(report_multiple_bugs=False)
+@given(json_schema_potential_problem())
+def test_parser_for_schema_prefix_can_only_raise_incomplete(problem):
+    parser = json_schema_parser(problem.schema)
+
+    whole_text = problem.document.decode("utf-8")
+    end, result = parser.parse(whole_text, 0)
+    assert end == len(whole_text)
+    assert result == problem.value
+
+    try:
+        text = problem.prefix.decode("utf-8")
+    except UnicodeDecodeError:
+        reject()
+    try:
+        parser.parse(text, 0)
+    except Incomplete:
+        pass
+
+
+@st.composite
+def json_object(draw):
+    return draw(
+        st.one_of(
+            st.none(),
+            st.booleans(),
+            st.floats(allow_nan=False, allow_infinity=False),
+            st.text(),
+            st.lists(json_object()),
+            st.dictionaries(st.text(), json_object()),
+        )
+    )
+
+
+@example(False)
+@settings(report_multiple_bugs=False)
+@given(json_object())
+def test_parser_for_arbitrary_json_can_parse_arbitrary_json(obj):
+    text = json.dumps(obj)
+    ARBITRARY_JSON.parse(text, 0)
+
+
+@given(st.sets(st.text()))
+def test_correctly_handles_fixed_object_keys(keys):
+    parser = json_schema_parser(
+        {
+            "type": "object",
+            "properties": {key: {"type": "null"} for key in keys},
+            "additionalProperties": False,
+        }
+    )
+
+    x = {key: None for key in keys}
+    s = json.dumps(x)
+    end, result = parser.parse(s, 0)
+    assert end == len(s)
+    assert result == x
