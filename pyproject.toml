@@ -22,7 +22,6 @@ dependencies = [
     "IPython",
     "numpy",
     "torch",
-    "llist",
     "json-stream",
     "jsonschema[format-nongpl]",
 ]
