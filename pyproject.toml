@@ -45,7 +45,6 @@ docs = [
     "mkdocs-gen-files",
     "mkdocs-literate-nav",
     "mkdocs-section-index",
-    "vllm>=0.6.6,<=0.8.3; sys_platform == 'linux'", # Fix version to avoid dependency conflicts in docs build.
 ]
 
 [tool.setuptools.packages.find]
