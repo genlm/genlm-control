@@ -5,6 +5,7 @@ on:
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
+      - 'pyproject.toml'
 
 jobs:
   preview:
