@@ -122,7 +122,7 @@ class FastCanonicalityFilterBPE:
 
         # priority dict might still be useful if merges aren't strictly ordered
         # or for potential future optimizations, keep it for now.
-        self.priority = {(u, v): -i for i, (u, v, _) in enumerate(self._merges)}
+        # self.priority = {(u, v): -i for i, (u, v, _) in enumerate(self._merges)}
         self.make_derivation_table()  # Call the rewritten method
 
         self.__left_spine, max_left_spine_width = self._left_spine_table()
