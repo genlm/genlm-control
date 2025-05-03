@@ -525,5 +525,38 @@ def test_extract_merges_final_fallback():
     assert merges == [], "Merges should be empty on final fallback"
 
 
+@pytest.mark.asyncio
+def test_call_unknown_last_token(llm):  # Use llm fixture
+    """Test FastCanonicalityFilterBPE.__call__ handles unknown last_token (KeyError)."""
+    # 1. Get a filter instance
+    filter_instance = FastCanonicalityFilterBPE.from_llm(llm)
+
+    # 2. Define a context with an unknown last token
+    unknown_token = b"@@@totally_unknown_token@@@"
+    # Check it's really not in the encode map (optional sanity check)
+    assert unknown_token not in filter_instance._encode
+    context = (
+        None,
+        unknown_token,
+    )  # Use None for the first element as per __call__ structure
+
+    # 3. Expect warning and check the returned mask
+    with pytest.warns(UserWarning, match=f"Last token {unknown_token!r} not found"):
+        mask = filter_instance(context)
+
+    # 4. Verify the mask allows only EOS tokens
+    expected_mask = np.zeros(filter_instance.V, dtype=bool)
+    # Ensure EOS IDs are within vocab bounds before indexing
+    valid_eos_ids = [
+        eid for eid in filter_instance.eos_token_ids if eid < filter_instance.V
+    ]
+    if valid_eos_ids:
+        expected_mask[valid_eos_ids] = True
+
+    np.testing.assert_array_equal(
+        mask, expected_mask, "Mask should only allow EOS for unknown context token"
+    )
+
+
 if __name__ == "__main__":
     pytest.main()
