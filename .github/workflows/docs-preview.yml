@@ -6,6 +6,7 @@ on:
       - 'docs/**'
       - 'mkdocs.yml'
       - 'pyproject.toml'
+  workflow_dispatch:
 
 jobs:
   preview:
