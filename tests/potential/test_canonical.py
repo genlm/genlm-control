@@ -1,11 +1,15 @@
 import pytest
 import numpy as np
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, PropertyMock
 from transformers import GPT2Tokenizer, BertTokenizer
 from genlm.backend.tokenization import decode_vocab
 from genlm.control import PromptedLLM, CanonicalTokenization
 from genlm.control.constant import EOS
-from genlm.control.potential.built_in.canonical import FastCanonicalityFilterBPE
+from genlm.control.potential.built_in.canonical import (
+    FastCanonicalityFilterBPE,
+    _extract_bpe_merges,
+)
+import json
 
 
 class MockAsyncTransformer:  # Mock the backend LLM object
@@ -343,6 +347,182 @@ async def test_canonical_tokenization_init_type_error():
         TypeError, match="Expected llm to be an instance of PromptedLLM"
     ):
         CanonicalTokenization(not_an_llm)
+
+
+@pytest.mark.asyncio
+def test_extract_merges_json_id_mapping_failure():
+    """Test _extract_bpe_merges warning when JSON merges exist but vocab mapping fails."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = True
+    mock_tokenizer._tokenizer = MagicMock()
+
+    # Mock to_str to return valid JSON with merges
+    mock_tokenizer._tokenizer.to_str.return_value = (
+        '{"model": {"merges": [("a", "b")]}}'
+    )
+
+    # Mock get_vocab to return empty dict, causing ID lookup failure
+    mock_tokenizer.get_vocab.return_value = {}
+
+    with pytest.warns(UserWarning, match="ID mapping failed for ALL pairs"):
+        merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty if ID mapping failed for all pairs"
+
+
+@pytest.mark.asyncio
+def test_extract_merges_json_parsing_exception():
+    """Test _extract_bpe_merges warning when JSON parsing raises an exception."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = True
+    mock_tokenizer._tokenizer = MagicMock()
+
+    # Mock to_str to raise an exception
+    mock_tokenizer._tokenizer.to_str.side_effect = json.JSONDecodeError(
+        "Mock decode error", "", 0
+    )
+    # can also do: mock_tokenizer._tokenizer.to_str.side_effect = Exception("Mock general error")
+
+    # Mock get_vocab needed for later stages if the first try fails (shouldn't be reached here)
+    mock_tokenizer.get_vocab.return_value = {"a": 1, "b": 2}
+
+    with pytest.warns(
+        UserWarning, match="Failed to extract merges using fast tokenizer JSON parsing"
+    ):
+        merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty if JSON parsing failed"
+
+
+@pytest.mark.asyncio
+def test_extract_merges_direct_access_id_mapping_failure():
+    """Test warning when direct access merges exist but vocab mapping fails."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = True
+    mock_tokenizer._tokenizer = MagicMock()
+    mock_tokenizer._tokenizer.model = MagicMock()
+
+    # Make JSON parsing fail
+    mock_tokenizer._tokenizer.to_str.side_effect = Exception("JSON Failed")
+
+    # Provide direct merges
+    mock_tokenizer._tokenizer.model.merges = [("a", "b")]
+
+    # Make vocab lookup fail
+    mock_tokenizer.get_vocab.return_value = {}
+
+    with pytest.warns(
+        UserWarning, match="Accessed direct merges, but ID mapping failed"
+    ):
+        merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty if direct access ID mapping failed"
+
+
+@pytest.mark.asyncio
+def test_extract_merges_direct_access_exception():
+    """Test warning when accessing direct merges raises an exception."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = True
+    mock_tokenizer._tokenizer = MagicMock()
+    mock_tokenizer._tokenizer.model = MagicMock()  # Ensure model attribute exists
+
+    # Make JSON parsing succeed but find no merges (e.g., return empty JSON)
+    mock_tokenizer._tokenizer.to_str.return_value = "{}"
+    # Also provide a vocab so ID mapping wouldn't fail if merges WERE found
+    mock_tokenizer.get_vocab.return_value = {"a": 1, "b": 2}
+
+    # Make accessing the .merges attribute itself raise an Exception
+    type(mock_tokenizer._tokenizer.model).merges = PropertyMock(
+        side_effect=Exception("Cannot access merges")
+    )
+
+    with pytest.warns(
+        UserWarning, match="Failed to extract merges using fast tokenizer direct access"
+    ) as record:
+        merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty if direct access failed"
+
+    assert "Cannot access merges" in str(record[0].message)
+
+
+@pytest.mark.asyncio
+def test_extract_merges_slow_id_mapping_failure():
+    """Test warning when slow tokenizer has bpe_ranks but vocab mapping fails."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = False
+    # Provide bpe_ranks directly on the mock
+    mock_tokenizer.bpe_ranks = {("a", "b"): 0}
+
+    # Make vocab lookup fail
+    mock_tokenizer.get_vocab.return_value = {}
+
+    with pytest.warns(UserWarning, match="ID mapping failed for ALL pairs"):
+        # Patch hasattr check for bpe_ranks to return True for this mock
+        with patch(
+            "builtins.hasattr",
+            lambda obj, name: name == "bpe_ranks"
+            if obj is mock_tokenizer
+            else hasattr(obj, name),
+        ):
+            merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty if slow ID mapping failed"
+
+
+@pytest.mark.asyncio
+def test_extract_merges_slow_exception():
+    """Test warning when accessing slow tokenizer bpe_ranks raises an exception."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = False
+
+    # Make accessing bpe_ranks raise an error using PropertyMock
+    type(mock_tokenizer).bpe_ranks = PropertyMock(
+        side_effect=Exception("Cannot access bpe_ranks")
+    )
+
+    # Patch hasattr check for bpe_ranks to return True for this mock
+    with patch(
+        "builtins.hasattr",
+        lambda obj, name: name == "bpe_ranks"
+        if obj is mock_tokenizer
+        else hasattr(obj, name),
+    ):
+        with pytest.warns(
+            UserWarning, match="Failed to extract merges using tokenizer.bpe_ranks"
+        ) as record:
+            merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty if slow access failed"
+    assert "Cannot access bpe_ranks" in str(record[0].message)
+
+
+@pytest.mark.asyncio
+def test_extract_merges_final_fallback():
+    """Test the final fallback warning when no merge extraction method works."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = False
+
+    # Mock hasattr to return False for bpe_ranks check
+    def mock_hasattr_false(obj, name):
+        if obj is mock_tokenizer and name == "bpe_ranks":
+            return False
+        # Fallback for other hasattr calls within the function if any
+        return hasattr(obj, name)
+
+    mock_tokenizer.hasattr.side_effect = mock_hasattr_false
+
+    mock_tokenizer.name_or_path = "mock_fallback_tokenizer"
+    # Patch builtins.hasattr for the check within the function
+    with patch("builtins.hasattr", mock_hasattr_false):
+        with pytest.warns(
+            UserWarning,
+            match="Could not determine BPE merges for tokenizer mock_fallback_tokenizer",
+        ):
+            merges = _extract_bpe_merges(mock_tokenizer)
+
+    assert merges == [], "Merges should be empty on final fallback"
 
 
 if __name__ == "__main__":
