@@ -555,34 +555,6 @@ def test_call_unknown_last_token(llm):
     )
 
 
-# @pytest.mark.asyncio
-# def test_extract_merges_json_id_mapping_failure():
-#     """Test _extract_bpe_merges warning when JSON merges exist but vocab mapping fails."""
-#     mock_tokenizer = MagicMock()
-#     mock_tokenizer.is_fast = True
-#     mock_tokenizer._tokenizer = MagicMock()
-#     mock_tokenizer.name_or_path = "mock_json_fail_tokenizer"
-
-#     # Mock to_str to return valid JSON with merges
-#     mock_tokenizer._tokenizer.to_str.return_value = (
-#         '{"model": {"merges": [["a", "b"]]}}'  # <--- VALID: uses square brackets
-#     )
-
-#     # Mock get_vocab to return empty dict, causing ID lookup failure
-#     mock_tokenizer.get_vocab.return_value = {}
-
-#     with pytest.warns(UserWarning) as record:
-#         merges = _extract_bpe_merges(mock_tokenizer)
-
-#     assert merges == [], "Merges should be empty if ID mapping failed for all pairs"
-#     recorded_messages = [str(w.message) for w in record]
-
-#     expected_warning = "Parsed JSON merges, but ID mapping failed for ALL pairs."
-#     assert any(expected_warning in msg for msg in recorded_messages), (
-#         f"Expected warning '{expected_warning}' not found in recorded warnings: {recorded_messages}"
-#     )
-
-
 def test_extract_merges_direct_access_success():
     """Test _extract_bpe_merges successfully extracts merges via direct access."""
     mock_tokenizer = MagicMock()
