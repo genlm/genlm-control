@@ -279,7 +279,7 @@ async def test_from_llm_extract_merges_slow_tokenizer():
 
 
 @pytest.mark.asyncio
-def test_from_llm_extract_merges_fallback():
+async def test_from_llm_extract_merges_fallback():
     """Test that creating the LLM/Filter fails for unsupported tokenizers."""
     tokenizer = BertTokenizer.from_pretrained(
         "bert-base-uncased"
@@ -508,7 +508,6 @@ def test_extract_merges_final_fallback():
     def mock_hasattr_false(obj, name):
         if obj is mock_tokenizer and name == "bpe_ranks":
             return False
-        # Fallback for other hasattr calls within the function if any
         return hasattr(obj, name)
 
     mock_tokenizer.hasattr.side_effect = mock_hasattr_false
@@ -526,21 +525,19 @@ def test_extract_merges_final_fallback():
 
 
 @pytest.mark.asyncio
-def test_call_unknown_last_token(llm):  # Use llm fixture
+def test_call_unknown_last_token(llm):
     """Test FastCanonicalityFilterBPE.__call__ handles unknown last_token (KeyError)."""
-    # 1. Get a filter instance
+
     filter_instance = FastCanonicalityFilterBPE.from_llm(llm)
 
-    # 2. Define a context with an unknown last token
     unknown_token = b"@@@totally_unknown_token@@@"
     # Check it's really not in the encode map (optional sanity check)
     assert unknown_token not in filter_instance._encode
     context = (
         None,
         unknown_token,
-    )  # Use None for the first element as per __call__ structure
+    )
 
-    # 3. Expect warning and check the returned mask
     with pytest.warns(UserWarning, match=f"Last token {unknown_token!r} not found"):
         mask = filter_instance(context)
 
@@ -555,6 +552,59 @@ def test_call_unknown_last_token(llm):  # Use llm fixture
 
     np.testing.assert_array_equal(
         mask, expected_mask, "Mask should only allow EOS for unknown context token"
+    )
+
+
+# @pytest.mark.asyncio
+# def test_extract_merges_json_id_mapping_failure():
+#     """Test _extract_bpe_merges warning when JSON merges exist but vocab mapping fails."""
+#     mock_tokenizer = MagicMock()
+#     mock_tokenizer.is_fast = True
+#     mock_tokenizer._tokenizer = MagicMock()
+#     mock_tokenizer.name_or_path = "mock_json_fail_tokenizer"
+
+#     # Mock to_str to return valid JSON with merges
+#     mock_tokenizer._tokenizer.to_str.return_value = (
+#         '{"model": {"merges": [["a", "b"]]}}'  # <--- VALID: uses square brackets
+#     )
+
+#     # Mock get_vocab to return empty dict, causing ID lookup failure
+#     mock_tokenizer.get_vocab.return_value = {}
+
+#     with pytest.warns(UserWarning) as record:
+#         merges = _extract_bpe_merges(mock_tokenizer)
+
+#     assert merges == [], "Merges should be empty if ID mapping failed for all pairs"
+#     recorded_messages = [str(w.message) for w in record]
+
+#     expected_warning = "Parsed JSON merges, but ID mapping failed for ALL pairs."
+#     assert any(expected_warning in msg for msg in recorded_messages), (
+#         f"Expected warning '{expected_warning}' not found in recorded warnings: {recorded_messages}"
+#     )
+
+
+def test_extract_merges_direct_access_success():
+    """Test _extract_bpe_merges successfully extracts merges via direct access."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.is_fast = True
+    mock_tokenizer._tokenizer = MagicMock()
+    mock_tokenizer._tokenizer.model = MagicMock()
+    mock_tokenizer.name_or_path = "mock_direct_success_tokenizer"
+
+    # Make JSON parsing fail (e.g., raise exception or return no merges)
+    mock_tokenizer._tokenizer.to_str.side_effect = Exception("JSON parsing failed")
+
+    # add direct merges
+    direct_merges_list = [("hel", "lo")]
+    mock_tokenizer._tokenizer.model.merges = direct_merges_list
+
+    # Provide vocab to allow successful mapping
+    mock_tokenizer.get_vocab.return_value = {"hel": 10, "lo": 20, "hello": 100}
+    merges = _extract_bpe_merges(mock_tokenizer)
+
+    # Assert that the correct merges were returned, confirming the target line was hit
+    assert merges == [(10, 20, 100)], (
+        "Merges extracted via direct access are incorrect."
     )
 
 
