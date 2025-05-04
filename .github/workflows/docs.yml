@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ".[docs]"
+          pip install ".[docs]" "vllm<=0.8.3"
 
       - name: Deploy documentation
         run: |
