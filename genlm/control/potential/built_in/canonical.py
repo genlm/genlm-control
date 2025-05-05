@@ -1,5 +1,4 @@
 import json
-import warnings
 import numpy as np
 import scipy.sparse as sp
 from collections import defaultdict
@@ -28,23 +27,27 @@ def _extract_bpe_merges(tokenizer):
     def _map_merges(merge_list_str):
         """Helper to convert string pairs to ID triples."""
         mapped = []
-        if not merge_list_str:
-            return mapped
         for u_str, v_str in merge_list_str:
             u_id = V.get(u_str)
             v_id = V.get(v_str)
             uv_id = V.get(u_str + v_str)
             if u_id is not None and v_id is not None and uv_id is not None:
                 mapped.append((u_id, v_id, uv_id))
-            else:
-                warnings.warn(
-                    f"ID mapping failed for merge pair: ({u_str!r}, {v_str!r})"
-                )
+            # else: ID mapping failed
         return mapped
 
     # fast tokenizer
     if tokenizer.is_fast and hasattr(tokenizer, "_tokenizer"):
-        try:
+        # fast tokenizer + direct access
+        if hasattr(tokenizer._tokenizer, "model") and hasattr(
+            tokenizer._tokenizer.model, "merges"
+        ):
+            hf_merges_list = tokenizer._tokenizer.model.merges
+            _merges = _map_merges(hf_merges_list)
+            if _merges or not hf_merges_list:
+                return _merges
+                # else: Accessed direct merges, but ID mapping failed for ALL pairs.
+        elif hasattr(tokenizer._tokenizer, "to_str"):
             subtokenizer_dict = json.loads(tokenizer._tokenizer.to_str())
             if "model" in subtokenizer_dict and "merges" in subtokenizer_dict["model"]:
                 hf_merges_list = subtokenizer_dict["model"]["merges"]
@@ -53,63 +56,25 @@ def _extract_bpe_merges(tokenizer):
                     _merges or not hf_merges_list
                 ):  # Return if successful or if there were no merges to begin with
                     return _merges
-                else:
-                    warnings.warn(
-                        "Parsed JSON merges, but ID mapping failed for ALL pairs."
-                    )
-        except Exception as e:
-            warnings.warn(
-                f"Failed to extract merges using fast tokenizer JSON parsing: {e}"
-            )
-
-    # fast tokenizer + direct access
-    if not _merges and tokenizer.is_fast and hasattr(tokenizer, "_tokenizer"):
-        try:
-            if hasattr(tokenizer._tokenizer, "model") and hasattr(
-                tokenizer._tokenizer.model, "merges"
-            ):
-                hf_merges_list = tokenizer._tokenizer.model.merges
-                _merges = _map_merges(hf_merges_list)
-                if _merges or not hf_merges_list:
-                    return _merges
-                else:
-                    warnings.warn(
-                        "Accessed direct merges, but ID mapping failed for ALL pairs."
-                    )
-        except Exception as e:
-            warnings.warn(
-                f"Failed to extract merges using fast tokenizer direct access: {e}"
-            )
+                # else: Parsed JSON merges, but ID mapping failed for ALL pairs.
 
     # slow tokenizer
     if not _merges and hasattr(
         tokenizer, "bpe_ranks"
     ):  # Only try if fast methods failed
-        try:
-            hf_merges_dict = tokenizer.bpe_ranks  # dict: (u_str, v_str) -> rank
-            if hf_merges_dict:
-                # Sort by rank to get merge order
-                sorted_merges_str = sorted(
-                    hf_merges_dict.keys(), key=lambda p: hf_merges_dict[p]
-                )
-                _merges = _map_merges(sorted_merges_str)
-                if _merges or not hf_merges_dict:
-                    return _merges
-                else:
-                    warnings.warn(
-                        "Tokenizer had bpe_ranks, but ID mapping failed for ALL pairs."
-                    )
-        except Exception as e:
-            warnings.warn(f"Failed to extract merges using tokenizer.bpe_ranks: {e}")
+        hf_merges_dict = tokenizer.bpe_ranks  # dict: (u_str, v_str) -> rank
+        if hf_merges_dict:
+            # Sort by rank to get merge order
+            sorted_merges_str = sorted(
+                hf_merges_dict.keys(), key=lambda p: hf_merges_dict[p]
+            )
+            _merges = _map_merges(sorted_merges_str)
+            if _merges or not hf_merges_dict:
+                return _merges
+            # else: Tokenizer had bpe_ranks, but ID mapping failed for ALL pairs
 
     if not _merges:
-        tokenizer_name = getattr(tokenizer, "name_or_path", "unknown")
-        warning_message = (
-            f"Could not determine BPE merges for tokenizer {tokenizer_name}. "
-            "Canonicality filter may not work correctly."
-        )
-        warnings.warn(warning_message)
-    return _merges
+        raise ValueError("Could not determine BPE merges.")
 
 
 class FastCanonicalityFilterBPE:
@@ -165,15 +130,10 @@ class FastCanonicalityFilterBPE:
             (_, last_token) = context
             try:
                 left_id = self._encode[last_token]  # Get the ID of the last token
-            except KeyError:
-                # If last token is unknown, disallow everything except EOS, maybe raise error?
-                warnings.warn(
+            except KeyError as e:
+                raise KeyError(
                     f"Last token {last_token!r} not found in encode map. Disallowing all next tokens except EOS."
-                )
-                mask = np.zeros(self.V, dtype=bool)
-                eos_indices = [e for e in self.eos_token_ids if e < self.V]
-                mask[eos_indices] = True
-                return mask
+                ) from e
 
             mask = self._vectorized_conflicting_next_tokens(
                 left_id
@@ -248,9 +208,6 @@ class FastCanonicalityFilterBPE:
         if "gpt2" in model_name:
             for left, right in [(198, 198), (2637, 82)]:
                 self.overrides[left].add(right)
-                warnings.warn(
-                    f"adding override {self._decode[left]} <-> {self._decode[right]}"
-                )
 
     def _vectorized_conflicting_next_tokens(self, left: int):
         spine_left = self.__right_spine[left]
@@ -276,29 +233,12 @@ class FastCanonicalityFilterBPE:
         return mask
 
     @classmethod
-    def from_llm(cls, llm):
-        assert isinstance(llm, PromptedLLM)
-        tokenizer = llm.model.tokenizer
-        _decode, _ = decode_vocab(tokenizer)  # _decode is byte_vocab (list[bytes])
-
-        # check for duplicate byte sequences in _decode
-        byte_to_ids = defaultdict(list)
-        for token_id, byte_sequence in enumerate(_decode):
-            if (
-                byte_sequence is not None
-            ):  # Ignore potential None entries if decode_vocab is sparse
-                byte_to_ids[byte_sequence].append(token_id)
-
-        duplicates = {
-            byte_seq: ids for byte_seq, ids in byte_to_ids.items() if len(ids) > 1
-        }
-        if duplicates:
-            error_message = "Duplicate byte sequences found in vocabulary from decode_vocab. Cannot create unique byte->ID mapping (_encode). Duplicates:\n"
-            for byte_seq, ids in duplicates.items():
-                error_message += (
-                    f"  - Bytes {byte_seq!r} correspond to token IDs: {ids}\n"
-                )
-            raise ValueError(error_message)
+    def from_tokenizer(cls, tokenizer, eos_token_ids=None):
+        _decode, _ = decode_vocab(tokenizer)
+        if len(_decode) != len(set(_decode)):
+            raise ValueError(
+                "Duplicate byte sequences found in vocabulary from get_byte_vocab. Cannot create unique byte->ID mapping (_encode)."
+            )
 
         _merges = _extract_bpe_merges(tokenizer)
 
@@ -312,12 +252,8 @@ class FastCanonicalityFilterBPE:
             if byte_val in _encode:
                 _encode_byte[i] = _encode[byte_val]
 
-        eos_token_ids = llm.token_maps.eos_idxs  # Assume this is already a list or set
         if not eos_token_ids:
-            warnings.warn(
-                f"llm.token_maps.eos_idxs is empty or None for tokenizer {tokenizer.name_or_path}. Canonical filter might not allow EOS."
-            )
-            eos_token_ids = []  # Ensure it's an iterable
+            eos_token_ids = [tokenizer.eos_token_id]
 
         return cls(_merges, _encode, _decode, _encode_byte, eos_token_ids)
 
@@ -330,47 +266,68 @@ class CanonicalTokenization(Potential):
     by using the FastCanonicalityFilterBPE under the hood.
     """
 
-    def __init__(self, llm, model_name=None):
+    def __init__(self, canonicality_filter):
         """
         Initialize the Canonical Potential
 
         Args:
-            llm: An instance of PromptedLLM containing the model and tokenizer.
-            model_name (optional): The name of the model (used for setting overrides).
-                                    If None, uses llm.model.model_name_or_path.
+            canonicality_filter (FastCanonicalityFilterBPE): An initialized FastCanonicalityFilterBPE instance.
+        """
+        # Store the pre-initialized filter and tokenizer
+        self.canonicality_filter = canonicality_filter
+
+        # IMPORTANT: In the base Potential class, EOS will be added to vocab automatically
+        # So we should NOT add it ourselves to the vocabulary we pass to super().__init__
+        vocabulary = self.canonicality_filter._decode
+        super().__init__(vocabulary)
+
+    @classmethod
+    def from_llm(cls, llm):
+        """
+        Factory method to create CanonicalTokenization from a PromptedLLM instance.
+
+        Args:
+            llm (PromptedLLM): An instance of PromptedLLM containing the model and tokenizer.
+
+        Returns:
+            (CanonicalTokenization): An initialized CanonicalTokenization instance.
         """
         if not isinstance(llm, PromptedLLM):
             raise TypeError(
                 f"Expected llm to be an instance of PromptedLLM, got {type(llm)}"
             )
 
-        self.canonicality_filter = FastCanonicalityFilterBPE.from_llm(llm)
-        self.canonicality_filter.set_overrides(
-            llm.model.tokenizer.name_or_path,
-        )
-        self.tokenizer = llm.model.tokenizer
-        # IMPORTANT: In the base Potential class, EOS will be added to vocab automatically
-        # So we should NOT add it ourselves to the vocabulary we pass to super().__init__
+        # Extract necessary components from llm
+        tokenizer = llm.model.tokenizer
+        eos_token_ids = llm.token_maps.eos_idxs
+        model_name = tokenizer.name_or_path
 
-        vocabulary = self.canonicality_filter._decode
-        super().__init__(vocabulary)
+        # Create the filter using its factory method
+        canonicality_filter = FastCanonicalityFilterBPE.from_tokenizer(
+            tokenizer, eos_token_ids
+        )
+
+        # Set overrides on the filter
+        canonicality_filter.set_overrides(model_name)
+
+        # Call __init__ with the created filter and tokenizer
+        return cls(canonicality_filter)
 
     async def complete(self, context):
         """
         Assess if a complete sequence follows canonical tokenization.
 
         Args:
-            context: Sequence of tokens
+            context (list): Sequence of tokens
 
         Returns:
-            float: 0.0 if canonical, float('-inf') otherwise
+            (float): 0.0 if canonical, float('-inf') otherwise
         """
         # Empty sequences are considered canonical
         if not context:
             return 0.0
 
         # Check if the sequence is canonical
-
         is_canonical = self._check_canonicality(context)
         return 0.0 if is_canonical else float("-inf")
 
@@ -380,10 +337,10 @@ class CanonicalTokenization(Potential):
         For canonicality, this is the same as complete.
 
         Args:
-            context: Sequence of tokens
+            context (list): Sequence of tokens
 
         Returns:
-            float: 0.0 if potentially canonical, float('-inf') otherwise
+            (float): 0.0 if potentially canonical, float('-inf') otherwise
         """
         return await self.complete(context)
 
@@ -392,18 +349,16 @@ class CanonicalTokenization(Potential):
         Compute weights for each possible next token given the context.
 
         Args:
-            context: Sequence of tokens
+            context (list): Sequence of tokens
 
         Returns:
-            LazyWeights: Weights for each token in the vocabulary and EOS
+            (LazyWeights): Weights for each token in the vocabulary and EOS
         """
         # Get the prefix weight (to check if context itself is canonical)
         ctx_log_w = await self.prefix(context)
 
         if ctx_log_w == float("-inf"):
-            logws = np.full((len(self.vocab_eos),), float("-inf"), dtype=np.float32)
-            # always allow eos
-            logws[-1] = 0.0
+            raise ValueError("Prefix is non-canonical")
         else:
             if context:
                 t = (None, context[-1])
@@ -426,13 +381,13 @@ class CanonicalTokenization(Potential):
         Check if a sequence follows canonical tokenization.
 
         Args:
-            context: Sequence of tokens
+            context (list): Sequence of tokens
 
         Returns:
-            bool: True if the sequence is canonical, False otherwise
+            (bool): True if the sequence is canonical, False otherwise
         """
         # If we're checking a single token, it's always canonical
-        if len(context) == 1:
+        if len(context) <= 1:
             return True
 
         # Check all adjacent token pairs for canonicality
