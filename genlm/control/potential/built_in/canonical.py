@@ -132,7 +132,7 @@ class FastCanonicalityFilterBPE:
                 left_id = self._encode[last_token]  # Get the ID of the last token
             except KeyError as e:
                 raise KeyError(
-                    f"Last token {last_token!r} not found in encode map. Disallowing all next tokens except EOS."
+                    f"Last token {last_token!r} not found in encode map."
                 ) from e
 
             mask = self._vectorized_conflicting_next_tokens(
@@ -237,7 +237,7 @@ class FastCanonicalityFilterBPE:
         _decode, _ = decode_vocab(tokenizer)
         if len(_decode) != len(set(_decode)):
             raise ValueError(
-                "Duplicate byte sequences found in vocabulary from get_byte_vocab. Cannot create unique byte->ID mapping (_encode)."
+                "Duplicate byte sequences found in vocabulary. Cannot create unique byte->ID mapping (_encode)."
             )
 
         _merges = _extract_bpe_merges(tokenizer)
@@ -358,7 +358,7 @@ class CanonicalTokenization(Potential):
         ctx_log_w = await self.prefix(context)
 
         if ctx_log_w == float("-inf"):
-            raise ValueError("Prefix is non-canonical")
+            raise ValueError("Context is non-canonical")
         else:
             if context:
                 t = (None, context[-1])
