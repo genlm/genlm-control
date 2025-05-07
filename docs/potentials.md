@@ -260,10 +260,10 @@ where
 * $\prefix : \A^* \rightarrow \mathbb{R}_{\geq 0}$ is the **prefix potential**
 * $\complete : \A^* \rightarrow \mathbb{R}_{\geq 0}$ is the **complete potential**
 
-The complete and prefix potentials are related by the following equation:
+The complete and prefix potentials are related by the following equality:
 
 $$
-\prefix(\xx) > 0 \implies \complete(\xx\yy) > 0 \, \forall \xx,\yy \text{ such that } \xx\yy \in \A^*
+\prefix(\xx) = 0 \implies \complete(\xx\yy) = 0 \, \forall \xx,\yy \text{ such that } \xx\yy \in \A^*
 $$
 
 Intuitively, this means that the prefix potential cannot rule out a sequence which can later on turn out to be valid according to the complete potential.
