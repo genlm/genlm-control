@@ -5,6 +5,7 @@ from genlm.control.potential.built_in.json import (
     ARBITRARY_JSON,
     Incomplete,
     FLOAT_PARSER,
+    chunk_to_complete_utf8,
 )
 import json
 from typing import Any
@@ -447,3 +448,24 @@ def test_correctly_handles_fixed_object_keys(keys):
 def test_float_parser_incomplete_literal():
     with pytest.raises(Incomplete):
         FLOAT_PARSER.parse("0.", 0)
+
+
+@st.composite
+def chunked_utf8(draw):
+    base = draw(st.text(min_size=1)).encode("utf-8")
+    assume(len(base) > 1)
+    offsets = draw(st.sets(st.integers(1, len(base) - 1)))
+    offsets.update((0, len(base)))
+    offsets = sorted(offsets)
+    chunks = [base[u:v] for u, v in zip(offsets, offsets[1:])]
+    assert b"".join(chunks) == base
+    return chunks
+
+
+@given(chunked_utf8())
+def test_utf8_chunking_always_splits_utf8(chunks):
+    rechunked = list(chunk_to_complete_utf8(chunks))
+    assert b"".join(rechunked) == b"".join(chunks)
+    for chunk in rechunked:
+        assert chunk
+        chunk.decode("utf-8")

@@ -2,11 +2,12 @@ import json_stream
 import json
 import regex
 from typing import Generic, TypeVar, Union, Any, Callable
-from jsonschema import Draft7Validator, ValidationError
+from jsonschema import Draft7Validator
 from jsonschema import _types
+from typing import Iterable
 
 
-from genlm.control.potential.base import Potential
+from genlm.control.potential.streaming import StreamingPotential
 
 
 def is_sequence(checker, instance):
@@ -81,6 +82,28 @@ def is_utf8_start_byte(n: int) -> bool:
 BAD_WHITESPACE = regex.compile(rb"(?:\n\s+\n)|(?:\n\n\n)", regex.MULTILINE)
 
 
+def chunk_to_complete_utf8(byte_blocks):
+    buffer = bytearray()
+    for block in byte_blocks:
+        buffer.extend(block)
+        try:
+            buffer.decode("utf-8")
+            yield bytes(buffer)
+            buffer.clear()
+            continue
+        except UnicodeDecodeError:
+            for i in range(1, min(5, len(buffer) + 1)):
+                if is_utf8_start_byte(buffer[-i]):
+                    block = buffer[:-i]
+                    block.decode("utf-8")
+                    if block:
+                        yield bytes(block)
+                        del buffer[:-i]
+                    break
+            else:
+                raise
+
+
 def remove_incomplete_trailing_utf8(context: bytes) -> tuple[bool, bytes, str]:
     context = bytes(context)
 
@@ -108,10 +131,10 @@ def remove_incomplete_trailing_utf8(context: bytes) -> tuple[bool, bytes, str]:
     return (incomplete_utf8_at_end, context, context_as_string)
 
 
-class JsonSchema(Potential):
+class JsonSchema(StreamingPotential):
     def __init__(self, schema):
         super().__init__(
-            list(range(256)),
+            vocabulary=list(range(256)),
         )
         self.schema = schema
         self.validator = LazyCompatibleValidator(
@@ -119,96 +142,11 @@ class JsonSchema(Potential):
         )
         self.parser = json_schema_parser(schema)
 
-    def __check_context(self, context):
-        context = bytes(context)
-
-        incomplete_utf8_at_end, context, context_as_string = (
-            remove_incomplete_trailing_utf8(context)
-        )
-
-        # Sometimes a model can get itself itno a position where it can't
-        # generate any valid tokens, but it can keep generating whitespace
-        # indefinitely.
-        if BAD_WHITESPACE.search(context):
-            raise ValueError("Improper JSON formatting.")
-
-        # Feeding just whitespace to json-stream causes it to raise
-        # StopIteration, and this is always a valid start to a JSON
-        # document of any schema, and never a valid JSON value.
-        if not context.strip():
-            raise OutOfBytes()
-
-        iterable = JustOneBlockIterable(context)
-        try:
-            x = json_stream.load(iterable, persistent=True)
-            self.validator.validate(x)
-            if hasattr(x, "read_all"):
-                x.read_all()
-        except ValueError:
-            if iterable.read_past_first_block:
-                raise OutOfBytes()
-            else:
-                raise
-        if incomplete_utf8_at_end:
-            raise OutOfBytes()
-
-        # json-stream will just read a JSON object off the start of
-        # the stream and then stop, so we reparse the whole string
-        # with the normal JSON parser to validate it at the end, or
-        # we will allow JSON values to be followed by arbitrary nonsense.
-        # This should only fire when we've successfully created a valid
-        # JSON value and want to terminate the sequence.
-        try:
-            json.loads(context)
-        except json.JSONDecodeError as e:
-            raise ValueError(*e.args)
-
-    async def complete(self, context) -> float:
-        # TODO:
-        # 1. Create some sort of caching for the validator, so
-        #    we can reuse ones from previous calls.
-        # 2. Use a Lark JSON grammar as a prefilter to rule out any
-        #    bytes that can't be included next in valid JSON.
-
-        try:
-            self.__check_context(context)
-        except (ValueError, ValidationError, OutOfBytes):
-            return -float("inf")
-
-        return 0.0
-
-    async def prefix(self, context) -> float:
-        # TODO:
-        # 1. Create some sort of caching for the validator, so
-        #    we can reuse ones from previous calls.
-        # 2. Use a Lark JSON grammar as a prefilter to rule out any
-        #    bytes that can't be included next in valid JSON.
-        try:
-            self.__check_context(context)
-        except (ValueError, ValidationError):
-            return -float("inf")
-        except OutOfBytes:
-            pass
-
-        # There are a number of cases where the approach we use in check_context
-        # will fail to catch an error early enough because it only operates on
-        # completed values. The biggest problem here is that if there is no way to
-        # close a string that conforms to the schema, it will force the LLM to
-        # just keep extending the string. In these cases what we do is use a very
-        # rough approximate parser that accepts a superset of valid JSON strings
-        # for this schema but is able to reject some cases earlier than the full
-        # validation.
-        #
-        # We only need to do this in prefix, because the full document is guaranteed
-        # to be checkable exactly by the JSONSchema validator.
-        context_as_string = remove_incomplete_trailing_utf8(context)[-1]
-        try:
-            self.parser.parse(context_as_string, 0)
-        except ParseError:
-            return -float("inf")
-        except Incomplete:
-            pass
-
+    def calculate_score_from_stream(self, stream: Iterable[Any]) -> float:
+        x = json_stream.load(chunk_to_complete_utf8(stream), persistent=True)
+        self.validator.validate(x)
+        if hasattr(x, "read_all"):
+            x.read_all()
         return 0.0
 
 
