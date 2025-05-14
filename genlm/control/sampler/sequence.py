@@ -66,9 +66,6 @@ class SMC:
 
         self.unit_sampler = unit_sampler
         self.critic = critic
-        self.model = SequenceModel(
-            unit_sampler=unit_sampler, critic=critic, max_tokens=float("inf")
-        )
 
     async def __call__(
         self,
@@ -103,25 +100,21 @@ class SMC:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
-        try:
-            original_max_tokens = self.model.max_tokens
-            original_verbosity = self.model.verbosity
-            original_twist_with_critic = self.model.twist_with_critic
-            self.model.max_tokens = max_tokens
-            self.model.verbosity = verbosity
-            self.model.twist_with_critic = ess_threshold > 0
+        model = SequenceModel(
+            unit_sampler=self.unit_sampler,
+            critic=self.critic,
+            max_tokens=max_tokens,
+            verbosity=verbosity,
+            twist_with_critic=ess_threshold > 0,
+        )
 
-            particles = await smc_standard(
-                model=self.model,
-                n_particles=n_particles,
-                ess_threshold=ess_threshold,
-                json_file=json_path,
-                **kwargs,
-            )
-        finally:
-            self.model.max_tokens = original_max_tokens
-            self.model.verbosity = original_verbosity
-            self.model.twist_with_critic = original_twist_with_critic
+        particles = await smc_standard(
+            model=model,
+            n_particles=n_particles,
+            ess_threshold=ess_threshold,
+            json_file=json_path,
+            **kwargs,
+        )
 
         return Sequences(*_unpack_particles(particles))
 
@@ -266,7 +259,14 @@ class Sequences:
 
 
 class SequenceModel(Model):
-    def __init__(self, unit_sampler, critic=None, max_tokens=float("inf"), verbosity=0):
+    def __init__(
+        self,
+        unit_sampler,
+        critic=None,
+        max_tokens=float("inf"),
+        verbosity=0,
+        twist_with_critic=True,
+    ):
         assert max_tokens > 0
 
         super().__init__()
@@ -276,7 +276,7 @@ class SequenceModel(Model):
         self.critic = critic
         self.logp = 0
         self.verbosity = verbosity
-        self.twist_with_critic = True  # This flag is used to avoid running the critic at each step for IS (when ess_threshold = 0)
+        self.twist_with_critic = twist_with_critic
 
     async def start(self):
         start_w = await self.unit_sampler.start_weight()
