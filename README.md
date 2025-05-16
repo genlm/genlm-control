@@ -32,7 +32,7 @@ See [DEVELOPING.md](DEVELOPING.md) for details on how to install the project for
 
 ## Examples
 
-**Note**: If you are running the examples below at the top-level in a regular Python script or REPL (as opposed to a Jupyter notebook), replace any `await token_sampler.smc(...)` calls with `asyncio.run(token_sampler.smc(...))`. See also the [Async primer](https://github.com/genlm/genlm-control/edit/main/README.md#async-primer) below.
+**Note**: If you are running the examples below at the top-level in a regular Python script or REPL (as opposed to a Jupyter notebook), replace any `await token_sampler.smc(...)` calls with `asyncio.run(token_sampler.smc(...))`. See also the [Async primer](https://github.com/genlm/genlm-control?tab=readme-ov-file#async-primer) below for more details on running asynchronous functions.
 
 ### Controlling an LLM with a regular expression
 
