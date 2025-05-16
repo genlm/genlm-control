@@ -16,19 +16,25 @@ See the [docs](https://genlm.github.io/genlm-control) for details.
 
 ## Quick Start
 
-This library can be installed using pip:
+This library requires python>=3.11 and can be installed using pip:
 
 ```bash
 pip install genlm-control
+```
+
+For faster and less error-prone installs, consider using [`uv`](https://github.com/astral-sh/uv):
+
+```bash
+uv pip install genlm-control
 ```
 
 See [DEVELOPING.md](DEVELOPING.md) for details on how to install the project for development.
 
 ## Examples
 
-### Controlling an LLM with a regular expression
+**Note**: If you are running the examples below at the top-level in a regular Python script or REPL (as opposed to a Jupyter notebook), replace any `await token_sampler.smc(...)` calls with `asyncio.run(token_sampler.smc(...))`. See also the [Async primer](https://github.com/genlm/genlm-control/edit/main/README.md#async-primer) below.
 
-This example demonstrates how to constrain an LLM using a regular expression.
+### Controlling an LLM with a regular expression
 
 ```python
 from genlm.control import PromptedLLM, BoolFSA, AWRS
@@ -161,6 +167,24 @@ sequences.decoded_posterior
 #   '{"title": "The Great Gatsby", "pages": 178, "genre": "fiction"}': 0.49916818351903025,
 # }
 ```
+
+### Async primer
+
+`genlm-control` makes use of asynchronous programming; the sampling method `token_sampler.smc(...)` in the examples below returns a coroutine that must be awaited.
+
+If you're running code inside an `async def` function or in a Jupyter notebook (which supports top-level await), you can use `await` directly:
+    
+```python
+sequences = await token_sampler.smc(...)
+```
+
+If you're writing a regular Python script (e.g., a .py file), you can't use `await` at the top level. In that case, wrap the call with `asyncio.run(...)` to run it inside an event loop:
+    
+```python
+import asyncio
+sequences = asyncio.run(token_sampler.smc(...))
+```
+This distinction is important so your code doesn't raise a `SyntaxError` (if you use `await` at the top level) or `RuntimeError` (if you call `asyncio.run()` from inside an already-running event loop).
 
 ### More examples
 
