@@ -23,6 +23,29 @@ pip install -e ".[test,docs]"
 
 This installs the dependencies needed for testing (test) and documentation (docs).
 
+For faster and less error-prone installs, consider using [`uv`](https://github.com/astral-sh/uv):
+
+```bash
+uv pip install -e ".[test,docs]"
+```
+
+It is also recommended to use a dedicated environment.
+
+With conda:
+```bash
+conda create -n genlm python=3.11
+conda activate genlm
+uv pip install -e ".[test,docs]"
+```
+
+With uv:
+```bash
+uv venv .venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[test,docs]"
+```
+
+
 ## Testing
 
 When test dependencies are installed, the test suite can be run via:
