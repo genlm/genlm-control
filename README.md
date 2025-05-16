@@ -36,6 +36,8 @@ See [DEVELOPING.md](DEVELOPING.md) for details on how to install the project for
 
 ### Controlling an LLM with a regular expression
 
+This example demonstrates how to constrain an LLM using a regular expression.
+
 ```python
 from genlm.control import PromptedLLM, BoolFSA, AWRS
 
