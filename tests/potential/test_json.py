@@ -6,6 +6,7 @@ from genlm.control.potential.built_in.json import (
     Incomplete,
     FLOAT_PARSER,
     chunk_to_complete_utf8,
+    ParseError,
 )
 import json
 from typing import Any
@@ -350,15 +351,17 @@ def json_schema_and_document(draw):
     return SchemaAndDocument(schema, document)
 
 
-@settings(report_multiple_bugs=False)
+@pytest.mark.asyncio
+@settings(report_multiple_bugs=False, deadline=None)
 @given(json_schema_and_document())
-def test_parser_for_schema_always_returns_document(sad):
+async def test_parser_for_schema_always_returns_document(sad):
     parser = json_schema_parser(sad.schema)
     text = json.dumps(sad.document)
-    _, result = parser.parse(text, 0)
+    result = await parser.parse_string(text)
     assert result == sad.document
 
 
+@pytest.mark.asyncio
 @example(
     JSONSchemaPotentialProblem(schema={"type": "integer"}, document=b"-1", prefix=b"-"),
 )
@@ -383,17 +386,23 @@ def test_parser_for_schema_always_returns_document(sad):
         prefix=b"{",
     ),
 )
-@settings(report_multiple_bugs=False)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"type": "array", "items": {"type": "number"}},
+        document=b"[\n1.3941332551795901e+28\n]",
+        prefix=b"[\n1.3941332551795901e+",
+    ),
+)
+@settings(report_multiple_bugs=False, deadline=None)
 @given(json_schema_potential_problem())
-def test_parser_for_schema_prefix_can_only_raise_incomplete(problem):
+async def test_parser_for_schema_prefix_can_only_raise_incomplete(problem):
     parser = json_schema_parser(problem.schema)
 
     # Just to get coverage on the repr methods.
     repr(parser)
 
     whole_text = problem.document.decode("utf-8")
-    end, result = parser.parse(whole_text, 0)
-    assert end == len(whole_text)
+    result = await parser.parse_string(whole_text)
     assert result == problem.value
 
     try:
@@ -401,7 +410,7 @@ def test_parser_for_schema_prefix_can_only_raise_incomplete(problem):
     except UnicodeDecodeError:
         reject()
     try:
-        parser.parse(text, 0)
+        await parser.parse_string(text)
     except Incomplete:
         pass
 
@@ -420,16 +429,19 @@ def json_object(draw):
     )
 
 
+@pytest.mark.asyncio
 @example(False)
-@settings(report_multiple_bugs=False)
+@settings(report_multiple_bugs=False, deadline=None)
 @given(json_object())
-def test_parser_for_arbitrary_json_can_parse_arbitrary_json(obj):
+async def test_parser_for_arbitrary_json_can_parse_arbitrary_json(obj):
     text = json.dumps(obj)
-    ARBITRARY_JSON.parse(text, 0)
+    await ARBITRARY_JSON.parse_string(text)
 
 
+@pytest.mark.asyncio
+@settings(report_multiple_bugs=False, deadline=None)
 @given(st.sets(st.text()))
-def test_correctly_handles_fixed_object_keys(keys):
+async def test_correctly_handles_fixed_object_keys(keys):
     parser = json_schema_parser(
         {
             "type": "object",
@@ -440,14 +452,14 @@ def test_correctly_handles_fixed_object_keys(keys):
 
     x = {key: None for key in keys}
     s = json.dumps(x)
-    end, result = parser.parse(s, 0)
-    assert end == len(s)
+    result = await parser.parse_string(s)
     assert result == x
 
 
-def test_float_parser_incomplete_literal():
+@pytest.mark.asyncio
+async def test_float_parser_incomplete_literal():
     with pytest.raises(Incomplete):
-        FLOAT_PARSER.parse("0.", 0)
+        await FLOAT_PARSER.parse_string("0.")
 
 
 @st.composite
@@ -463,9 +475,30 @@ def chunked_utf8(draw):
 
 
 @given(chunked_utf8())
+@settings(report_multiple_bugs=False, deadline=None)
 def test_utf8_chunking_always_splits_utf8(chunks):
     rechunked = list(chunk_to_complete_utf8(chunks))
     assert b"".join(rechunked) == b"".join(chunks)
     for chunk in rechunked:
         assert chunk
         chunk.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_parser_raises_incomplete_on_empty_string():
+    with pytest.raises(Incomplete):
+        await FLOAT_PARSER.parse_string("")
+
+
+@pytest.mark.asyncio
+async def test_validates_a_list_of_integers_parser_only():
+    parser = json_schema_parser({"type": "array", "items": {"type": "integer"}})
+
+    with pytest.raises(Incomplete):
+        await parser.parse_string("[1,2,3")
+
+    with pytest.raises(ParseError):
+        assert await parser.parse_string('["hello world"')
+
+    with pytest.raises(ParseError):
+        await parser.parse_string("{")

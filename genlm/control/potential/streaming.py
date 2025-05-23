@@ -1,6 +1,6 @@
 from genlm.control.potential.base import StatefulPotential, ParticleState
 from abc import ABC, abstractmethod
-from typing import Any, Iterable
+from typing import Any, Iterable, AsyncIterable
 from queue import SimpleQueue
 from enum import Enum, auto
 from threading import Thread
@@ -14,8 +14,16 @@ class Responses(Enum):
     ERROR = auto()
 
 
-PING_TOKEN = object()
-SHUTDOWN_TOKEN = object()
+class UniqueIdentifier:
+    def __init__(self, name):
+        self.__name = name
+
+    def __repr__(self):
+        return self.__name
+
+
+PING_TOKEN = UniqueIdentifier("PING_TOKEN")
+SHUTDOWN_TOKEN = UniqueIdentifier("SHUTDOWN_TOKEN")
 
 
 def timeout_sequence():
@@ -119,6 +127,9 @@ class StreamingState(ParticleState):
             if not self.__background.responses.empty():
                 break
             await asyncio.sleep(timeout)
+        self.__receive_response(token)
+
+    def __receive_response(self, token):
         response_token, response_type, *payload = self.__background.responses.get()
         assert token == response_token
         match response_type:
@@ -127,7 +138,7 @@ class StreamingState(ParticleState):
             case Responses.COMPLETE:
                 self.__score = payload[0] or 0.0
             case Responses.ERROR:
-                self.__score = payload[0] = -float("inf")
+                self.__score = -float("inf")
 
     def shutdown(self):
         if self.__background_thread is not None and self.__background_thread.is_alive():
@@ -136,6 +147,7 @@ class StreamingState(ParticleState):
             # Should in fact terminate very fast. Long timeout here for debugging purposes
             # only - we want a log if it hangs.
             self.__background_thread.join(timeout=1.0)
+            self.__receive_response(token)
 
     def __del__(self):
         self.shutdown()
@@ -152,3 +164,111 @@ class StreamingPotential(StatefulPotential, ABC):
 
     @abstractmethod
     def calculate_score_from_stream(self, stream: Iterable[Any]) -> float: ...
+
+
+class RunningInTask:
+    def __init__(self, function):
+        self.incoming_data = asyncio.Queue()
+        self.responses = asyncio.Queue()
+        self.last_message = None
+        self.running = False
+        self.complete = False
+        self.function = function
+
+    async def __chunks(self):
+        while True:
+            self.last_message, chunk = await self.incoming_data.get()
+            if chunk is SHUTDOWN_TOKEN:
+                break
+            yield chunk
+            await self.responses.put((self.last_message, Responses.INCOMPLETE))
+
+    async def run(self):
+        assert not self.running
+        try:
+            self.running = True
+            self.last_message, chunk = await self.incoming_data.get()
+            assert chunk == PING_TOKEN
+            await self.responses.put((self.last_message, Responses.INCOMPLETE))
+            result = await self.function(self.__chunks())
+        except Exception as e:
+            await self.responses.put((self.last_message, Responses.ERROR, e))
+        else:
+            await self.responses.put((self.last_message, Responses.COMPLETE, result))
+        finally:
+            self.running = False
+            self.complete = True
+
+
+class AsyncStreamingState(ParticleState):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.__token = 0
+        self.__background = None
+        self.__score = 0.0
+
+    def __new_token(self):
+        self.__token += 1
+        return self.__token
+
+    async def __initialize_background(self):
+        if self.__background is None:
+            self.__background = RunningInTask(self.owner.calculate_score_from_stream)
+            self.__background_task = asyncio.create_task(self.__background.run())
+            await self.__send_message(PING_TOKEN)
+        assert self.__background is not None
+
+    async def impl_update_context(self, incremental_context):
+        await self.__initialize_background()
+        await self.__send_message(incremental_context)
+
+    async def impl_finish(self):
+        await self.__initialize_background()
+        await self.shutdown()
+
+    @property
+    def current_score(self):
+        return self.__score
+
+    async def __send_message(self, message):
+        if self.__background.complete:
+            return
+        token = self.__new_token()
+        await self.__background.incoming_data.put((token, message))
+
+        (
+            response_token,
+            response_type,
+            *payload,
+        ) = await self.__background.responses.get()
+
+        assert token == response_token
+        match response_type:
+            case Responses.INCOMPLETE:
+                pass
+            case Responses.COMPLETE:
+                self.__score = payload[0] or 0.0
+            case Responses.ERROR:
+                self.__score = -float("inf")
+
+    async def shutdown(self):
+        if self.__background is not None:
+            await self.__send_message(SHUTDOWN_TOKEN)
+            # Should in fact terminate very fast. Long timeout here for debugging purposes
+            # only - we want a log if it hangs.
+            await self.__background_task
+
+
+class AsyncStreamingPotential(StatefulPotential, ABC):
+    def __init__(self, vocabulary, token_type=None, eos=None):
+        super().__init__(
+            vocabulary=vocabulary,
+            token_type=token_type,
+            eos=eos,
+            state_class=AsyncStreamingState,
+        )
+
+    @abstractmethod
+    async def calculate_score_from_stream(
+        self, stream: AsyncIterable[Any]
+    ) -> float: ...
