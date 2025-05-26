@@ -2,11 +2,16 @@ import json_stream
 import json
 import regex
 from typing import Generic, TypeVar, Union, Any, Callable
-from jsonschema import Draft7Validator, ValidationError
+from jsonschema import Draft7Validator
 from jsonschema import _types
-
-
-from genlm.control.potential.base import Potential
+from typing import Iterable, AsyncIterator, AsyncIterable
+from genlm.control.potential import Potential
+from contextlib import contextmanager
+from genlm.control.potential.streaming import (
+    StreamingPotential,
+    AsyncStreamingPotential,
+)
+from array import array
 
 
 def is_sequence(checker, instance):
@@ -41,25 +46,6 @@ _types.is_object.__code__ = is_object.__code__
 LazyCompatibleValidator = Draft7Validator
 
 
-class OutOfBytes(Exception):
-    pass
-
-
-class JustOneBlockIterable:
-    """Provides a single value (intended to be bytes from a context)
-    and then signals if the reader tried to read past it. This allows
-    us to distinguish invalid JSON from incomplete JSON by seeing if
-    the reader tried to read more than it had or failed early."""
-
-    def __init__(self, block):
-        self.block = block
-        self.read_past_first_block = False
-
-    def __iter__(self):
-        yield self.block
-        self.read_past_first_block = True
-
-
 UTF8_START_BYTE_MASKS = [
     (0b00000000, 0b10000000),
     (0b11000000, 0b11100000),
@@ -81,37 +67,38 @@ def is_utf8_start_byte(n: int) -> bool:
 BAD_WHITESPACE = regex.compile(rb"(?:\n\s+\n)|(?:\n\n\n)", regex.MULTILINE)
 
 
-def remove_incomplete_trailing_utf8(context: bytes) -> tuple[bool, bytes, str]:
-    context = bytes(context)
+def chunk_to_complete_utf8(byte_blocks):
+    for s in chunk_bytes_to_strings(byte_blocks):
+        yield s.encode("utf-8")
 
-    # JSON documents have to be valid UTF-8, but we might be
-    # in the middle of generating a UTF-8 character. If so, we
-    # only consider the prefix that is valid UTF-8, but need
-    # to signal at the end that this is a valid prefix and not
-    # a valid complete document.
-    incomplete_utf8_at_end = False
-    try:
+
+def chunk_bytes_to_strings(byte_blocks):
+    buffer = bytearray()
+    for block in byte_blocks:
+        buffer.extend(block)
         try:
-            context_as_string = context.decode("utf-8")
+            yield buffer.decode("utf-8")
+            buffer.clear()
+            continue
         except UnicodeDecodeError:
-            for i in range(1, min(5, len(context))):
-                if is_utf8_start_byte(context[-i]):
-                    context = context[:-i]
-                    context_as_string = context.decode("utf-8")
-                    incomplete_utf8_at_end = True
+            for i in range(1, min(5, len(buffer) + 1)):
+                if is_utf8_start_byte(buffer[-i]):
+                    block = buffer[:-i]
+                    if block:
+                        yield block.decode("utf-8")
+                        del buffer[:-i]
                     break
             else:
                 raise
-    except UnicodeDecodeError:
-        raise ValueError("Invalid UTF-8")
+    if buffer:
+        buffer.decode("utf-8")
+        raise AssertionError("Leftover bytes are valid UTF-8")
 
-    return (incomplete_utf8_at_end, context, context_as_string)
 
-
-class JsonSchema(Potential):
+class StreamingJsonSchema(StreamingPotential):
     def __init__(self, schema):
         super().__init__(
-            list(range(256)),
+            vocabulary=list(range(256)),
         )
         self.schema = schema
         self.validator = LazyCompatibleValidator(
@@ -119,38 +106,34 @@ class JsonSchema(Potential):
         )
         self.parser = json_schema_parser(schema)
 
-    def __check_context(self, context):
-        context = bytes(context)
+    def calculate_score_from_stream(self, stream: Iterable[Any]) -> float:
+        x = json_stream.load(chunk_to_complete_utf8(stream), persistent=True)
+        self.validator.validate(x)
+        if hasattr(x, "read_all"):
+            x.read_all()
+        return 0.0
 
-        incomplete_utf8_at_end, context, context_as_string = (
-            remove_incomplete_trailing_utf8(context)
+
+class ValidateJSON(Potential):
+    def __init__(self):
+        super().__init__(
+            vocabulary=list(range(256)),
         )
 
-        # Sometimes a model can get itself itno a position where it can't
+    async def prefix(self, context):
+        # Sometimes a model can get itself into a position where it can't
         # generate any valid tokens, but it can keep generating whitespace
         # indefinitely.
+        context = bytes(context)
         if BAD_WHITESPACE.search(context):
-            raise ValueError("Improper JSON formatting.")
+            return float("-inf")
+        return 0.0
 
-        # Feeding just whitespace to json-stream causes it to raise
-        # StopIteration, and this is always a valid start to a JSON
-        # document of any schema, and never a valid JSON value.
-        if not context.strip():
-            raise OutOfBytes()
-
-        iterable = JustOneBlockIterable(context)
-        try:
-            x = json_stream.load(iterable, persistent=True)
-            self.validator.validate(x)
-            if hasattr(x, "read_all"):
-                x.read_all()
-        except ValueError:
-            if iterable.read_past_first_block:
-                raise OutOfBytes()
-            else:
-                raise
-        if incomplete_utf8_at_end:
-            raise OutOfBytes()
+    async def complete(self, context):
+        context = bytes(context)
+        prefix = await self.prefix(context)
+        if prefix == float("-inf"):
+            return prefix
 
         # json-stream will just read a JSON object off the start of
         # the stream and then stop, so we reparse the whole string
@@ -160,55 +143,54 @@ class JsonSchema(Potential):
         # JSON value and want to terminate the sequence.
         try:
             json.loads(context)
-        except json.JSONDecodeError as e:
-            raise ValueError(*e.args)
+            return 0.0
+        except json.JSONDecodeError:
+            return float("-inf")
 
-    async def complete(self, context) -> float:
-        # TODO:
-        # 1. Create some sort of caching for the validator, so
-        #    we can reuse ones from previous calls.
-        # 2. Use a Lark JSON grammar as a prefilter to rule out any
-        #    bytes that can't be included next in valid JSON.
 
+def JsonSchema(schema):
+    return (
+        StreamingJsonSchema(schema)
+        * ValidateJSON()
+        * ParserPotential(json_schema_parser(schema))
+    )
+
+
+async def async_chunk_bytes_to_strings(byte_blocks):
+    buffer = bytearray()
+    async for block in byte_blocks:
+        buffer.extend(block)
         try:
-            self.__check_context(context)
-        except (ValueError, ValidationError, OutOfBytes):
-            return -float("inf")
+            yield buffer.decode("utf-8")
+            buffer.clear()
+            continue
+        except UnicodeDecodeError:
+            for i in range(1, min(5, len(buffer) + 1)):
+                if is_utf8_start_byte(buffer[-i]):
+                    block = buffer[:-i]
+                    if block:
+                        yield block.decode("utf-8")
+                        del buffer[:-i]
+                    break
+            else:
+                raise
+    if buffer:
+        buffer.decode("utf-8")
+        raise AssertionError("Leftover bytes are valid UTF-8")
 
-        return 0.0
 
-    async def prefix(self, context) -> float:
-        # TODO:
-        # 1. Create some sort of caching for the validator, so
-        #    we can reuse ones from previous calls.
-        # 2. Use a Lark JSON grammar as a prefilter to rule out any
-        #    bytes that can't be included next in valid JSON.
-        try:
-            self.__check_context(context)
-        except (ValueError, ValidationError):
-            return -float("inf")
-        except OutOfBytes:
-            pass
+class ParserPotential(AsyncStreamingPotential):
+    def __init__(self, parser):
+        super().__init__(
+            vocabulary=list(range(256)),
+        )
+        self.parser = parser
 
-        # There are a number of cases where the approach we use in check_context
-        # will fail to catch an error early enough because it only operates on
-        # completed values. The biggest problem here is that if there is no way to
-        # close a string that conforms to the schema, it will force the LLM to
-        # just keep extending the string. In these cases what we do is use a very
-        # rough approximate parser that accepts a superset of valid JSON strings
-        # for this schema but is able to reject some cases earlier than the full
-        # validation.
-        #
-        # We only need to do this in prefix, because the full document is guaranteed
-        # to be checkable exactly by the JSONSchema validator.
-        context_as_string = remove_incomplete_trailing_utf8(context)[-1]
-        try:
-            self.parser.parse(context_as_string, 0)
-        except ParseError:
-            return -float("inf")
-        except Incomplete:
-            pass
+    async def calculate_score_from_stream(self, stream: AsyncIterable[Any]) -> float:
+        rechunked = async_chunk_bytes_to_strings(stream)
 
+        input = Input(rechunked)
+        await input.parse(self.parser)
         return 0.0
 
 
@@ -224,10 +206,106 @@ class Incomplete(Exception):
     pass
 
 
+class Input:
+    """Convenience wrapper to provide a stateful stream-like interface
+    that makes it easier to write parsers."""
+
+    def __init__(self, incoming: AsyncIterator[str]):
+        self.__incoming = incoming
+        self.__finished = False
+        # There's no textarray equivalent, so we store the growable
+        # string as an array of integer codepoints.
+        self.buffer = array("I")
+        self.index = 0
+
+    async def __read_more(self):
+        if self.__finished:
+            return False
+        try:
+            next_block = await anext(self.__incoming)
+            self.buffer.extend([ord(c) for c in next_block])
+            return True
+        except StopAsyncIteration:
+            self.__finished = True
+            return False
+
+    async def __read_until(self, condition):
+        while True:
+            if condition():
+                break
+            if not await self.__read_more():
+                raise Incomplete()
+
+    async def read_pattern(self, pattern, group=0):
+        await self.__read_until(lambda: self.index < len(self.buffer))
+        while True:
+            # Having to convert the whole thing to a string here is really
+            # annoying, but in practice the inefficiency is dwarfed by the LLM
+            # so hopefully we don't have to worry about it.
+            buffer = "".join(chr(i) for i in self.buffer[self.index :])
+            match = pattern.match(buffer, pos=0, partial=True)
+            if match is None or (result := match.group(group)) is None:
+                raise ParseError()
+            elif match.partial:
+                if not await self.__read_more():
+                    raise Incomplete()
+            else:
+                self.index += match.end()
+                return result
+
+    async def current_char(self):
+        await self.__read_until(lambda: self.index < len(self.buffer))
+        return chr(self.buffer[self.index])
+
+    async def read(self, n) -> str:
+        await self.__read_until(lambda: self.index + n <= len(self.buffer))
+        result = self.buffer[self.index : self.index + n]
+        assert len(result) == n
+        self.index += n
+        return "".join(map(chr, result))
+
+    async def expect(self, expected: str):
+        actual = await self.read(len(expected))
+        if actual != expected:
+            raise ParseError(
+                f"Expected: {expected} but got {actual} at index {self.index}"
+            )
+
+    @contextmanager
+    def preserving_index(self):
+        """Only advance the index if the operation in the context block does
+        not error."""
+        start = self.index
+        try:
+            yield
+        except Exception:
+            self.index = start
+            raise
+
+    async def parse(self, parser: "Parser[T]") -> T:
+        with self.preserving_index():
+            return await parser.parse(self)
+
+    async def skip_whitespace(self):
+        if self.index == len(self.buffer):
+            if not await self.__read_more():
+                return
+        # TODO: Given inefficiencies with regex, maybe worth a more direct
+        # implementation here?
+        await self.parse(WHITESPACE_PARSER)
+
+
+async def trivial_iterator(s):
+    yield s
+
+
 class Parser(Generic[T]):
     """Very basic parser combinators for mostly unambiguous grammars."""
 
-    def parse(self, buffer: str, start: int) -> tuple[int, T]: ...
+    async def parse(self, input: Input) -> T: ...
+
+    async def parse_string(self, s: str) -> T:
+        return await Input(trivial_iterator(s)).parse(self)
 
     def __floordiv__(self, other: Generic[S]) -> "Parser[Union[T, S]]":
         return AltParser(self, other)
@@ -239,55 +317,13 @@ class Parser(Generic[T]):
         return MapParser(self, apply)
 
 
-class Input:
-    """Convenience wrapper to provide a stateful stream-like interface
-    that makes it easier to write parsers."""
-
-    def __init__(self, buffer, index):
-        self.buffer = buffer
-        self.index = index
-
-    def current_char(self):
-        if self.index >= len(self.buffer):
-            raise Incomplete()
-        else:
-            return self.buffer[self.index]
-
-    def read(self, n) -> str:
-        result = self.buffer[self.index : self.index + n]
-        if len(result) < n:
-            raise Incomplete()
-        else:
-            self.index += n
-            return result
-
-    def expect(self, expected: str):
-        actual = self.read(len(expected))
-        if actual != expected:
-            raise ParseError(
-                f"Expected: {expected} but got {actual} at index {self.index}"
-            )
-
-    def parse(self, parser: Parser[T]) -> T:
-        try:
-            self.index, result = parser.parse(self.buffer, self.index)
-            return result
-        except Incomplete:
-            self.index = len(self.buffer)
-            raise
-
-    def skip_whitespace(self):
-        self.parse(WHITESPACE_PARSER)
-
-
 class MapParser(Parser[T]):
     def __init__(self, base: Parser[S], apply: Callable[[S], T]):
         self.base = base
         self.apply = apply
 
-    def parse(self, buffer: str, start: int) -> tuple[int, T]:
-        end, result = self.base.parse(buffer, start)
-        return (end, self.apply(result))
+    async def parse(self, input: Input) -> T:
+        return self.apply(await input.parse(self.base))
 
     def __repr__(self):
         return f"{self.base}.map({self.apply})"
@@ -298,14 +334,12 @@ class AltParser(Parser[Union[S, T]]):
         self.left = left
         self.right = right
 
-    def parse(self, buffer: str, start: int) -> tuple[int, Union[S, T]]:
+    async def parse(self, input: Input) -> T:
         try:
-            return self.left.parse(buffer, start)
-        # NB it's correct that we don't catch incomplete here. If
-        # the first parser needs more characters to tell whether it matches
-        # then we can't yet try the second.
+            with input.preserving_index():
+                return await self.left.parse(input)
         except ParseError:
-            return self.right.parse(buffer, start)
+            return await self.right.parse(input)
 
 
 class RegexParser(Parser[str]):
@@ -313,14 +347,8 @@ class RegexParser(Parser[str]):
         self.pattern = regex.compile(pattern, options)
         self.group = group
 
-    def parse(self, buffer: str, start: int) -> tuple[int, str]:
-        match = self.pattern.match(buffer, pos=start, partial=True)
-        if match is None or (result := match.group(self.group)) is None:
-            raise ParseError()
-        elif match.partial:
-            raise Incomplete()
-        else:
-            return (match.end(), result)
+    async def parse(self, input: Input) -> str:
+        return await input.read_pattern(self.pattern, group=self.group)
 
     def __repr__(self):
         return f"RegexParser({self.pattern})"
@@ -332,17 +360,27 @@ FLOAT_REGEX_PARSER: Parser[float] = RegexParser(
 
 
 class FloatParser(Parser[float]):
-    def parse(self, buffer: str, start: int) -> tuple[int, float]:
-        i, result = FLOAT_REGEX_PARSER.parse(buffer, start)
-        # We need to do a tiny bit of lookahead here so that we
-        # can guarantee that if we're in the middle of a float
-        # we always either return a valid value or raise Incomplete.
-        # Otherwise we end up in situations like "[0." raising
-        # ParseError because the float completes and then the
-        # list parser looks for a comma and gets a dot.
-        if i < len(buffer) and buffer[i] in ".eE":
-            raise Incomplete()
-        return (i, result)
+    async def parse(self, input: Input) -> float:
+        start = input.index
+        preliminary_result = await input.parse(FLOAT_REGEX_PARSER)
+        reset_point = input.index
+        try:
+            next_char = await input.read(1)
+        except Incomplete:
+            return preliminary_result
+
+        if next_char == ".":
+            await input.read(1)
+        elif next_char in "eE":
+            next_next_char = await input.read(1)
+            if next_next_char in "-+":
+                await input.read(1)
+        else:
+            input.index = reset_point
+            return preliminary_result
+
+        input.index = start
+        return await input.parse(FLOAT_REGEX_PARSER)
 
 
 FLOAT_PARSER = FloatParser()
@@ -383,11 +421,10 @@ class ObjectSchemaParser(Parser[Any]):
     def __repr__(self):
         return f"ObjectSchemaParser({self.schema})"
 
-    def parse(self, buffer: str, start: int):
-        input = Input(buffer, start)
-        input.skip_whitespace()
+    async def parse(self, input: Input):
+        await input.skip_whitespace()
 
-        input.expect("{")
+        await input.expect("{")
 
         result = {}
 
@@ -396,25 +433,25 @@ class ObjectSchemaParser(Parser[Any]):
         first = True
 
         while True:
-            input.skip_whitespace()
-            if input.current_char() == "}":
-                input.read(1)
+            await input.skip_whitespace()
+            if await input.current_char() == "}":
+                await input.read(1)
                 break
             if not first:
-                input.expect(",")
-                input.skip_whitespace()
+                await input.expect(",")
+                await input.skip_whitespace()
             first = False
-            key = input.parse(self.key_parser)
+            key = await input.parse(self.key_parser)
             assert isinstance(key, str)
             if key in keys_seen:
                 raise ParseError(f"Duplicated key {repr(key)}")
             keys_seen.add(key)
-            input.skip_whitespace()
-            input.expect(":")
-            input.skip_whitespace()
+            await input.skip_whitespace()
+            await input.expect(":")
+            await input.skip_whitespace()
             value_parser = self.child_parsers.get(key, ARBITRARY_JSON)
-            result[key] = input.parse(value_parser)
-        return (input.index, result)
+            result[key] = await input.parse(value_parser)
+        return result
 
 
 class ArraySchemaParser(Parser[Any]):
@@ -428,11 +465,10 @@ class ArraySchemaParser(Parser[Any]):
     def __repr__(self):
         return f"ArraySchemaParser({self.schema})"
 
-    def parse(self, buffer: str, start: int):
-        input = Input(buffer, start)
-        input.skip_whitespace()
+    async def parse(self, input: Input):
+        await input.skip_whitespace()
 
-        input.expect("[")
+        await input.expect("[")
 
         if self.items_parser is None:
             items_parser = ARBITRARY_JSON
@@ -444,16 +480,16 @@ class ArraySchemaParser(Parser[Any]):
         first = True
 
         while True:
-            input.skip_whitespace()
-            if input.current_char() == "]":
-                input.read(1)
+            await input.skip_whitespace()
+            if await input.current_char() == "]":
+                await input.read(1)
                 break
             if not first:
-                input.expect(",")
-                input.skip_whitespace()
+                await input.expect(",")
+                await input.skip_whitespace()
             first = False
-            result.append(input.parse(items_parser))
-        return (input.index, result)
+            result.append(await input.parse(items_parser))
+        return result
 
 
 ARBITRARY_JSON = (

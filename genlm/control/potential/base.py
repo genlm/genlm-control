@@ -1,6 +1,6 @@
 import asyncio
 import numpy as np
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.util import LazyWeights
@@ -285,3 +285,143 @@ class Potential(ABC, PotentialOps, PotentialTests):
         This method may be implemented by subclasses to release resources.
         """
         pass
+
+
+class ParticleState(ABC):
+    def __init__(self, owner):
+        self.owner = owner
+        self.finished = False
+        self.context = []
+
+    async def update_context(self, incremental_context):
+        """Update the context with more data that has come in."""
+        if self.finished:
+            return
+        self.context.extend(incremental_context)
+        await self.impl_update_context(incremental_context)
+
+    async def finish(self):
+        """Mark this state as finished, clearing up any associated
+        state, and updating the current score to reflect whether
+        this is a valid string in the associated language."""
+        if self.finished:
+            return
+        self.finished = True
+        await self.impl_finish()
+
+    @abstractproperty
+    def current_score(self):
+        """The current score associated with this potential, which
+        will reflect whether the current context is a suitable member
+        of the language if this has been finished, or whether it is a
+        suitable prefix if it has not."""
+
+    @abstractmethod
+    async def impl_update_context(self, incremental_context): ...
+
+    @abstractmethod
+    async def impl_finish(self): ...
+
+    async def clone(self):
+        if self.finished:
+            return self
+        result = self.owner.new_state()
+        await result.update_context(self.context)
+        assert self.context == result.context
+        assert self.current_score == result.current_score
+        return result
+
+
+class StatefulPotential(Potential):
+    def __init__(self, vocabulary, token_type=None, eos=None, state_class=None):
+        super().__init__(vocabulary=vocabulary, token_type=token_type, eos=eos)
+        self.__state_class = state_class
+
+        self.__previous_states = []
+
+    def new_state(self) -> ParticleState:
+        if self.__state_class is None:
+            raise NotImplementedError()
+        return self.__state_class(self)
+
+    def __look_up_state(self, context):
+        # TODO: This is a horrible algorithm and is only here as a placeholder.
+        context = list(context)
+        for i, state in enumerate(self.__previous_states):
+            if context[: len(state.context)] == state.context:
+                return i
+
+    async def prefix(self, context):
+        i = self.__look_up_state(context)
+        if i is None:
+            state = self.new_state()
+        else:
+            state = self.__previous_states[i]
+            if state.context == list(context):
+                return state.current_score
+            else:
+                del self.__previous_states[i]
+
+        await state.update_context(context[len(state.context) :])
+
+        # FIXME: Temporary code for debugging some resource leaks,
+        # which means we never return the state object to the pool.
+        result = state.current_score
+        await state.finish()
+        return result
+        self.__previous_states.append(state)
+        return state.current_score
+
+    async def complete(self, context):
+        i = self.__look_up_state(context)
+        if i is None:
+            state = self.new_state()
+        else:
+            state = self.__previous_states[i]
+            del self.__previous_states[i]
+
+        await state.update_context(context[len(state.context) :])
+        await state.finish()
+        return state.current_score
+
+    async def logw_next(self, context):
+        """Compute the next-token weights of each token in `self.vocab_eos` given `context`.
+
+        Args:
+            context (list): Sequence of tokens.
+
+        Returns:
+            (LazyWeights): Weights of each token in the vocabulary and EOS.
+        """
+        i = self.__look_up_state(context)
+        if i is None:
+            state = self.new_state()
+            await state.update_context(context)
+        else:
+            state = await self.__previous_states[i].clone()
+
+        assert not state.finished
+        ctx_log_w = state.current_score
+
+        if ctx_log_w == float("-inf"):
+            raise ValueError(f"Context {context!r} has weight zero under `prefix`.")
+
+        async def step_score(x):
+            local_state = await state.clone()
+            await local_state.update_context([x])
+            if x == self.eos:
+                await local_state.finish()
+                return local_state.current_score
+            else:
+                await local_state.update_context([x])
+                result = local_state.current_score
+                await local_state.finish()
+                return result
+
+        scores = np.array(
+            await asyncio.gather(*[step_score(x) for x in self.vocab_eos])
+        )
+
+        logws = scores - ctx_log_w
+
+        return self.make_lazy_weights(logws)
