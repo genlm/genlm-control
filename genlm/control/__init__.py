@@ -1,5 +1,14 @@
 from .constant import EOS, EOT
-from .potential import Potential, PromptedLLM, BoolCFG, BoolFSA, WFSA, WCFG, JsonSchema, CanonicalTokenization
+from .potential import (
+    Potential,
+    PromptedLLM,
+    BoolCFG,
+    BoolFSA,
+    WFSA,
+    WCFG,
+    JsonSchema,
+    CanonicalTokenization,
+)
 from .sampler import (
     SMC,
     direct_token_sampler,
@@ -8,6 +17,7 @@ from .sampler import (
     AWRS,
 )
 from .viz import InferenceVisualizer
+from . import evaluation
 
 __all__ = [
     "EOS",
@@ -26,4 +36,5 @@ __all__ = [
     "eager_token_sampler",
     "topk_token_sampler",
     "InferenceVisualizer",
+    "evaluation",
 ]
