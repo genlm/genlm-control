@@ -5,7 +5,7 @@ from queue import SimpleQueue
 from enum import Enum, auto
 from threading import Thread
 import asyncio
-from time import time
+import random
 
 
 class Responses(Enum):
@@ -27,20 +27,16 @@ SHUTDOWN_TOKEN = UniqueIdentifier("SHUTDOWN_TOKEN")
 
 
 def timeout_sequence():
-    start = time()
     # Initially we just yield to the the event loop
     for _ in range(3):
         yield 0.0
     # Then we do a series of short sleeps
     for _ in range(3):
-        yield 0.01
+        yield random.random() * 0.01
     sleep = 0.015
-    # Long timeout which we should never really hit,
-    # this is just hang detection.
-    while time() < start + 5:
-        yield sleep
-        sleep *= 1.1
-    raise AssertionError("Timeout")
+    while True:
+        yield random.random() * sleep
+        sleep = min(sleep * 1.1, 1)
 
 
 THREAD_COUNTER = 0
@@ -91,6 +87,7 @@ class StreamingState(ParticleState):
         self.__token = 0
         self.__background = None
         self.__score = 0.0
+        self.__shut_down = False
 
     def __new_token(self):
         self.__token += 1
@@ -99,8 +96,18 @@ class StreamingState(ParticleState):
     async def __initialize_background(self):
         if self.__background is None:
             self.__background = RunningInThread(self.owner.calculate_score_from_stream)
-            self.__background_thread = Thread(target=self.__background.run, daemon=True)
-            self.__background_thread.start()
+
+            # Sometimes, especially in consistency check tests, we have too many threads
+            # running and need to wait before we're able to start a new thread.
+            for t in timeout_sequence():
+                try:
+                    self.__background_thread = Thread(
+                        target=self.__background.run, daemon=True
+                    )
+                    self.__background_thread.start()
+                    break
+                except RuntimeError:
+                    await asyncio.sleep(t)
             await self.__send_message(PING_TOKEN)
             assert self.__background.running or self.__background.complete
         assert self.__background is not None
@@ -141,6 +148,9 @@ class StreamingState(ParticleState):
                 self.__score = -float("inf")
 
     def shutdown(self):
+        if self.__shut_down:
+            return
+        self.__shut_down = True
         if self.__background_thread is not None and self.__background_thread.is_alive():
             token = self.__new_token()
             self.__background.incoming_data.put((token, SHUTDOWN_TOKEN))
@@ -190,7 +200,11 @@ class RunningInTask:
             self.last_message, chunk = await self.incoming_data.get()
             assert chunk == PING_TOKEN
             await self.responses.put((self.last_message, Responses.INCOMPLETE))
-            result = await self.function(self.__chunks())
+            chunks = self.__chunks()
+            try:
+                result = await self.function(chunks)
+            finally:
+                await chunks.aclose()
         except Exception as e:
             await self.responses.put((self.last_message, Responses.ERROR, e))
         else:
