@@ -299,6 +299,7 @@ class PromptedLLM(Potential):
         # This is ugly, but it's useful for all potentials to adhere to the convention
         # of keeping the EOS token at the end of the weights array.
         _logw_next = np.full(len(self.vocab) + 1, -np.inf, dtype=logw_next.dtype)
+        logw_next = logw_next[: len(self.token_maps.decode)]
         _logw_next[: len(self.vocab)] = logw_next[
             ~np.isin(np.arange(len(logw_next)), self.token_maps.eos_idxs)
         ]
