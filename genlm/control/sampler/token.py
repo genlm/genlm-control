@@ -198,10 +198,18 @@ class AWRS(TokenSampler):
         prune_logws (bool): Whether to prune the logws to only include the tokens in the intersection of the potential and condition vocabularies
         proper_weights (bool): Whether to return properly weighted samples.
             If False, the sampler will only run one round of adaptive rejection sampling.
+        clip: Parameter that allows low-acceptance probabilities to be rounded to zero. Pick `clip` to be roughly
+            the smallest probability of acceptance that you care about.
     """
 
     def __init__(
-        self, potential, condition, seed=42, prune_logws=True, proper_weights=True
+        self,
+        potential,
+        condition,
+        seed=42,
+        prune_logws=True,
+        proper_weights=True,
+        clip=0.0,
     ):
         super().__init__(target=potential * condition)
         self.potential = potential
@@ -209,6 +217,7 @@ class AWRS(TokenSampler):
 
         self.prune_logws = prune_logws
         self.proper_weights = proper_weights
+        self.clip = clip
         self.valid_idxs = np.array(
             [self.potential.lookup[t] for t in self.target.vocab_eos]
         )
@@ -260,19 +269,29 @@ class AWRS(TokenSampler):
         if self.prune_logws:
             logws = self._prune_logws(logws)
 
-        logZ = logsumexp(logws.weights)
-        logps = logws.weights - logZ
+        weights = logws.weights
+        logZ = logsumexp(weights)
+        logps = weights - logZ
         toks = logws.decode
+
+        # If we are clipping small Z then we add an artificial token at the end
+        # that we always accept. If this is the only accepted token we see during
+        # sampling, we are allowed to return a weight of zero.
+        if self.clip > 0:
+            logps = np.concatenate([logps + np.log(1 - self.clip), [np.log(self.clip)]])
 
         tok, nrej, logp0 = None, 0, []
         for _ in range(2):
-            keys = logps - np.log(-np.log(self.rng.random((self.V,))))
+            keys = logps - np.log(-np.log(self.rng.random((len(logps)))))
             order = np.argsort(-keys)
             for rank in range(logps.size):
                 item = order[rank]
                 if keys[item] == -np.inf:
                     break
-                if await self._accept(context, toks[item], verbosity):
+                if item == len(toks):
+                    assert self.clip > 0
+                    break
+                elif await self._accept(context, toks[item], verbosity):
                     if tok is None:
                         tok = toks[item]
                     break
@@ -288,6 +307,22 @@ class AWRS(TokenSampler):
                 return tok, 0, np.nan
 
         if tok is None:  # No token was accepted, return EOS and kill the particle.
+            if self.clip > 0:
+                # This is a bit fussy, but technically the correctness of this
+                # method relies on the branch where we never successfully sampled
+                # also being an unbiased estimate of Z, so in this case we do a
+                # single loop of the rejection sample, check if it's accepted,
+                # and return either 0 or 1 (in logspace) appropriately.
+                #
+                # Most of the time unless clip is set quite high (e.g. 0.5) this
+                # has little benefit.
+                keys = logps[:-1] - np.log(-np.log(self.rng.random((len(logps) - 1))))
+                tok = toks[np.argmax(-keys)]
+                if await self._accept(context, tok, verbosity):
+                    return tok, 0.0, np.nan
+                else:
+                    return tok, -float("inf"), np.nan
+
             return self.target.eos, float("-inf"), np.nan
 
         if not logp0:  # Success on first try.
@@ -295,4 +330,4 @@ class AWRS(TokenSampler):
         else:
             logw = logZ + log1mexp(logsumexp(logp0)) - np.log(nrej + 1)
 
-        return tok, logw, np.nan
+        return tok, logw / (1 - self.clip), np.nan

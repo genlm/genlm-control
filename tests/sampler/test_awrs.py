@@ -232,3 +232,35 @@ async def test_awrs_with_no_pruning_and_different_vocabs():
     have = await monte_carlo(sampler, [], 10000)
 
     assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.asyncio
+async def test_can_clip_sample_and_remain_unbiased():
+    potential = MockPotential(
+        list(range(100)),
+        np.log([0.01] * 101),
+    )
+    condition = MockPotential(
+        list(range(100)),
+        [-float("inf")] * 40 + [0] + [-float("inf")] * 60,
+    )
+
+    sampler_unclipped = AWRS(potential, condition, prune_logws=False)
+    sampler_clipped = AWRS(potential, condition, prune_logws=False, clip=0.1)
+
+    unclipped_weight = await monte_carlo(sampler_unclipped, [], 10000)
+    clipped_weight = await monte_carlo(sampler_clipped, [], 10000)
+
+    for _ in range(100):
+        _, log_weight, _ = await sampler_clipped.sample([])
+        if log_weight == -float("inf"):
+            break
+    else:
+        raise AssertionError("Clipped sampler never sampled zero weight")
+
+    assert np.isclose(
+        np.exp(unclipped_weight.sum()),
+        np.exp(clipped_weight.sum()),
+        rtol=5e-3,
+        atol=5e-3,
+    )
