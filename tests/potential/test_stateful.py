@@ -179,3 +179,18 @@ def test_peek_after_set():
     x[0] = 0
     x[0] = 1
     assert x.peek() == (0, 1)
+
+
+def test_validation_errors_are_raised():
+    x = PriorityMap()
+    with pytest.raises(ValueError):
+        x.peek()
+    with pytest.raises(ValueError):
+        x.pop()
+
+
+def test_priority_map_repr():
+    x = PriorityMap()
+    x[0] = 0
+    x[1] = 1
+    assert repr(x) == "PriorityMap({0: 0, 1: 1})"
