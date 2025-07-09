@@ -27,7 +27,6 @@ jobs:
       - name: Install UV
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          source $HOME/.local/bin/env
 
       - name: Run Tests
         run: |
