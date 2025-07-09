@@ -24,12 +24,16 @@ jobs:
       # - name: Clear pip cache
       #   run: |
       #     pip cache purge
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          source $HOME/.local/bin/env
 
       - name: Run Tests
         run: |
-          python -m venv venv
+          uv venv venv
           source venv/bin/activate
-          pip install -e .[test]
+          uv pip install -e .[test]
           pytest tests --cov=genlm/control --cov-report=json
 
       - name: Upload coverage to Codecov
