@@ -94,9 +94,10 @@ def chunk_bytes_to_strings(byte_blocks):
 
 
 class StreamingJsonSchema(StreamingPotential):
-    def __init__(self, schema):
+    def __init__(self, schema, **kwargs):
         super().__init__(
             vocabulary=list(range(256)),
+            **kwargs,
         )
         self.schema = schema
         self.validator = LazyCompatibleValidator(

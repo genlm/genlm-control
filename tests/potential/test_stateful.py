@@ -10,6 +10,17 @@ import pytest
 import asyncio
 import time
 from threading import Thread
+from hypothesis.stateful import (
+    RuleBasedStateMachine,
+    rule,
+    invariant,
+    precondition,
+    Bundle,
+    consumes,
+)
+import hypothesis.strategies as st
+from hypothesis import assume
+from genlm.control.potential.stateful import PriorityMap
 
 
 def test_make_immutable_converts_non_bytes_to_tuple():
@@ -115,3 +126,56 @@ async def test_operations_after_finish_are_ignored():
     assert len(state.context) == 1
     await state.finish()
     assert state.finished
+
+
+class PriorityMapTest(RuleBasedStateMachine):
+    keys = Bundle("keys")
+
+    def __init__(self):
+        super().__init__()
+        self.priority_map = PriorityMap()
+        self.model = {}
+
+    @invariant()
+    def check_soundness(self):
+        assert len(self.priority_map) == len(self.model)
+        for k, v in self.model.items():
+            assert self.priority_map[k] == v
+        if len(self.model) > 0:
+            k, v = self.priority_map.peek()
+            assert k in self.model
+            assert v == min(self.model.values())
+
+    @rule(x=st.integers(), y=st.integers(), target=keys)
+    def set_item(self, x, y):
+        self.priority_map[x] = y
+        assert self.priority_map[x] == y
+        self.model[x] = y
+
+    @precondition(lambda self: len(self.model) > 0)
+    @rule(x=consumes(keys))
+    def del_item(self, x):
+        # The key can be added to the bundle multiple times, so the
+        # `consumes` will not always ensure that the key is in the model.
+        assume(x in self.model)
+        del self.priority_map[x]
+        assert x not in self.priority_map
+        del self.model[x]
+
+    @precondition(lambda self: len(self.model) > 0)
+    @rule()
+    def pop(self):
+        expected_v = min(self.model.values())
+        k, v = self.priority_map.pop()
+        assert v == expected_v
+        assert self.model.pop(k) == v
+
+
+TestPriorityMap = PriorityMapTest.TestCase
+
+
+def test_peek_after_set():
+    x = PriorityMap()
+    x[0] = 0
+    x[0] = 1
+    assert x.peek() == (0, 1)

@@ -17,6 +17,82 @@ def make_immutable(context):
         return tuple(context)
 
 
+class PriorityMap:
+    """A map from keys to ordered priorities, supporting efficient
+    pop and peek operations returning the key with the lowest priority.
+
+    It probably wan't reasonable to write our own implementation of this,
+    but it was easier than finding a robust existing implementation.
+    """
+
+    def __init__(self):
+        self.__priorities = {}
+        self.__priorities_to_keys = defaultdict(set)
+        self.__heap = []
+
+    def __repr__(self):
+        return f"PriorityMap({self.__priorities})"
+
+    def __clear_dead_priorities(self):
+        while self.__heap and self.__heap[0] not in self.__priorities_to_keys:
+            heapq.heappop(self.__heap)
+
+    def __setitem__(self, key, value):
+        if key in self.__priorities:
+            old_value = self.__priorities[key]
+            if old_value == value:
+                return
+            else:
+                self.__priorities_to_keys[old_value].remove(key)
+                if not self.__priorities_to_keys[old_value]:
+                    del self.__priorities_to_keys[old_value]
+
+        self.__priorities[key] = value
+        if value not in self.__priorities_to_keys:
+            heapq.heappush(self.__heap, value)
+        self.__priorities_to_keys[value].add(key)
+
+    def __getitem__(self, key):
+        return self.__priorities[key]
+
+    def __delitem__(self, key):
+        value = self.__priorities.pop(key)
+        self.__priorities_to_keys[value].remove(key)
+        if not self.__priorities_to_keys[value]:
+            del self.__priorities_to_keys[value]
+
+    def peek(self):
+        if not self.__heap:
+            raise ValueError("Peek on empty PriorityMap")
+        self.__clear_dead_priorities()
+        min_priority = self.__heap[0]
+        assert self.__priorities_to_keys[min_priority]
+        key = next(iter(self.__priorities_to_keys[min_priority]))
+        return key, min_priority
+
+    def pop(self):
+        if not self.__heap:
+            raise ValueError("Pop on empty PriorityMap")
+        self.__clear_dead_priorities()
+        min_priority = self.__heap[0]
+        assert self.__priorities_to_keys[min_priority]
+        key = next(iter(self.__priorities_to_keys[min_priority]))
+        del self.__priorities[key]
+        self.__priorities_to_keys[min_priority].remove(key)
+        if not self.__priorities_to_keys[min_priority]:
+            del self.__priorities_to_keys[min_priority]
+            heapq.heappop(self.__heap)
+        return key, min_priority
+
+    def clear(self):
+        self.__priorities.clear()
+        self.__priorities_to_keys.clear()
+        self.__heap.clear()
+
+    def __len__(self):
+        return len(self.__priorities)
+
+
 class ParticleState(ABC):
     def __init__(self, owner):
         self.owner = owner
@@ -75,8 +151,8 @@ class StatefulPotential(Potential):
         self.__state_pool = defaultdict(list)
         self.__known_contexts = []
 
-        self.__eviction_heap = []
-        self.__ages = dict()
+        self.__eviction_heap = PriorityMap()
+
         self.__epoch = 0
 
     def __tick(self):
@@ -94,7 +170,6 @@ class StatefulPotential(Potential):
         )
         self.__state_pool.clear()
         self.__known_contexts.clear()
-        self.__ages.clear()
         self.__eviction_heap.clear()
 
     async def __look_up_state(self, context):
@@ -111,8 +186,9 @@ class StatefulPotential(Potential):
                     state = pool.pop()
                     if not pool:
                         del self.__known_contexts[i]
+                        del self.__state_pool[existing]
                     self.__state_count -= 1
-                    assert self.__state_count >= 0
+                    self.__check_soundness()
         if state is None:
             state = self.new_state()
         if len(context) > len(state.context):
@@ -121,7 +197,14 @@ class StatefulPotential(Potential):
         assert list(state.context) == list(context)
         return state
 
+    def __check_soundness(self):
+        assert self.__state_count >= 0
+        assert len(self.__eviction_heap) == len(self.__state_pool)
+        assert self.__state_count >= len(self.__state_pool)
+        assert len(self.__known_contexts) == len(self.__state_pool)
+
     def __return_state(self, state):
+        self.__check_soundness()
         assert not state.finished
         context = make_immutable(state.context)
         i = bisect.bisect_left(self.__known_contexts, context)
@@ -132,18 +215,24 @@ class StatefulPotential(Potential):
         self.__state_pool[context].append(state)
         self.__state_count += 1
         age = self.__tick()
-        heapq.heappush(self.__eviction_heap, (age, context))
-        self.__ages[context] = age
+        self.__eviction_heap[context] = age
+        self.__check_soundness()
+        assert len(self.__eviction_heap) > 0
+        assert self.__eviction_heap[context] == age
         while self.__state_count > self.__cache_size:
-            assert len(self.__eviction_heap) >= self.__state_count
-            seen_age, to_evict = heapq.heappop(self.__eviction_heap)
-            if seen_age == self.__ages[to_evict]:
-                i = bisect.bisect_left(self.__known_contexts, to_evict)
-                assert self.__known_contexts[i] == to_evict
-                pool = self.__state_pool.pop(to_evict, ())
-                assert pool
-                self.__state_count -= len(pool)
+            self.__check_soundness()
+            to_evict, _ = self.__eviction_heap.peek()
+            i = bisect.bisect_left(self.__known_contexts, to_evict)
+            assert self.__known_contexts[i] == to_evict
+            pool = self.__state_pool[to_evict]
+            pool.pop()
+            self.__state_count -= 1
+            if not pool:
+                del self.__state_pool[to_evict]
+                check, _ = self.__eviction_heap.pop()
+                assert check == to_evict
                 del self.__known_contexts[i]
+            self.__check_soundness()
 
     async def prefix(self, context):
         state = await self.__look_up_state(context)

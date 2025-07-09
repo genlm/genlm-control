@@ -138,7 +138,7 @@ class StreamingState(ParticleState):
 
     def __receive_response(self, token):
         response_token, response_type, *payload = self.__background.responses.get()
-        assert token == response_token
+        assert token == response_token, (token, response_token, response_type)
         match response_type:
             case Responses.INCOMPLETE:
                 pass
@@ -164,12 +164,13 @@ class StreamingState(ParticleState):
 
 
 class StreamingPotential(StatefulPotential, ABC):
-    def __init__(self, vocabulary, token_type=None, eos=None):
+    def __init__(self, vocabulary, token_type=None, eos=None, **kwargs):
         super().__init__(
             vocabulary=vocabulary,
             token_type=token_type,
             eos=eos,
             state_class=StreamingState,
+            **kwargs,
         )
 
     @abstractmethod
