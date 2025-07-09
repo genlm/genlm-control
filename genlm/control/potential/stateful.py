@@ -187,6 +187,7 @@ class StatefulPotential(Potential):
                     if not pool:
                         del self.__known_contexts[i]
                         del self.__state_pool[existing]
+                        del self.__eviction_heap[existing]
                     self.__state_count -= 1
                     self.__check_soundness()
         if state is None:
