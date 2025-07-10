@@ -395,7 +395,6 @@ class PromptedLLM(Potential):
             prompt_ids=self.prompt_ids.copy() if prompt_ids is None else prompt_ids,
             eos_tokens=self._eos_tokens.copy() if eos_tokens is None else eos_tokens,
             temperature=self.temperature if temperature is None else temperature,
-            **kwargs,
         )
 
     def spawn_new_eos(self, eos_tokens):
