@@ -382,7 +382,7 @@ class PromptedLLM(Potential):
             eos_tokens (optional, list[bytes]): A list of tokens to treat as end-of-sequence tokens. 
                 Defaults to the same eos_tokens as `self`.
             temperature (optional, float): The temperature with which to rescale logprobs. 
-                Defaults tot he same temperature as `self`.
+                Defaults to the same temperature as `self`.
             kwargs (optional, dict): Additional options to pass to `PromptedLLM` at initialization.
 
         Returns:
