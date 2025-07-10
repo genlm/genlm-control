@@ -393,9 +393,9 @@ class PromptedLLM(Potential):
         """
         return PromptedLLM(
             self.model,
-            prompt_ids=prompt_ids or self.prompt_ids.copy(),
-            eos_tokens=eos_tokens or self._eos_tokens.copy(),
-            temperature=temperature or self.temperature,
+            prompt_ids=self.prompt_ids.copy() if prompt_ids is None else prompt_ids,
+            eos_tokens=self._eos_tokens.copy() if eos_tokens is None else eos_tokens,
+            temperature=self.temperature if temperature is None else temperature,
             **kwargs,
         )
 
