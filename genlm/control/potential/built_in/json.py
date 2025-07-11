@@ -374,7 +374,7 @@ class FilterParser(Parser[T]):
         return result
 
     def __repr__(self):
-        return f"{self.base}.map({self.apply})"
+        return f"{self.base}.filter({self.predicate})"
 
 
 R = TypeVar("R")

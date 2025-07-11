@@ -13,6 +13,7 @@ from genlm.control.potential.built_in.json import (
     StringSource,
     Input,
     FloatParser,
+    WHITESPACE_PARSER,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -748,7 +749,7 @@ def test_chunk_to_complete_utf8_will_error_on_invalid_unicode():
 @pytest.mark.asyncio
 async def test_rejects_using_unicode_whitespace():
     pot = JsonSchema({"type": "object"})
-    assert await pot.prefix(" \u3000".encode("utf-8")) == -float("inf")
+    assert await pot.prefix("{ \u3000".encode("utf-8")) == -float("inf")
 
 
 def test_chunking_immediately_rejects_invalid_utf8_bytes():
@@ -779,3 +780,7 @@ async def test_no_double_newline_after_start():
     potential = JsonSchema({"type": "object"})
     assert await potential.prefix(b"{\n\n") == -float("inf")
     assert await potential.prefix(b"{\n  \n") == -float("inf")
+
+
+def test_repr_of_filter():
+    assert "filter" in repr(WHITESPACE_PARSER)
