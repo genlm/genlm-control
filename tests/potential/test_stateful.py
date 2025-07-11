@@ -194,3 +194,13 @@ def test_priority_map_repr():
     x[0] = 0
     x[1] = 1
     assert repr(x) == "PriorityMap({0: 0, 1: 1})"
+
+
+@pytest.mark.asyncio
+async def test_error_on_startup_is_correctly_handled():
+    class ErrorPotential(StreamingPotential):
+        def calculate_score_from_stream(self, stream) -> float:
+            raise Exception("Oh no")
+
+    potential = ErrorPotential(vocabulary=list(range(256)))
+    assert await potential.prefix(b"") == -float("inf")

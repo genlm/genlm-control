@@ -106,6 +106,11 @@ class ParticleState(ABC):
         self.context.extend(incremental_context)
         await self.impl_update_context(incremental_context)
 
+    async def start(self):
+        """May be implemented by subclasses to perform initialization logic
+        that needs to be async."""
+        pass
+
     async def finish(self):
         """Mark this state as finished, clearing up any associated
         state, and updating the current score to reflect whether
@@ -131,7 +136,7 @@ class ParticleState(ABC):
     async def clone(self):
         if self.finished:
             return self
-        result = self.owner.new_state()
+        result = await self.owner.new_state()
         await result.update_context(self.context)
         assert self.context == result.context
         assert self.current_score == result.current_score
@@ -159,10 +164,12 @@ class StatefulPotential(Potential):
         self.__epoch += 1
         return self.__epoch
 
-    def new_state(self) -> ParticleState:
+    async def new_state(self) -> ParticleState:
         if self.__state_class is None:
             raise NotImplementedError()
-        return self.__state_class(self)
+        result = self.__state_class(self)
+        await result.start()
+        return result
 
     async def cleanup(self):
         await asyncio.gather(
@@ -191,7 +198,7 @@ class StatefulPotential(Potential):
                     self.__state_count -= 1
                     self.__check_soundness()
         if state is None:
-            state = self.new_state()
+            state = await self.new_state()
         if len(context) > len(state.context):
             await state.update_context(context[len(state.context) :])
         assert len(state.context) == len(context)
