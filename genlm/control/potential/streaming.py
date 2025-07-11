@@ -53,6 +53,7 @@ class RunningInThread:
         self.last_message = None
         self.running = False
         self.complete = False
+        self.error = None
         self.function = function
 
     def __chunks(self):
@@ -60,7 +61,8 @@ class RunningInThread:
             self.last_message, chunk = self.incoming_data.get()
             if chunk is SHUTDOWN_TOKEN:
                 break
-            yield chunk
+            if chunk:
+                yield chunk
             self.responses.put((self.last_message, Responses.INCOMPLETE))
 
     def run(self):
@@ -72,6 +74,7 @@ class RunningInThread:
             self.responses.put((self.last_message, Responses.INCOMPLETE))
             result = self.function(self.__chunks())
         except Exception as e:
+            self.error = e
             self.responses.put((self.last_message, Responses.ERROR, e))
         else:
             self.responses.put((self.last_message, Responses.COMPLETE, result))
@@ -119,8 +122,7 @@ class StreamingState(ParticleState):
         if incremental_context and incremental_context[-1] == self.owner.eos:
             finish = True
             incremental_context = incremental_context[:-1]
-        bytes(incremental_context)
-        await self.__send_message(incremental_context)
+        await self.__send_message(bytes(incremental_context))
         if finish:
             await self.finish()
 
@@ -128,13 +130,21 @@ class StreamingState(ParticleState):
         await self.__initialize_background()
         self.shutdown()
 
+    async def start(self):
+        await self.__initialize_background()
+        await self.__send_message(b"")
+
     @property
     def current_score(self):
         return self.__score
 
     async def __send_message(self, message):
         if self.__background.complete:
+            if self.__background.error and "error" not in self.diagnostics:
+                self.__score = -float("inf")
+                self.diagnostics["error"] = self.__background.error
             return
+
         token = self.__new_token()
         self.__background.incoming_data.put((token, message))
 

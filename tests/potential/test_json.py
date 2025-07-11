@@ -13,6 +13,7 @@ from genlm.control.potential.built_in.json import (
     StringSource,
     Input,
     FloatParser,
+    WHITESPACE_PARSER,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -37,14 +38,6 @@ async def test_rejects_as_prefix_when_no_valid_continuation():
     potential = JsonSchema({"type": "object"})
 
     assert await potential.prefix(b"}") == -float("inf")
-
-
-@pytest.mark.asyncio
-async def test_whitespace_is_valid_prefix_and_invalid_complete():
-    potential = JsonSchema({"type": "object"})
-
-    assert await potential.prefix(b" ") == 0.0
-    assert await potential.complete(b" ") == -float("inf")
 
 
 @pytest.mark.asyncio
@@ -505,8 +498,9 @@ async def test_float_parser_incomplete_literal():
 
 
 @st.composite
-def chunked_utf8(draw):
-    base = draw(st.text(min_size=1)).encode("utf-8")
+def chunked_utf8(draw, base=None):
+    if base is None:
+        base = draw(st.text(min_size=1)).encode("utf-8")
     assume(len(base) > 1)
     offsets = draw(st.sets(st.integers(1, len(base) - 1)))
     offsets.update((0, len(base)))
@@ -739,3 +733,57 @@ async def test_can_reject_early_in_any_of():
     assert await potential.prefix(b'{"a": "') == 0
     assert await potential.prefix(b'{"a": 1') == 0
     assert await potential.prefix(b'{"a": {') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_will_reject_invalid_unicode_at_end():
+    potential = StreamingJsonSchema({"type": "object"})
+    assert await potential.prefix(b"{ }\n\n    \xe2\x9d\x8d\xb0") == -float("inf")
+
+
+def test_chunk_to_complete_utf8_will_error_on_invalid_unicode():
+    with pytest.raises(UnicodeDecodeError):
+        list(chunk_to_complete_utf8([b"{ }\n\n    \xe2\x9d\x8d\xb0"]))
+
+
+@pytest.mark.asyncio
+async def test_rejects_using_unicode_whitespace():
+    pot = JsonSchema({"type": "object"})
+    assert await pot.prefix("{ \u3000".encode("utf-8")) == -float("inf")
+
+
+def test_chunking_immediately_rejects_invalid_utf8_bytes():
+    def bad_bytes():
+        yield b"\xc0"
+        assert False
+
+    with pytest.raises(UnicodeDecodeError):
+        list(chunk_to_complete_utf8(bad_bytes()))
+
+
+def test_chunking_bails_early_on_invalid_start_bytes():
+    def bad_bytes():
+        yield b"\xe3\x86\x8c\x80"
+        assert False
+
+    with pytest.raises(UnicodeDecodeError):
+        list(chunk_to_complete_utf8(bad_bytes()))
+
+
+@pytest.mark.asyncio
+async def test_long_whitespace_at_start_is_rejected():
+    assert await ValidateJSON().prefix(b"  ") == 0
+    assert await ValidateJSON().prefix(b"\n\n") == 0
+    assert await ValidateJSON().prefix(b"    ") == -float("inf")
+    assert await ValidateJSON().prefix(b"\n\n  ") == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_no_double_newline_after_start():
+    potential = JsonSchema({"type": "object"})
+    assert await potential.prefix(b"{\n\n") == -float("inf")
+    assert await potential.prefix(b"{\n  \n") == -float("inf")
+
+
+def test_repr_of_filter():
+    assert "filter" in repr(WHITESPACE_PARSER)

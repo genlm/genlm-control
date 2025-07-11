@@ -74,16 +74,17 @@ async def test_will_time_out_if_too_many_threads_start(monkeypatch):
 @pytest.mark.asyncio
 async def test_finished_clone_is_no_op():
     potential = DummyPotential()
-    state = potential.new_state()
+    state = await potential.new_state()
     await state.finish()
     assert state.finished
     assert (await state.clone()) is state
 
 
-def test_must_specify_state_class_or_implement_new_state():
+@pytest.mark.asyncio
+async def test_must_specify_state_class_or_implement_new_state():
     potential = StatefulPotential(vocabulary=[0, 1])
     with pytest.raises(NotImplementedError):
-        potential.new_state()
+        await potential.new_state()
 
 
 def test_tokens_have_right_repr():
@@ -118,7 +119,7 @@ async def test_cleanup_clears_up_async_tasks():
 @pytest.mark.asyncio
 async def test_operations_after_finish_are_ignored():
     potential = DummyAsyncPotential()
-    state = potential.new_state()
+    state = await potential.new_state()
     await state.update_context([0])
     await state.finish()
     assert state.finished
@@ -194,3 +195,13 @@ def test_priority_map_repr():
     x[0] = 0
     x[1] = 1
     assert repr(x) == "PriorityMap({0: 0, 1: 1})"
+
+
+@pytest.mark.asyncio
+async def test_error_on_startup_is_correctly_handled():
+    class ErrorPotential(StreamingPotential):
+        def calculate_score_from_stream(self, stream) -> float:
+            raise Exception("Oh no")
+
+    potential = ErrorPotential(vocabulary=list(range(256)))
+    assert await potential.prefix(b"") == -float("inf")
