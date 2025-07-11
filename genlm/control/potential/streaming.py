@@ -53,6 +53,7 @@ class RunningInThread:
         self.last_message = None
         self.running = False
         self.complete = False
+        self.error = None
         self.function = function
 
     def __chunks(self):
@@ -72,6 +73,7 @@ class RunningInThread:
             self.responses.put((self.last_message, Responses.INCOMPLETE))
             result = self.function(self.__chunks())
         except Exception as e:
+            self.error = e
             self.responses.put((self.last_message, Responses.ERROR, e))
         else:
             self.responses.put((self.last_message, Responses.COMPLETE, result))
@@ -134,6 +136,11 @@ class StreamingState(ParticleState):
 
     async def __send_message(self, message):
         if self.__background.complete:
+            self.__score = -float("inf")
+            self.diagnostics["error"] = self.__background.error
+            import traceback
+
+            traceback.print_exception(self.__background.error)
             return
         token = self.__new_token()
         self.__background.incoming_data.put((token, message))

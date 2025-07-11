@@ -91,6 +91,8 @@ def chunk_bytes_to_strings(byte_blocks):
                     break
             else:
                 raise
+    buffer.decode("utf-8")
+    assert not buffer
 
 
 class StreamingJsonSchema(StreamingPotential):
@@ -106,22 +108,23 @@ class StreamingJsonSchema(StreamingPotential):
         self.parser = json_schema_parser(schema)
 
     def calculate_score_from_stream(self, stream: Iterable[Any]) -> float:
-        rechunked = chunk_to_complete_utf8(stream)
-
         buffer = bytearray()
 
-        def buffer_rechunked():
-            for s in rechunked:
+        def buffer_stream():
+            for s in stream:
                 buffer.extend(s)
                 yield s
 
-        x = json_stream.load(buffer_rechunked(), persistent=True)
+        buffered = buffer_stream()
+        rechunked = chunk_to_complete_utf8(buffered)
+
+        x = json_stream.load(rechunked, persistent=True)
         self.validator.validate(x)
         if hasattr(x, "read_all"):
             x.read_all()
 
         json.loads(buffer)
-        for s in rechunked:
+        for s in buffered:
             if s.strip():
                 raise ValueError(f"Data after JSON: {s.decode('utf-8')}")
         return 0.0

@@ -505,8 +505,9 @@ async def test_float_parser_incomplete_literal():
 
 
 @st.composite
-def chunked_utf8(draw):
-    base = draw(st.text(min_size=1)).encode("utf-8")
+def chunked_utf8(draw, base=None):
+    if base is None:
+        base = draw(st.text(min_size=1)).encode("utf-8")
     assume(len(base) > 1)
     offsets = draw(st.sets(st.integers(1, len(base) - 1)))
     offsets.update((0, len(base)))
@@ -739,3 +740,14 @@ async def test_can_reject_early_in_any_of():
     assert await potential.prefix(b'{"a": "') == 0
     assert await potential.prefix(b'{"a": 1') == 0
     assert await potential.prefix(b'{"a": {') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_will_reject_invalid_unicode_at_end():
+    potential = StreamingJsonSchema({"type": "object"})
+    assert await potential.prefix(b"{ }\n\n    \xe2\x9d\x8d\xb0") == -float("inf")
+
+
+def test_chunk_to_complete_utf8_will_error_on_invalid_unicode():
+    with pytest.raises(UnicodeDecodeError):
+        list(chunk_to_complete_utf8([b"{ }\n\n    \xe2\x9d\x8d\xb0"]))
