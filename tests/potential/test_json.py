@@ -771,8 +771,11 @@ def test_chunking_bails_early_on_invalid_start_bytes():
 
 
 @pytest.mark.asyncio
-async def test_whitespace_at_start_is_rejected():
-    assert await ValidateJSON().prefix(b" ") == -float("inf")
+async def test_long_whitespace_at_start_is_rejected():
+    assert await ValidateJSON().prefix(b"  ") == 0
+    assert await ValidateJSON().prefix(b"\n\n") == 0
+    assert await ValidateJSON().prefix(b"    ") == -float("inf")
+    assert await ValidateJSON().prefix(b"\n\n  ") == -float("inf")
 
 
 @pytest.mark.asyncio

@@ -65,9 +65,6 @@ def is_utf8_start_byte(n: int) -> bool:
     return False
 
 
-BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)", regex.MULTILINE)
-
-
 def chunk_to_complete_utf8(byte_blocks):
     for s in chunk_bytes_to_strings(byte_blocks):
         yield s.encode("utf-8")
@@ -130,7 +127,10 @@ class StreamingJsonSchema(StreamingPotential):
         return 0.0
 
 
-VALID_JSON_START = regex.compile(rb'^\[|\{|"|(-?[0-9])|[nft]', regex.MULTILINE)
+BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)", regex.MULTILINE)
+VALID_JSON_START = regex.compile(
+    rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]', regex.MULTILINE
+)
 
 
 class ValidateJSON(Potential):
@@ -155,7 +155,10 @@ class ValidateJSON(Potential):
         # Sometimes a model can get itself into a position where it can't
         # generate any valid tokens, but it can keep generating whitespace
         # indefinitely.
-        if BAD_WHITESPACE.search(context):
+        #
+        # pos=1 because we specifically allow two newlines at the start,
+        # as LLMs like doing that for tokenization reasons.
+        if BAD_WHITESPACE.search(context, pos=1):
             return float("-inf")
         for c in context:
             # Forbid control characters other than newline.
