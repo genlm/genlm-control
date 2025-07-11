@@ -65,7 +65,7 @@ def is_utf8_start_byte(n: int) -> bool:
     return False
 
 
-BAD_WHITESPACE = regex.compile(rb"(?:\n\s+\n)|(?:\n\n\n)", regex.MULTILINE)
+BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)", regex.MULTILINE)
 
 
 def chunk_to_complete_utf8(byte_blocks):
@@ -81,16 +81,16 @@ def chunk_bytes_to_strings(byte_blocks):
             yield buffer.decode("utf-8")
             buffer.clear()
             continue
-        except UnicodeDecodeError:
-            for i in range(1, min(5, len(buffer) + 1)):
-                if is_utf8_start_byte(buffer[-i]):
-                    block = buffer[:-i]
-                    if block:
-                        yield block.decode("utf-8")
-                        del buffer[:-i]
-                    break
+        except UnicodeDecodeError as e:
+            if e.reason == "unexpected end of data":
+                good_prefix = buffer[: e.start]
+                if good_prefix:
+                    yield good_prefix.decode("utf-8")
+                    del buffer[: e.start]
             else:
                 raise
+        if buffer:
+            assert is_utf8_start_byte(buffer[0])
     buffer.decode("utf-8")
     assert not buffer
 
@@ -113,7 +113,7 @@ class StreamingJsonSchema(StreamingPotential):
         def buffer_stream():
             for s in stream:
                 buffer.extend(s)
-                yield s
+                yield bytes(s)
 
         buffered = buffer_stream()
         rechunked = chunk_to_complete_utf8(buffered)
@@ -130,11 +130,12 @@ class StreamingJsonSchema(StreamingPotential):
         return 0.0
 
 
+VALID_JSON_START = regex.compile(rb'^\[|\{|"|(-?[0-9])|[nft]', regex.MULTILINE)
+
+
 class ValidateJSON(Potential):
     """This is a dumping ground for any extra JSON validation we want to do
-    to work around LLM weirdness. Currently it just checks for whitespace
-    and non-printable characters, but it has done more in the past and may
-    do more again in the future.
+    to work around LLM weirdness.
     """
 
     def __init__(self):
@@ -143,10 +144,17 @@ class ValidateJSON(Potential):
         )
 
     async def prefix(self, context):
+        context = bytes(context)
+        # Sometimes a model gets itself off to a bad start immediately.
+        # We want to catch this early. Note that we forbid whitespace
+        # at the start of the context. It seems to almost always be
+        # a bad sign.
+        if not VALID_JSON_START.match(context, partial=True):
+            return float("-inf")
+
         # Sometimes a model can get itself into a position where it can't
         # generate any valid tokens, but it can keep generating whitespace
         # indefinitely.
-        context = bytes(context)
         if BAD_WHITESPACE.search(context):
             return float("-inf")
         for c in context:
@@ -161,8 +169,8 @@ class ValidateJSON(Potential):
 
 def JsonSchema(schema):
     return (
-        StreamingJsonSchema(schema)
-        * ValidateJSON()
+        ValidateJSON()
+        * StreamingJsonSchema(schema)
         * ParserPotential(json_schema_parser(schema))
     )
 
@@ -338,6 +346,9 @@ class Parser(Generic[T]):
     def map(self, apply: Callable[[T], S]) -> "Parser[S]":
         return MapParser(self, apply)
 
+    def filter(self, predicate: Callable[[T], bool]) -> "Parser[T]":
+        return FilterParser(self, predicate)
+
 
 class MapParser(Parser[T]):
     def __init__(self, base: Parser[S], apply: Callable[[S], T]):
@@ -346,6 +357,21 @@ class MapParser(Parser[T]):
 
     async def parse(self, input: Input) -> T:
         return self.apply(await input.parse(self.base))
+
+    def __repr__(self):
+        return f"{self.base}.map({self.apply})"
+
+
+class FilterParser(Parser[T]):
+    def __init__(self, base: Parser[S], predicate: Callable[[S], T]):
+        self.base = base
+        self.predicate = predicate
+
+    async def parse(self, input: Input) -> T:
+        result = await input.parse(self.base)
+        if not self.predicate(result):
+            raise ParseError(f"{result} did not satisfy {self.predicate}")
+        return result
 
     def __repr__(self):
         return f"{self.base}.map({self.apply})"
@@ -428,7 +454,11 @@ NULL_PARSER = RegexParser("null").drop_result()
 
 BOOL_PARSER = RegexParser("false|true").map(json.loads)
 
-WHITESPACE_PARSER = RegexParser(r"\s*")
+# We restrict whitespace to be ASCII to avoid the model doing silly things
+# to avoid being rejected. Note that unicode whitespace *inside a string*
+# is still allowed. This parser is not used for that part, only whitespace
+# between tokens.
+WHITESPACE_PARSER = RegexParser(r"\s*").filter(lambda x: all(ord(c) < 256 for c in x))
 
 
 class ObjectSchemaParser(Parser[Any]):
