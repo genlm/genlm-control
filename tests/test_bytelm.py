@@ -2,10 +2,8 @@
 import pytest
 import numpy as np
 import asyncio
-
 from genlm.bytes import BeamParams
-from genlm.control.potential.bytelm import ByteLLM
-from genlm.control import AWRS, BoolFSA, Potential
+from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
 
 
 @pytest.fixture(scope="module")
@@ -18,7 +16,6 @@ def beam_params(model_name):
     """Provides BeamParams configured with the model's default EOS token."""
     from genlm.backend import load_model_by_name
 
-    # Temporarily load model to get EOS token
     llm = load_model_by_name(model_name)
     model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
     return BeamParams(K=5, prune_threshold=0.05, eos_tokens={model_eos_token})
@@ -109,17 +106,15 @@ async def test_logw_next_values(byte_llm: ByteLLM):
 
 
 @pytest.mark.asyncio
-async def test_smc_with_fsa_constraint(byte_llm: ByteLLM):
+async def test_bytelm_smc(byte_llm: ByteLLM):
     
     prompt = "Here is my honest opinion:"
     byte_llm.set_prompt_from_str(prompt)
 
     fsa = BoolFSA.from_regex(r" SMC is (🔥🔥|😍😍|🤌🤌) with LMs")
 
-    # The AWRS sampler combines the LM potential with the FSA constraint
     sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))
 
-    # Run SMC sampling
     sequences = await sampler.smc(
         n_particles=10,
         max_tokens=30, 

@@ -70,7 +70,6 @@ class ByteLLM(Potential):
         return beam.logZ + eos_prob
 
     async def logw_next(self, context):
-        # This now correctly uses the default implementation in the Potential base class
         return await super().logw_next(context)
 
     async def cleanup(self):
