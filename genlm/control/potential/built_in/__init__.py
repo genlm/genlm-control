@@ -3,7 +3,7 @@ from .wcfg import WCFG, BoolCFG
 from .wfsa import WFSA, BoolFSA
 from .json import JsonSchema
 from .canonical import CanonicalTokenization
-
+from .bytelm import ByteLLM
 __all__ = [
     "PromptedLLM",
     "JsonSchema",
@@ -12,4 +12,5 @@ __all__ = [
     "WFSA",
     "BoolFSA",
     "CanonicalTokenization",
+    "ByteLLM",
 ]
