@@ -396,6 +396,20 @@ class AltParser(Parser[Union[S, T]]):
             return await self.right.parse(input)
 
 
+class ConstParser(Parser[None]):
+    def __init__(self, value: str):
+        self.value = value
+
+    async def parse(self, input: Input) -> None:
+        await input.skip_whitespace()
+        i = 0
+        while c := await input.read(1):
+            if c != self.value[i]:
+                raise ParseError(f"Expected char {self.value[i]} but got {c}")
+            i += 1
+        assert i == len(self.value)
+
+
 class RegexParser(Parser[str]):
     def __init__(self, pattern, group=0, options=regex.MULTILINE | regex.UNICODE):
         self.pattern = regex.compile(pattern, options)
@@ -575,6 +589,9 @@ ARBITRARY_JSON = (
 
 
 def json_schema_parser(schema):
+    if "const" in schema:
+        return ConstParser(json.dumps(schema["const"]))
+
     if "anyOf" in schema:
         *rest, base = schema["anyOf"]
         result = json_schema_parser(base)
