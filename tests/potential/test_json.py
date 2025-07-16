@@ -787,3 +787,31 @@ async def test_no_double_newline_after_start():
 
 def test_repr_of_filter():
     assert "filter" in repr(WHITESPACE_PARSER)
+
+
+@pytest.mark.asyncio
+async def test_const_fails_fast():
+    potential = ParserPotential(json_schema_parser({"const": False}))
+    assert await potential.prefix(b" ") == 0
+    assert await potential.prefix(b" f") == 0
+    assert await potential.prefix(b" false") == 0
+    assert await potential.prefix(b" n") == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_const_fails_fast_in_string_literals():
+    potential = ParserPotential(json_schema_parser({"const": "Hello world"}))
+    assert await potential.prefix(b" ") == 0
+    assert await potential.prefix(b'"Hello') == 0
+    assert await potential.prefix(b'"Hi') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_const_in_object():
+    potential = ParserPotential(
+        json_schema_parser({"type": "object", "properties": {"foo": {"const": None}}})
+    )
+
+    assert await potential.prefix(b'{"foo": nu') == 0
+    assert await potential.complete(b'{"foo": null}') == 0
+    assert await potential.prefix(b'{"foo": f') == -float("inf")
