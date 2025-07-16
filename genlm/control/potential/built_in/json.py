@@ -402,12 +402,10 @@ class ConstParser(Parser[None]):
 
     async def parse(self, input: Input) -> None:
         await input.skip_whitespace()
-        i = 0
-        while c := await input.read(1):
-            if c != self.value[i]:
-                raise ParseError(f"Expected char {self.value[i]} but got {c}")
-            i += 1
-        assert i == len(self.value)
+        for expected in self.value:
+            got = await input.read(1)
+            if got != expected:
+                raise ParseError(f"Expected char {expected} but got {got}")
 
 
 class RegexParser(Parser[str]):

@@ -804,3 +804,14 @@ async def test_const_fails_fast_in_string_literals():
     assert await potential.prefix(b" ") == 0
     assert await potential.prefix(b'"Hello') == 0
     assert await potential.prefix(b'"Hi') == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_const_in_object():
+    potential = ParserPotential(
+        json_schema_parser({"type": "object", "properties": {"foo": {"const": None}}})
+    )
+
+    assert await potential.prefix(b'{"foo": nu') == 0
+    assert await potential.complete(b'{"foo": null}') == 0
+    assert await potential.prefix(b'{"foo": f') == -float("inf")
