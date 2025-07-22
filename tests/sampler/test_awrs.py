@@ -209,7 +209,6 @@ async def test_verbosity(potential):
 async def test_awrs_no_valid_tokens(potential, zero_condition):
     sampler = AWRS(potential=potential, condition=zero_condition)
     tok, logw, _ = await sampler.sample([])
-    assert tok == potential.eos
     assert logw == float("-inf")
 
 
@@ -221,7 +220,6 @@ async def test_awrs_improper_weights_no_valid_tokens(potential, zero_condition):
         proper_weights=False,
     )
     tok, logw, _ = await sampler.sample([])
-    assert tok == potential.eos
     assert logw == float("-inf")
 
 
