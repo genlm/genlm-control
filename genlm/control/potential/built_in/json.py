@@ -171,6 +171,7 @@ class ValidateJSON(Potential):
 
 
 def JsonSchema(schema):
+    Draft7Validator.check_schema(schema)
     return (
         ValidateJSON()
         * StreamingJsonSchema(schema)
