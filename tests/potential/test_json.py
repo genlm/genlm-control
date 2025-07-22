@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from hypothesis import given, strategies as st, assume, example, settings, reject
 from hypothesis_jsonschema import from_schema
 import asyncio
+from jsonschema import SchemaError
 
 
 @pytest.mark.asyncio
@@ -815,3 +816,8 @@ async def test_const_in_object():
     assert await potential.prefix(b'{"foo": nu') == 0
     assert await potential.complete(b'{"foo": null}') == 0
     assert await potential.prefix(b'{"foo": f') == -float("inf")
+
+
+def test_errors_on_bad_types():
+    with pytest.raises(SchemaError):
+        JsonSchema({"type": "float"})
