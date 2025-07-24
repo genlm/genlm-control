@@ -37,6 +37,7 @@ test = [
     "pytest-mock",
     "hypothesis==6.130.13",
     "hypothesis-jsonschema",
+    "setuptools"
 ]
 docs = [
     "mkdocs",
