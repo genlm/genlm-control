@@ -11,6 +11,7 @@ from llamppl import smc_standard
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
+from genlm.control.util import escape
 
 
 class SMC:
@@ -323,12 +324,12 @@ class SequenceModel(Model):
         return (
             f"{self.weight:.2f}:\t"
             + colors.magenta % "["
-            + (colors.magenta % "|").join(repr(y) for y in self.token_ctx)
+            + (colors.magenta % "|").join(escape(y) for y in self.token_ctx)
             + colors.magenta % "]"
         )
 
     def string_for_serialization(self):
-        return "|".join(repr(y) for y in self.token_ctx)
+        return "|".join(escape(y) for y in self.token_ctx)
 
     def immutable_properties(self):
         return set(["unit_sampler", "critic"])

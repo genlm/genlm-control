@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from genlm.control.util import LazyWeights, load_trie
+from genlm.control.util import LazyWeights, load_trie, escape
 
 
 def test_lazy_weights_basic():
@@ -187,3 +187,9 @@ def test_lazy_weights_repr():
 
     lw = LazyWeights(weights, encode, decode, log=False)
     lw.__repr__()
+
+
+def test_escape():
+    assert escape(10) == "\\n"
+    assert escape(b"hello") == "hello"
+    assert escape("hello") == "hello"
