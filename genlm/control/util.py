@@ -275,3 +275,13 @@ def fast_sample_lazyweights(lazyweights):
     assert lazyweights.is_log
     token_id = fast_sample_logprobs(lazyweights.weights, size=1)[0]
     return lazyweights.decode[token_id]
+
+
+def escape(x):
+    if isinstance(x, int):  # assume its a byte
+        x = bytes([x])
+    if isinstance(x, bytes):
+        y = repr(x)[2:-1]
+    else:
+        y = repr(x)[1:-1]
+    return y.replace(" ", "␣")
