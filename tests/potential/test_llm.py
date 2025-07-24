@@ -235,7 +235,11 @@ async def test_vllm_backend():
     # VLLM backend isn't playing well with hypothesis so we test it here.
     # Note though that any differences between backends are encapsulated in the AsyncLM class, which
     # is tested in genlm_backend, so we shouldn't expect any significant differences in testing outcomes.
-    llm = PromptedLLM.from_name("gpt2", backend="vllm", engine_opts={"dtype": "float"})
+    llm = PromptedLLM.from_name(
+        "gpt2",
+        backend="vllm",
+        engine_opts={"dtype": "float", "gpu_memory_utilization": 0.5},
+    )
 
     llm.set_prompt_from_str("hello")
     context = llm.tokenize(" world!")

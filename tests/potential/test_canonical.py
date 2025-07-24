@@ -58,14 +58,12 @@ class MockLLM(PromptedLLM):
 
 @pytest.fixture(scope="module")
 def llm():
-    return PromptedLLM.from_name("gpt2", temperature=0.7)
+    return PromptedLLM.from_name("gpt2", temperature=0.7, backend="hf")
 
 
 @pytest.fixture(scope="module")
-def llm_with_multiple_eos():
-    return PromptedLLM.from_name(
-        "gpt2", temperature=0.7, eos_tokens=[b".", b" city", b"\n", b" "]
-    )
+def llm_with_multiple_eos(llm):
+    return llm.spawn_new_eos(eos_tokens=[b".", b" city", b"\n", b" "])
 
 
 @pytest.fixture(scope="module")
