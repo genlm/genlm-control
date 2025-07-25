@@ -105,8 +105,7 @@ def composite_schema(draw, sub_schema):
         st.sampled_from(
             [
                 "array",
-                # FIXME: Disabled because it revealed a bug that I need to fix later.
-                # "anyOf",
+                "anyOf",
                 "object",
             ]
         )
@@ -205,6 +204,30 @@ def json_schema_potential_problem(draw):
         },
         document=b'"000\\u001f\xc2\x80\xc2\x80\xc2\x80"',
         prefix=b'"000\\u001f\xc2\x80\xc2\x80\xc2',
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"type": "array", "items": {"type": "integer"}},
+        document=b"[0]",
+        prefix=b"[",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "anyOf": [
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                {
+                    "type": "object",
+                    "properties": {"0": {"type": "null"}},
+                    "required": ["0"],
+                    "additionalProperties": False,
+                },
+            ]
+        },
+        document=b'{"0": null}',
+        prefix=b"{",
     ),
 )
 @given(json_schema_potential_problem())
