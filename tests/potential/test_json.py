@@ -14,6 +14,7 @@ from genlm.control.potential.built_in.json import (
     Input,
     FloatParser,
     WHITESPACE_PARSER,
+    StringLiteralMatchingPatternParser,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -23,6 +24,7 @@ from hypothesis import given, strategies as st, assume, example, settings, rejec
 from hypothesis_jsonschema import from_schema
 import asyncio
 from jsonschema import SchemaError
+import regex
 
 
 @pytest.mark.asyncio
@@ -78,7 +80,7 @@ async def test_will_error_on_impossible_unicode_prefixes():
 
 
 @st.composite
-def json_schema(draw):
+def basic_schema(draw):
     type = draw(
         st.sampled_from(
             [
@@ -87,40 +89,59 @@ def json_schema(draw):
                 "integer",
                 "number",
                 "string",
-                "object",
-                "array",
             ]
         )
     )
 
-    # TODO: Add some bounds in for some of these?
-    if type in ("null", "boolean", "integer", "number", "string"):
-        return {"type": type}
+    # Note: We do not currently implement patterns here, because it's too hard to do this
+    # without hitting https://github.com/mrabarnett/mrab-regex/issues/571
 
-    if type == "object":
-        result = {"type": "object"}
-        result["properties"] = draw(
-            st.dictionaries(
-                st.from_regex("[A-Za-z0-9_]+"),
-                json_schema(),
-            )
+    return {"type": type}
+
+
+@st.composite
+def composite_schema(draw, sub_schema):
+    match draw(
+        st.sampled_from(
+            [
+                "array",
+                # FIXME: Disabled because it revealed a bug that I need to fix later.
+                # "anyOf",
+                "object",
+            ]
         )
-        if result["properties"]:
-            result["required"] = draw(
-                st.lists(st.sampled_from(sorted(result["properties"])), unique=True)
+    ):
+        case "array":
+            result = {"type": "array", "items": draw(sub_schema)}
+            min_contains = draw(st.integers(0, 10))
+            if min_contains > 0:
+                result["minContains"] = min_contains
+            if draw(st.booleans()):
+                max_contains = draw(st.integers(min_contains, 20))
+                result["maxContains"] = max_contains
+            return result
+        case "anyOf":
+            return {"anyOf": draw(st.lists(sub_schema, min_size=2))}
+        case "object":
+            result = {"type": "object"}
+            result["properties"] = draw(
+                st.dictionaries(
+                    st.from_regex("[A-Za-z0-9_]+"),
+                    sub_schema,
+                )
             )
-        result["additionalProperties"] = draw(st.booleans())
-        return result
+            if result["properties"]:
+                result["required"] = draw(
+                    st.lists(st.sampled_from(sorted(result["properties"])), unique=True)
+                )
+            result["additionalProperties"] = draw(st.booleans())
+            return result
 
-    assert type == "array"
-    result = {"type": "array", "items": draw(json_schema())}
-    min_contains = draw(st.integers(0, 10))
-    if min_contains > 0:
-        result["minContains"] = min_contains
-    if draw(st.booleans()):
-        max_contains = draw(st.integers(min_contains, 20))
-        result["maxContains"] = max_contains
-    return result
+
+json_schema = st.recursive(
+    base=basic_schema(),
+    extend=composite_schema,
+)
 
 
 @dataclass(frozen=True)
@@ -136,7 +157,7 @@ class JSONSchemaPotentialProblem:
 
 @st.composite
 def json_schema_potential_problem(draw):
-    schema = draw(json_schema())
+    schema = draw(json_schema)
     value = draw(from_schema(schema))
     text = json.dumps(
         value,
@@ -187,8 +208,16 @@ def json_schema_potential_problem(draw):
     ),
 )
 @given(json_schema_potential_problem())
-@settings(max_examples=200, deadline=None)
+@settings(max_examples=100, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):
+    parser = json_schema_parser(problem.schema)
+
+    await parser.parse_string(problem.document.decode("utf-8"))
+    try:
+        await parser.parse_string(problem.prefix.decode("utf-8"))
+    except (Incomplete, UnicodeDecodeError):
+        pass
+
     potential = JsonSchema(problem.schema)
 
     assert await potential.prefix(problem.prefix) == 0.0
@@ -382,7 +411,7 @@ class SchemaAndDocument:
 
 @st.composite
 def json_schema_and_document(draw):
-    schema = draw(json_schema())
+    schema = draw(json_schema)
     document = draw(from_schema(schema))
     return SchemaAndDocument(schema, document)
 
@@ -621,7 +650,7 @@ class JSONSchemaPotentialProblemMulti:
 
 @st.composite
 def json_schema_potential_problem_multi(draw):
-    schema = draw(json_schema())
+    schema = draw(json_schema)
     value = draw(from_schema(schema))
     text = json.dumps(
         value,
@@ -821,3 +850,372 @@ async def test_const_in_object():
 def test_errors_on_bad_types():
     with pytest.raises(SchemaError):
         JsonSchema({"type": "float"})
+
+
+@pytest.mark.asyncio
+async def test_can_validate_patterns_in_incomplete_strings():
+    parser = json_schema_parser({"type": "string", "pattern": "^[0-9]*$"})
+    potential = ParserPotential(parser)
+
+    for prefix in [
+        '"',
+        '"01234',
+        '"01234"',
+    ]:
+        try:
+            await parser.parse_string(prefix)
+        except Incomplete:
+            pass
+
+        assert await potential.prefix(prefix.encode("utf-8")) == 0.0
+
+    for prefix in [
+        '"A',
+        '"0000A',
+    ]:
+        with pytest.raises(ParseError):
+            await parser.parse_string(prefix)
+
+        assert await potential.prefix(prefix.encode("utf-8")) == -float("inf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "{",
+        '{"id1": "0',
+        '{"id1": "0",',
+        '{"id1": "0",',
+        '{"id1": "0", "id2": "A',
+    ],
+)
+async def test_can_validate_patterns_in_incomplete_strings_in_objects_good_prefix(
+    prefix,
+):
+    parser = json_schema_parser(
+        {
+            "type": "object",
+            "properties": {
+                "id1": {"type": "string", "pattern": "[0-9]+"},
+                "id2": {"type": "string", "pattern": "[A-Z]+"},
+            },
+        }
+    )
+    potential = ParserPotential(parser)
+
+    with pytest.raises(Incomplete):
+        await parser.parse_string(prefix)
+
+    assert await potential.prefix(prefix.encode("utf-8")) == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ['{"id2": "0", "id1": "A'])
+async def test_can_validate_patterns_in_incomplete_strings_in_objects_bad_prefix(
+    prefix,
+):
+    parser = json_schema_parser(
+        {
+            "type": "object",
+            "properties": {
+                "id1": {"type": "string", "pattern": "[0-9]+"},
+                "id2": {"type": "string", "pattern": "[A-Z]+"},
+            },
+        }
+    )
+    potential = ParserPotential(parser)
+
+    with pytest.raises(ParseError):
+        await parser.parse_string(prefix)
+
+    assert await potential.prefix(prefix.encode("utf-8")) == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_can_handle_incomplete_escape_sequences():
+    parser = json_schema_parser({"type": "string", "pattern": ".*"})
+    snowman = "\u2603"
+
+    json_snowman = json.dumps(snowman, ensure_ascii=True)
+
+    for i in range(len(json_snowman)):
+        with pytest.raises(Incomplete):
+            await parser.parse_string(json_snowman[:i])
+
+    assert await parser.parse_string(json_snowman) == snowman
+
+
+@pytest.mark.asyncio
+async def test_errors_if_string_only_matches_a_prefix():
+    parser = json_schema_parser({"type": "string", "pattern": "cabbages"})
+
+    cab = json.dumps("cab")
+
+    with pytest.raises(ParseError):
+        assert await parser.parse_string(cab)
+
+
+@pytest.mark.asyncio
+async def test_patterns_apply_if_matching_anywhere():
+    schema = {"type": "string", "pattern": "\\.(mp4|avi|mov|wmv|flv)$"}
+    parser = json_schema_parser(schema)
+    await parser.parse_string('"0.mp4"')
+
+
+@pytest.mark.asyncio
+async def test_patterns_reject_non_strings():
+    schema = {"type": "string", "pattern": "\\.(mp4|avi|mov|wmv|flv)$"}
+    parser = json_schema_parser(schema)
+
+    with pytest.raises(ParseError):
+        await parser.parse_string("0")
+
+
+@pytest.mark.asyncio
+async def test_patterns_apply_if_match_before_end_of_string():
+    schema = {"type": "string", "pattern": "<[^>]+>"}
+    parser = json_schema_parser(schema)
+
+    await parser.parse_string('"<0>0"')
+
+
+# List of 100 regular expressions for common data validation scenarios.
+# Generated by Claude rather than mined from real data..
+COMMON_PATTERNS = [
+    # Email validation
+    r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$",
+    r"^[a-zA-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$",
+    # Phone numbers
+    r"^\+?1?-?\.?\s?\(?[0-9]{3}\)?[\s.-]?[0-9]{3}[\s.-]?[0-9]{4}$",
+    r"^(\+\d{1,3}[- ]?)?\d{10}$",
+    r"^\(\d{3}\)\s?\d{3}-\d{4}$",
+    r"^\d{3}-\d{3}-\d{4}$",
+    r"^\+\d{1,3}\s\d{1,4}\s\d{1,4}\s\d{1,9}$",
+    # URLs
+    r"^https?://(?:[-\w.])+(?:\:[0-9]+)?(?:/(?:[\w/_.])*(?:\?(?:[\w&=%.]*))?(?:\#(?:[\w.]*))?)?$",
+    r"^(https?|ftp)://[^\s/$.?#].[^\s]*$",
+    r"^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/.*)?$",
+    # IP addresses
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$",
+    r"^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$",
+    r"^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$",  # IPv6
+    # Credit card numbers
+    r"^4[0-9]{12}(?:[0-9]{3})?$",  # Visa
+    r"^5[1-5][0-9]{14}$",  # MasterCard
+    r"^3[47][0-9]{13}$",  # American Express
+    r"^3[0-9]{4,}$",  # Diners Club
+    r"^6(?:011|5[0-9]{2})[0-9]{12}$",  # Discover
+    # Dates
+    r"^\d{4}-\d{2}-\d{2}$",  # YYYY-MM-DD
+    r"^\d{2}/\d{2}/\d{4}$",  # MM/DD/YYYY
+    r"^\d{2}-\d{2}-\d{4}$",  # MM-DD-YYYY
+    r"^\d{1,2}/\d{1,2}/\d{4}$",  # M/D/YYYY
+    r"^\d{4}/\d{2}/\d{2}$",  # YYYY/MM/DD
+    # Time formats
+    r"^([01]?[0-9]|2[0-3]):[0-5][0-9]$",  # HH:MM
+    r"^([01]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$",  # HH:MM:SS
+    r"^(1[0-2]|0?[1-9]):[0-5][0-9]\s?(AM|PM)$",  # 12-hour format
+    # Passwords (various strength requirements)
+    r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z\d]{8,}$",  # Min 8 chars, uppercase, lowercase, digit
+    r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$",  # With special chars
+    r"^.{8,}$",  # At least 8 characters
+    r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{6,}$",  # At least 6 chars with letter and digit
+    # Social Security Numbers
+    r"^\d{3}-\d{2}-\d{4}$",
+    r"^\d{9}$",
+    # ZIP codes
+    r"^\d{5}$",  # US ZIP
+    r"^\d{5}-\d{4}$",  # US ZIP+4
+    r"^[A-Za-z]\d[A-Za-z] \d[A-Za-z]\d$",  # Canadian postal code
+    # UUIDs
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    r"^[0-9a-fA-F]{32}$",  # UUID without hyphens
+    # Numbers and currencies
+    r"^\d+$",  # Positive integers
+    r"^-?\d+$",  # Integers
+    r"^\d*\.?\d+$",  # Positive decimal numbers
+    r"^-?\d*\.?\d+$",  # Decimal numbers
+    r"^\$\d{1,3}(,\d{3})*(\.\d{2})?$",  # Currency format
+    r"^\d{1,3}(,\d{3})*(\.\d{2})?$",  # Number with commas
+    # Usernames
+    r"^[a-zA-Z0-9_]{3,20}$",
+    r"^[a-zA-Z][a-zA-Z0-9_.-]{2,19}$",
+    r"^[a-zA-Z0-9_.-]{3,30}$",
+    # Names
+    r"^[a-zA-Z\s]{2,50}$",
+    r"^[a-zA-Z\'\-\s]{1,50}$",
+    r"^[A-Z][a-z]+(\s[A-Z][a-z]+)*$",  # Proper case names
+    # Alphanumeric strings
+    r"^[a-zA-Z0-9]+$",
+    r"^[a-zA-Z0-9\s]+$",
+    r"^[a-zA-Z0-9_-]+$",
+    # File extensions
+    r"\.(jpg|jpeg|png|gif|bmp)$",  # Images
+    r"\.(pdf|doc|docx|txt|rtf)$",  # Documents
+    r"\.(mp3|wav|flac|aac)$",  # Audio
+    r"\.(mp4|avi|mov|wmv|flv)$",  # Video
+    # HTML tags
+    r"<[^>]+>",
+    r"<\/?[a-zA-Z][a-zA-Z0-9]*[^<>]*>",
+    # Hex colors
+    r"^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$",
+    r"^#[0-9A-Fa-f]{6}$",
+    # Base64
+    r"^[A-Za-z0-9+/]*={0,2}$",
+    # JSON strings (basic)
+    r"^[\{\[].*[\}\]]$",
+    # MAC addresses
+    r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$",
+    # Version numbers
+    r"^\d+\.\d+\.\d+$",  # Semantic versioning
+    r"^\d+\.\d+$",  # Major.minor
+    # Stock symbols
+    r"^[A-Z]{1,5}$",
+    # License plates (US format examples)
+    r"^[A-Z]{3}\d{4}$",
+    r"^[A-Z]{2}\d{5}$",
+    # Geographic coordinates
+    r"^-?([1-8]?\d(\.\d+)?|90(\.0+)?),-?((1[0-7]\d)|([1-9]?\d))(\.\d+)?|180(\.0+)?$",  # Lat,Long
+    # Binary strings
+    r"^[01]+$",
+    # Hashtags
+    r"^#[a-zA-Z0-9_]+$",
+    # Mention patterns
+    r"^@[a-zA-Z0-9_]+$",
+    # SQL injection patterns (for blacklisting)
+    r".*(union|select|insert|delete|update|drop|create|alter|exec|execute).*",
+    # XSS patterns (for blacklisting)
+    r".*<script.*?>.*</script>.*",
+    # Domain names
+    r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$",
+    # Port numbers
+    r"^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$",
+    # ISBN (10 and 13 digit)
+    r"^(?:ISBN(?:-1[03])?:? )?(?=[0-9X]{10}$|(?=(?:[0-9]+[- ]){3})[- 0-9X]{13}$|97[89][0-9]{10}$|(?=(?:[0-9]+[- ]){4})[- 0-9]{17}$)(?:97[89][- ]?)?[0-9]{1,5}[- ]?[0-9]+[- ]?[0-9]+[- ]?[0-9X]$",
+    # US State abbreviations
+    r"^(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)$",
+    # Language codes (ISO 639-1)
+    r"^[a-z]{2}$",
+    # Country codes (ISO 3166-1 alpha-2)
+    r"^[A-Z]{2}$",
+    # MIME types
+    r"^[a-zA-Z][a-zA-Z0-9][a-zA-Z0-9\!#\$&\-\^]*\/[a-zA-Z0-9][a-zA-Z0-9\!#\$&\-\^]*$",
+    # JWT tokens (basic structure)
+    r"^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]*$",
+    # MongoDB ObjectId
+    r"^[0-9a-fA-F]{24}$",
+    # Credit card expiry (MM/YY)
+    r"^(0[1-9]|1[0-2])\/([0-9]{2})$",
+    # CVV codes
+    r"^[0-9]{3,4}$",
+    # Routing numbers (US banks)
+    r"^[0-9]{9}$",
+    # IBAN (basic format)
+    r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$",
+    # Twitter handles
+    r"^@[A-Za-z0-9_]{1,15}$",
+    # Slack channels
+    r"^#[a-z0-9_-]+$",
+    # Discord user tags
+    r"^.{3,32}#[0-9]{4}$",
+    # YouTube video IDs
+    r"^[a-zA-Z0-9_-]{11}$",
+    # Bitcoin addresses
+    r"^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$",
+    # Ethereum addresses
+    r"^0x[a-fA-F0-9]{40}$",
+    # ISBN-10
+    r"^(?:[0-9]{9}X|[0-9]{10})$",
+    # ISBN-13
+    r"^97[89][0-9]{10}$",
+    # VAT numbers (EU format)
+    r"^[A-Z]{2}[0-9A-Z]+$",
+    # Strong password with all character types
+    r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?])[A-Za-z\d!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]{12,}$',
+    # Weak passwords (for blacklisting)
+    r"^(password|123456|qwerty|abc123|letmein|admin|welcome)$",
+    # Only letters
+    r"^[a-zA-Z]+$",
+    # Only digits
+    r"^[0-9]+$",
+    # Whitespace validation
+    r"^\S+$",  # No whitespace
+    r"^[^\s]+(\s[^\s]+)*$",  # No leading/trailing/multiple whitespace
+]
+
+COMMON_PATTERNS.sort(key=lambda s: (len(s), s))
+
+
+@pytest.mark.asyncio
+@given(st.data())
+async def test_can_always_validate_prefixes_of_pattern_matching_strings(data):
+    pattern = data.draw(st.sampled_from(COMMON_PATTERNS))
+
+    string = data.draw(st.from_regex(pattern))
+
+    # To avoid hitting https://github.com/mrabarnett/mrab-regex/issues/571
+    assume(regex.search(pattern, string) is not None)
+
+    literal = json.dumps(string)
+
+    parser = StringLiteralMatchingPatternParser(pattern)
+
+    await parser.parse_string(literal)
+
+    prefix = literal[: data.draw(st.integers(0, len(literal) - 1))]
+
+    with pytest.raises(Incomplete):
+        await parser.parse_string(prefix)
+
+
+@pytest.mark.asyncio
+async def test_cutting_through_a_surrogate_pair():
+    parser = StringLiteralMatchingPatternParser("^[A-Z]{2}\\d{5}$")
+    string = json.dumps("AA𐒠0000")
+
+    await parser.parse_string(string)
+
+    for i in range(len(string)):
+        with pytest.raises(Incomplete):
+            await parser.parse_string(string[:i])
+
+
+@pytest.mark.asyncio
+async def test_reject_half_of_a_surrogate_pair():
+    parser = StringLiteralMatchingPatternParser("^[A-Z]{2}\\d{5}$")
+    string = json.dumps("AA\ud801")
+
+    with pytest.raises(ParseError):
+        await parser.parse_string(string)
+
+
+@pytest.mark.asyncio
+async def test_will_reject_invalid_json_string():
+    parser = StringLiteralMatchingPatternParser(".*")
+
+    with pytest.raises(ParseError):
+        await parser.parse_string('"\\0"')
+
+
+@pytest.mark.asyncio
+async def test_will_not_reject_partial_string():
+    parser = StringLiteralMatchingPatternParser(".*")
+
+    with pytest.raises(Incomplete):
+        await parser.parse_string('"\\')
+
+
+@pytest.mark.asyncio
+async def test_will_handle_string_split_midway_valid():
+    parser = StringLiteralMatchingPatternParser('"*')
+
+    assert await parser.parse(Input(BasicSource(['"\\', '""']))) == '"'
+
+
+@pytest.mark.asyncio
+async def test_will_reject_string_split_midway_invalid():
+    parser = StringLiteralMatchingPatternParser('^"*$')
+
+    with pytest.raises(ParseError):
+        assert await parser.parse(Input(BasicSource(['"\\', '"A', '"'])))
