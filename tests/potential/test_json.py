@@ -81,7 +81,7 @@ async def test_will_error_on_impossible_unicode_prefixes():
 
 @st.composite
 def basic_schema(draw):
-    type = draw(
+    dtype = draw(
         st.sampled_from(
             [
                 "null",
@@ -89,6 +89,7 @@ def basic_schema(draw):
                 "integer",
                 "number",
                 "string",
+                "enum",
             ]
         )
     )
@@ -96,7 +97,22 @@ def basic_schema(draw):
     # Note: We do not currently implement patterns here, because it's too hard to do this
     # without hitting https://github.com/mrabarnett/mrab-regex/issues/571
 
-    return {"type": type}
+    if dtype == "enum":
+        return {
+            "enum": draw(
+                st.lists(
+                    st.none()
+                    | st.booleans()
+                    | st.integers()
+                    | st.floats(allow_nan=False, allow_infinity=False)
+                    | st.text(),
+                    min_size=1,
+                    unique_by=lambda x: (type(x), x),
+                )
+            )
+        }
+
+    return {"type": dtype}
 
 
 @st.composite
@@ -1300,3 +1316,35 @@ async def test_empty_object_allows_keys():
     for i in range(100):
         with pytest.raises(Incomplete):
             await parser.parse_string('{ "' + str(i))
+
+
+@pytest.mark.asyncio
+async def test_enum_parsing():
+    values = [1, "two", "twin", 3.0]
+    parser = json_schema_parser({"enum": values})
+
+    for v in values:
+        s = json.dumps(v)
+        await parser.parse_string(s)
+        for i in range(len(s)):
+            with pytest.raises(Incomplete):
+                await parser.parse_string(s[:i])
+
+    for s in [
+        "2",
+        '"q',
+        "30",
+        "twa",
+    ]:
+        with pytest.raises(ParseError):
+            await parser.parse_string(s)
+
+
+@pytest.mark.asyncio
+async def test_single_value_enum():
+    values = [1]
+    parser = json_schema_parser({"enum": values})
+    await parser.parse("1")
+
+    with pytest.raises(ParseError):
+        await parser.parse("2")
