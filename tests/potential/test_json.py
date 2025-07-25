@@ -1204,3 +1204,18 @@ async def test_will_not_reject_partial_string():
 
     with pytest.raises(Incomplete):
         await parser.parse_string('"\\')
+
+
+@pytest.mark.asyncio
+async def test_will_handle_string_split_midway_valid():
+    parser = StringLiteralMatchingPatternParser('"*')
+
+    assert await parser.parse(Input(BasicSource(['"\\', '""']))) == '"'
+
+
+@pytest.mark.asyncio
+async def test_will_reject_string_split_midway_invalid():
+    parser = StringLiteralMatchingPatternParser('^"*$')
+
+    with pytest.raises(ParseError):
+        assert await parser.parse(Input(BasicSource(['"\\', '"A', '"'])))
