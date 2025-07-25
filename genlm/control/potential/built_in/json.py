@@ -583,6 +583,14 @@ class ObjectSchemaParser(Parser[Any]):
     def __init__(self, schema):
         self.schema = schema
 
+        if not schema.get("additionalProperties", True) and not schema.get(
+            "properties"
+        ):
+            self.empty_object = True
+            return
+        else:
+            self.empty_object = False
+
         properties = self.schema.get("properties", {})
         self.child_parsers = {k: json_schema_parser(v) for k, v in properties.items()}
 
@@ -617,6 +625,10 @@ class ObjectSchemaParser(Parser[Any]):
         await input.skip_whitespace()
 
         await input.expect("{")
+        if self.empty_object:
+            await input.skip_whitespace()
+            await input.expect("}")
+            return {}
 
         result = {}
 
