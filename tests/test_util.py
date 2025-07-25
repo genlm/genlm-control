@@ -1,5 +1,6 @@
 import pytest
 import numpy as np
+from genlm.control.constant import EOS
 from genlm.control.util import LazyWeights, load_trie, escape
 
 
@@ -193,3 +194,4 @@ def test_escape():
     assert escape(10) == "\\n"
     assert escape(b"hello") == "hello"
     assert escape("hello") == "hello"
+    assert escape(EOS) == "EOS"
