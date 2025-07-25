@@ -1188,3 +1188,19 @@ async def test_reject_half_of_a_surrogate_pair():
 
     with pytest.raises(ParseError):
         await parser.parse_string(string)
+
+
+@pytest.mark.asyncio
+async def test_will_reject_invalid_json_string():
+    parser = StringLiteralMatchingPatternParser(".*")
+
+    with pytest.raises(ParseError):
+        await parser.parse_string('"\\0"')
+
+
+@pytest.mark.asyncio
+async def test_will_not_reject_partial_string():
+    parser = StringLiteralMatchingPatternParser(".*")
+
+    with pytest.raises(Incomplete):
+        await parser.parse_string('"\\')

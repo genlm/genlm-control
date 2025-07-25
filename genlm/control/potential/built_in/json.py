@@ -244,10 +244,6 @@ class Input:
         self.buffer = array("I")
         self.index = 0
 
-    @property
-    def finished(self):
-        return self.__finished
-
     async def advance_input(self):
         if self.__finished:
             return False
@@ -291,13 +287,7 @@ class Input:
 
         await self.__read_until(lambda: self.index < len(self.buffer))
         buffer = "".join(chr(i) for i in self.buffer[self.index :])
-        match = pattern.match(buffer, pos=0, partial=True)
-        if match is None:
-            return None
-        elif match.partial and match.end() != len(buffer):
-            return None
-        else:
-            return match
+        return pattern.match(buffer, pos=0, partial=True)
 
     async def current_char(self):
         await self.__read_until(lambda: self.index < len(self.buffer))
