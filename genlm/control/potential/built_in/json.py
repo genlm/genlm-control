@@ -465,9 +465,28 @@ class FloatParser(Parser[float]):
 
 FLOAT_PARSER = FloatParser()
 
-INTEGER_PARSER: Parser[float] = RegexParser(
-    r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)"
-).map(json.loads)
+INTEGER_REGEX = regex.compile(r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)")
+
+
+class IntegerParser(Parser[int]):
+    async def parse(self, input: Input) -> float:
+        start = input.index
+        await input.read_pattern(INTEGER_REGEX)
+
+        while True:
+            try:
+                c = await input.read(1)
+            except Incomplete:
+                break
+            if c == ".":
+                raise ParseError()
+            if c not in "0123456789":
+                break
+        input.index = start
+        return json.loads(await input.read_pattern(INTEGER_REGEX))
+
+
+INTEGER_PARSER = IntegerParser()
 
 STRING_REGEX = r'"([^\\"]|\\"|\\[^"])*"'
 

@@ -1219,3 +1219,19 @@ async def test_will_reject_string_split_midway_invalid():
 
     with pytest.raises(ParseError):
         assert await parser.parse(Input(BasicSource(['"\\', '"A', '"'])))
+
+
+@pytest.mark.asyncio
+async def test_union_of_integer_and_number():
+    parser = json_schema_parser(
+        {
+            "type": "array",
+            "items": {"anyOf": [{"type": "integer"}, {"type": "number"}]},
+        }
+    )
+
+    assert await parser.parse_string("[0]") == [0]
+    assert await parser.parse_string("[0.0]") == [0.0]
+    xs = await parser.parse_string("[0.0, 0, 0.0]")
+    assert xs == [0.0, 0, 0.0]
+    assert list(map(type, xs)) == [float, int, float]
