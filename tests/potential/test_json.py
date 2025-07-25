@@ -105,8 +105,7 @@ def composite_schema(draw, sub_schema):
         st.sampled_from(
             [
                 "array",
-                # FIXME: Disabled because it revealed a bug that I need to fix later.
-                # "anyOf",
+                "anyOf",
                 "object",
             ]
         )
@@ -205,6 +204,30 @@ def json_schema_potential_problem(draw):
         },
         document=b'"000\\u001f\xc2\x80\xc2\x80\xc2\x80"',
         prefix=b'"000\\u001f\xc2\x80\xc2\x80\xc2',
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"type": "array", "items": {"type": "integer"}},
+        document=b"[0]",
+        prefix=b"[",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "anyOf": [
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                {
+                    "type": "object",
+                    "properties": {"0": {"type": "null"}},
+                    "required": ["0"],
+                    "additionalProperties": False,
+                },
+            ]
+        },
+        document=b'{"0": null}',
+        prefix=b"{",
     ),
 )
 @given(json_schema_potential_problem())
@@ -1219,3 +1242,61 @@ async def test_will_reject_string_split_midway_invalid():
 
     with pytest.raises(ParseError):
         assert await parser.parse(Input(BasicSource(['"\\', '"A', '"'])))
+
+
+@pytest.mark.asyncio
+async def test_union_of_integer_and_number():
+    parser = json_schema_parser(
+        {
+            "type": "array",
+            "items": {"anyOf": [{"type": "integer"}, {"type": "number"}]},
+        }
+    )
+
+    assert await parser.parse_string("[0]") == [0]
+    assert await parser.parse_string("[0.0]") == [0.0]
+    xs = await parser.parse_string("[0.0, 0, 0.0]")
+    assert xs == [0.0, 0, 0.0]
+    assert list(map(type, xs)) == [float, int, float]
+
+
+@pytest.mark.asyncio
+async def test_union_of_objects():
+    schema = {
+        "anyOf": [
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            {
+                "type": "object",
+                "properties": {"0": {"type": "null"}},
+                "required": ["0"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+
+    document = '{"0": null}'
+
+    parser = json_schema_parser(schema)
+
+    assert await parser.parse_string(document) == {"0": None}
+
+
+@pytest.mark.asyncio
+async def test_empty_object():
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    parser = json_schema_parser(schema)
+
+    assert await parser.parse_string("{}") == dict()
+
+    with pytest.raises(ParseError):
+        await parser.parse_string('{"')
+
+
+@pytest.mark.asyncio
+async def test_empty_object_allows_keys():
+    parser = json_schema_parser({"type": "object"})
+
+    for i in range(100):
+        with pytest.raises(Incomplete):
+            await parser.parse_string('{ "' + str(i))

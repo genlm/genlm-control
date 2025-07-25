@@ -465,9 +465,28 @@ class FloatParser(Parser[float]):
 
 FLOAT_PARSER = FloatParser()
 
-INTEGER_PARSER: Parser[float] = RegexParser(
-    r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)"
-).map(json.loads)
+INTEGER_REGEX = regex.compile(r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)")
+
+
+class IntegerParser(Parser[int]):
+    async def parse(self, input: Input) -> float:
+        start = input.index
+        await input.read_pattern(INTEGER_REGEX)
+
+        while True:
+            try:
+                c = await input.read(1)
+            except Incomplete:
+                break
+            if c == ".":
+                raise ParseError()
+            if c not in "0123456789":
+                break
+        input.index = start
+        return json.loads(await input.read_pattern(INTEGER_REGEX))
+
+
+INTEGER_PARSER = IntegerParser()
 
 STRING_REGEX = r'"([^\\"]|\\"|\\[^"])*"'
 
@@ -564,6 +583,14 @@ class ObjectSchemaParser(Parser[Any]):
     def __init__(self, schema):
         self.schema = schema
 
+        if not schema.get("additionalProperties", True) and not schema.get(
+            "properties"
+        ):
+            self.empty_object = True
+            return
+        else:
+            self.empty_object = False
+
         properties = self.schema.get("properties", {})
         self.child_parsers = {k: json_schema_parser(v) for k, v in properties.items()}
 
@@ -598,6 +625,10 @@ class ObjectSchemaParser(Parser[Any]):
         await input.skip_whitespace()
 
         await input.expect("{")
+        if self.empty_object:
+            await input.skip_whitespace()
+            await input.expect("}")
+            return {}
 
         result = {}
 
