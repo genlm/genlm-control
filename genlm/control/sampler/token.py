@@ -194,7 +194,7 @@ class AWRS(TokenSampler):
     Args:
         potential (Potential): The non-boolean potential.
         condition (Potential): The boolean condition. This potential must only output boolean values (0 or -inf in log-space).
-        seed (int): The seed for the random number generator.
+        seed (int or None): The seed for the random number generator.
         prune_logws (bool): Whether to prune the logws to only include the tokens in the intersection of the potential and condition vocabularies
         proper_weights (bool): Whether to return properly weighted samples.
             If False, the sampler will only run one round of adaptive rejection sampling.
@@ -207,7 +207,7 @@ class AWRS(TokenSampler):
         self,
         potential,
         condition,
-        seed=42,
+        seed=None,
         prune_logws=True,
         proper_weights=True,
         max_accepts=2,

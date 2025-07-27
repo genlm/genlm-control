@@ -13,6 +13,7 @@ from genlm.control.potential.streaming import (
     AsyncSource,
 )
 from array import array
+import unicodedata
 
 
 def is_sequence(checker, instance):
@@ -171,6 +172,7 @@ class ValidateJSON(Potential):
 
 
 def JsonSchema(schema):
+    Draft7Validator.check_schema(schema)
     return (
         ValidateJSON()
         * StreamingJsonSchema(schema)
@@ -242,7 +244,7 @@ class Input:
         self.buffer = array("I")
         self.index = 0
 
-    async def __read_more(self):
+    async def advance_input(self):
         if self.__finished:
             return False
         try:
@@ -257,7 +259,7 @@ class Input:
         while True:
             if condition():
                 break
-            if not await self.__read_more():
+            if not await self.advance_input():
                 raise Incomplete()
 
     async def read_pattern(self, pattern, group=0):
@@ -271,11 +273,21 @@ class Input:
             if match is None or (result := match.group(group)) is None:
                 raise ParseError()
             elif match.partial:
-                if not await self.__read_more():
+                if not await self.advance_input():
                     raise Incomplete()
             else:
                 self.index += match.end()
                 return result
+
+    async def get_partial_pattern(self, pattern):
+        """If the remainder of the buffer read so far could match a prefix
+        of pattern, or start with a complete match for the pattern return it.
+
+        Note: This is pure lookahead and does *not* advance the input."""
+
+        await self.__read_until(lambda: self.index < len(self.buffer))
+        buffer = "".join(chr(i) for i in self.buffer[self.index :])
+        return pattern.match(buffer, pos=0, partial=True)
 
     async def current_char(self):
         await self.__read_until(lambda: self.index < len(self.buffer))
@@ -312,7 +324,7 @@ class Input:
 
     async def skip_whitespace(self):
         if self.index == len(self.buffer):
-            if not await self.__read_more():
+            if not await self.advance_input():
                 return
         # TODO: Given inefficiencies with regex, maybe worth a more direct
         # implementation here?
@@ -396,6 +408,18 @@ class AltParser(Parser[Union[S, T]]):
             return await self.right.parse(input)
 
 
+class ConstParser(Parser[None]):
+    def __init__(self, value: str):
+        self.value = value
+
+    async def parse(self, input: Input) -> None:
+        await input.skip_whitespace()
+        for expected in self.value:
+            got = await input.read(1)
+            if got != expected:
+                raise ParseError(f"Expected char {expected} but got {got}")
+
+
 class RegexParser(Parser[str]):
     def __init__(self, pattern, group=0, options=regex.MULTILINE | regex.UNICODE):
         self.pattern = regex.compile(pattern, options)
@@ -441,12 +465,32 @@ class FloatParser(Parser[float]):
 
 FLOAT_PARSER = FloatParser()
 
-INTEGER_PARSER: Parser[float] = RegexParser(
-    r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)"
-).map(json.loads)
+INTEGER_REGEX = regex.compile(r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)")
 
 
-STRING_LITERAL_PARSER = RegexParser(r'"([^\\"]|\\"|\\[^"])*"').map(json.loads)
+class IntegerParser(Parser[int]):
+    async def parse(self, input: Input) -> float:
+        start = input.index
+        await input.read_pattern(INTEGER_REGEX)
+
+        while True:
+            try:
+                c = await input.read(1)
+            except Incomplete:
+                break
+            if c == ".":
+                raise ParseError()
+            if c not in "0123456789":
+                break
+        input.index = start
+        return json.loads(await input.read_pattern(INTEGER_REGEX))
+
+
+INTEGER_PARSER = IntegerParser()
+
+STRING_REGEX = r'"([^\\"]|\\"|\\[^"])*"'
+
+STRING_LITERAL_PARSER = RegexParser(STRING_REGEX).map(json.loads)
 
 NULL_PARSER = RegexParser("null").drop_result()
 
@@ -458,10 +502,94 @@ BOOL_PARSER = RegexParser("false|true").map(json.loads)
 # between tokens.
 WHITESPACE_PARSER = RegexParser(r"\s*").filter(lambda x: all(ord(c) < 256 for c in x))
 
+STRING_PATTERN = regex.compile(STRING_REGEX)
+
+
+class StringLiteralMatchingPatternParser(Parser[str]):
+    def __init__(self, pattern):
+        self.pattern = regex.compile(pattern, regex.MULTILINE | regex.UNICODE)
+
+    async def parse(self, input: Input):
+        prev = None
+        while True:
+            # We check whether whatever we've read so far of the
+            # available data is the start of or starts with a string
+            # literal.
+            #
+            # If it's not, the pattern is irrelevant, we've got the
+            # wrong type (or bad JSON) here.
+
+            match = await input.get_partial_pattern(STRING_PATTERN)
+            if match is None:
+                raise ParseError()
+            literal = match.group(0)
+            # We advance the input on each loop, so this literal should always
+            # increase in length on each iteration.
+            assert literal != prev
+            prev = literal
+            if not match.partial:
+                # We have a complete string literal and we just need to
+                # parse the whole thing.
+                try:
+                    decoded = json.loads(literal)
+                except json.JSONDecodeError:
+                    raise ParseError()
+            else:
+                # We have the start of a string literal. Try to read it
+                # interpret it as a valid string.
+                try:
+                    decoded = json.loads(literal + '"')
+                except json.JSONDecodeError:
+                    # This might be because there's an escaped character at the
+                    # end that hasn't been finished. We could try to repair that,
+                    # but we'll advance by one character each loop, so it doesn't
+                    # seem worth the effort.
+                    if not await input.advance_input():
+                        raise Incomplete()
+                    continue
+
+            # If we've seen the string halfway through a surrogate pair, drop the
+            # surrogate, as it will throw off the match.
+            if decoded and unicodedata.category(decoded[-1]) == "Cs":
+                if not match.partial:
+                    raise ParseError()
+                else:
+                    decoded = decoded[:-1]
+
+            # The pattern applies to the decoded string. If we have a complete
+            # string then we don't want to allow partial matches, because the
+            # pattern has to match the whole thing, but if we've only got a
+            # partial string then we only want a partial match.
+            #
+            # Note search rather than match here, because a pattern constraint
+            # in JSON schema applies if the pattern matches anywhere in the string.
+            match_decoded = self.pattern.search(decoded, partial=match.partial)
+            if match_decoded is None:
+                raise ParseError()
+
+            if not match.partial:
+                advance = await input.read(len(literal))
+                assert advance == literal
+                return decoded
+
+            # If we're here, then the entire buffer read so far is a partial
+            # match for the pattern. We can't make progress until more
+            # data has arrived.
+            if not await input.advance_input():
+                raise Incomplete()
+
 
 class ObjectSchemaParser(Parser[Any]):
     def __init__(self, schema):
         self.schema = schema
+
+        if not schema.get("additionalProperties", True) and not schema.get(
+            "properties"
+        ):
+            self.empty_object = True
+            return
+        else:
+            self.empty_object = False
 
         properties = self.schema.get("properties", {})
         self.child_parsers = {k: json_schema_parser(v) for k, v in properties.items()}
@@ -497,6 +625,10 @@ class ObjectSchemaParser(Parser[Any]):
         await input.skip_whitespace()
 
         await input.expect("{")
+        if self.empty_object:
+            await input.skip_whitespace()
+            await input.expect("}")
+            return {}
 
         result = {}
 
@@ -575,6 +707,9 @@ ARBITRARY_JSON = (
 
 
 def json_schema_parser(schema):
+    if "const" in schema:
+        return ConstParser(json.dumps(schema["const"]))
+
     if "anyOf" in schema:
         *rest, base = schema["anyOf"]
         result = json_schema_parser(base)
@@ -593,7 +728,11 @@ def json_schema_parser(schema):
     elif schema["type"] == "boolean":
         return BOOL_PARSER
     elif schema["type"] == "string":
-        return STRING_LITERAL_PARSER
+        pattern = schema.get("pattern")
+        if pattern is not None:
+            return StringLiteralMatchingPatternParser(pattern)
+        else:
+            return STRING_LITERAL_PARSER
     elif schema["type"] == "object":
         return ObjectSchemaParser(schema)
     elif schema["type"] == "array":

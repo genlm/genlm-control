@@ -2,6 +2,8 @@ import numpy as np
 from genlm.grammar import Float, Log
 from arsenal.maths import logsumexp
 
+from genlm.control.constant import EndOfSequence
+
 
 class LazyWeights:
     """
@@ -275,3 +277,15 @@ def fast_sample_lazyweights(lazyweights):
     assert lazyweights.is_log
     token_id = fast_sample_logprobs(lazyweights.weights, size=1)[0]
     return lazyweights.decode[token_id]
+
+
+def escape(x):
+    if isinstance(x, EndOfSequence):
+        return repr(x)
+    elif isinstance(x, int):  # assume its a byte
+        x = bytes([x])
+    if isinstance(x, bytes):
+        y = repr(x)[2:-1]
+    else:
+        y = repr(x)[1:-1]
+    return y.replace(" ", "␣")
