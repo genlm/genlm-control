@@ -97,3 +97,16 @@ following command:
 ```bash
 pre-commit run --all-files
 ```
+
+## Releasing to PyPI
+
+To publish a new version of the library on PyPI:
+
+1. Go to the repository homepage and click Releases (right side).
+2. Click Draft a new release (top right).
+3. Create a new tag (e.g., v0.2.6) following semantic versioning.
+4. Add or generate release notes.
+5. Click Publish release.
+
+This triggers the Release workflow. Once it completes, the new version will appear at:
+https://pypi.org/project/genlm-control/#history.
