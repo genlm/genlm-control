@@ -1353,7 +1353,7 @@ async def test_enum_parsing():
 async def test_single_value_enum():
     values = [1]
     parser = json_schema_parser({"enum": values})
-    await parser.parse("1")
+    await parser.parse_string("1")
 
     with pytest.raises(ParseError):
-        await parser.parse("2")
+        await parser.parse_string("2")
