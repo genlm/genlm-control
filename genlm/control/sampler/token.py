@@ -1,7 +1,7 @@
 import numpy as np
 from arsenal import colors
 from llamppl import SubModel
-from arsenal.maths import logsumexp
+from arsenal.maths import log1mexp, logsumexp
 
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
@@ -231,7 +231,7 @@ class AWRS(TokenSampler):
             raise ValueError("`n_monte_carlo_samples` must be at least 1")
 
         self.max_accepts = max_accepts
-        self.max_rejects = max_rejects or len(self.potential.vocab_eos)
+        self.max_rejects = max_rejects or float("inf")
         self.n_monte_carlo_samples = n_monte_carlo_samples
 
         self.valid_idxs = np.array(
@@ -289,224 +289,243 @@ class AWRS(TokenSampler):
         logps = logws.weights - logZ
         toks = logws.decode
 
-        # Note that this is a different algorithm than the one described
-        # in the paper.
-        #
-        # Rather than use a RAVI-based estimator for the weight, we reduce
-        # the sampling without replacement process to a sampling with
-        # replacement process.
-        #
-        # This works by imagining that each token produced by the sampling
-        # without replacement is preceded by some number of tokens that have
-        # previously been seen. We don't need to know what those tokens are,
-        # only how many of them there are, which can be calculated by sampling
-        # from a geometric distribution with parameter equal to the total mass
-        # of tokens that have previously been removed from our distribution.
-        #
-        # This will have a significantly lower variance than the estimator
-        # from the paper. It might in fact be the Minimum Variance Unbiased
-        # Estimator (MVUE) for the weight, but we're not 100% sure of the
-        # details. Informal experiments suggest that it has about 2-5x lower
-        # variance than the paper's estimator. It also allows a clean
-        # implementation of the max_rejects parameter.
+        # We cache successful calls, as algorithms may want to see the
+        # same successful token more than once (currently just geometric_awrs)
+        cache = {}
 
-        replacement_probabilities = [0.0]
-        accepted = []
+        async def accept(tok):
+            try:
+                return cache[tok]
+            except KeyError:
+                pass
+            result = await self._accept(context, tok, verbosity)
+            if result:
+                cache[tok] = result
+            return result
 
-        n_accepts = 0
-        n_rejects = 0
-
-        tok = None
-        tok_logp = -float("inf")
-        rejected_tok = None
-        progress = True
-
-        while (
-            n_accepts < self.max_accepts and n_rejects < self.max_rejects and progress
+        if not self.proper_weights:
+            return await improper_sample(
+                logps=logps,
+                toks=toks,
+                accept=accept,
+                rng=self.rng,
+                max_rejects=self.max_rejects,
+            )
+        # We pick which algorithm to use based on parameters and the
+        # shape of the distribution, as this lets us pick the most
+        # effective option.
+        elif (
+            # If max_accepts is large then recursive_awrs (which
+            # does not currently support this parameter) isn't very
+            # useful, because the recursive step means that you never
+            # revisit the same value, so will often throw away most
+            # of the accepted mass if you were to continue. Also
+            # this parameter is only really relevant if you want to
+            # lower the variance, and geometric_awrs is lower variance.
+            self.max_accepts > 2
+            or
+            # If the distribution is strongly peaked around a single value
+            # then geometric_awrs will be more efficient. See below
+            # for specific derivation.
+            logps.max() >= GEOMETRIC_THRESHOLD
         ):
-            progress = False
-            keys = logps - np.log(-np.log(self.rng.random((self.V,))))
-            order = np.argsort(-keys)
-            for item in order:
-                if keys[item] == -np.inf:
-                    break
-                progress = True
-                if await self._accept(context, toks[item], verbosity):
-                    accepted.append(True)
-                    replacement_probabilities.append(replacement_probabilities[-1])
-                    if tok is None:
-                        tok = toks[item]
-                        tok_logp = logps[item]
-                    n_accepts += 1
-                    break
-                else:
-                    rejected_tok = toks[item]
-                    accepted.append(False)
-                    replacement_probabilities.append(
-                        replacement_probabilities[-1] + np.exp(logps[item])
-                    )
-                    logps[item] = -np.inf
-                    n_rejects += 1
-                    if n_rejects == self.max_rejects:
-                        break
-
-            if not self.proper_weights:
-                if tok is None:
-                    return self.target.eos, float("-inf"), np.nan
-                return tok, 0, np.nan
-
-        # No token was accepted, return a rejected tokenand kill the particle.
-        if tok is None:
-            return rejected_tok, float("-inf"), np.nan
-
-        if n_rejects == 0:
-            return tok, logZ, np.nan
-
-        def calc_estimator(local_accepts, local_rejects):
-            # This is an estimator for the probability of acceptance,
-            # from a random variable that samples with replacement until
-            # it sees either a certain number of accepted tokens or a certain
-            # number of rejected tokens.
-            #
-            # You can work out this estimator by applying the Rao-Blackwell
-            # theorem, starting from the estimator that returns 1 if the first
-            # sample is accepted, and 0 otherwise, conditioned on the total number
-            # of accepted and rejected tokens seen. When you do this, it reduces
-            # to a sequence counting problem, by looking at the fraction of sequences
-            # that have those counts which start with 1.
-
-            denominator = local_rejects + local_accepts - 1
-
-            if local_accepts == self.max_accepts:
-                return (self.max_accepts - 1) / denominator
-            else:
-                assert local_rejects == self.max_rejects
-                return local_accepts / denominator
-
-        novel_probabilities = 1 - np.array(replacement_probabilities[:-1])
-        # The novel probability should never be less than the probability of
-        # the token we accepted, but it can be for numerical stability reasons.
-        # We boost it to avoid zero probabilities.
-        novel_probabilities = np.maximum(novel_probabilities, np.exp(tok_logp))
-
-        for i, x in enumerate(novel_probabilities):
-            if x < 1:
-                novel_start = i
-                break
-        sub_one_probabilities = novel_probabilities[novel_start:]
-
-        # If we have successfully found a token but are very close to
-        # the maximum number of rejects, it's possible for the simulation
-        # of the sampling with replacement to always exceed the maximum
-        # number of rejections, which gives us a weight of zero despite
-        # having successfully found a token. We don't want to do that.
-        #
-        # So we split the estimator up into two parts: One where all
-        # of the geometric distributions rolled zero, which we can calculate
-        # the probability of exactly and can estimate in that case, and do
-        # the monte-carlo simulation conditional on at least one of the
-        # geometric samples rolling non-zero. We then combine the two
-        # estimators at the end.
-        logp_all_zero = np.log(novel_probabilities).sum()
-
-        # Note: In many cases this rounds to zero, but that's actually fine.
-        # The difference between 1 and 1 - epsilon is negligible for these
-        # calculations.
-        logp_non_zero = np.log1p(-np.exp(logp_all_zero))
-
-        # This is the estimator we get when every geometric distribution
-        # rolled zero. It is guaranteed to be > 0 because we've seeen
-        # at least one accepted token.
-        base_estimator = calc_estimator(n_accepts, n_rejects)
-
-        def gen_monte_carlo_samples(n_samples):
-            # We want geometric samples for the monte carlo simulation, but
-            # annoyingly numpy's geometric distribution doesn't allow us to
-            # set p=1, so we create the initial samples as zeros, then
-            # concatenate them with the geometric samples to get the whole
-            # sample for the simulation.
-            initial_zeros = np.zeros(
-                (n_samples, len(novel_probabilities[:novel_start]))
+            tok, w, _ = await geometric_awrs(
+                logps=logps,
+                toks=toks,
+                accept=accept,
+                rng=self.rng,
+                max_rejects=self.max_rejects,
+                max_accepts=self.max_accepts,
             )
-            geometric_samples = (
-                self.rng.geometric(
-                    sub_one_probabilities,
-                    size=(n_samples, len(sub_one_probabilities)),
-                )
-                - 1
-            )
-
-            samples = np.concatenate((initial_zeros, geometric_samples), axis=1)
-
-            assert samples.shape == (
-                n_samples,
-                len(novel_probabilities),
-            )
-            return samples
-
-        estimators = []
-
-        # Because the monte carlo simulation is done conditionally on
-        # not all of the geometric samples rolling zero, we may need
-        # to run it a few times to get the number of samples we need.
-        n_monte_carlo_samples_done = 0
-        while n_monte_carlo_samples_done < self.n_monte_carlo_samples:
-            for sample in gen_monte_carlo_samples(
-                self.n_monte_carlo_samples - n_monte_carlo_samples_done
-            ):
-                # Simulate the sampling with replacement process, by modelling
-                # a number of discarded tokens that were previously seen,
-                # inserted before each novel token in the rejection sample.
-
-                if not sample.any():
-                    continue
-
-                n_monte_carlo_samples_done += 1
-
-                if sample.sum() + n_rejects < self.max_rejects:
-                    local_rejects = sample.sum() + n_rejects
-                    local_accepts = self.max_accepts
-                else:
-                    local_accepts = 0
-                    local_rejects = 0
-
-                    for i in range(len(accepted)):
-                        if (
-                            local_accepts == self.max_accepts
-                            or local_rejects == self.max_rejects
-                        ):
-                            break
-
-                        local_rejects += sample[i]
-                        if local_rejects >= self.max_rejects:
-                            local_rejects = self.max_rejects
-                            break
-
-                        if accepted[i]:
-                            local_accepts += 1
-                        else:
-                            local_rejects += 1
-                estimators.append(calc_estimator(local_accepts, local_rejects))
-
-        estimators_prediction = np.mean(estimators)
-
-        # p = p_all_zero * base_estimator + p_non_zero * estimators_prediction
-        # The following calculation just does this in log-space.
-
-        # This can be zero if `max_rejects` is finite and the rejection
-        # sampling has thrown away a very large amount of probability mass.
-        if estimators_prediction > 0:
-            logp = logsumexp(
-                (
-                    logp_all_zero + np.log(base_estimator),
-                    logp_non_zero + np.log(estimators_prediction),
-                )
-            )
+            return tok, w + logZ, np.nan
         else:
-            logp = logp_all_zero + np.log(base_estimator)
+            tok, w, _ = await recursive_awrs(
+                logps=logps,
+                toks=toks,
+                accept=accept,
+                rng=self.rng,
+                max_rejects=self.max_rejects,
+            )
+            return tok, w + logZ, np.nan
 
-        assert 0 >= logp > -float("inf"), logp
 
-        logw = logp + logZ
+# If the top log probability exceeds this value, then it will be
+# more efficient to use geometric_awrs. This is because the
+# expected number of distinct calls is bounded above by 1 +
+# a negative binomial distribution with parameters 2, p (
+# the number of calls that would be made by sampling with
+# replacement before seeing two of the top probability), so
+# has expected value 1 + 2(1 - p) / p, and so is < 2 whenever
+# p > 2/ 3. As recursive_awrs always makes at least two calls,
+# geometric_awrs dominates here.
+GEOMETRIC_THRESHOLD = np.log(2 / 3)
 
-        return tok, logw, np.nan
+
+async def improper_sample(*, logps, toks, accept, rng, max_rejects):
+    """Implements a single rejection sampling loop which returns
+    the first value found with no attempt to make a properly
+    weighted sample."""
+    keys = logps - np.log(-np.log(rng.random((len(logps),))))
+    order = np.argsort(-keys)
+    if len(order) > max_rejects:
+        order = order[:max_rejects]
+    for item in order:
+        if keys[item] == -np.inf:
+            break
+        tok = toks[item]
+        if await accept(tok):
+            return tok, 0.0, np.nan
+    return tok, -float("inf"), np.nan
+
+
+async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
+    """Implements Recursive AWRS.
+
+    This uses the observation that
+
+    E(f(X)) = P(X = x) f(x) + (1 - P(X = x)) E(f(X)|X != x)
+
+    To construct a recursive estimator of the weight from a single
+    sampling-with-rejection run. The first time accept(x) passes,
+    we use a simple coin flip estimator for the tail.
+    """
+    n_accepts = 0
+    n_rejects = 0
+
+    log_rejected_mass = -float("inf")
+    log_multiplier = 0.0
+
+    error_tolerance = 10e-5
+
+    keys = logps - np.log(-np.log(rng.random((len(logps),))))
+    order = np.argsort(-keys)
+    for index_into_list, item in enumerate(order):
+        assert n_accepts == 0
+        if keys[item] == -np.inf:
+            break
+        tok = toks[item]
+        last = (
+            index_into_list + 1 == len(order)
+            or keys[order[index_into_list + 1]] == -np.inf
+        )
+
+        log_q = logps[item] - log1mexp(log_rejected_mass)
+
+        # The last check is because in the case where there is a single
+        # accepted token with very low log probability, numerical stability
+        # issues make it very hard to get this calculation right.
+        assert not last or log_q >= -error_tolerance or logps[item] < -32
+        assert log_q <= error_tolerance
+        assert log_multiplier <= error_tolerance
+        assert log_rejected_mass <= error_tolerance
+
+        # Fix some minor numerical stability errors that can come up.
+        if last:
+            log_q = 0
+        log_q = min(log_q, 0)
+        log_multiplier = min(log_multiplier, 0)
+        log_rejected_mass = min(log_rejected_mass, 0)
+
+        if await accept(toks[item]):
+            n_accepts += 1
+            if n_rejects == max_rejects - 1:
+                return tok, log_multiplier, np.nan
+            elif last:
+                final_estimator = 0.0
+            else:
+                next_token = toks[order[index_into_list + 1]]
+                if await accept(next_token):
+                    final_estimator = 0
+                else:
+                    final_estimator = log_q
+            logp = log_multiplier + final_estimator
+            return tok, logp, np.nan
+        elif last or n_rejects == max_rejects - 1:
+            # No token was accepted, return a rejected token and kill the particle.
+            return tok, float("-inf"), np.nan
+        else:
+            n_rejects += 1
+            log_rejected_mass = logsumexp([log_rejected_mass, logps[item]])
+            m = log1mexp(log_q)
+            assert not np.isnan(m)
+            log_multiplier += m
+        assert not last
+
+    raise AssertionError("Unreachable")
+
+
+async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
+    """Implements Geometric AWRS.
+
+    This simulates a single run of sampling with replacement from a sampling
+    without replacement run, reconstructing the counts of "phantom" elements
+    discarded from the without-replacement run as a series of draws from
+    geometric distributions. We can then use an appropriate estimator
+    for the with-replacement run at the end.
+    """
+    n_accepts = 0
+    n_rejects = 0
+
+    rejected_mass = 0.0
+    result = None
+    rejected_token = None
+
+    for _ in range(max_accepts):
+        if n_rejects >= max_rejects:
+            break
+        keys = logps - np.log(-np.log(rng.random((len(logps),))))
+        order = np.argsort(-keys)
+        for item in order:
+            if keys[item] == -np.inf or rejected_mass >= 1:
+                break
+
+            tok = toks[item]
+
+            if rejected_mass >= 1:
+                # If rejected mass is >= 1 but we have a non-zero probability
+                # we've really had numerical precision issues that rounded us to 1.
+                # However, this means that the correct estimator is ridiculously
+                # small, and we'd exceed any reasonable `max_rejects`, so we just
+                # immediately terminate in this case.
+                assert rejected_token is not None
+                return rejected_token, -float("inf"), np.nan
+            elif rejected_mass > 0:
+                # Add a geometric distribution with parameter 1 - rejected_mass
+                # to the number of rejects, account for the phantom tokens
+                # "hidden" by sampling without replacement.
+                phantom_tokens = rng.geometric(1 - rejected_mass) - 1
+                n_rejects += phantom_tokens
+
+            if n_rejects >= max_rejects:
+                break
+
+            if await accept(tok):
+                n_accepts += 1
+                if result is None:
+                    result = tok
+                break
+            else:
+                if rejected_token is None:
+                    rejected_token = tok
+                n_rejects += 1
+                rejected_mass += np.exp(logps[item])
+                logps[item] = -float("inf")
+
+    # If we stopped in the middle of a sequence of phantom tokens,
+    # n_rejects may have gone over max_rejects.
+    n_rejects = min(n_rejects, max_rejects)
+
+    # The correctness of this estimator can be verified by applying
+    # the Rao-Blackwell theorem to the estimator that just returns
+    # 1 if the first sample was accepted and 0 if it was rejected
+    # to the sufficient statistic (n_accepts, n_rejects). Some
+    # straightforward sequence counting gives you this estimator.
+    estimator = min(max_accepts - 1, n_accepts) / (n_accepts + n_rejects - 1)
+
+    assert estimator > 0 or result is None
+
+    if result is None:
+        assert n_accepts == 0
+        result = rejected_token
+
+    return result, np.log(estimator), np.nan
