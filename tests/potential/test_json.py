@@ -1124,7 +1124,7 @@ COMMON_PATTERNS = [
     r"^[A-Z]{3}\d{4}$",
     r"^[A-Z]{2}\d{5}$",
     # Geographic coordinates
-    r"^-?([1-8]?\d(\.\d+)?|90(\.0+)?),-?((1[0-7]\d)|([1-9]?\d))(\.\d+)?|180(\.0+)?$",  # Lat,Long
+    r"^-?(([1-8]?\d(\.\d+)?|90(\.0+)?),-?((1[0-7]\d)|([1-9]?\d))(\.\d+)?|180(\.0+)?)$",  # Lat,Long
     # Binary strings
     r"^[01]+$",
     # Hashtags
@@ -1215,6 +1215,23 @@ async def test_can_always_validate_prefixes_of_pattern_matching_strings(data):
 
     with pytest.raises(Incomplete):
         await parser.parse_string(prefix)
+
+
+@pytest.mark.asyncio
+@given(st.sampled_from(COMMON_PATTERNS), st.text(min_size=1))
+async def test_will_reject_incomplete_bad_strings(pattern, text):
+    assume(pattern[0] == "^")
+    assume(not regex.match(pattern, text, partial=True))
+
+    literal = json.dumps(text)
+
+    parser = StringLiteralMatchingPatternParser(pattern)
+
+    with pytest.raises(ParseError):
+        await parser.parse_string(literal)
+
+    with pytest.raises(ParseError):
+        await parser.parse_string(literal[:-1])
 
 
 @pytest.mark.asyncio
@@ -1384,3 +1401,18 @@ async def test_integer_accepts_only_positive_e_notation():
 
     with pytest.raises(ParseError):
         await parser.parse_string("[1e-05]")
+
+
+@pytest.mark.asyncio
+async def test_catches_error_before_close_of_string():
+    schema = {
+        "type": "object",
+        "properties": {
+            "location": {"type": "string", "pattern": r"^[A-Za-z\s\-\.]+,\s[A-Z]{2}$"}
+        },
+        "required": ["location"],
+    }
+    parser = json_schema_parser(schema)
+
+    with pytest.raises(ParseError):
+        await parser.parse_string('{"location" : "Miami, Flo')
