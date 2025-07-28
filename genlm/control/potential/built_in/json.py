@@ -482,7 +482,13 @@ class IntegerParser(Parser[int]):
                 break
             if c == ".":
                 raise ParseError()
-            if c not in "0123456789":
+            elif c in "Ee":
+                # Might raise Incomplete, but if so it's
+                # correct to raise Incomplete here.
+                d = await input.read(1)
+                if d == "-":
+                    raise ParseError()
+            elif c not in "0123456789":
                 break
         input.index = start
         return json.loads(await input.read_pattern(INTEGER_REGEX))

@@ -1357,3 +1357,30 @@ async def test_single_value_enum():
 
     with pytest.raises(ParseError):
         await parser.parse_string("2")
+
+
+@pytest.mark.asyncio
+async def test_union_of_integer_and_number_with_e_notation():
+    schema = {
+        "type": "array",
+        "items": {"anyOf": [{"type": "null"}, {"type": "integer"}, {"type": "number"}]},
+    }
+
+    parser = json_schema_parser(schema)
+
+    await parser.parse_string("[1e-05]") == [1e-05]
+
+
+@pytest.mark.asyncio
+async def test_integer_accepts_only_positive_e_notation():
+    schema = {
+        "type": "array",
+        "items": {"type": "integer"},
+    }
+
+    parser = json_schema_parser(schema)
+
+    await parser.parse_string("[1e05]")
+
+    with pytest.raises(ParseError):
+        await parser.parse_string("[1e-05]")
