@@ -128,10 +128,8 @@ class StreamingJsonSchema(StreamingPotential):
         return 0.0
 
 
-BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)", regex.MULTILINE)
-VALID_JSON_START = regex.compile(
-    rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]', regex.MULTILINE
-)
+BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)")
+VALID_JSON_START = regex.compile(rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]')
 
 
 class ValidateJSON(Potential):
@@ -423,7 +421,7 @@ class ConstParser(Parser[None]):
 
 
 class RegexParser(Parser[str]):
-    def __init__(self, pattern, group=0, options=regex.MULTILINE | regex.UNICODE):
+    def __init__(self, pattern, group=0, options=regex.UNICODE):
         self.pattern = regex.compile(pattern, options)
         self.group = group
 
@@ -515,7 +513,7 @@ STRING_PATTERN = regex.compile(STRING_REGEX)
 
 class StringLiteralMatchingPatternParser(Parser[str]):
     def __init__(self, pattern):
-        self.pattern = regex.compile(pattern, regex.MULTILINE | regex.UNICODE)
+        self.pattern = regex.compile(pattern, regex.UNICODE)
 
     async def parse(self, input: Input):
         prev = None
