@@ -409,15 +409,17 @@ class AltParser(Parser[Union[S, T]]):
 
 
 class ConstParser(Parser[None]):
-    def __init__(self, value: str):
+    def __init__(self, value: Any):
         self.value = value
+        self.literal = json.dumps(value)
 
     async def parse(self, input: Input) -> None:
         await input.skip_whitespace()
-        for expected in self.value:
+        for expected in self.literal:
             got = await input.read(1)
             if got != expected:
                 raise ParseError(f"Expected char {expected} but got {got}")
+        return self.value
 
 
 class RegexParser(Parser[str]):
@@ -480,7 +482,13 @@ class IntegerParser(Parser[int]):
                 break
             if c == ".":
                 raise ParseError()
-            if c not in "0123456789":
+            elif c in "Ee":
+                # Might raise Incomplete, but if so it's
+                # correct to raise Incomplete here.
+                d = await input.read(1)
+                if d == "-":
+                    raise ParseError()
+            elif c not in "0123456789":
                 break
         input.index = start
         return json.loads(await input.read_pattern(INTEGER_REGEX))
@@ -579,6 +587,17 @@ class StringLiteralMatchingPatternParser(Parser[str]):
                 raise Incomplete()
 
 
+def EnumParser(values):
+    parts = {
+        f"({regex.escape(json.dumps(k, ensure_ascii=b))})"
+        for k in values
+        for b in [False, True]
+    }
+    if len(parts) == 1:
+        return ConstParser(values[0])
+    return RegexParser("|".join(sorted(parts))).map(json.loads)
+
+
 class ObjectSchemaParser(Parser[Any]):
     def __init__(self, schema):
         self.schema = schema
@@ -608,14 +627,7 @@ class ObjectSchemaParser(Parser[Any]):
         if allow_additional_properties:
             self.key_parser = STRING_LITERAL_PARSER
         else:
-            # TODO: Something is going wrong here with regex escape codes
-            self.key_parser = RegexParser(
-                "|".join(
-                    f"({regex.escape(json.dumps(k, ensure_ascii=b))})"
-                    for k in properties
-                    for b in [False, True]
-                )
-            ).map(json.loads)
+            self.key_parser = EnumParser(list(properties.keys()))
         self.required_keys = frozenset(schema.get("required", ()))
 
     def __repr__(self):
@@ -708,7 +720,10 @@ ARBITRARY_JSON = (
 
 def json_schema_parser(schema):
     if "const" in schema:
-        return ConstParser(json.dumps(schema["const"]))
+        return ConstParser(schema["const"])
+
+    if "enum" in schema:
+        return EnumParser(schema["enum"])
 
     if "anyOf" in schema:
         *rest, base = schema["anyOf"]
