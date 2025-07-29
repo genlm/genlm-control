@@ -510,7 +510,7 @@ async def test_can_sample_reliably_with_rounding_to_one():
 )
 @pytest.mark.asyncio
 async def test_sample_empty_with_zeros(sampler_kwargs):
-    c_weights = [0.9, 0.1, 0.0, 0.0]
+    c_weights = [0.5, 0.5, 0.0, 0.0]
 
     vocab = [bytes([i]) for i in range(len(c_weights) - 1)]
 

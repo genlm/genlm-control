@@ -404,8 +404,6 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     order = np.argsort(-keys)
     for index_into_list, item in enumerate(order):
         assert n_accepts == 0
-        if keys[item] == -np.inf:
-            break
         tok = toks[item]
         last = (
             index_into_list + 1 == len(order)
