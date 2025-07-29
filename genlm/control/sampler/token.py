@@ -2,6 +2,7 @@ import numpy as np
 from arsenal import colors
 from llamppl import SubModel
 from arsenal.maths import log1mexp, logsumexp
+import warnings
 
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
@@ -212,7 +213,7 @@ class AWRS(TokenSampler):
         proper_weights=True,
         max_accepts=2,
         max_rejects=float("inf"),
-        n_monte_carlo_samples=10,
+        n_monte_carlo_samples=None,
     ):
         super().__init__(target=potential * condition)
         self.potential = potential
@@ -221,18 +222,20 @@ class AWRS(TokenSampler):
         self.prune_logws = prune_logws
         self.proper_weights = proper_weights
 
-        if max_accepts < 2:
+        if max_accepts < 2 and proper_weights:
             raise ValueError("`max_accepts` must be at least 2")
 
-        if max_rejects < 2:
+        if max_rejects < 2 and proper_weights:
             raise ValueError("`max_rejects` must be at least 2")
 
-        if n_monte_carlo_samples < 1:
-            raise ValueError("`n_monte_carlo_samples` must be at least 1")
+        if n_monte_carlo_samples is not None:
+            warnings.warn(
+                "n_monte_carlo_samples no longer does anything.",
+                DeprecationWarning,
+            )
 
         self.max_accepts = max_accepts
         self.max_rejects = max_rejects or float("inf")
-        self.n_monte_carlo_samples = n_monte_carlo_samples
 
         self.valid_idxs = np.array(
             [self.potential.lookup[t] for t in self.target.vocab_eos]
@@ -476,7 +479,7 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
         keys = logps - np.log(-np.log(rng.random((len(logps),))))
         order = np.argsort(-keys)
         for item in order:
-            if keys[item] == -np.inf or rejected_mass >= 1:
+            if keys[item] == -np.inf:
                 break
 
             tok = toks[item]
@@ -487,6 +490,10 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
                 # However, this means that the correct estimator is ridiculously
                 # small, and we'd exceed any reasonable `max_rejects`, so we just
                 # immediately terminate in this case.
+                #
+                # This can technically happen after we've seen an accepted token
+                # but this only happens if the distribution / constraint has gone
+                # very wrong.
                 assert rejected_token is not None
                 return rejected_token, -float("inf"), np.nan
             elif rejected_mass > 0:

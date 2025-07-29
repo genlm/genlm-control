@@ -53,3 +53,8 @@ include = ["genlm", "genlm/control"]
 
 [tool.setuptools]
 package-data = { "genlm.control" = ["html/*"] }
+
+[tool.coverage.report]
+exclude_also = [
+    "raise AssertionError",
+]
