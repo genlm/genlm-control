@@ -293,6 +293,50 @@ async def test_awrs_with_different_limits(
 @pytest.mark.asyncio
 @settings(deadline=None, max_examples=100)
 @given(
+    max_accepts=st.integers(min_value=2, max_value=5),
+    max_rejects=st.integers(min_value=2, max_value=5),
+    params=params(),
+    n_samples=st.integers(1, 10),
+    seed=st.integers(0, 1000),
+)
+async def test_awrs_with_different_limits_single_sample(
+    params,
+    max_accepts,
+    max_rejects,
+    n_samples,
+    seed,
+):
+    vocab, b_weights, c_weights = params
+    potential = MockPotential(
+        vocab,
+        np.array([np.log(w) if w > 0 else float("-inf") for w in c_weights]),
+    )
+    condition = MockPotential(
+        vocab,
+        np.array([np.log(w) if w > 0 else float("-inf") for w in b_weights]),
+    )
+
+    sampler = AWRS(
+        potential,
+        condition,
+        seed=seed,
+        max_accepts=max_accepts,
+        max_rejects=max_rejects,
+    )
+
+    for _ in range(n_samples):
+        tok, weight, _ = await sampler.sample([])
+        assert tok in sampler.vocab_eos_set
+        try:
+            i = vocab.index(tok)
+        except ValueError:
+            i = len(vocab)
+        assert b_weights[i] or weight == -np.inf
+
+
+@pytest.mark.asyncio
+@settings(deadline=None, max_examples=100)
+@given(
     max_accepts=st.integers(min_value=2, max_value=2),
     max_rejects=st.integers(min_value=2, max_value=500),
     seed=st.integers(min_value=0, max_value=100),
@@ -490,6 +534,23 @@ async def test_can_sample_reliably_with_rounding_to_one():
     for _ in range(1000):
         tok, logp, _ = await sampler.sample([])
         assert tok == bytes([1]) or logp == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_can_sample_reliably_with_rounding_to_one_no_accept():
+    vocab = [0]
+    c_weights = [1.00000000e000, 2.22507386e-313]
+    b_weights = [False, False]
+
+    potential = MockPotential(vocab, np.log(c_weights))
+    condition = MockPotential(vocab, np.log(b_weights))
+
+    sampler = AWRS(potential, condition, max_accepts=2, max_rejects=11)
+
+    for _ in range(100):
+        tok, logp, _ = await sampler.sample([])
+        assert logp == -float("inf")
+        assert tok in sampler.vocab_eos_set
 
 
 @pytest.mark.parametrize(
