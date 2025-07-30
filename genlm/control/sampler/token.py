@@ -395,10 +395,13 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     n_accepts = 0
     n_rejects = 0
 
-    log_rejected_mass = -float("inf")
+    rejected_mass = 0.0
     log_multiplier = 0.0
 
-    error_tolerance = 10e-5
+    # We treat any number smaller than this as "effetively" zero.
+    # This causes us to terminate early in some cases, but those
+    # cases are all ones where the remaining weight is very bad.
+    error_tolerance = 10e-6
 
     keys = logps - np.log(-np.log(rng.random((len(logps),))))
     order = np.argsort(-keys)
@@ -410,7 +413,7 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
             or keys[order[index_into_list + 1]] == -np.inf
         )
 
-        log_q = logps[item] - log1mexp(log_rejected_mass)
+        log_q = logps[item] - np.log1p(-rejected_mass)
 
         # The last check is because in the case where there is a single
         # accepted token with very low log probability, numerical stability
@@ -418,14 +421,13 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
         assert not last or log_q >= -error_tolerance or logps[item] < -32
         assert log_q <= error_tolerance
         assert log_multiplier <= error_tolerance
-        assert log_rejected_mass <= error_tolerance
+        assert rejected_mass <= 1
 
         # Fix some minor numerical stability errors that can come up.
         if last:
             log_q = 0
         log_q = min(log_q, 0)
         log_multiplier = min(log_multiplier, 0)
-        log_rejected_mass = min(log_rejected_mass, 0)
 
         if await accept(toks[item]):
             n_accepts += 1
@@ -446,7 +448,11 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
             return tok, float("-inf"), np.nan
         else:
             n_rejects += 1
-            log_rejected_mass = logsumexp([log_rejected_mass, logps[item]])
+            rejected_mass += np.exp(logps[item])
+            if rejected_mass >= 1 - error_tolerance:
+                # We've explored all the probability mass and still found no
+                # accepted token.
+                return tok, float("-inf"), np.nan
             m = log1mexp(log_q)
             assert not np.isnan(m)
             log_multiplier += m
@@ -499,6 +505,7 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
                 # to the number of rejects, account for the phantom tokens
                 # "hidden" by sampling without replacement.
                 phantom_tokens = rng.geometric(1 - rejected_mass) - 1
+                assert phantom_tokens >= 0
                 n_rejects += phantom_tokens
 
             if n_rejects >= max_rejects:
@@ -516,6 +523,10 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
                 rejected_mass += np.exp(logps[item])
                 logps[item] = -float("inf")
 
+    if n_accepts == 0:
+        assert rejected_token is not None
+        return rejected_token, -np.inf, np.nan
+
     # If we stopped in the middle of a sequence of phantom tokens,
     # n_rejects may have gone over max_rejects.
     n_rejects = min(n_rejects, max_rejects)
@@ -528,9 +539,5 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
     estimator = min(max_accepts - 1, n_accepts) / (n_accepts + n_rejects - 1)
 
     assert estimator > 0 or result is None
-
-    if result is None:
-        assert n_accepts == 0
-        result = rejected_token
 
     return result, np.log(estimator), np.nan

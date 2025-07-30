@@ -3,9 +3,9 @@ import asyncio
 import numpy as np
 from arsenal.maths import logsumexp
 from conftest import MockPotential
-from hypothesis import given, strategies as st, settings, example
-
-from genlm.control.sampler.token import AWRS
+from hypothesis import given, strategies as st, settings, example, assume, note
+import hypothesis.extra.numpy as hnp
+from genlm.control.sampler.token import AWRS, recursive_awrs, geometric_awrs
 
 
 async def monte_carlo(sampler, context, N, **kwargs):
@@ -473,7 +473,6 @@ async def test_awrs_example_with_underflow_error():
     sampler = AWRS(
         max_accepts=2,
         max_rejects=183,
-        n_monte_carlo_samples=1,
         seed=17,
         potential=potential,
         condition=condition,
@@ -504,7 +503,6 @@ async def test_awrs_example_with_underflow_error_never_zero_in_default_configura
 
     sampler = AWRS(
         max_accepts=2,
-        n_monte_carlo_samples=1,
         seed=17,
         potential=potential,
         condition=condition,
@@ -583,3 +581,165 @@ async def test_sample_empty_with_zeros(sampler_kwargs):
     tok, logp, _ = await sampler.sample([])
     assert logp == -float("inf")
     assert tok in sampler.vocab_eos_set
+
+
+@st.composite
+def logps(draw):
+    n = draw(st.integers(2, 100))
+    values = draw(hnp.arrays(dtype=float, shape=n, elements=st.floats(0, 1)))
+    assume(values.sum() > 0.01)
+    log_weights = np.log(values)
+    return log_weights - np.log(values.sum())
+
+
+class FakeRNG:
+    def __init__(self, values):
+        self.values = np.array(values)
+        self.index = 0
+
+    def __repr__(self):
+        return f"FakeRNG({list(self.values)})"
+
+    def random(self, shape):
+        (i,) = shape
+        assume(i + self.index <= len(self.values))
+        result = self.values[self.index : self.index + i]
+        self.index += 1
+        return result
+
+    def geometric(self, p):
+        (u,) = self.random((1,))
+        result = np.ceil(np.log1p(-u) / np.log1p(-p))
+        assume(result >= 1)
+        return result
+
+
+@st.composite
+def numpy_rng(draw):
+    return FakeRNG(
+        draw(
+            hnp.arrays(
+                dtype=float,
+                elements=st.floats(0, 1, exclude_min=True, exclude_max=True),
+                shape=st.integers(0, 100),
+            )
+        )
+    )
+
+
+async def always_reject(token):
+    return False
+
+
+async def always_accept(token):
+    return True
+
+
+def accept_tokens(tokens):
+    async def accept(token):
+        return token in tokens
+
+    accept.__name__ = accept.__qualname__ = f"accept_tokens({tokens})"
+    return accept
+
+
+@st.composite
+def interactive_accepts(draw):
+    cache = {}
+
+    async def accept(token):
+        try:
+            return cache[token]
+        except KeyError:
+            pass
+        result = draw(st.booleans())
+        note(f"accept({token}) -> {result}")
+        cache[token] = result
+        return result
+
+    return accept
+
+
+accepts = st.one_of(
+    st.just(always_reject),
+    st.just(always_accept),
+    st.builds(accept_tokens, st.sets(st.integers(0, 100))),
+    interactive_accepts(),
+)
+
+
+@pytest.mark.asyncio
+@example(
+    logps=np.array([0.0, -744.44007192]),
+    accept=always_reject,
+    rng=FakeRNG([0.5, 0.5]),
+    max_rejects=2,
+)
+@example(
+    logps=np.array([-3.57559713e01, -2.77555756e-16, -np.inf]),
+    rng=FakeRNG([np.float64(0.5), np.float64(0.5), np.float64(0.5)]),
+    max_rejects=2,
+    accept=always_accept,
+)
+@example(
+    logps=np.array([-0.40546511, -1.09861229, -35.75597132, -np.inf]),
+    rng=FakeRNG([np.float64(0.5), np.float64(0.5), np.float64(0.5), np.float64(0.5)]),
+    max_rejects=3,
+    accept=always_reject,
+)
+@given(
+    logps=logps(),
+    rng=numpy_rng(),
+    max_rejects=st.integers(1, 100),
+    accept=accepts,
+)
+@settings(max_examples=500, report_multiple_bugs=False)
+async def test_recursive_awrs_validity(logps, accept, rng, max_rejects):
+    toks = np.arange(len(logps))
+
+    tok, logp, _ = await recursive_awrs(
+        logps=logps,
+        toks=toks,
+        accept=accept,
+        rng=rng,
+        max_rejects=max_rejects,
+    )
+
+    if await accept(tok):
+        assert logp > -np.inf
+    else:
+        assert logp == -np.inf
+
+
+@pytest.mark.asyncio
+@given(
+    logps=logps(),
+    rng=numpy_rng(),
+    max_rejects=st.integers(2, 100),
+    max_accepts=st.integers(2, 100),
+    accept=accepts,
+)
+@example(
+    logps=np.array([-np.inf, 0.0]),
+    rng=FakeRNG([np.float64(0.5), np.float64(0.5), np.float64(0.5)]),
+    max_rejects=2,
+    max_accepts=2,
+    accept=always_reject,
+)
+@settings(max_examples=500, report_multiple_bugs=False)
+async def test_geometric_awrs_validity(logps, accept, rng, max_rejects, max_accepts):
+    toks = np.arange(len(logps))
+
+    tok, logp, _ = await geometric_awrs(
+        logps=logps,
+        toks=toks,
+        accept=accept,
+        rng=rng,
+        max_rejects=max_rejects,
+        max_accepts=max_accepts,
+    )
+
+    if await accept(tok):
+        assert logp > -np.inf
+    else:
+        assert logp == -np.inf
