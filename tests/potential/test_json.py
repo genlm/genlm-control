@@ -1395,7 +1395,7 @@ async def test_empty_object_allows_keys():
 
 @pytest.mark.asyncio
 async def test_enum_parsing():
-    values = [1, "two", "twin", 3.0]
+    values = [1, "two", "twin", 3.5]
     parser = json_schema_parser({"enum": values})
 
     for v in values:
