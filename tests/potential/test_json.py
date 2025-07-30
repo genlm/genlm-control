@@ -300,6 +300,22 @@ def json_schema_potential_problem(draw):
         prefix=b"{",
     ),
 )
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"enum": [True]},
+                    {"anyOf": [{"type": "null"}, {"type": "number"}]},
+                ]
+            },
+        },
+        document=b"[1.0000000000000001e+133]",
+        prefix=b"[",
+    ),
+)
 @given(json_schema_potential_problem())
 @settings(max_examples=25, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):

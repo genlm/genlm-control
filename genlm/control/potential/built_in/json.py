@@ -741,7 +741,7 @@ class FixedSetParser(Parser[str]):
 
 
 def possible_representations(value):
-    if isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         values = (value, float(value))
     elif isinstance(value, float) and value == math.floor(value):
         values = (value, int(value))
