@@ -9,8 +9,7 @@ from genlm.control.potential.built_in.json import (
     FLOAT_PARSER,
     chunk_to_complete_utf8,
     ParseError,
-    StreamingJsonSchema,
-    ValidateJSON,
+    FullValidatorJsonSchema,
     ParserPotential,
     StringSource,
     Input,
@@ -24,7 +23,6 @@ from typing import Any
 from dataclasses import dataclass
 from hypothesis import given, strategies as st, assume, example, settings, reject
 from hypothesis_jsonschema import from_schema
-import asyncio
 from jsonschema import SchemaError
 import regex
 
@@ -63,8 +61,7 @@ async def test_consistency_properties(schema, context):
 @pytest.mark.parametrize(
     "potential",
     [
-        StreamingJsonSchema({"type": "array", "items": {"type": "integer"}}),
-        ValidateJSON(),
+        FullValidatorJsonSchema({"type": "array", "items": {"type": "integer"}}),
         ParserPotential(
             json_schema_parser({"type": "array", "items": {"type": "integer"}})
         ),
@@ -301,6 +298,9 @@ def json_schema_potential_problem(draw):
     ),
 )
 @example(
+    JSONSchemaPotentialProblem(schema={"enum": [None, 10]}, document=b"10", prefix=b"1")
+)
+@example(
     JSONSchemaPotentialProblem(
         schema={
             "type": "array",
@@ -314,10 +314,10 @@ def json_schema_potential_problem(draw):
         },
         document=b"[1.0000000000000001e+133]",
         prefix=b"[",
-    ),
+    )
 )
 @given(json_schema_potential_problem())
-@settings(max_examples=25, deadline=None, report_multiple_bugs=False)
+@settings(max_examples=10000, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):
     parser = json_schema_parser(problem.schema)
 
@@ -731,8 +731,8 @@ async def test_raises_value_error_for_logw_next_of_bad_prefix():
 
 
 @pytest.mark.asyncio
-async def test_basic_json_validator_rejects_silly_whitespace():
-    potential = ValidateJSON()
+async def test_json_validator_rejects_silly_whitespace():
+    potential = FullValidatorJsonSchema({"type": "object"})
     assert await potential.prefix(b"\n\n\n") == -float("inf")
     assert await potential.complete(b"\n\n\n") == -float("inf")
 
@@ -798,36 +798,6 @@ def json_schema_potential_problem_multi(draw):
 
 
 @pytest.mark.asyncio
-@example(
-    problem=JSONSchemaPotentialProblemMulti(
-        schema={"type": "boolean"},
-        document=b"false",
-        values=[b"f", b"fa", b"fal", b"f"],
-    ),
-    cache_size=1,
-)
-@example(
-    problem=JSONSchemaPotentialProblemMulti(
-        schema={"type": "boolean"},
-        document=b"false",
-        values=[b"f", b"fa", b"f", b"fa", b"fal", b"f", b"fa", b"fal", b"fals"],
-    ),
-    cache_size=5,
-)
-@given(json_schema_potential_problem_multi(), st.integers(1, 100))
-@settings(report_multiple_bugs=False, deadline=None)
-async def test_cache_eviction_with_many_prefixes(problem, cache_size):
-    potential = StreamingJsonSchema(problem.schema, cache_size=cache_size)
-
-    results = list(
-        await asyncio.gather(*[potential.prefix(value) for value in problem.values])
-    )
-    assert all(result == 0.0 for result in results)
-
-    assert await potential.complete(problem.document) == 0.0
-
-
-@pytest.mark.asyncio
 async def test_can_reject_wrong_type_inside_any_of():
     schema = {
         "anyOf": [
@@ -880,7 +850,7 @@ async def test_can_reject_early_in_any_of():
 
 @pytest.mark.asyncio
 async def test_will_reject_invalid_unicode_at_end():
-    potential = StreamingJsonSchema({"type": "object"})
+    potential = FullValidatorJsonSchema({"type": "object"})
     assert await potential.prefix(b"{ }\n\n    \xe2\x9d\x8d\xb0") == -float("inf")
 
 
@@ -915,10 +885,11 @@ def test_chunking_bails_early_on_invalid_start_bytes():
 
 @pytest.mark.asyncio
 async def test_long_whitespace_at_start_is_rejected():
-    assert await ValidateJSON().prefix(b"  ") == 0
-    assert await ValidateJSON().prefix(b"\n\n") == 0
-    assert await ValidateJSON().prefix(b"    ") == -float("inf")
-    assert await ValidateJSON().prefix(b"\n\n  ") == -float("inf")
+    validator = FullValidatorJsonSchema({"type": "object"})
+    assert await validator.prefix(b"  ") == 0
+    assert await validator.prefix(b"\n\n") == 0
+    assert await validator.prefix(b"    ") == -float("inf")
+    assert await validator.prefix(b"\n\n  ") == -float("inf")
 
 
 @pytest.mark.asyncio

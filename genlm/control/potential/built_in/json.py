@@ -3,19 +3,20 @@ import json
 import regex
 import math
 from typing import Generic, TypeVar, Union, Any, Callable
-from jsonschema import Draft7Validator
-from jsonschema import _types
-from typing import Iterable, AsyncIterator
+from jsonschema import Draft7Validator, ValidationError
+from jsonschema import _types, SchemaError
+from typing import AsyncIterator
 from genlm.control.potential import Potential
 from contextlib import contextmanager
 from genlm.control.potential.streaming import (
-    StreamingPotential,
     AsyncStreamingPotential,
     AsyncSource,
 )
 from array import array
 import unicodedata
 from dataclasses import dataclass, field
+import numpy as np
+from functools import lru_cache
 
 
 def is_sequence(checker, instance):
@@ -95,63 +96,43 @@ def chunk_bytes_to_strings(byte_blocks):
     assert not buffer
 
 
-class StreamingJsonSchema(StreamingPotential):
-    def __init__(self, schema, **kwargs):
+class JustOneBlockIterable:
+    """Provides a single value (intended to be bytes from a context)
+    and then signals if the reader tried to read past it. This allows
+    us to distinguish invalid JSON from incomplete JSON by seeing if
+    the reader tried to read more than it had or failed early."""
+
+    def __init__(self, block):
+        self.__block = block
+        self.read_past_first_block = False
+
+    def __iter__(self):
+        yield self.__block
+        self.read_past_first_block = True
+
+
+class FullValidatorJsonSchema(Potential):
+    def __init__(self, schema):
         super().__init__(
-            vocabulary=list(range(256)),
-            **kwargs,
+            list(range(256)),
         )
         self.schema = schema
         self.validator = LazyCompatibleValidator(
             self.schema, format_checker=Draft7Validator.FORMAT_CHECKER
         )
-        self.parser = json_schema_parser(schema)
-
-    def calculate_score_from_stream(self, stream: Iterable[Any]) -> float:
-        buffer = bytearray()
-
-        def buffer_stream():
-            for s in stream:
-                buffer.extend(s)
-                yield bytes(s)
-
-        buffered = buffer_stream()
-        rechunked = chunk_to_complete_utf8(buffered)
-
-        x = json_stream.load(rechunked, persistent=True)
-        self.validator.validate(x)
-        if hasattr(x, "read_all"):
-            x.read_all()
-
-        json.loads(buffer)
-        for s in buffered:
-            if s.strip():
-                raise ValueError(f"Data after JSON: {s.decode('utf-8')}")
-        return 0.0
-
-
-BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)")
-VALID_JSON_START = regex.compile(rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]')
-
-
-class ValidateJSON(Potential):
-    """This is a dumping ground for any extra JSON validation we want to do
-    to work around LLM weirdness.
-    """
-
-    def __init__(self):
-        super().__init__(
-            vocabulary=list(range(256)),
+        self.__validate_validatable_prefix = lru_cache(1024)(
+            self.__validate_validatable_prefix
         )
 
-    async def prefix(self, context):
-        context = bytes(context)
+    def __prechecks(self, context):
+        assert isinstance(context, bytes)
+
         # Sometimes a model gets itself off to a bad start immediately.
         # We want to catch this early. Note that we forbid whitespace
         # at the start of the context. It seems to almost always be
         # a bad sign.
         if not VALID_JSON_START.match(context, partial=True):
-            return float("-inf")
+            raise ValueError(f"Bad start {context[:5]}")
 
         # Sometimes a model can get itself into a position where it can't
         # generate any valid tokens, but it can keep generating whitespace
@@ -159,25 +140,81 @@ class ValidateJSON(Potential):
         #
         # pos=1 because we specifically allow two newlines at the start,
         # as LLMs like doing that for tokenization reasons.
-        if BAD_WHITESPACE.search(context, pos=1):
-            return float("-inf")
-        for c in context:
-            # Forbid control characters other than newline.
+        if bad_whitespace := BAD_WHITESPACE.search(context, pos=1):
+            raise ValueError(
+                f"Bad whitespace {bad_whitespace.group(0)} as position {bad_whitespace.start()}"
+            )
+
+        for i, c in enumerate(context):
+            # Forbid ascii control characters other than newline.
             if c != ord(b"\n") and c < ord(b" "):
-                return float("-inf")
+                raise ValueError(f"Forbidden character {bytes([c])} at position {i}")
+
+    async def complete(self, context) -> float:
+        context = bytes(context)
+        try:
+            self.__prechecks(context)
+            document = json.loads(context)
+            self.validator.validate(document)
+        except (ValueError, SchemaError, json.JSONDecodeError):
+            return -np.inf
         return 0.0
 
-    async def complete(self, context):
-        return await self.prefix(context)
+    def __prune_to_validatable_prefix(self, context):
+        """We don't want to run the JSON validator on objects that are in the
+        middle of generating a string or a float. We also don't want to run it
+        immediately at the end of a string, or on whitespace changes. This finds
+        us a reasonable prefix that ends at a "logical unit" that makes it a good
+        place to check. We can then cache checks based on the relevant prefix.
+        """
+        assert isinstance(context, bytes)
+        try:
+            context.decode("utf-8")
+        except UnicodeDecodeError as e:
+            if e.reason == "unexpected end of data":
+                context = context[: e.start]
+            else:
+                raise
+
+        for i in range(len(context) - 1, -1, -1):
+            if context[i] in b"}],":
+                return context[: i + 1]
+        return b""
+
+    def __validate_validatable_prefix(self, context):
+        iterable = JustOneBlockIterable(context)
+        try:
+            x = json_stream.load(iterable, persistent=True)
+            self.validator.validate(x)
+            if hasattr(x, "read_all"):
+                x.read_all()
+        except ValueError:
+            if not iterable.read_past_first_block:
+                raise
+
+    async def prefix(self, context) -> float:
+        context = bytes(context)
+
+        try:
+            self.__prechecks(context)
+
+            prefix = self.__prune_to_validatable_prefix(context)
+            self.__validate_validatable_prefix(prefix)
+        except StopIteration:
+            pass
+        except (ValueError, ValidationError):
+            return -float("inf")
+
+        return 0.0
+
+
+BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)")
+VALID_JSON_START = regex.compile(rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]')
 
 
 def JsonSchema(schema):
     Draft7Validator.check_schema(schema)
-    return (
-        ValidateJSON()
-        * StreamingJsonSchema(schema)
-        * ParserPotential(json_schema_parser(schema))
-    )
+    return ParserPotential(json_schema_parser(schema)) * FullValidatorJsonSchema(schema)
 
 
 class StringSource(AsyncSource):
@@ -291,6 +328,8 @@ class Input:
                 if not await self.advance_input():
                     raise Incomplete()
             else:
+                if match.end() == len(buffer) and await self.advance_input():
+                    continue
                 self.index += match.end()
                 return result
 
