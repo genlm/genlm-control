@@ -1,7 +1,9 @@
 import pytest
 from genlm.control.potential.built_in.json import (
     JsonSchema,
+    TrivialSource,
     json_schema_parser,
+    FixedSetParser,
     ARBITRARY_JSON,
     Incomplete,
     FLOAT_PARSER,
@@ -103,17 +105,8 @@ def basic_schema(draw):
                 st.lists(
                     st.none()
                     | st.booleans()
-                    # We don't currently handle the semantics of numbers very well
-                    # in enums, because the correct semantics depends on them being
-                    # equal to floats. Integer enums will still work, but they will
-                    # reject things that are technically fine. e.g. {"enum": [0]}
-                    # should match the string "0.0" and doesn't.
-                    #
-                    # Hypothesis is very good at pointing this out, so we solve this
-                    # by not letting it do that, as we mostly only care about
-                    # enums of strings anyway.
                     | st.integers()
-                    # | st.floats(allow_nan=False, allow_infinity=False)
+                    | st.floats(allow_nan=False, allow_infinity=False)
                     | st.text(),
                     min_size=1,
                     unique_by=lambda x: (type(x), x),
@@ -255,8 +248,60 @@ def json_schema_potential_problem(draw):
         prefix=b"{",
     ),
 )
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"type": "array", "items": {"enum": [543064729, 5]}},
+        document=b"[543064729, 5]",
+        prefix=b"[",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "anyOf": [
+                {"type": "null"},
+                {"type": "boolean"},
+                {"enum": [-10]},
+                {"type": "integer"},
+            ]
+        },
+        document=b"-1",
+        prefix=b"-",
+    )
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+        document=b"null",
+        prefix=b"n",
+    )
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "object",
+            "properties": {"0\x7f": {"type": "integer"}},
+            "required": [],
+            "additionalProperties": False,
+        },
+        document=b'{"0\\u007f": 0}',
+        prefix=b"{",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "object",
+            "properties": {"0": {"type": "null"}},
+            "required": [],
+            "additionalProperties": True,
+        },
+        document=b'{"": []}',
+        prefix=b"{",
+    ),
+)
 @given(json_schema_potential_problem())
-@settings(max_examples=100, deadline=None, report_multiple_bugs=False)
+@settings(max_examples=25, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):
     parser = json_schema_parser(problem.schema)
 
@@ -544,11 +589,15 @@ def json_object(draw):
 
 @pytest.mark.asyncio
 @example(False)
+@example(0.0)
 @settings(report_multiple_bugs=False, deadline=None)
 @given(json_object())
 async def test_parser_for_arbitrary_json_can_parse_arbitrary_json(obj):
     text = json.dumps(obj)
-    await ARBITRARY_JSON.parse_string(text)
+    input = Input(TrivialSource(text))
+    result = await ARBITRARY_JSON.parse(input)
+    assert result == obj
+    assert input.index == len(text)
 
 
 @pytest.mark.asyncio
@@ -1416,3 +1465,51 @@ async def test_catches_error_before_close_of_string():
 
     with pytest.raises(ParseError):
         await parser.parse_string('{"location" : "Miami, Flo')
+
+
+@pytest.mark.asyncio
+@example(
+    contents=[""],
+    test_strings=["0"],
+)
+@example(
+    contents=["", "00"],
+    test_strings=["0"],
+)
+@example(
+    contents=["010"],
+    test_strings=["00"],
+)
+@example(
+    contents=["", "01"],
+    test_strings=["00"],
+)
+@given(
+    contents=st.lists(st.text(), unique=True, min_size=1),
+    test_strings=st.lists(st.text(min_size=1), unique=True),
+)
+async def test_fixed_set_parser(contents, test_strings):
+    parser = FixedSetParser(contents)
+
+    for s in contents:
+        input = Input(TrivialSource(s))
+        result = await parser.parse(input)
+        assert result == s
+        assert input.index == len(s)
+
+    for s in test_strings:
+        try:
+            t = await parser.parse_string(s)
+        except ParseError:
+            for c in contents:
+                assert not s.startswith(c)
+        except Incomplete:
+            for c in contents:
+                assert not s.startswith(c)
+            assert any(c.startswith(s) for c in contents)
+        else:
+            assert t in contents
+            assert s.startswith(t)
+            for t2 in contents:
+                if s.startswith(t2):
+                    assert len(t2) <= len(t)

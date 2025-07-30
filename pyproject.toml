@@ -57,4 +57,5 @@ package-data = { "genlm.control" = ["html/*"] }
 [tool.coverage.report]
 exclude_also = [
     "raise AssertionError",
+    "def __repr__"
 ]
