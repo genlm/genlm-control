@@ -1513,3 +1513,8 @@ async def test_fixed_set_parser(contents, test_strings):
             for t2 in contents:
                 if s.startswith(t2):
                     assert len(t2) <= len(t)
+
+
+def test_fixed_set_parser_not_empty():
+    with pytest.raises(ValueError):
+        FixedSetParser(())
