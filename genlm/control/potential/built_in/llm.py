@@ -398,20 +398,23 @@ class PromptedLLM(Potential):
         Note:
             This is a shallow copy. The new PromptedLLM will share the underlying AsyncLM instance.
         """
+        prompt_ids = prompt_ids if prompt_ids is not None else self.prompt_ids.copy()
+        temperature = temperature if temperature is not None else self.temperature
+
         if (eos_tokens is None) or (eos_tokens == self.token_maps.eos_tokens):
             # If the eos tokens don't change, we don't need to recompute the token maps or vocabulary.
             return PromptedLLM(
                 self.model,
-                prompt_ids=self.prompt_ids.copy() if prompt_ids is None else prompt_ids,
-                temperature=self.temperature if temperature is None else temperature,
+                prompt_ids=prompt_ids,
+                temperature=temperature,
                 token_maps=self.token_maps,
             )
 
         return PromptedLLM(
             self.model,
-            prompt_ids=self.prompt_ids.copy() if prompt_ids is None else prompt_ids,
+            prompt_ids=prompt_ids,
             eos_tokens=eos_tokens,
-            temperature=self.temperature if temperature is None else temperature,
+            temperature=temperature,
         )
 
     def spawn_new_eos(self, eos_tokens):
