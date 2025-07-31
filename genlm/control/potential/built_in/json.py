@@ -4,7 +4,7 @@ import regex
 import math
 from typing import Generic, TypeVar, Union, Any, Callable
 from jsonschema import Draft7Validator, ValidationError
-from jsonschema import _types, SchemaError
+from jsonschema import _types
 from typing import AsyncIterator
 from genlm.control.potential import Potential
 from contextlib import contextmanager
@@ -156,7 +156,7 @@ class FullValidatorJsonSchema(Potential):
             self.__prechecks(context)
             document = json.loads(context)
             self.validator.validate(document)
-        except (ValueError, SchemaError, json.JSONDecodeError):
+        except (ValueError, ValidationError, json.JSONDecodeError):
             return -np.inf
         return 0.0
 
