@@ -1,7 +1,6 @@
 import json_stream
 import json
 import regex
-import math
 from typing import Generic, TypeVar, Union, Any, Callable
 from jsonschema import Draft7Validator, ValidationError
 from jsonschema import _types
@@ -690,11 +689,14 @@ def split_node(node, i):
 
 class PatriciaTrie:
     def __init__(self, values=()):
-        self.root = PatriciaTrieNode(prefix="", accepting=False)
+        self.root = None
         for v in values:
             self.add_string(v)
 
     def add_string(self, value):
+        if self.root is None:
+            self.root = PatriciaTrieNode(prefix=value, accepting=True)
+            return
         node = self.root
         while True:
             if node.prefix == value:
@@ -785,14 +787,7 @@ class FixedSetParser(Parser[str]):
 
 
 def possible_representations(value):
-    if isinstance(value, int) and not isinstance(value, bool):
-        values = (value, float(value))
-    elif isinstance(value, float) and value == math.floor(value):
-        values = (value, int(value))
-    else:
-        values = (value,)
-
-    return {json.dumps(v, ensure_ascii=b) for v in values for b in [False, True]}
+    return {json.dumps(value, ensure_ascii=b) for b in [False, True]}
 
 
 def EnumParser(values):

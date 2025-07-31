@@ -17,6 +17,7 @@ from genlm.control.potential.built_in.json import (
     WHITESPACE_PARSER,
     StringLiteralMatchingPatternParser,
     prune_to_validatable_prefix,
+    PatriciaTrie,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -1540,3 +1541,15 @@ async def test_parser_with_empty_properties():
 async def test_whitespace_parser_rejects_unicode_whitespace():
     with pytest.raises(ParseError):
         await WHITESPACE_PARSER.parse_string("\u3000")
+
+
+def test_trie_adding_prefix_of_existing():
+    trie = PatriciaTrie(["foobar"])
+
+    trie.add_string("foo")
+
+    assert trie.root.prefix == "foo"
+    assert trie.root.accepting
+
+    assert trie.root.children["b"].prefix == "ar"
+    assert trie.root.children["b"].accepting
