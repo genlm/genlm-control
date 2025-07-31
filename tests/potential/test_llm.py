@@ -178,7 +178,7 @@ def test_invalid_eos_tokens(llm):
 
     # Test duplicate EOS tokens
     duplicate_eos = [llm.token_maps.decode[0], llm.token_maps.decode[0]]
-    with pytest.raises(AssertionError, match="duplicate eos tokens"):
+    with pytest.raises(ValueError, match="Duplicate eos tokens"):
         llm.spawn_new_eos(eos_tokens=duplicate_eos)
 
     # Test attempting to modify eos_tokens directly
@@ -203,25 +203,38 @@ def test_prompt_from_str_invalid_type(llm):
 def test_spawn(llm):
     new_llm = llm.spawn()
     assert new_llm.prompt_ids == llm.prompt_ids
-    assert new_llm.token_maps.decode == llm.token_maps.decode
-    assert new_llm.token_maps.eos_idxs == llm.token_maps.eos_idxs
+    assert new_llm.token_maps == llm.token_maps
     assert new_llm.vocab == llm.vocab
 
     new_llm = llm.spawn(temperature=1.0)
     assert new_llm.temperature == 1.0
     assert new_llm.prompt_ids == llm.prompt_ids
-    assert new_llm.token_maps.decode == llm.token_maps.decode
-    assert new_llm.token_maps.eos_idxs == llm.token_maps.eos_idxs
+    assert new_llm.token_maps == llm.token_maps
     assert new_llm.vocab == llm.vocab
 
     new_llm = llm.spawn(prompt_ids=[0])
     assert new_llm.temperature == llm.temperature
     assert new_llm.prompt_ids == [0]
+    assert new_llm.token_maps == llm.token_maps
+    assert new_llm.vocab == llm.vocab
 
     new_llm = llm.spawn(eos_tokens=[b"!"], temperature=1.0)
     assert new_llm.token_maps.eos_idxs == [0]
     assert new_llm.temperature == 1.0
     assert new_llm.prompt_ids == llm.prompt_ids
+    assert new_llm.token_maps != llm.token_maps
+
+
+def test_providing_eos_tokens_and_token_maps(llm):
+    with pytest.raises(
+        ValueError, match="eos_tokens must not be provided when token_maps is provided."
+    ):
+        PromptedLLM(
+            llm.model,
+            prompt_ids=llm.prompt_ids,
+            eos_tokens=[b"!"],
+            token_maps=llm.token_maps,
+        )
 
 
 def test_to_autobatched(llm):
