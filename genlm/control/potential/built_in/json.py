@@ -832,7 +832,11 @@ class ObjectSchemaParser(Parser[Any]):
         if allow_additional_properties:
             self.key_parser = STRING_LITERAL_PARSER
         else:
-            self.key_parser = EnumParser(list(properties.keys()))
+            try:
+                self.key_parser = EnumParser(list(properties.keys()))
+            except:
+                print(schema)
+                raise
         self.required_keys = frozenset(schema.get("required", ()))
 
     def __repr__(self):

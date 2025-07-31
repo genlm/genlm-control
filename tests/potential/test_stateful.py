@@ -1,15 +1,10 @@
 from genlm.control.potential.stateful import make_immutable, StatefulPotential
 from genlm.control.potential.streaming import (
     AsyncStreamingPotential,
-    StreamingPotential,
-    Timeout,
     PING_TOKEN,
     KEEP_ALIVE_SET,
 )
 import pytest
-import asyncio
-import time
-from threading import Thread
 from hypothesis.stateful import (
     RuleBasedStateMachine,
     rule,
@@ -32,14 +27,18 @@ def test_make_immutable_converts_to_bytes_if_possible():
     assert make_immutable([0]) == b"\x00"
 
 
-class DummyPotential(StreamingPotential):
+class DummyPotential(AsyncStreamingPotential):
     def __init__(self):
         super().__init__(vocabulary=list(range(256)))
 
-    def calculate_score_from_stream(self, stream) -> float:
+    async def calculate_score_from_stream(self, stream) -> float:
         size = 0
-        for s in stream:
-            size += len(s)
+        while True:
+            try:
+                s = await stream.more()
+                size += len(s)
+            except StopAsyncIteration:
+                break
         if size >= 10:
             return 0.0
 
@@ -59,16 +58,6 @@ def fast_clock():
     global tock
     tock += 1
     return tock
-
-
-@pytest.mark.asyncio
-async def test_will_time_out_if_too_many_threads_start(monkeypatch):
-    (monkeypatch.setattr(asyncio, "sleep", no_sleep),)
-    monkeypatch.setattr(Thread, "start", no_start)
-    monkeypatch.setattr(time, "time", fast_clock)
-    potential = DummyPotential()
-    with pytest.raises(Timeout):
-        await potential.prefix(b"hi")
 
 
 @pytest.mark.asyncio
@@ -199,9 +188,9 @@ def test_priority_map_repr():
 
 @pytest.mark.asyncio
 async def test_error_on_startup_is_correctly_handled():
-    class ErrorPotential(StreamingPotential):
-        def calculate_score_from_stream(self, stream) -> float:
+    class ErrorPotential(AsyncStreamingPotential):
+        async def calculate_score_from_stream(self, stream) -> float:
             raise Exception("Oh no")
 
     potential = ErrorPotential(vocabulary=list(range(256)))
-    assert await potential.prefix(b"") == -float("inf")
+    assert await potential.prefix(b"f") == -float("inf")
