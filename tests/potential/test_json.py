@@ -378,7 +378,7 @@ async def test_always_returns_correctly_on_valid_documents(problem):
 )
 async def test_validates_formats(format):
     potential = JsonSchema({"format": format, "type": "string"})
-    assert await potential.prefix(b'"hello world"') == -float("inf")
+    assert await potential.complete(b'"hello world"') == -float("inf")
 
 
 @pytest.mark.asyncio
