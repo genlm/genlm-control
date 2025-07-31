@@ -37,8 +37,7 @@ def product(request):
 def test_initialization_same_vocab():
     base_vocab = [b"a", b"b", b"c"]
     product = Product(
-        SimplePotential(base_vocab, scale=1.0), 
-        SimplePotential(base_vocab, scale=2.0)
+        SimplePotential(base_vocab, scale=1.0), SimplePotential(base_vocab, scale=2.0)
     )
     assert product.token_type == Atomic(bytes)
     assert len(product.vocab) == len(base_vocab)
@@ -49,19 +48,20 @@ def test_initialization_same_vocab():
 
 def test_initialization_different_vocab():
     product = Product(
-        SimplePotential([b"a", b"b", b"c"], scale=1.0), 
-        SimplePotential([b"a", b"b", b"d"], scale=2.0)
+        SimplePotential([b"a", b"b", b"c"], scale=1.0),
+        SimplePotential([b"a", b"b", b"d"], scale=2.0),
     )
     assert product.token_type == Atomic(bytes)
     assert len(product.vocab) == 2
     assert product.v1_idxs != ...
     assert product.v2_idxs != ...
-    assert len(product.v1_idxs) == 3 # (2 + eos)
-    assert len(product.v2_idxs) == 3 # (2 + eos)
+    assert len(product.v1_idxs) == 3  # (2 + eos)
+    assert len(product.v2_idxs) == 3  # (2 + eos)
 
 
 def test_vocab_errors():
     p1 = SimplePotential([b"a", b"b", b"c"], scale=1.0)
+
     # Test mismatched token types
     class DifferentPotential(SimplePotential):
         def __init__(self):
