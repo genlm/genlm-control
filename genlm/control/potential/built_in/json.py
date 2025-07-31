@@ -111,6 +111,28 @@ class JustOneBlockIterable:
         self.read_past_first_block = True
 
 
+def prune_to_validatable_prefix(context):
+    """We don't want to run the JSON validator on objects that are in the
+    middle of generating a string or a float. We also don't want to run it
+    immediately at the end of a string, or on whitespace changes. This finds
+    us a reasonable prefix that ends at a "logical unit" that makes it a good
+    place to check. We can then cache checks based on the relevant prefix.
+    """
+    assert isinstance(context, bytes)
+    try:
+        context.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.reason == "unexpected end of data":
+            context = context[: e.start]
+        else:
+            raise
+
+    for i in range(len(context) - 1, -1, -1):
+        if context[i] in b"}],":
+            return context[: i + 1]
+    return b""
+
+
 class FullValidatorJsonSchema(Potential):
     def __init__(self, schema):
         super().__init__(
@@ -160,27 +182,6 @@ class FullValidatorJsonSchema(Potential):
             return -np.inf
         return 0.0
 
-    def __prune_to_validatable_prefix(self, context):
-        """We don't want to run the JSON validator on objects that are in the
-        middle of generating a string or a float. We also don't want to run it
-        immediately at the end of a string, or on whitespace changes. This finds
-        us a reasonable prefix that ends at a "logical unit" that makes it a good
-        place to check. We can then cache checks based on the relevant prefix.
-        """
-        assert isinstance(context, bytes)
-        try:
-            context.decode("utf-8")
-        except UnicodeDecodeError as e:
-            if e.reason == "unexpected end of data":
-                context = context[: e.start]
-            else:
-                raise
-
-        for i in range(len(context) - 1, -1, -1):
-            if context[i] in b"}],":
-                return context[: i + 1]
-        return b""
-
     def __validate_validatable_prefix(self, context):
         iterable = JustOneBlockIterable(context)
         try:
@@ -198,7 +199,7 @@ class FullValidatorJsonSchema(Potential):
         try:
             self.__prechecks(context)
 
-            prefix = self.__prune_to_validatable_prefix(context)
+            prefix = prune_to_validatable_prefix(context)
             self.__validate_validatable_prefix(prefix)
         except StopIteration:
             pass

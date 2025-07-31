@@ -16,6 +16,7 @@ from genlm.control.potential.built_in.json import (
     FloatParser,
     WHITESPACE_PARSER,
     StringLiteralMatchingPatternParser,
+    prune_to_validatable_prefix,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -23,7 +24,7 @@ from typing import Any
 from dataclasses import dataclass
 from hypothesis import given, strategies as st, assume, example, settings, reject
 from hypothesis_jsonschema import from_schema
-from jsonschema import SchemaError, Draft7Validator
+from jsonschema import SchemaError
 import regex
 
 
@@ -332,24 +333,25 @@ def json_schema_potential_problem(draw):
 @settings(max_examples=25, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):
     parser = json_schema_parser(problem.schema)
-
     await parser.parse_string(problem.document.decode("utf-8"))
+
     try:
         await parser.parse_string(problem.prefix.decode("utf-8"))
     except (Incomplete, UnicodeDecodeError):
         pass
 
-    potential = JsonSchema(problem.schema)
-
-    assert await potential.prefix(problem.prefix) == 0.0
-    assert await potential.prefix(problem.document) == 0.0
-    if await potential.complete(problem.prefix) > -float("inf"):
-        # This can sometimes happen because e.g. numeric literals can have
-        # a prefix that is also a valid JSON value. We check here that the
-        # prefix is actually valid JSON and if so allow it.
-        validator = Draft7Validator(problem.schema)
-        validator.validate(json.loads(problem.prefix))
-    assert await potential.complete(problem.document) == 0.0
+    for potential in [
+        ParserPotential(parser),
+        FullValidatorJsonSchema(problem.schema),
+    ]:
+        assert await potential.prefix(problem.prefix) == 0.0
+        assert await potential.prefix(problem.document) == 0.0
+        if await potential.complete(problem.prefix) > -float("inf"):
+            # This can sometimes happen because e.g. numeric literals can have
+            # a prefix that is also a valid JSON value. We check here that the
+            # prefix is actually valid JSON and if so allow it.
+            json.loads(problem.prefix)
+        assert await potential.complete(problem.document) == 0.0
 
 
 @pytest.mark.asyncio
@@ -1518,3 +1520,10 @@ async def test_fixed_set_parser(contents, test_strings):
 def test_fixed_set_parser_not_empty():
     with pytest.raises(ValueError):
         FixedSetParser(())
+
+
+@pytest.mark.parametrize(
+    "document,expected", [(b"1", b""), (b'["foo", b"ba', b'["foo",')]
+)
+def test_prune_to_validatable_prefix(document, expected):
+    assert prune_to_validatable_prefix(document) == expected
