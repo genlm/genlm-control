@@ -1527,3 +1527,10 @@ def test_fixed_set_parser_not_empty():
 )
 def test_prune_to_validatable_prefix(document, expected):
     assert prune_to_validatable_prefix(document) == expected
+
+
+@pytest.mark.asyncio
+async def test_parser_with_empty_properties():
+    parser = json_schema_parser({"type": "object", "properties": {}})
+
+    await parser.parse_string('{"foo": 1}')

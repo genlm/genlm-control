@@ -822,7 +822,8 @@ class ObjectSchemaParser(Parser[Any]):
         if "additionalProperties" in schema:
             allow_additional_properties = schema["additionalProperties"]
         else:
-            allow_additional_properties = "properties" not in schema
+            # Allow additional properties if schema has no or empty properties
+            allow_additional_properties = not schema.get("properties")
 
         if allow_additional_properties:
             self.key_parser = STRING_LITERAL_PARSER
