@@ -41,7 +41,7 @@ class Product(Potential):
         self.p2 = p2
 
         if self.p1.token_type == self.p2.token_type:
-            self.token_type = self.p1.token_type
+            token_type = self.p1.token_type
         else:
             raise ValueError(
                 "Potentials in product must have the same token type. "
@@ -59,27 +59,30 @@ class Product(Potential):
         if self.p1.vocab == self.p2.vocab:
             self._v1_idxs = ...
             self._v2_idxs = ...
-            super().__init__(self.p1.vocab, token_type=self.token_type)
+            super().__init__(self.p1.vocab, token_type=token_type)
+
         else:
-            common_vocab = list(set(p1.vocab) & set(p2.vocab))
+            common_vocab = list(set(self.p1.vocab) & set(self.p2.vocab))
             if not common_vocab:
                 raise ValueError("Potentials in product must share a common vocabulary")
 
-            # Check for small vocabulary overlap
-            threshold = 0.1
-            for potential, name in [(p1, "p1"), (p2, "p2")]:
-                overlap_ratio = len(common_vocab) / len(potential.vocab)
-                if overlap_ratio < threshold:
-                    warnings.warn(
-                        f"Common vocabulary ({len(common_vocab)} tokens) is less than {threshold * 100}% "
-                        f"of {name}'s ({potential!r}) vocabulary ({len(potential.vocab)} tokens). "
-                        "This Product potential only operates on this relatively small subset of tokens.",
-                        RuntimeWarning,
-                    )
+            self._check_vocab_overlap(common_vocab, self.p1, self.p2, threshold=0.1)
 
             self._v1_idxs = None
             self._v2_idxs = None
-            super().__init__(common_vocab, token_type=self.token_type)
+
+            super().__init__(common_vocab, token_type=token_type)
+
+    def _check_vocab_overlap(self, common_vocab, p1, p2, threshold=0.1):
+        for potential, name in [(p1, "p1"), (p2, "p2")]:
+            overlap_ratio = len(common_vocab) / len(potential.vocab)
+            if overlap_ratio < threshold:
+                warnings.warn(
+                    f"Common vocabulary ({len(common_vocab)} tokens) is less than {threshold * 100}% "
+                    f"of {name}'s ({potential!r}) vocabulary ({len(potential.vocab)} tokens). "
+                    "This Product potential only operates on this relatively small subset of tokens.",
+                    RuntimeWarning,
+                )
 
     @property
     def v1_idxs(self):
