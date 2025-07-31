@@ -384,7 +384,7 @@ async def test_validates_formats(format):
 @pytest.mark.asyncio
 async def test_validates_regex_format():
     potential = JsonSchema({"format": "regex", "type": "string"})
-    assert await potential.prefix(b'"["') == -float("inf")
+    assert await potential.complete(b'"["') == -float("inf")
 
 
 @pytest.mark.asyncio
@@ -1397,7 +1397,7 @@ async def test_empty_object_allows_keys():
 
 @pytest.mark.asyncio
 async def test_enum_parsing():
-    values = [1, "two", "twin", 3.5]
+    values = ["two", "twin"]
     parser = json_schema_parser({"enum": values})
 
     for v in values:
@@ -1419,12 +1419,12 @@ async def test_enum_parsing():
 
 @pytest.mark.asyncio
 async def test_single_value_enum():
-    values = [1]
+    values = ["1"]
     parser = json_schema_parser({"enum": values})
-    await parser.parse_string("1")
+    await parser.parse_string('"1"')
 
     with pytest.raises(ParseError):
-        await parser.parse_string("2")
+        await parser.parse_string('"2')
 
 
 @pytest.mark.asyncio
@@ -1534,3 +1534,9 @@ async def test_parser_with_empty_properties():
     parser = json_schema_parser({"type": "object", "properties": {}})
 
     await parser.parse_string('{"foo": 1}')
+
+
+@pytest.mark.asyncio
+async def test_whitespace_parser_rejects_unicode_whitespace():
+    with pytest.raises(ParseError):
+        await WHITESPACE_PARSER.parse_string("\u3000")

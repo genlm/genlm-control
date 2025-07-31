@@ -255,7 +255,12 @@ class ParserPotential(AsyncStreamingPotential):
         rechunked = StringSource(stream)
         input = Input(rechunked)
         await input.parse(self.parser)
-        return 0.0
+        await input.skip_whitespace()
+        try:
+            await input.read(1)
+            return -np.inf
+        except Incomplete:
+            return 0.0
 
 
 S = TypeVar("S")
@@ -329,8 +334,6 @@ class Input:
                 if not await self.advance_input():
                     raise Incomplete()
             else:
-                if match.end() == len(buffer) and await self.advance_input():
-                    continue
                 self.index += match.end()
                 return result
 
@@ -391,9 +394,10 @@ class Input:
         if self.index == len(self.buffer):
             if not await self.advance_input():
                 return
-        # TODO: Given inefficiencies with regex, maybe worth a more direct
-        # implementation here?
-        await self.parse(WHITESPACE_PARSER)
+        try:
+            await self.parse(WHITESPACE_PARSER)
+        except Incomplete:
+            pass
 
 
 class TrivialSource(AsyncSource):
