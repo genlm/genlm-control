@@ -42,7 +42,8 @@ class TokenMappings(NamedTuple):
         if not all(eos in encode for eos in eos_tokens):
             raise ValueError("EOS token not in language model vocabulary")
         eos_idxs = [encode[eos] for eos in eos_tokens]
-        potential_vocab = [x for x in decode if x not in eos_tokens]
+        eos_tokens_set = set(eos_tokens)
+        potential_vocab = [x for x in decode if x not in eos_tokens_set]
         return cls(
             decode=decode,
             encode=encode,
