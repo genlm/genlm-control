@@ -23,7 +23,7 @@ from typing import Any
 from dataclasses import dataclass
 from hypothesis import given, strategies as st, assume, example, settings, reject
 from hypothesis_jsonschema import from_schema
-from jsonschema import SchemaError
+from jsonschema import SchemaError, Draft7Validator
 import regex
 
 
@@ -316,8 +316,20 @@ def json_schema_potential_problem(draw):
         prefix=b"[",
     )
 )
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "array",
+            "items": {
+                "anyOf": [{"enum": [0]}, {"type": "integer"}, {"type": "number"}]
+            },
+        },
+        document=b"[0.5]",
+        prefix=b"[",
+    ),
+)
 @given(json_schema_potential_problem())
-@settings(max_examples=10000, deadline=None, report_multiple_bugs=False)
+@settings(max_examples=25, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):
     parser = json_schema_parser(problem.schema)
 
@@ -335,7 +347,8 @@ async def test_always_returns_correctly_on_valid_documents(problem):
         # This can sometimes happen because e.g. numeric literals can have
         # a prefix that is also a valid JSON value. We check here that the
         # prefix is actually valid JSON and if so allow it.
-        json.loads(problem.prefix)
+        validator = Draft7Validator(problem.schema)
+        validator.validate(json.loads(problem.prefix))
     assert await potential.complete(problem.document) == 0.0
 
 

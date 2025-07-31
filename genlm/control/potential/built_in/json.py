@@ -918,13 +918,38 @@ ARBITRARY_JSON = (
     // ObjectSchemaParser({"additionalProperties": True})
 )
 
+TYPES_TO_JSON_TYPES = {
+    type(None): "null",
+    int: "integer",
+    float: "number",
+    dict: "object",
+    str: "string",
+    bool: "boolean",
+}
+
 
 def json_schema_parser(schema):
     if "const" in schema:
         return ConstParser(schema["const"])
 
     if "enum" in schema:
-        return EnumParser(schema["enum"])
+        values = schema["enum"]
+        types = {type(s) for s in values}
+        # These cause us problems because they can be a prefix of other
+        # values, and if you them first in an anyOf this will cause
+        # parse errors later. This is a limitation of the approach to
+        # parsing we're taking here (which has limited backtracking),
+        # but it's easier to fix this here than change the parsing.
+        #
+        # Note that we can't check that they are the right values here,
+        # because we can't easily distinguish incomplete values at this
+        # point.
+        #
+        # This is all very stupid. Sorry.
+        if int in types or float in types:
+            return json_schema_parser({"type": [TYPES_TO_JSON_TYPES[t] for t in types]})
+        else:
+            return EnumParser(schema["enum"])
 
     if "anyOf" in schema:
         *rest, base = schema["anyOf"]
