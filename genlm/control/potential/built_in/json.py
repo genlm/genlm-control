@@ -2,18 +2,20 @@ import json_stream
 import json
 import regex
 from typing import Generic, TypeVar, Union, Any, Callable
-from jsonschema import Draft7Validator
+from jsonschema import Draft7Validator, ValidationError
 from jsonschema import _types
-from typing import Iterable, AsyncIterator
+from typing import AsyncIterator
 from genlm.control.potential import Potential
 from contextlib import contextmanager
 from genlm.control.potential.streaming import (
-    StreamingPotential,
     AsyncStreamingPotential,
     AsyncSource,
 )
 from array import array
 import unicodedata
+from dataclasses import dataclass, field
+import numpy as np
+from functools import lru_cache
 
 
 def is_sequence(checker, instance):
@@ -93,63 +95,65 @@ def chunk_bytes_to_strings(byte_blocks):
     assert not buffer
 
 
-class StreamingJsonSchema(StreamingPotential):
-    def __init__(self, schema, **kwargs):
+class JustOneBlockIterable:
+    """Provides a single value (intended to be bytes from a context)
+    and then signals if the reader tried to read past it. This allows
+    us to distinguish invalid JSON from incomplete JSON by seeing if
+    the reader tried to read more than it had or failed early."""
+
+    def __init__(self, block):
+        self.__block = block
+        self.read_past_first_block = False
+
+    def __iter__(self):
+        yield self.__block
+        self.read_past_first_block = True
+
+
+def prune_to_validatable_prefix(context):
+    """We don't want to run the JSON validator on objects that are in the
+    middle of generating a string or a float. We also don't want to run it
+    immediately at the end of a string, or on whitespace changes. This finds
+    us a reasonable prefix that ends at a "logical unit" that makes it a good
+    place to check. We can then cache checks based on the relevant prefix.
+    """
+    assert isinstance(context, bytes)
+    try:
+        context.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.reason == "unexpected end of data":
+            context = context[: e.start]
+        else:
+            raise
+
+    for i in range(len(context) - 1, -1, -1):
+        if context[i] in b"}],":
+            return context[: i + 1]
+    return b""
+
+
+class FullValidatorJsonSchema(Potential):
+    def __init__(self, schema):
         super().__init__(
-            vocabulary=list(range(256)),
-            **kwargs,
+            list(range(256)),
         )
         self.schema = schema
         self.validator = LazyCompatibleValidator(
             self.schema, format_checker=Draft7Validator.FORMAT_CHECKER
         )
-        self.parser = json_schema_parser(schema)
-
-    def calculate_score_from_stream(self, stream: Iterable[Any]) -> float:
-        buffer = bytearray()
-
-        def buffer_stream():
-            for s in stream:
-                buffer.extend(s)
-                yield bytes(s)
-
-        buffered = buffer_stream()
-        rechunked = chunk_to_complete_utf8(buffered)
-
-        x = json_stream.load(rechunked, persistent=True)
-        self.validator.validate(x)
-        if hasattr(x, "read_all"):
-            x.read_all()
-
-        json.loads(buffer)
-        for s in buffered:
-            if s.strip():
-                raise ValueError(f"Data after JSON: {s.decode('utf-8')}")
-        return 0.0
-
-
-BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)")
-VALID_JSON_START = regex.compile(rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]')
-
-
-class ValidateJSON(Potential):
-    """This is a dumping ground for any extra JSON validation we want to do
-    to work around LLM weirdness.
-    """
-
-    def __init__(self):
-        super().__init__(
-            vocabulary=list(range(256)),
+        self.__validate_validatable_prefix = lru_cache(1024)(
+            self.__validate_validatable_prefix
         )
 
-    async def prefix(self, context):
-        context = bytes(context)
+    def __prechecks(self, context):
+        assert isinstance(context, bytes)
+
         # Sometimes a model gets itself off to a bad start immediately.
         # We want to catch this early. Note that we forbid whitespace
         # at the start of the context. It seems to almost always be
         # a bad sign.
         if not VALID_JSON_START.match(context, partial=True):
-            return float("-inf")
+            raise ValueError(f"Bad start {context[:5]}")
 
         # Sometimes a model can get itself into a position where it can't
         # generate any valid tokens, but it can keep generating whitespace
@@ -157,25 +161,60 @@ class ValidateJSON(Potential):
         #
         # pos=1 because we specifically allow two newlines at the start,
         # as LLMs like doing that for tokenization reasons.
-        if BAD_WHITESPACE.search(context, pos=1):
-            return float("-inf")
-        for c in context:
-            # Forbid control characters other than newline.
+        if bad_whitespace := BAD_WHITESPACE.search(context, pos=1):
+            raise ValueError(
+                f"Bad whitespace {bad_whitespace.group(0)} as position {bad_whitespace.start()}"
+            )
+
+        for i, c in enumerate(context):
+            # Forbid ascii control characters other than newline.
             if c != ord(b"\n") and c < ord(b" "):
-                return float("-inf")
+                raise ValueError(f"Forbidden character {bytes([c])} at position {i}")
+
+    async def complete(self, context) -> float:
+        context = bytes(context)
+        try:
+            self.__prechecks(context)
+            document = json.loads(context)
+            self.validator.validate(document)
+        except (ValueError, ValidationError, json.JSONDecodeError):
+            return -np.inf
         return 0.0
 
-    async def complete(self, context):
-        return await self.prefix(context)
+    def __validate_validatable_prefix(self, context):
+        iterable = JustOneBlockIterable(context)
+        try:
+            x = json_stream.load(iterable, persistent=True)
+            self.validator.validate(x)
+            if hasattr(x, "read_all"):
+                x.read_all()
+        except ValueError:
+            if not iterable.read_past_first_block:
+                raise
+
+    async def prefix(self, context) -> float:
+        context = bytes(context)
+
+        try:
+            self.__prechecks(context)
+
+            prefix = prune_to_validatable_prefix(context)
+            self.__validate_validatable_prefix(prefix)
+        except StopIteration:
+            pass
+        except (ValueError, ValidationError):
+            return -float("inf")
+
+        return 0.0
+
+
+BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)")
+VALID_JSON_START = regex.compile(rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]')
 
 
 def JsonSchema(schema):
     Draft7Validator.check_schema(schema)
-    return (
-        ValidateJSON()
-        * StreamingJsonSchema(schema)
-        * ParserPotential(json_schema_parser(schema))
-    )
+    return ParserPotential(json_schema_parser(schema)) * FullValidatorJsonSchema(schema)
 
 
 class StringSource(AsyncSource):
@@ -215,7 +254,12 @@ class ParserPotential(AsyncStreamingPotential):
         rechunked = StringSource(stream)
         input = Input(rechunked)
         await input.parse(self.parser)
-        return 0.0
+        await input.skip_whitespace()
+        try:
+            await input.read(1)
+            return -np.inf
+        except Incomplete:
+            return 0.0
 
 
 S = TypeVar("S")
@@ -240,7 +284,22 @@ class Input:
         # There's no textarray equivalent, so we store the growable
         # string as an array of integer codepoints.
         self.buffer = array("I")
-        self.index = 0
+        self.__index = 0
+        self.__in_preserving_block = False
+
+    @property
+    def index(self):
+        return self.__index
+
+    @index.setter
+    def index(self, value):
+        assert value >= self.__index
+        self.__index = value
+
+    def __repr__(self):
+        buffer = "".join(chr(i) for i in self.buffer)
+        i = self.index
+        return f"Input({repr(buffer[:i])}, ||, {repr(buffer[i:])})"
 
     async def advance_input(self):
         if self.__finished:
@@ -299,11 +358,12 @@ class Input:
         return "".join(map(chr, result))
 
     async def expect(self, expected: str):
-        actual = await self.read(len(expected))
-        if actual != expected:
-            raise ParseError(
-                f"Expected: {expected} but got {actual} at index {self.index}"
-            )
+        for c in expected:
+            actual = await self.read(1)
+            if actual != c:
+                raise ParseError(
+                    f"Expected: {c} but got {actual} at index {self.index - 1}"
+                )
 
     @contextmanager
     def preserving_index(self):
@@ -313,8 +373,17 @@ class Input:
         try:
             yield
         except Exception:
-            self.index = start
+            self.__index = start
             raise
+
+    @contextmanager
+    def resetting_index(self):
+        """Always reset the index to where it started at the end of this block."""
+        start = self.index
+        try:
+            yield
+        finally:
+            self.__index = start
 
     async def parse(self, parser: "Parser[T]") -> T:
         with self.preserving_index():
@@ -324,9 +393,10 @@ class Input:
         if self.index == len(self.buffer):
             if not await self.advance_input():
                 return
-        # TODO: Given inefficiencies with regex, maybe worth a more direct
-        # implementation here?
-        await self.parse(WHITESPACE_PARSER)
+        try:
+            await self.parse(WHITESPACE_PARSER)
+        except Incomplete:
+            pass
 
 
 class TrivialSource(AsyncSource):
@@ -394,16 +464,32 @@ R = TypeVar("R")
 
 
 class AltParser(Parser[Union[S, T]]):
-    def __init__(self, left: Parser[S], right: Parser[T]):
-        self.left = left
-        self.right = right
+    def __init__(self, *parsers):
+        flattened_parsers = []
+        for parser in parsers:
+            if isinstance(parser, AltParser):
+                flattened_parsers.extend(parser.parsers)
+            else:
+                flattened_parsers.append(parser)
+        self.parsers = flattened_parsers
 
     async def parse(self, input: Input) -> Union[S, T]:
-        try:
-            with input.preserving_index():
-                return await self.left.parse(input)
-        except ParseError:
-            return await self.right.parse(input)
+        incomplete_parsers = []
+        for parser in self.parsers:
+            try:
+                with input.preserving_index():
+                    start = input.index
+                    result = await parser.parse(input)
+                    assert input.index > start
+                    return result
+            except Incomplete:
+                incomplete_parsers.append(parser)
+            except ParseError:
+                continue
+        if incomplete_parsers:
+            raise Incomplete(f"{incomplete_parsers} have not yet completed.")
+        else:
+            raise ParseError(f"None of {self.parsers} successfully parsed.")
 
 
 class ConstParser(Parser[None]):
@@ -413,10 +499,7 @@ class ConstParser(Parser[None]):
 
     async def parse(self, input: Input) -> None:
         await input.skip_whitespace()
-        for expected in self.literal:
-            got = await input.read(1)
-            if got != expected:
-                raise ParseError(f"Expected char {expected} but got {got}")
+        await input.expect(self.literal)
         return self.value
 
 
@@ -439,27 +522,25 @@ FLOAT_REGEX_PARSER: Parser[float] = RegexParser(
 
 class FloatParser(Parser[float]):
     async def parse(self, input: Input) -> float:
-        start = input.index
-        preliminary_result = await input.parse(FLOAT_REGEX_PARSER)
-        try:
-            next_char = await input.read(1)
-        except Incomplete:
-            return preliminary_result
+        with input.resetting_index():
+            await input.parse(FLOAT_REGEX_PARSER)
+            try:
+                next_char = await input.read(1)
+            except Incomplete:
+                pass
+            else:
+                if next_char == ".":
+                    await input.read(1)
+                elif next_char in "eE":
+                    next_next_char = await input.read(1)
+                    if next_next_char in "-+":
+                        await input.read(1)
 
-        if next_char == ".":
-            await input.read(1)
-        elif next_char in "eE":
-            next_next_char = await input.read(1)
-            if next_next_char in "-+":
-                await input.read(1)
-
-        try:
-            while (await input.read(1)) in "0123456789":
-                continue
-        except Incomplete:
-            pass
-
-        input.index = start
+                try:
+                    while (await input.read(1)) in "0123456789":
+                        continue
+                except Incomplete:
+                    pass
         return await input.parse(FLOAT_REGEX_PARSER)
 
 
@@ -470,25 +551,24 @@ INTEGER_REGEX = regex.compile(r"-?((0|([1-9][0-9]*))([eE]+?[0-9]+)?)")
 
 class IntegerParser(Parser[int]):
     async def parse(self, input: Input) -> float:
-        start = input.index
-        await input.read_pattern(INTEGER_REGEX)
+        with input.resetting_index():
+            await input.read_pattern(INTEGER_REGEX)
 
-        while True:
-            try:
-                c = await input.read(1)
-            except Incomplete:
-                break
-            if c == ".":
-                raise ParseError()
-            elif c in "Ee":
-                # Might raise Incomplete, but if so it's
-                # correct to raise Incomplete here.
-                d = await input.read(1)
-                if d == "-":
+            while True:
+                try:
+                    c = await input.read(1)
+                except Incomplete:
+                    break
+                if c == ".":
                     raise ParseError()
-            elif c not in "0123456789":
-                break
-        input.index = start
+                elif c in "Ee":
+                    # Might raise Incomplete, but if so it's
+                    # correct to raise Incomplete here.
+                    d = await input.read(1)
+                    if d == "-":
+                        raise ParseError()
+                elif c not in "0123456789":
+                    break
         return json.loads(await input.read_pattern(INTEGER_REGEX))
 
 
@@ -585,15 +665,136 @@ class StringLiteralMatchingPatternParser(Parser[str]):
                 raise Incomplete()
 
 
+@dataclass()
+class PatriciaTrieNode:
+    # All strings accepted by this node start with prefix
+    prefix: str
+    # Is the prefix accepted
+    accepting: bool
+
+    children: "dict[int, PatriciaTrieNode]" = field(default_factory=dict)
+
+
+def split_node(node, i):
+    assert i < len(node.prefix)
+    new_prefix = node.prefix[:i]
+    c = node.prefix[i]
+    new_child = PatriciaTrieNode(
+        accepting=node.accepting, children=node.children, prefix=node.prefix[i + 1 :]
+    )
+    node.accepting = False
+    node.prefix = new_prefix
+    node.children = {c: new_child}
+
+
+class PatriciaTrie:
+    def __init__(self, values=()):
+        self.root = None
+        for v in values:
+            self.add_string(v)
+
+    def add_string(self, value):
+        if self.root is None:
+            self.root = PatriciaTrieNode(prefix=value, accepting=True)
+            return
+        node = self.root
+        while True:
+            if node.prefix == value:
+                node.accepting = True
+                return
+            elif value.startswith(node.prefix):
+                c = value[len(node.prefix)]
+                tail = value[len(node.prefix) + 1 :]
+                try:
+                    node = node.children[c]
+                    value = tail
+                except KeyError:
+                    node.children[c] = PatriciaTrieNode(
+                        accepting=True,
+                        prefix=tail,
+                    )
+                    return
+            elif node.prefix.startswith(value):
+                split_node(node, len(value))
+                assert node.prefix == value
+            else:
+                for i in range(len(value)):
+                    if node.prefix[i] != value[i]:
+                        break
+                else:  # pragma: no cover
+                    assert False, (
+                        f"{value} and {node.prefix} should have a different char at this point."
+                    )
+                split_node(node, i)
+                assert value.startswith(node.prefix)
+
+
+class FixedSetParser(Parser[str]):
+    """Parser that matches a precise set of strings, some of which might
+    be prefixes of each other, always returning the longest matching one."""
+
+    def __init__(self, values):
+        super().__init__()
+        if not values:
+            raise ValueError("values for FixedSetParser cannot be empty")
+        self.trie = PatriciaTrie(values)
+        self.values = values
+
+    def __repr__(self):
+        return f"FixedSetParser({self.values})"
+
+    async def parse(self, input: Input) -> str:
+        start = input.index
+        match_length = -1
+        node = self.trie.root
+
+        with input.resetting_index():
+            while True:
+                assert node.accepting or node.children or node is self.trie.root
+
+                try:
+                    await input.expect(node.prefix)
+                except (Incomplete, ParseError):
+                    if match_length < 0:
+                        raise
+                    else:
+                        break
+                if node.accepting:
+                    match_length = input.index - start
+                    if not node.children:
+                        break
+                try:
+                    c = await input.read(1)
+                except Incomplete:
+                    if match_length < 0:
+                        raise
+                    else:
+                        break
+                try:
+                    node = node.children[c]
+                except KeyError:
+                    if match_length < 0:
+                        raise ParseError(
+                            f"Unexpected character {c}. Expected one of {repr(''.join(node.children))}"
+                        )
+                    break
+
+        # Should have errored in the loop if not
+        assert match_length >= 0
+        result = await input.read(match_length)
+        assert input.index == start + match_length
+        return result
+
+
+def possible_representations(value):
+    return {json.dumps(value, ensure_ascii=b) for b in [False, True]}
+
+
 def EnumParser(values):
-    parts = {
-        f"({regex.escape(json.dumps(k, ensure_ascii=b))})"
-        for k in values
-        for b in [False, True]
-    }
-    if len(parts) == 1:
+    reps = {s for v in values for s in possible_representations(v)}
+    if len(reps) == 1:
         return ConstParser(values[0])
-    return RegexParser("|".join(sorted(parts))).map(json.loads)
+    return FixedSetParser(reps).map(json.loads)
 
 
 class ObjectSchemaParser(Parser[Any]):
@@ -620,12 +821,17 @@ class ObjectSchemaParser(Parser[Any]):
         if "additionalProperties" in schema:
             allow_additional_properties = schema["additionalProperties"]
         else:
-            allow_additional_properties = "properties" not in schema
+            # Allow additional properties if schema has no or empty properties
+            allow_additional_properties = not schema.get("properties")
 
         if allow_additional_properties:
             self.key_parser = STRING_LITERAL_PARSER
         else:
-            self.key_parser = EnumParser(list(properties.keys()))
+            try:
+                self.key_parser = EnumParser(list(properties.keys()))
+            except:
+                print(schema)
+                raise
         self.required_keys = frozenset(schema.get("required", ()))
 
     def __repr__(self):
@@ -664,7 +870,9 @@ class ObjectSchemaParser(Parser[Any]):
             await input.expect(":")
             await input.skip_whitespace()
             value_parser = self.child_parsers.get(key, ARBITRARY_JSON)
+            start = input.index
             result[key] = await input.parse(value_parser)
+            assert input.index > start, (input.index, start)
         return result
 
 
@@ -715,13 +923,38 @@ ARBITRARY_JSON = (
     // ObjectSchemaParser({"additionalProperties": True})
 )
 
+TYPES_TO_JSON_TYPES = {
+    type(None): "null",
+    int: "integer",
+    float: "number",
+    dict: "object",
+    str: "string",
+    bool: "boolean",
+}
+
 
 def json_schema_parser(schema):
     if "const" in schema:
         return ConstParser(schema["const"])
 
     if "enum" in schema:
-        return EnumParser(schema["enum"])
+        values = schema["enum"]
+        types = {type(s) for s in values}
+        # These cause us problems because they can be a prefix of other
+        # values, and if you them first in an anyOf this will cause
+        # parse errors later. This is a limitation of the approach to
+        # parsing we're taking here (which has limited backtracking),
+        # but it's easier to fix this here than change the parsing.
+        #
+        # Note that we can't check that they are the right values here,
+        # because we can't easily distinguish incomplete values at this
+        # point.
+        #
+        # This is all very stupid. Sorry.
+        if int in types or float in types:
+            return json_schema_parser({"type": [TYPES_TO_JSON_TYPES[t] for t in types]})
+        else:
+            return EnumParser(schema["enum"])
 
     if "anyOf" in schema:
         *rest, base = schema["anyOf"]

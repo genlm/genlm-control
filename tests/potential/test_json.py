@@ -1,20 +1,23 @@
 import pytest
 from genlm.control.potential.built_in.json import (
     JsonSchema,
+    TrivialSource,
     json_schema_parser,
+    FixedSetParser,
     ARBITRARY_JSON,
     Incomplete,
     FLOAT_PARSER,
     chunk_to_complete_utf8,
     ParseError,
-    StreamingJsonSchema,
-    ValidateJSON,
+    FullValidatorJsonSchema,
     ParserPotential,
     StringSource,
     Input,
     FloatParser,
     WHITESPACE_PARSER,
     StringLiteralMatchingPatternParser,
+    prune_to_validatable_prefix,
+    PatriciaTrie,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -22,7 +25,6 @@ from typing import Any
 from dataclasses import dataclass
 from hypothesis import given, strategies as st, assume, example, settings, reject
 from hypothesis_jsonschema import from_schema
-import asyncio
 from jsonschema import SchemaError
 import regex
 
@@ -61,8 +63,7 @@ async def test_consistency_properties(schema, context):
 @pytest.mark.parametrize(
     "potential",
     [
-        StreamingJsonSchema({"type": "array", "items": {"type": "integer"}}),
-        ValidateJSON(),
+        FullValidatorJsonSchema({"type": "array", "items": {"type": "integer"}}),
         ParserPotential(
             json_schema_parser({"type": "array", "items": {"type": "integer"}})
         ),
@@ -103,17 +104,8 @@ def basic_schema(draw):
                 st.lists(
                     st.none()
                     | st.booleans()
-                    # We don't currently handle the semantics of numbers very well
-                    # in enums, because the correct semantics depends on them being
-                    # equal to floats. Integer enums will still work, but they will
-                    # reject things that are technically fine. e.g. {"enum": [0]}
-                    # should match the string "0.0" and doesn't.
-                    #
-                    # Hypothesis is very good at pointing this out, so we solve this
-                    # by not letting it do that, as we mostly only care about
-                    # enums of strings anyway.
                     | st.integers()
-                    # | st.floats(allow_nan=False, allow_infinity=False)
+                    | st.floats(allow_nan=False, allow_infinity=False)
                     | st.text(),
                     min_size=1,
                     unique_by=lambda x: (type(x), x),
@@ -255,27 +247,112 @@ def json_schema_potential_problem(draw):
         prefix=b"{",
     ),
 )
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"type": "array", "items": {"enum": [543064729, 5]}},
+        document=b"[543064729, 5]",
+        prefix=b"[",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "anyOf": [
+                {"type": "null"},
+                {"type": "boolean"},
+                {"enum": [-10]},
+                {"type": "integer"},
+            ]
+        },
+        document=b"-1",
+        prefix=b"-",
+    )
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+        document=b"null",
+        prefix=b"n",
+    )
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "object",
+            "properties": {"0\x7f": {"type": "integer"}},
+            "required": [],
+            "additionalProperties": False,
+        },
+        document=b'{"0\\u007f": 0}',
+        prefix=b"{",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "object",
+            "properties": {"0": {"type": "null"}},
+            "required": [],
+            "additionalProperties": True,
+        },
+        document=b'{"": []}',
+        prefix=b"{",
+    ),
+)
+@example(
+    JSONSchemaPotentialProblem(schema={"enum": [None, 10]}, document=b"10", prefix=b"1")
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"enum": [True]},
+                    {"anyOf": [{"type": "null"}, {"type": "number"}]},
+                ]
+            },
+        },
+        document=b"[1.0000000000000001e+133]",
+        prefix=b"[",
+    )
+)
+@example(
+    JSONSchemaPotentialProblem(
+        schema={
+            "type": "array",
+            "items": {
+                "anyOf": [{"enum": [0]}, {"type": "integer"}, {"type": "number"}]
+            },
+        },
+        document=b"[0.5]",
+        prefix=b"[",
+    ),
+)
 @given(json_schema_potential_problem())
-@settings(max_examples=100, deadline=None, report_multiple_bugs=False)
+@settings(max_examples=25, deadline=None, report_multiple_bugs=False)
 async def test_always_returns_correctly_on_valid_documents(problem):
     parser = json_schema_parser(problem.schema)
-
     await parser.parse_string(problem.document.decode("utf-8"))
+
     try:
         await parser.parse_string(problem.prefix.decode("utf-8"))
     except (Incomplete, UnicodeDecodeError):
         pass
 
-    potential = JsonSchema(problem.schema)
-
-    assert await potential.prefix(problem.prefix) == 0.0
-    assert await potential.prefix(problem.document) == 0.0
-    if await potential.complete(problem.prefix) > -float("inf"):
-        # This can sometimes happen because e.g. numeric literals can have
-        # a prefix that is also a valid JSON value. We check here that the
-        # prefix is actually valid JSON and if so allow it.
-        json.loads(problem.prefix)
-    assert await potential.complete(problem.document) == 0.0
+    for potential in [
+        ParserPotential(parser),
+        FullValidatorJsonSchema(problem.schema),
+    ]:
+        assert await potential.prefix(problem.prefix) == 0.0
+        assert await potential.prefix(problem.document) == 0.0
+        if await potential.complete(problem.prefix) > -float("inf"):
+            # This can sometimes happen because e.g. numeric literals can have
+            # a prefix that is also a valid JSON value. We check here that the
+            # prefix is actually valid JSON and if so allow it.
+            json.loads(problem.prefix)
+        assert await potential.complete(problem.document) == 0.0
 
 
 @pytest.mark.asyncio
@@ -302,13 +379,13 @@ async def test_always_returns_correctly_on_valid_documents(problem):
 )
 async def test_validates_formats(format):
     potential = JsonSchema({"format": format, "type": "string"})
-    assert await potential.prefix(b'"hello world"') == -float("inf")
+    assert await potential.complete(b'"hello world"') == -float("inf")
 
 
 @pytest.mark.asyncio
 async def test_validates_regex_format():
     potential = JsonSchema({"format": "regex", "type": "string"})
-    assert await potential.prefix(b'"["') == -float("inf")
+    assert await potential.complete(b'"["') == -float("inf")
 
 
 @pytest.mark.asyncio
@@ -544,11 +621,15 @@ def json_object(draw):
 
 @pytest.mark.asyncio
 @example(False)
+@example(0.0)
 @settings(report_multiple_bugs=False, deadline=None)
 @given(json_object())
 async def test_parser_for_arbitrary_json_can_parse_arbitrary_json(obj):
     text = json.dumps(obj)
-    await ARBITRARY_JSON.parse_string(text)
+    input = Input(TrivialSource(text))
+    result = await ARBITRARY_JSON.parse(input)
+    assert result == obj
+    assert input.index == len(text)
 
 
 @pytest.mark.asyncio
@@ -666,8 +747,8 @@ async def test_raises_value_error_for_logw_next_of_bad_prefix():
 
 
 @pytest.mark.asyncio
-async def test_basic_json_validator_rejects_silly_whitespace():
-    potential = ValidateJSON()
+async def test_json_validator_rejects_silly_whitespace():
+    potential = FullValidatorJsonSchema({"type": "object"})
     assert await potential.prefix(b"\n\n\n") == -float("inf")
     assert await potential.complete(b"\n\n\n") == -float("inf")
 
@@ -733,36 +814,6 @@ def json_schema_potential_problem_multi(draw):
 
 
 @pytest.mark.asyncio
-@example(
-    problem=JSONSchemaPotentialProblemMulti(
-        schema={"type": "boolean"},
-        document=b"false",
-        values=[b"f", b"fa", b"fal", b"f"],
-    ),
-    cache_size=1,
-)
-@example(
-    problem=JSONSchemaPotentialProblemMulti(
-        schema={"type": "boolean"},
-        document=b"false",
-        values=[b"f", b"fa", b"f", b"fa", b"fal", b"f", b"fa", b"fal", b"fals"],
-    ),
-    cache_size=5,
-)
-@given(json_schema_potential_problem_multi(), st.integers(1, 100))
-@settings(report_multiple_bugs=False, deadline=None)
-async def test_cache_eviction_with_many_prefixes(problem, cache_size):
-    potential = StreamingJsonSchema(problem.schema, cache_size=cache_size)
-
-    results = list(
-        await asyncio.gather(*[potential.prefix(value) for value in problem.values])
-    )
-    assert all(result == 0.0 for result in results)
-
-    assert await potential.complete(problem.document) == 0.0
-
-
-@pytest.mark.asyncio
 async def test_can_reject_wrong_type_inside_any_of():
     schema = {
         "anyOf": [
@@ -815,7 +866,7 @@ async def test_can_reject_early_in_any_of():
 
 @pytest.mark.asyncio
 async def test_will_reject_invalid_unicode_at_end():
-    potential = StreamingJsonSchema({"type": "object"})
+    potential = FullValidatorJsonSchema({"type": "object"})
     assert await potential.prefix(b"{ }\n\n    \xe2\x9d\x8d\xb0") == -float("inf")
 
 
@@ -850,10 +901,11 @@ def test_chunking_bails_early_on_invalid_start_bytes():
 
 @pytest.mark.asyncio
 async def test_long_whitespace_at_start_is_rejected():
-    assert await ValidateJSON().prefix(b"  ") == 0
-    assert await ValidateJSON().prefix(b"\n\n") == 0
-    assert await ValidateJSON().prefix(b"    ") == -float("inf")
-    assert await ValidateJSON().prefix(b"\n\n  ") == -float("inf")
+    validator = FullValidatorJsonSchema({"type": "object"})
+    assert await validator.prefix(b"  ") == 0
+    assert await validator.prefix(b"\n\n") == 0
+    assert await validator.prefix(b"    ") == -float("inf")
+    assert await validator.prefix(b"\n\n  ") == -float("inf")
 
 
 @pytest.mark.asyncio
@@ -1346,7 +1398,7 @@ async def test_empty_object_allows_keys():
 
 @pytest.mark.asyncio
 async def test_enum_parsing():
-    values = [1, "two", "twin", 3.0]
+    values = ["two", "twin"]
     parser = json_schema_parser({"enum": values})
 
     for v in values:
@@ -1368,12 +1420,12 @@ async def test_enum_parsing():
 
 @pytest.mark.asyncio
 async def test_single_value_enum():
-    values = [1]
+    values = ["1"]
     parser = json_schema_parser({"enum": values})
-    await parser.parse_string("1")
+    await parser.parse_string('"1"')
 
     with pytest.raises(ParseError):
-        await parser.parse_string("2")
+        await parser.parse_string('"2')
 
 
 @pytest.mark.asyncio
@@ -1416,3 +1468,88 @@ async def test_catches_error_before_close_of_string():
 
     with pytest.raises(ParseError):
         await parser.parse_string('{"location" : "Miami, Flo')
+
+
+@pytest.mark.asyncio
+@example(
+    contents=[""],
+    test_strings=["0"],
+)
+@example(
+    contents=["", "00"],
+    test_strings=["0"],
+)
+@example(
+    contents=["010"],
+    test_strings=["00"],
+)
+@example(
+    contents=["", "01"],
+    test_strings=["00"],
+)
+@given(
+    contents=st.lists(st.text(), unique=True, min_size=1),
+    test_strings=st.lists(st.text(min_size=1), unique=True),
+)
+async def test_fixed_set_parser(contents, test_strings):
+    parser = FixedSetParser(contents)
+
+    for s in contents:
+        input = Input(TrivialSource(s))
+        result = await parser.parse(input)
+        assert result == s
+        assert input.index == len(s)
+
+    for s in test_strings:
+        try:
+            t = await parser.parse_string(s)
+        except ParseError:
+            for c in contents:
+                assert not s.startswith(c)
+        except Incomplete:
+            for c in contents:
+                assert not s.startswith(c)
+            assert any(c.startswith(s) for c in contents)
+        else:
+            assert t in contents
+            assert s.startswith(t)
+            for t2 in contents:
+                if s.startswith(t2):
+                    assert len(t2) <= len(t)
+
+
+def test_fixed_set_parser_not_empty():
+    with pytest.raises(ValueError):
+        FixedSetParser(())
+
+
+@pytest.mark.parametrize(
+    "document,expected", [(b"1", b""), (b'["foo", b"ba', b'["foo",')]
+)
+def test_prune_to_validatable_prefix(document, expected):
+    assert prune_to_validatable_prefix(document) == expected
+
+
+@pytest.mark.asyncio
+async def test_parser_with_empty_properties():
+    parser = json_schema_parser({"type": "object", "properties": {}})
+
+    await parser.parse_string('{"foo": 1}')
+
+
+@pytest.mark.asyncio
+async def test_whitespace_parser_rejects_unicode_whitespace():
+    with pytest.raises(ParseError):
+        await WHITESPACE_PARSER.parse_string("\u3000")
+
+
+def test_trie_adding_prefix_of_existing():
+    trie = PatriciaTrie(["foobar"])
+
+    trie.add_string("foo")
+
+    assert trie.root.prefix == "foo"
+    assert trie.root.accepting
+
+    assert trie.root.children["b"].prefix == "ar"
+    assert trie.root.children["b"].accepting

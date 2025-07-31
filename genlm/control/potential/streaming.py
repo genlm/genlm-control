@@ -1,12 +1,7 @@
 from genlm.control.potential.stateful import StatefulPotential, ParticleState
 from abc import ABC, abstractmethod
-from typing import Any, Iterable
-from queue import SimpleQueue
 from enum import Enum, auto
-from threading import Thread
 import asyncio
-import random
-import time
 
 
 class Responses(Enum):
@@ -27,181 +22,6 @@ PING_TOKEN = UniqueIdentifier("PING_TOKEN")
 SHUTDOWN_TOKEN = UniqueIdentifier("SHUTDOWN_TOKEN")
 
 
-class Timeout(Exception):
-    pass
-
-
-def timeout_sequence():
-    start = time.time()
-    # Initially we just yield to the the event loop
-    for _ in range(3):
-        yield 0.0
-    # Then we do a series of short sleeps
-    for _ in range(3):
-        yield random.random() * 0.01
-    sleep = 0.015
-    while time.time() < start + 30:
-        yield random.random() * sleep
-        sleep = min(sleep * 1.1, 1)
-    raise Timeout(f"Timed out after {time.time() - start:.2f}s")
-
-
-class RunningInThread:
-    def __init__(self, function):
-        self.incoming_data = SimpleQueue()
-        self.responses = SimpleQueue()
-        self.last_message = None
-        self.running = False
-        self.complete = False
-        self.error = None
-        self.function = function
-
-    def __chunks(self):
-        while True:
-            self.last_message, chunk = self.incoming_data.get()
-            if chunk is SHUTDOWN_TOKEN:
-                break
-            if chunk:
-                yield chunk
-            self.responses.put((self.last_message, Responses.INCOMPLETE))
-
-    def run(self):
-        assert not self.running
-        try:
-            self.running = True
-            self.last_message, chunk = self.incoming_data.get()
-            assert chunk == PING_TOKEN
-            self.responses.put((self.last_message, Responses.INCOMPLETE))
-            result = self.function(self.__chunks())
-        except Exception as e:
-            self.error = e
-            self.responses.put((self.last_message, Responses.ERROR, e))
-        else:
-            self.responses.put((self.last_message, Responses.COMPLETE, result))
-        finally:
-            self.running = False
-            self.complete = True
-
-
-class StreamingState(ParticleState):
-    def __init__(self, owner):
-        super().__init__(owner)
-        self.__token = 0
-        self.__background = None
-        self.__background_thread = None
-        self.__score = 0.0
-        self.__shut_down = False
-        self.diagnostics = {}
-
-    def __new_token(self):
-        self.__token += 1
-        return self.__token
-
-    async def __initialize_background(self):
-        if self.__background is None:
-            self.__background = RunningInThread(self.owner.calculate_score_from_stream)
-
-            # Sometimes, especially in consistency check tests, we have too many threads
-            # running and need to wait before we're able to start a new thread.
-            for t in timeout_sequence():
-                try:
-                    self.__background_thread = Thread(
-                        target=self.__background.run, daemon=True
-                    )
-                    self.__background_thread.start()
-                    break
-                except RuntimeError:
-                    await asyncio.sleep(t)
-            await self.__send_message(PING_TOKEN)
-            assert self.__background.running or self.__background.complete
-        assert self.__background is not None
-
-    async def impl_update_context(self, incremental_context):
-        await self.__initialize_background()
-        finish = False
-        if incremental_context and incremental_context[-1] == self.owner.eos:
-            finish = True
-            incremental_context = incremental_context[:-1]
-        await self.__send_message(bytes(incremental_context))
-        if finish:
-            await self.finish()
-
-    async def impl_finish(self):
-        await self.__initialize_background()
-        self.shutdown()
-
-    async def start(self):
-        await self.__initialize_background()
-        await self.__send_message(b"")
-
-    @property
-    def current_score(self):
-        return self.__score
-
-    async def __send_message(self, message):
-        if self.__background.complete:
-            if self.__background.error and "error" not in self.diagnostics:
-                self.__score = -float("inf")
-                self.diagnostics["error"] = self.__background.error
-            return
-
-        token = self.__new_token()
-        self.__background.incoming_data.put((token, message))
-
-        for timeout in timeout_sequence():
-            if not self.__background.responses.empty():
-                break
-            await asyncio.sleep(timeout)
-        self.__receive_response(token)
-
-    def __receive_response(self, token):
-        while True:
-            # In some error cases we can fail to acknowledge a response. We just silently
-            # drop these.
-            response_token, response_type, *payload = self.__background.responses.get()
-            assert response_token <= token
-            if token == response_token:
-                break
-        assert token == response_token, (token, response_token, response_type)
-        match response_type:
-            case Responses.INCOMPLETE:
-                pass
-            case Responses.COMPLETE:
-                self.__score = payload[0] or 0.0
-            case Responses.ERROR:
-                self.__score = -float("inf")
-                self.diagnostics["error"] = payload[0]
-
-    def shutdown(self):
-        if self.__shut_down:
-            return
-        self.__shut_down = True
-        if self.__background_thread is not None and self.__background_thread.is_alive():
-            token = self.__new_token()
-            self.__background.incoming_data.put((token, SHUTDOWN_TOKEN))
-            # Should in fact terminate very fast. Long timeout here for debugging purposes
-            # only - we want a log if it hangs.
-            self.__background_thread.join(timeout=1.0)
-            self.__receive_response(token)
-
-    def __del__(self):
-        self.shutdown()
-
-
-class StreamingPotential(StatefulPotential, ABC):
-    def __init__(self, vocabulary, token_type=None, eos=None, **kwargs):
-        super().__init__(
-            vocabulary=vocabulary,
-            token_type=token_type,
-            eos=eos,
-            state_class=StreamingState,
-            **kwargs,
-        )
-
-    @abstractmethod
-    def calculate_score_from_stream(self, stream: Iterable[Any]) -> float: ...
-
-
 # This should be an async generator really but async generators
 # are fundamentally broken. See https://peps.python.org/pep-0789/
 # I kept running into problems with this during implementation, so
@@ -218,11 +38,9 @@ class Chunks(AsyncSource):
         self.__first = True
 
     async def more(self):
-        if not self.__first:
-            await self.running_in_task.responses.put(
-                (self.running_in_task.last_message, Responses.INCOMPLETE)
-            )
-        self.__first = False
+        await self.running_in_task.responses.put(
+            (self.running_in_task.last_message, Responses.INCOMPLETE)
+        )
         (
             self.running_in_task.last_message,
             chunk,
@@ -247,7 +65,6 @@ class RunningInTask:
             self.running = True
             self.last_message, chunk = await self.incoming_data.get()
             assert chunk == PING_TOKEN
-            await self.responses.put((self.last_message, Responses.INCOMPLETE))
             chunks = Chunks(self)
             result = await self.function(chunks)
         except Exception as e:
@@ -271,6 +88,7 @@ class AsyncStreamingState(ParticleState):
         self.__token = 0
         self.__background = None
         self.__score = 0.0
+        self.diagnostics = {}
 
     def __new_token(self):
         self.__token += 1
@@ -323,6 +141,7 @@ class AsyncStreamingState(ParticleState):
             case Responses.COMPLETE:
                 self.__score = payload[0] or 0.0
             case Responses.ERROR:
+                self.diagnostics["error"] = payload
                 self.__score = -float("inf")
 
     async def shutdown(self):
