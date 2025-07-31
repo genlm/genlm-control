@@ -56,27 +56,42 @@ class Product(Potential):
                 )
             )
 
-        common_vocab = list(set(p1.vocab) & set(p2.vocab))
-        if not common_vocab:
-            raise ValueError("Potentials in product must share a common vocabulary")
+        if self.p1.vocab == self.p2.vocab:
+            self._v1_idxs = ...
+            self._v2_idxs = ...
+            super().__init__(self.p1.vocab, token_type=self.token_type)
+        else:
+            common_vocab = list(set(p1.vocab) & set(p2.vocab))
+            if not common_vocab:
+                raise ValueError("Potentials in product must share a common vocabulary")
 
-        # Check for small vocabulary overlap
-        threshold = 0.1
-        for potential, name in [(p1, "p1"), (p2, "p2")]:
-            overlap_ratio = len(common_vocab) / len(potential.vocab)
-            if overlap_ratio < threshold:
-                warnings.warn(
-                    f"Common vocabulary ({len(common_vocab)} tokens) is less than {threshold * 100}% "
-                    f"of {name}'s ({potential!r}) vocabulary ({len(potential.vocab)} tokens). "
-                    "This Product potential only operates on this relatively small subset of tokens.",
-                    RuntimeWarning,
-                )
+            # Check for small vocabulary overlap
+            threshold = 0.1
+            for potential, name in [(p1, "p1"), (p2, "p2")]:
+                overlap_ratio = len(common_vocab) / len(potential.vocab)
+                if overlap_ratio < threshold:
+                    warnings.warn(
+                        f"Common vocabulary ({len(common_vocab)} tokens) is less than {threshold * 100}% "
+                        f"of {name}'s ({potential!r}) vocabulary ({len(potential.vocab)} tokens). "
+                        "This Product potential only operates on this relatively small subset of tokens.",
+                        RuntimeWarning,
+                    )
 
-        super().__init__(common_vocab, token_type=self.token_type)
+            self._v1_idxs = None
+            self._v2_idxs = None
+            super().__init__(common_vocab, token_type=self.token_type)
 
-        # For fast products of weights
-        self.v1_idxs = [p1.lookup[token] for token in self.vocab_eos]
-        self.v2_idxs = [p2.lookup[token] for token in self.vocab_eos]
+    @property
+    def v1_idxs(self):
+        if self._v1_idxs is None:
+            self._v1_idxs = [self.p1.lookup[token] for token in self.vocab_eos]
+        return self._v1_idxs
+
+    @property
+    def v2_idxs(self):
+        if self._v2_idxs is None:
+            self._v2_idxs = [self.p2.lookup[token] for token in self.vocab_eos]
+        return self._v2_idxs
 
     async def prefix(self, context):
         w1 = await self.p1.prefix(context)
