@@ -41,7 +41,7 @@ class Product(Potential):
         self.p2 = p2
 
         if self.p1.token_type == self.p2.token_type:
-            self.token_type = self.p1.token_type
+            token_type = self.p1.token_type
         else:
             raise ValueError(
                 "Potentials in product must have the same token type. "
@@ -56,12 +56,24 @@ class Product(Potential):
                 )
             )
 
-        common_vocab = list(set(p1.vocab) & set(p2.vocab))
-        if not common_vocab:
-            raise ValueError("Potentials in product must share a common vocabulary")
+        if self.p1.vocab == self.p2.vocab:
+            self._v1_idxs = ...
+            self._v2_idxs = ...
+            super().__init__(self.p1.vocab, token_type=token_type)
 
-        # Check for small vocabulary overlap
-        threshold = 0.1
+        else:
+            common_vocab = list(set(self.p1.vocab) & set(self.p2.vocab))
+            if not common_vocab:
+                raise ValueError("Potentials in product must share a common vocabulary")
+
+            self._check_vocab_overlap(common_vocab, self.p1, self.p2, threshold=0.1)
+
+            self._v1_idxs = None
+            self._v2_idxs = None
+
+            super().__init__(common_vocab, token_type=token_type)
+
+    def _check_vocab_overlap(self, common_vocab, p1, p2, threshold=0.1):
         for potential, name in [(p1, "p1"), (p2, "p2")]:
             overlap_ratio = len(common_vocab) / len(potential.vocab)
             if overlap_ratio < threshold:
@@ -72,11 +84,17 @@ class Product(Potential):
                     RuntimeWarning,
                 )
 
-        super().__init__(common_vocab, token_type=self.token_type)
+    @property
+    def v1_idxs(self):
+        if self._v1_idxs is None:
+            self._v1_idxs = [self.p1.lookup[token] for token in self.vocab_eos]
+        return self._v1_idxs
 
-        # For fast products of weights
-        self.v1_idxs = [p1.lookup[token] for token in self.vocab_eos]
-        self.v2_idxs = [p2.lookup[token] for token in self.vocab_eos]
+    @property
+    def v2_idxs(self):
+        if self._v2_idxs is None:
+            self._v2_idxs = [self.p2.lookup[token] for token in self.vocab_eos]
+        return self._v2_idxs
 
     async def prefix(self, context):
         w1 = await self.p1.prefix(context)

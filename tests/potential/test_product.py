@@ -20,32 +20,47 @@ class SimplePotential(Potential):
         return SimplePotential(self.vocab, scale=self.scale)
 
 
-@pytest.fixture
-def vocab():
-    return [b"a", b"b", b"c"]
+VOCAB_CASES = {
+    "same_vocab": ([b"a", b"b", b"c"], [b"a", b"b", b"c"]),
+    "different_vocabs": ([b"a", b"b", b"c"], [b"a", b"b", b"d"]),
+}
 
 
-@pytest.fixture
-def p1(vocab):
-    return SimplePotential(vocab, scale=1.0)
-
-
-@pytest.fixture
-def p2(vocab):
-    return SimplePotential(vocab, scale=2.0)
-
-
-@pytest.fixture
-def product(p1, p2):
+@pytest.fixture(params=list(VOCAB_CASES.keys()))
+def product(request):
+    v1, v2 = VOCAB_CASES[request.param]
+    p1 = SimplePotential(v1, scale=1.0)
+    p2 = SimplePotential(v2, scale=2.0)
     return Product(p1, p2)
 
 
-def test_initialization(vocab, p1, p2):
-    # Test successful initialization
-    product = Product(p1, p2)
+def test_initialization_same_vocab():
+    base_vocab = [b"a", b"b", b"c"]
+    product = Product(
+        SimplePotential(base_vocab, scale=1.0), SimplePotential(base_vocab, scale=2.0)
+    )
     assert product.token_type == Atomic(bytes)
-    assert len(product.vocab) == len(vocab)
-    assert set(product.vocab) == set(vocab)
+    assert len(product.vocab) == len(base_vocab)
+    assert product.vocab == base_vocab
+    assert product.v1_idxs == ...
+    assert product.v2_idxs == ...
+
+
+def test_initialization_different_vocab():
+    product = Product(
+        SimplePotential([b"a", b"b", b"c"], scale=1.0),
+        SimplePotential([b"a", b"b", b"d"], scale=2.0),
+    )
+    assert product.token_type == Atomic(bytes)
+    assert len(product.vocab) == 2
+    assert product.v1_idxs != ...
+    assert product.v2_idxs != ...
+    assert len(product.v1_idxs) == 3  # (2 + eos)
+    assert len(product.v2_idxs) == 3  # (2 + eos)
+
+
+def test_vocab_errors():
+    p1 = SimplePotential([b"a", b"b", b"c"], scale=1.0)
 
     # Test mismatched token types
     class DifferentPotential(SimplePotential):
@@ -58,7 +73,7 @@ def test_initialization(vocab, p1, p2):
         Product(p1, DifferentPotential())
 
     # Test non-overlapping vocabularies
-    p3 = SimplePotential([b"d", b"e", b"f"])
+    p3 = SimplePotential([b"e", b"f", b"g"])
     with pytest.raises(
         ValueError, match="Potentials in product must share a common vocabulary"
     ):
@@ -119,9 +134,9 @@ async def test_batch_operations(product):
 @pytest.mark.asyncio
 async def test_properties(product):
     # Test the inherited property checks
-    await product.assert_logw_next_consistency([b"b", b"c"], verbosity=1)
-    await product.assert_autoreg_fact([b"b", b"c"], verbosity=1)
-    await product.assert_batch_consistency([[b"b", b"c"], [b"a"]], verbosity=1)
+    await product.assert_logw_next_consistency([b"b", b"a"], verbosity=1)
+    await product.assert_autoreg_fact([b"b", b"a"], verbosity=1)
+    await product.assert_batch_consistency([[b"b", b"a"], [b"a"]], verbosity=1)
 
 
 def test_product_repr(product):
