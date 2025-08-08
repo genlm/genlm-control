@@ -1553,3 +1553,23 @@ def test_trie_adding_prefix_of_existing():
 
     assert trie.root.children["b"].prefix == "ar"
     assert trie.root.children["b"].accepting
+
+
+@pytest.mark.asyncio
+async def test_rejects_if_required_keys_are_missing():
+    parser = json_schema_parser(
+        {
+            "type": "object",
+            "properties": {"foo": {"type": "string"}, "bar": {"type": "number"}},
+            "required": ["foo"],
+        }
+    )
+
+    for incomplete in [
+        "{}",
+        '{"bar": 0.0}',
+    ]:
+        with pytest.raises(ParseError):
+            await parser.parse_string(incomplete)
+
+    assert await parser.parse_string('{"foo": "hello"}') == {"foo": "hello"}
