@@ -855,6 +855,11 @@ class ObjectSchemaParser(Parser[Any]):
         while True:
             await input.skip_whitespace()
             if await input.current_char() == "}":
+                if not self.required_keys.issubset(keys_seen):
+                    raise ParseError(
+                        "Missing keys: "
+                        + ", ".join(map(json.dumps, self.required_keys))
+                    )
                 await input.read(1)
                 break
             if not first:
