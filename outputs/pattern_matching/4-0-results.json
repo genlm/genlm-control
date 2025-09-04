@@ -1,0 +1,16 @@
+{
+    "weighted_accuracy": 1.0,
+    "runtime_seconds": null,
+    "results": [
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        }
+    ]
+}

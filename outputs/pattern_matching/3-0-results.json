@@ -1,0 +1,71 @@
+{
+    "weighted_accuracy": 0.9999999999999998,
+    "runtime_seconds": null,
+    "results": [
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        },
+        {
+            "score": 1.0,
+            "desc": "valid",
+            "metadata": {}
+        }
+    ]
+}

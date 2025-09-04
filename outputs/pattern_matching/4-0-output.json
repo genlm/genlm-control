@@ -1,0 +1,16 @@
+{
+    "responses": [
+        {
+            "response": "1871e105-4ee1-4a4a-a4c8-ab9c57a38ffd",
+            "weight": 0.8125,
+            "metadata": null
+        },
+        {
+            "response": "1871e105-4ee1-4a4a-a4c8-ab9c57a3fe8d",
+            "weight": 0.18750000000000003,
+            "metadata": null
+        }
+    ],
+    "runtime_seconds": null,
+    "metadata": null
+}

@@ -1,0 +1,11 @@
+{
+    "responses": [
+        {
+            "response": "abc",
+            "weight": 1.0,
+            "metadata": null
+        }
+    ],
+    "runtime_seconds": null,
+    "metadata": null
+}

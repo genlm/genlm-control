@@ -1,0 +1,71 @@
+{
+    "responses": [
+        {
+            "response": "b5-9F-9F-9F-9F-9F",
+            "weight": 0.17241379310344826,
+            "metadata": null
+        },
+        {
+            "response": "b5-fa-e5-e5-e5-e5",
+            "weight": 0.13793103448275862,
+            "metadata": null
+        },
+        {
+            "response": "b5-b5-b5-b5-b5-b6",
+            "weight": 0.13793103448275862,
+            "metadata": null
+        },
+        {
+            "response": "b5-fa-b6-b7-9f-f8",
+            "weight": 0.10344827586206896,
+            "metadata": null
+        },
+        {
+            "response": "b5-b6-b7-b8-b9-ca",
+            "weight": 0.10344827586206896,
+            "metadata": null
+        },
+        {
+            "response": "b5-fa-b6-b7-b8-b9",
+            "weight": 0.06896551724137931,
+            "metadata": null
+        },
+        {
+            "response": "b5-9C-c8-9d-9e-cF",
+            "weight": 0.06896551724137931,
+            "metadata": null
+        },
+        {
+            "response": "b5-fa-b2-ef-f4-4b",
+            "weight": 0.034482758620689655,
+            "metadata": null
+        },
+        {
+            "response": "b5-b5-b5-b5-b5-b5",
+            "weight": 0.034482758620689655,
+            "metadata": null
+        },
+        {
+            "response": "b5-fa-b2-ef-e8-b9",
+            "weight": 0.034482758620689655,
+            "metadata": null
+        },
+        {
+            "response": "b5-b6-b7-b8-b9-bb",
+            "weight": 0.034482758620689655,
+            "metadata": null
+        },
+        {
+            "response": "b5-b6-b7-b8-b9-a0",
+            "weight": 0.034482758620689655,
+            "metadata": null
+        },
+        {
+            "response": "b5-fa-b6-b7-9f-fb",
+            "weight": 0.034482758620689655,
+            "metadata": null
+        }
+    ],
+    "runtime_seconds": null,
+    "metadata": null
+}

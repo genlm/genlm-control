@@ -1,0 +1,26 @@
+{
+    "responses": [
+        {
+            "response": "\n]",
+            "weight": 0.8571151500527381,
+            "metadata": null
+        },
+        {
+            "response": "_]",
+            "weight": 0.09580997074466703,
+            "metadata": null
+        },
+        {
+            "response": "/]",
+            "weight": 0.023814294378893767,
+            "metadata": null
+        },
+        {
+            "response": "&]",
+            "weight": 0.023260584823701188,
+            "metadata": null
+        }
+    ],
+    "runtime_seconds": null,
+    "metadata": null
+}
