@@ -29,10 +29,11 @@ class TokenMappings(NamedTuple):
     """
 
     decode: list[bytes]  # token_id -> bytes
-    encode: dict[bytes, int]  # bytes -> token_id
+    encode: dict[bytes, int]  # bytes -> token_id (arbitrary when duplicates exist)
     eos_idxs: list[int]  # IDs of EOS tokens
     eos_tokens: list[bytes]  # EOS tokens
-    potential_vocab: list[bytes]  # tokens in the potential's vocabulary
+    potential_vocab: list[bytes]  # tokens in the potential's vocabulary (non-EOS, deduplicated)
+    non_eos_id_groups: list[list[int]]  # groups of LM token IDs that map to the same bytes token in potential_vocab
 
     @classmethod
     def create(cls, decode, eos_tokens):
@@ -43,13 +44,29 @@ class TokenMappings(NamedTuple):
             raise ValueError("EOS token not in language model vocabulary")
         eos_idxs = [encode[eos] for eos in eos_tokens]
         eos_tokens_set = set(eos_tokens)
-        potential_vocab = [x for x in decode if x not in eos_tokens_set]
+
+        # Build groups of non-EOS LM token IDs keyed by their bytes token, preserving first occurrence order.
+        group_map = {}
+        first_index = {}
+        for idx, tok in enumerate(decode):
+            if tok in eos_tokens_set:
+                continue
+            if tok in group_map:
+                group_map[tok].append(idx)
+            else:
+                group_map[tok] = [idx]
+                first_index[tok] = idx
+
+        potential_vocab = sorted(group_map.keys(), key=lambda t: first_index[t])
+        non_eos_id_groups = [group_map[tok] for tok in potential_vocab]
+
         return cls(
             decode=decode,
             encode=encode,
             eos_idxs=eos_idxs,
             eos_tokens=eos_tokens,
             potential_vocab=potential_vocab,
+            non_eos_id_groups=non_eos_id_groups,
         )
 
 
@@ -312,20 +329,18 @@ class PromptedLLM(Potential):
         # This is ugly, but it's useful for all potentials to adhere to the convention
         # of keeping the EOS token at the end of the weights array.
 
-        # Cache eos_idxs_tensor and non_eos_indices on first use
+        # Cache eos and non-eos grouping tensors on first use or when device changes
         if (
             not hasattr(self, "_eos_idxs_tensor")
-            or not hasattr(self, "_non_eos_indices")
+            or not hasattr(self, "_non_eos_groups")
             or self._eos_idxs_tensor.device != logw_next.device
         ):
             self._eos_idxs_tensor = torch.tensor(
                 self.token_maps.eos_idxs, device=logw_next.device
             )
-            all_indices = torch.arange(
-                len(self.token_maps.decode), device=logw_next.device
-            )
-            self._non_eos_indices = all_indices[
-                ~torch.isin(all_indices, self._eos_idxs_tensor)
+            self._non_eos_groups = [
+                torch.tensor(group, device=logw_next.device)
+                for group in self.token_maps.non_eos_id_groups
             ]
 
         logw_next = logw_next[: len(self.token_maps.decode)]
@@ -336,7 +351,12 @@ class PromptedLLM(Potential):
             dtype=logw_next.dtype,
             device=logw_next.device,
         )
-        _logw_next[: len(self.vocab)] = logw_next[self._non_eos_indices]
+        # Aggregate duplicate-id groups via logsumexp so each unique bytes token has a single score
+        if len(self._non_eos_groups) > 0:
+            aggregated = torch.stack(
+                [torch.logsumexp(logw_next[idxs], dim=0) for idxs in self._non_eos_groups]
+            )
+            _logw_next[: len(self.vocab)] = aggregated
 
         # Special case: if only one EOS idx, just assign directly (avoids cost of logsumexp)
         if self._eos_idxs_tensor.numel() == 1:
