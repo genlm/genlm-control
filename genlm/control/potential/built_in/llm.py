@@ -329,19 +329,36 @@ class PromptedLLM(Potential):
         # This is ugly, but it's useful for all potentials to adhere to the convention
         # of keeping the EOS token at the end of the weights array.
 
-        # Cache eos and non-eos grouping tensors on first use or when device changes
-        if (
+        # Prepare cached tensors; also guard against logits size differing from decode size by filtering indices
+        lm_dim = logw_next.shape[0]
+        need_rebuild = (
             not hasattr(self, "_eos_idxs_tensor")
             or not hasattr(self, "_non_eos_groups")
-            or self._eos_idxs_tensor.device != logw_next.device
-        ):
-            self._eos_idxs_tensor = torch.tensor(
-                self.token_maps.eos_idxs, device=logw_next.device
-            )
-            self._non_eos_groups = [
-                torch.tensor(group, device=logw_next.device)
-                for group in self.token_maps.non_eos_id_groups
-            ]
+            or getattr(self, "_groups_cache_device", None) != logw_next.device
+            or getattr(self, "_groups_cache_dim", None) != lm_dim
+        )
+        if need_rebuild:
+            self._groups_cache_device = logw_next.device
+            self._groups_cache_dim = lm_dim
+
+            # Filter EOS indices to those within logits dimension
+            eos_idxs = [i for i in self.token_maps.eos_idxs if i < lm_dim]
+            if not eos_idxs:
+                raise ValueError(
+                    "No valid EOS indices within logits dimension; model/tokenizer mismatch."
+                )
+            self._eos_idxs_tensor = torch.tensor(eos_idxs, device=logw_next.device)
+
+            # Filter each non-EOS group to valid indices
+            filtered_groups = []
+            for group in self.token_maps.non_eos_id_groups:
+                valid = [i for i in group if i < lm_dim]
+                if valid:
+                    filtered_groups.append(torch.tensor(valid, device=logw_next.device))
+                else:
+                    # Placeholder empty tensor; will yield -inf after aggregation handling
+                    filtered_groups.append(torch.tensor([], device=logw_next.device, dtype=torch.long))
+            self._non_eos_groups = filtered_groups
 
         logw_next = logw_next[: len(self.token_maps.decode)]
         logw_next = logw_next.log_softmax(dim=0)
@@ -353,9 +370,19 @@ class PromptedLLM(Potential):
         )
         # Aggregate duplicate-id groups via logsumexp so each unique bytes token has a single score
         if len(self._non_eos_groups) > 0:
-            aggregated = torch.stack(
-                [torch.logsumexp(logw_next[idxs], dim=0) for idxs in self._non_eos_groups]
-            )
+            agg_values = []
+            for idxs in self._non_eos_groups:
+                if idxs.numel() == 0:
+                    agg_values.append(
+                        torch.tensor(
+                            float("-inf"), dtype=logw_next.dtype, device=logw_next.device
+                        )
+                    )
+                elif idxs.numel() == 1:
+                    agg_values.append(logw_next[idxs.item()])
+                else:
+                    agg_values.append(torch.logsumexp(logw_next[idxs], dim=0))
+            aggregated = torch.stack(agg_values)
             _logw_next[: len(self.vocab)] = aggregated
 
         # Special case: if only one EOS idx, just assign directly (avoids cost of logsumexp)
