@@ -13,6 +13,10 @@ def load_model_by_name(name, backend, **kwargs):
         from genlm.backend.llm import AsyncTransformer
 
         model_cls = AsyncTransformer
+    elif backend == "mlx":
+        from genlm.backend.llm import AsyncMlxLM
+
+        model_cls = AsyncMlxLM
     else:
         raise ValueError(
             f"Unknown backend: {backend}. Must be one of ['vllm', 'hf']"
