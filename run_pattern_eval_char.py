@@ -1,6 +1,7 @@
 import asyncio
 import os
 from typing import List
+import argparse
 
 import pandas as pd
 
@@ -19,16 +20,21 @@ from genlm.eval.domains.pattern_matching import (
 
 # Path to the pattern dataset (same as in test_eval.py)
 PATTERNS_CSV = \
-    "/Users/yemara/Desktop/genlm/genlm-eval/assets/pattern_matching/patterns.csv"
+    "../genlm-eval/assets/pattern_matching/patterns.csv"
 
 
 def build_bytelm():
+    # llm = load_model_by_name("unsloth/Qwen3-4B-128K-GGUF", backend="hf")
+    # llm = load_model_by_name("allenai/OLMo-2-0425-1B", backend="hf") 
+    # llm = load_model_by_name("meta-llama/Llama-3.2-1B-Instruct", backend="hf")
     llm = load_model_by_name("gpt2", backend="hf")
+    # llm = load_model_by_name("deepseek-ai/deepseek-coder-1.3b-base", backend="hf")
     # Match test_eval.py EOS handling and healing config
     beam_params = BeamParams(
-        K=1,
+        K=5,
         prune_threshold=0.0,
         eos_tokens={b"\n", b"\n\n"},
+        # eos_tokens={b"\n"},
         heal=True,
     )
     return ByteLLM(llm, beam_params)
@@ -52,8 +58,8 @@ async def pattern_model_adaptor(instance, output_dir: str, replicate: int) -> Mo
     sequences = await sampler.smc(
         n_particles=5,
         ess_threshold=0.5,
-        max_tokens=200,
-        verbosity=1,  # print SMC particle states each step
+        max_tokens=100,
+        verbosity=0,  # print SMC particle states each step
     )
 
     # Show outputs for this instance
@@ -71,6 +77,17 @@ async def pattern_model_adaptor(instance, output_dir: str, replicate: int) -> Mo
 
 
 async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--end_idx", type=int, default=None)  # exclusive
+    parser.add_argument(
+        "--skip_idxs",
+        type=str,
+        default="",
+        help="Comma or space separated original indices to skip (e.g., '133,275').",
+    )
+    args = parser.parse_args()
+
     global BYTE_LLM
     BYTE_LLM = build_bytelm()
 
@@ -78,6 +95,27 @@ async def main():
     print(pd.read_csv(PATTERNS_CSV, nrows=0).columns.tolist())
 
     dataset = PatternMatchingDataset.from_csv(PATTERNS_CSV, pattern_column="regex")
+
+    # Parse skip indices into a set
+    skip_set = set()
+    if args.skip_idxs:
+        for tok in args.skip_idxs.replace(",", " ").split():
+            try:
+                skip_set.add(int(tok))
+            except ValueError:
+                pass
+
+    # Slice and filter by original indices (start/end are applied to original order)
+    selected = []
+    for i, inst in enumerate(dataset):
+        if i in skip_set:
+            continue
+        if i < args.start_idx:
+            continue
+        if args.end_idx is not None and i >= args.end_idx:
+            break
+        selected.append(inst)
+    dataset = selected
     evaluator = PatternMatchingEvaluator()
 
     # Limit to first 5 instances using max_instances
@@ -89,7 +127,7 @@ async def main():
         n_replicates=1,
         overwrite_results=False,
         overwrite_outputs=False,
-        max_instances=20,
+        # max_instances=5,
         verbosity=1,
     )
 

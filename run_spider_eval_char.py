@@ -12,17 +12,20 @@ from genlm.eval.domains.spider.spider import (
     default_prompt_formatter,
 )
 from genlm.eval.domains.spider.table_column_potential import SpiderTableColumnVerifier
+from pprint import pprint as pp
 
-
-# Paths to the sample Spider assets shipped in genlm-eval
-SPIDER_DATA_DIR = \
-    "/Users/yemara/Desktop/genlm/genlm-eval/assets/spider/spider_sample"
-SPIDER_GRAMMARS = \
-    "/Users/yemara/Desktop/genlm/genlm-eval/assets/spider/grammars.json"
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_TOKEN"] = "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"
+# "/teamspace/studios/this_studio/spider_data"
+SPIDER_DATA_DIR = "/teamspace/studios/this_studio/genlm-eval/assets/spider/spider_sample"
+# SPIDER_DATA_DIR = "/teamspace/studios/this_studio/spider_data"
+SPIDER_GRAMMARS = "/teamspace/studios/this_studio/genlm-eval/assets/spider/grammars.json"
 
 
 def build_bytelm():
-    llm = load_model_by_name("gpt2", backend="hf")
+    llm = load_model_by_name("meta-llama/Llama-3.2-1B-Instruct", backend="hf")
+    # llm = load_model_by_name("gpt2", backend="hf")
     model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
     beam_params = BeamParams(
         K=1,
@@ -36,29 +39,36 @@ def build_bytelm():
 async def spider_model_adaptor(instance, output_dir: str, replicate: int) -> ModelOutput:
     global BYTE_LLM
 
-    # Prepare prompt for this instance (chat template → prompt_ids → str)
-    # GPT-2 has no chat template; use a plain prompt format
     prompt_ids = default_prompt_formatter(
         BYTE_LLM.llm.tokenizer,
         instance,
         use_chat_format=False,
     )
-    BYTE_LLM.set_prompt_from_str(BYTE_LLM.llm.tokenizer.decode(prompt_ids))
+    prompt_text = BYTE_LLM.llm.tokenizer.decode(prompt_ids)
+    BYTE_LLM.set_prompt_from_str(prompt_text)
 
-    # Optional constraint: table/column verifier if grammar available
-    if instance.lark_grammar:
-        condition = SpiderTableColumnVerifier(
-            grammar=instance.lark_grammar, tables=instance.tables
-        ).coerce(BYTE_LLM, f=b"".join)
-        sampler = AWRS(BYTE_LLM, condition)
+    # Print few-shot examples being used
+    print("\n--- Few-shot examples ---")
+    if instance.few_shot_examples:
+        for i, (inp, out) in enumerate(instance.few_shot_examples):
+            preview = inp.replace("\n", " ")
+            if len(preview) > 200:
+                preview = preview[:200] + "..."
+            print(f"[{i}] Input: {preview}")
+            print(f"    Output: {out}")
     else:
-        # Fallback: no grammar available -> unconstrained LM sampling
-        sampler = direct_token_sampler(BYTE_LLM)
+        print("(none)")
+
+    # Print prompt and gold SQL for inspection
+    print("\n--- Prompt ---\n" + prompt_text)
+    print("\n--- Gold SQL ---\n" + instance.gold)
+    condition = SpiderTableColumnVerifier(grammar=instance.lark_grammar, tables=instance.tables).coerce(BYTE_LLM, f=b"".join)
+    sampler = AWRS(BYTE_LLM, condition)
 
     sequences = await sampler.smc(
-        n_particles=1,
-        ess_threshold=0.5,
-        max_tokens=400,
+        n_particles=2,
+        ess_threshold=0.9,
+        max_tokens=70,
         verbosity=1,
     )
 
@@ -69,7 +79,6 @@ async def spider_model_adaptor(instance, output_dir: str, replicate: int) -> Mod
         for seq, prob in sequences.decoded_posterior.items()
     ]
 
-    # Cleanup between instances to silence background task warnings
     await BYTE_LLM.cleanup()
 
     return ModelOutput(responses=responses, runtime_seconds=None)
@@ -80,10 +89,12 @@ async def main():
     BYTE_LLM = build_bytelm()
 
     dataset = SpiderDataset.from_spider_dir(
-        SPIDER_DATA_DIR, grammar_json_path=SPIDER_GRAMMARS, few_shot_example_ids=[0, 1]
+        SPIDER_DATA_DIR,
+        grammar_json_path=SPIDER_GRAMMARS,
+        few_shot_example_ids=[0,1],
     )
-    evaluator = SpiderEvaluator(SPIDER_DATA_DIR)
 
+    evaluator = SpiderEvaluator(SPIDER_DATA_DIR)
     results = await run_evaluation(
         dataset=dataset,
         model=spider_model_adaptor,
@@ -92,7 +103,7 @@ async def main():
         n_replicates=1,
         overwrite_results=False,
         overwrite_outputs=False,
-        max_instances=2,
+        max_instances=1,
         verbosity=1,
     )
 

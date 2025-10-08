@@ -1,0 +1,127 @@
+COMMANDS
+
+python run_pattern_eval_5.py --start_idx 5 --end_idx 11
+python -u run_pattern_eval_5.py --start_idx 5 --end_idx 11 |& tee test_idx.log  
+
+python run_spider_eval_token.py --start_idx 1 --end_idx 200 --skip_idxs 133,175
+python run_pattern_eval_token.py --start_idx 1 --end_idx 454 |& tee test_token_pattern.log
+---------------------------------------------------
+TO DO
+
+run token model pattern eval next for gpt2 and llama 3.2 1B, deepseek-ai/deepseek-coder-1.3b-base
+run char model for gpt2med, large adn see if it goes down in acc, then token model too
+now run all pattern eval for gpt2 and llama 3.2 1B
+then run text2sql for token model same models and see on first 100 whats the performance
+then run json
+
+get the spider eval working on 1, try it on token 
+should I be trying out different ess thresholds too?
+---------------------------------------------------
+TO RUN
+
+Byte Level:
+GPT2
+k, particles
+5,5: 0.955
+10, 5: 0.963
+16, 5: 0.965
+32, 5: 0.966
+5, 10: 0.972
+10,10: 
+16, 10: 
+32, 10: 
+
+GPT2-Medium
+k, particles
+5, 5: 
+10, 5:
+16, 5:
+32, 5:
+5, 10:
+10,10: 
+16, 10: 
+32, 10: 
+
+GPT2-Large
+k, particles
+5, 5: 
+10, 5:
+16, 5:
+32, 5:
+5, 10:
+10,10: 
+16, 10: 
+32, 10: 
+
+llama3.2-1B-instruct
+k, particles
+5, 5: 0.92
+10, 5:
+16, 5:
+32, 5:
+5, 10:
+10,10: 
+16, 10: 
+32, 10: 
+
+Qwen3...
+k, particles
+5, 5: 
+10, 5:
+16, 5:
+32, 5:
+5, 10:
+10,10: 
+16, 10: 
+32, 10: 
+
+
+Token Level:
+GPT2
+particles
+5 0.935
+10 0.954
+
+Qwen3-4B
+particles
+5 0.958
+10
+
+
+GPT2-Medium
+particles
+5 0.945
+10
+
+
+GPT2-Large
+particles
+5 0.94
+10 
+
+Llama 3.2-1B-instruct
+particles
+5 0.94
+10 
+---------------------------------------------------
+
+SPIDER
+python run_spider_eval_token.py --start_idx 100 --end_idx 200 --skip_idxs 133,175
+Token Level:
+
+Llama 3.2 1B
+
+Qwen3 4B
+
+
+try on token level model on its own and compare results if 0.6
+
+---------------------------------------------------
+JSON
+
+TOKEN LEVEL
+
+
+FUTURE-TODO
+
+run qwen/gptoss
