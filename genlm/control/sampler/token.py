@@ -6,6 +6,8 @@ import warnings
 
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
+import codeop
+from collections import defaultdict
 
 
 class TokenSampler(SubModel):
@@ -37,9 +39,21 @@ class TokenSampler(SubModel):
     async def forward(self):
         parent = self.parent  # For some reason, need to hold onto this reference.
         token, logw, logp = await self.sample(parent.token_ctx)
+        ###
+        try:
+            parent.last_logw_incr = logw
+        except Exception:
+            pass
+        ###
         parent.score(logw)
         parent.logp += logp
         return token
+
+    def on_particle_cloned(self, new_parent, src_parent):
+        return
+
+    def on_particle_removed(self, parent):
+        return
 
     async def sample(self, context, draw):
         """Sample a token and weight from the `target`potential's vocabulary.
@@ -183,6 +197,71 @@ class SetTokenSampler(TokenSampler):
         This method should be called when the sampler is no longer needed.
         """
         await self.set_sampler.cleanup()
+
+
+class SampleUntil(TokenSampler):
+    def __init__(
+        self, lm_potential, stop_tokens=(), patience_init=5, aggregate_weights=False
+    ):
+        """Sample until a stop token or EOS is reached, then aggregate the weights of the sampled tokens.
+
+        Args:
+            lm_potential (Potential): The language model potential to sample from.
+            stop_tokens (list): The tokens that define the stop condition.
+            patience_init (int): The initial patience value.
+            aggregate_weights (bool): Whether to aggregate the weights of the sampled tokens.
+        """
+        super().__init__(target=lm_potential)
+        self._proposal = DirectTokenSampler(lm_potential)
+        self._stop_tokens = set(stop_tokens)
+        self._patience_init = int(patience_init or 0)
+        self.aggregate_weights = aggregate_weights
+
+    def _is_boundary(self, tok):
+        return (tok is self.target.eos) or (tok in self._stop_tokens)
+
+    async def sample(self, context, draw=None):
+        parent = self.parent
+        # Lazily create per-particle fields
+        if not hasattr(parent, "_pending_logZ"):
+            parent._pending_logZ = 0.0
+        if not hasattr(parent, "_patience"):
+            parent._patience = self._patience_init
+
+        tok, logZ_i, logp_i = await self._proposal.sample(context, draw=draw)
+        if self._is_boundary(tok):
+
+            if self.aggregate_weights:
+                # Aggregate the log-weights of the sampled tokens until the boundary
+                out_logw = parent._pending_logZ + logZ_i
+                parent._pending_logZ = 0.0
+            else:
+                # Neutral logweight
+                out_logw = 0.0
+        else:
+            parent._pending_logZ += logZ_i
+            out_logw = 0.0
+
+        parent.last_logw_incr = out_logw
+        return tok, out_logw, logp_i
+
+    async def smc(self, n_particles, ess_threshold, max_tokens, critic=None, **kwargs):
+        """
+        Override of the SMC method to use the StopTokenSequenceModel.
+        """
+        from genlm.control.sampler.sequence import SMC, StopTokenSequenceModel
+
+        return await SMC(self, critic)(
+            n_particles=n_particles,
+            ess_threshold=ess_threshold,
+            max_tokens=max_tokens,
+            stop_tokens=self._stop_tokens,
+            sequence_model=StopTokenSequenceModel,
+            **kwargs,
+        )
+
+    async def cleanup(self):
+        return
 
 
 class AWRS(TokenSampler):
