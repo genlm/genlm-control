@@ -17,7 +17,7 @@ authors = [
 dependencies = [
     "genlm-grammar>=0.2.0",
     "genlm-backend>=0.1.1",
-    "llamppl",
+    "llamppl @ git+https://github.com/genlm/llamppl.git@samuki/improve-resampling-uniform-revival",
     "arsenal>=3.1.3",
     "IPython",
     "numpy",
