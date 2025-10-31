@@ -15,21 +15,24 @@ from genlm.eval.domains.spider.spider import (
 from genlm.eval.domains.spider.table_column_potential import SpiderTableColumnVerifier
 
 
+
 # Default paths; change SPIDER_DATA_DIR to full dataset if desired
-SPIDER_DATA_DIR = \
-    "/teamspace/studios/this_studio/genlm-eval/assets/spider/spider_sample"
-SPIDER_GRAMMARS = \
-    "/teamspace/studios/this_studio/genlm-eval/assets/spider/grammars.json"
+SPIDER_DATA_DIR = "/teamspace/studios/this_studio/spider_data"
+    # "/teamspace/studios/this_studio/genlm-eval/assets/spider/spider_sample"
+SPIDER_GRAMMARS = "/teamspace/studios/this_studio/genlm-eval/assets/spider/grammars.json"
 
 
 def build_token_llm(model_name: str = "meta-llama/Llama-3.2-1B-Instruct") -> PromptedLLM:
     # Use PromptedLLM with token-level EOS; AWRS will enforce constraints
+    # Add chat template tokens as EOS to prevent model from continuing with chat format
+   
     llm = PromptedLLM.from_name(
         model_name,
         backend="hf",
-        eos_tokens=[b"\n", b"\n\n"],
-        temperature=1.0,
+        eos_tokens=[b"\n", b"\n\n", b"<|end_of_text|>", b"<|eot_id|>"],
+        # eos_tokens=[b"\n", b"<|end_of_text|>", b"<|eot_id|>"],
     )
+    print("eos tokens", llm.eos_tokens)
     return llm
 
 
@@ -40,7 +43,7 @@ async def spider_model_adaptor(instance, output_dir: str, replicate: int) -> Mod
     prompt_ids = default_prompt_formatter(
         TOKEN_LLM.model.tokenizer,
         instance,
-        use_chat_format=False,
+        use_chat_format=True,
     )
     TOKEN_LLM.prompt_ids = prompt_ids
 
@@ -53,8 +56,8 @@ async def spider_model_adaptor(instance, output_dir: str, replicate: int) -> Mod
     sampler = AWRS(TOKEN_LLM, condition)
     sequences = await sampler.smc(
         n_particles=5,
-        ess_threshold=0.9,
-        max_tokens=70,
+        ess_threshold=0.5,
+        max_tokens=100,
         verbosity=0,
     )
 
@@ -78,12 +81,11 @@ async def main():
     # Build token LM
     global TOKEN_LLM
     TOKEN_LLM = build_token_llm(args.model)
-
     # Dataset
     dataset = SpiderDataset.from_spider_dir(
         SPIDER_DATA_DIR if args.use_sample else "/teamspace/studios/this_studio/spider_data",
         grammar_json_path=SPIDER_GRAMMARS,
-        few_shot_example_ids=[],
+        few_shot_example_ids=[0,1],
     )
 
     # Parse skip indices
@@ -118,7 +120,7 @@ async def main():
         n_replicates=1,
         overwrite_results=False,
         overwrite_outputs=False,
-        max_instances=args.max_instances,
+        # max_instances=args.max_instances,
         verbosity=1,
     )
 

@@ -5,9 +5,28 @@ python -u run_pattern_eval_5.py --start_idx 5 --end_idx 11 |& tee test_idx.log
 
 python run_spider_eval_token.py --start_idx 1 --end_idx 200 --skip_idxs 133,175
 python run_pattern_eval_token.py --start_idx 1 --end_idx 454 |& tee test_token_pattern.log
+
+to get 100% on tasks: get probability of continuation, if good at task, you preserve probability of string that satisfies constraint, should get 
+higher LL + pass constraints to evaluate | can encode string length into regex| whenever EOS is available, sample it
 ---------------------------------------------------
 TO DO
 
+- I changed eos, turned on chat template. try w ess 0.7 rn, then 0.5 (0.6 acc) 
+0.5char: 0.53, 0.3char: 0.53
+- increase beam size to 10 and try again
+- try 0.1 ess for char (HERE) same
+- 10 beam size | same
+- mol synthesis: 0.6 all basically (0.54 first tok, char)
+- (HERE) json, goal inference
+- find where token level model does better or where char level model does better
+- why does resampling not help
+- look into resampling techniques
+- try resampling only at terminal end (force resample at terminal end) or resample at ess threshold + terminal end
+- json, collie, molecular synthesis, goal inference, then resampling at 
+meaningful char units so it resamples only at grammar endings or terminal ends
+-------
+DRAFT
+what about forcing it to sample EOS whenever EOS is available
 run token model pattern eval next for gpt2 and llama 3.2 1B, deepseek-ai/deepseek-coder-1.3b-base
 run char model for gpt2med, large adn see if it goes down in acc, then token model too
 now run all pattern eval for gpt2 and llama 3.2 1B
@@ -33,8 +52,8 @@ k, particles
 
 GPT2-Medium
 k, particles
-5, 5: 
-10, 5:
+5, 5: 0.94
+10, 5: 0.94
 16, 5:
 32, 5:
 5, 10:
@@ -44,7 +63,7 @@ k, particles
 
 GPT2-Large
 k, particles
-5, 5: 
+5, 5: 0.951
 10, 5:
 16, 5:
 32, 5:
@@ -107,15 +126,41 @@ particles
 
 SPIDER
 python run_spider_eval_token.py --start_idx 100 --end_idx 200 --skip_idxs 133,175
+
+python run_spider_eval_token.py --model meta-llama/Llama-3.2-1B-Instruct --start_idx 0
 Token Level:
 
-Llama 3.2 1B
+Llama 3.2 1B-Instruct
+5 0.16 
+10
 
-Qwen3 4B
+Llama 3.1 8B-Instruct
+5 0.45
+
+gpt2
 
 
-try on token level model on its own and compare results if 0.6
+Character Level:
+python run_spider_eval_char.py --model meta-llama/Llama-3.2-1B-Instruct |& tee spider_char.log
 
+Llama 3.2 1B-Instruct
+
+5,5
+5,10
+10,5
+10,10
+16,5
+16,10
+32,5
+32,10
+
+Llama 3.1 8B-Instruct
+5,5 0.43
+
+gpt2
+
+*** all instruct: charlevel for 3.2-1b, then token 3.1-8b then char then gpt2
+then json eval
 ---------------------------------------------------
 JSON
 

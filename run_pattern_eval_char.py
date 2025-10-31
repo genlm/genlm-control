@@ -27,7 +27,7 @@ def build_bytelm():
     # llm = load_model_by_name("unsloth/Qwen3-4B-128K-GGUF", backend="hf")
     # llm = load_model_by_name("allenai/OLMo-2-0425-1B", backend="hf") 
     # llm = load_model_by_name("meta-llama/Llama-3.2-1B-Instruct", backend="hf")
-    llm = load_model_by_name("gpt2", backend="hf")
+    llm = load_model_by_name("gpt2-large", backend="hf")
     # llm = load_model_by_name("deepseek-ai/deepseek-coder-1.3b-base", backend="hf")
     # Match test_eval.py EOS handling and healing config
     beam_params = BeamParams(
