@@ -16,7 +16,7 @@ from pprint import pprint as pp
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["HF_TOKEN"] = "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"
+# HF_TOKEN should be set via environment variable or huggingface-cli login
 # "/teamspace/studios/this_studio/spider_data"
 SPIDER_DATA_DIR = "/teamspace/studios/this_studio/genlm-eval/assets/spider/spider_sample"
 SPIDER_GRAMMARS = "/teamspace/studios/this_studio/genlm-eval/assets/spider/grammars.json"
