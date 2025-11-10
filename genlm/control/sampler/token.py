@@ -220,6 +220,7 @@ class SampleUntil(TokenSampler):
     def _is_boundary(self, tok):
         return (tok is self.target.eos) or (tok in self._stop_tokens)
 
+    # TODO: Discuss proper weighting of samples here
     async def sample(self, context, draw=None):
         parent = self.parent
         # Lazily create per-particle fields
@@ -247,16 +248,16 @@ class SampleUntil(TokenSampler):
 
     async def smc(self, n_particles, ess_threshold, max_tokens, critic=None, **kwargs):
         """
-        Override of the SMC method to use the StopTokenSequenceModel.
+        Override of the SMC method to use the MultiTokenSequenceModel.
         """
-        from genlm.control.sampler.sequence import SMC, StopTokenSequenceModel
+        from genlm.control.sampler.sequence import SMC, MultiTokenSequenceModel
 
         return await SMC(self, critic)(
             n_particles=n_particles,
             ess_threshold=ess_threshold,
             max_tokens=max_tokens,
             stop_tokens=self._stop_tokens,
-            sequence_model=StopTokenSequenceModel,
+            sequence_model=MultiTokenSequenceModel,
             **kwargs,
         )
 

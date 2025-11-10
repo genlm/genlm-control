@@ -114,8 +114,8 @@ class SMC:
             twist_with_critic=ess_threshold > 0,
         )
 
-        if ModelClass is StopTokenSequenceModel or issubclass(
-            ModelClass, StopTokenSequenceModel
+        if ModelClass is MultiTokenSequenceModel or issubclass(
+            ModelClass, MultiTokenSequenceModel
         ):
             model_kwargs["stop_tokens"] = kwargs.pop("stop_tokens", set())
 
@@ -346,7 +346,7 @@ class SequenceModel(Model):
         return set(["unit_sampler", "critic"])
 
 
-class StopTokenSequenceModel(Model):
+class MultiTokenSequenceModel(Model):
     def __init__(
         self,
         unit_sampler,
@@ -359,7 +359,7 @@ class StopTokenSequenceModel(Model):
         check_syntax=True,
     ):
         """
-        Sequence model that grows tokens until a stop word, then applies a critic.
+        Sequence model that grows tokens until a boundary word or grammar terminal, then applies a critic.
 
         Args:
         unit_sampler: TokenSampler used to propose next tokens.
@@ -408,6 +408,8 @@ class StopTokenSequenceModel(Model):
             return
 
         if self.critic and self.twist_with_critic:
+
+            # TODO: We need to generalize additional boundary conditions here.
             if self.check_syntax:
                 # this will run prefix() at non-EOS and set last_was_syntax_error
                 twist_amt = await self.critic.score(self.token_ctx)
