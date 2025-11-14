@@ -6,8 +6,6 @@ import warnings
 
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
-import codeop
-from collections import defaultdict
 
 
 class TokenSampler(SubModel):
