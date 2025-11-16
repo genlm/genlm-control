@@ -47,6 +47,10 @@ docs = [
     "mkdocs-literate-nav",
     "mkdocs-section-index",
 ]
+mlx = [
+    "mlx",
+    "mlx-lm"
+]
 
 [tool.setuptools.packages.find]
 include = ["genlm", "genlm/control"]
