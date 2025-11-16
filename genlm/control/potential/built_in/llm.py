@@ -13,9 +13,13 @@ def load_model_by_name(name, backend, **kwargs):
         from genlm.backend.llm import AsyncTransformer
 
         model_cls = AsyncTransformer
+    elif backend == "mlx":
+        from genlm.backend.llm import AsyncMlxLM
+
+        model_cls = AsyncMlxLM
     else:
         raise ValueError(
-            f"Unknown backend: {backend}. Must be one of ['vllm', 'hf']"
+            f"Unknown backend: {backend}. Must be one of ['vllm', 'hf', 'mlx']"
         )  # pragma: no cover
 
     return model_cls.from_name(name, **kwargs)
@@ -72,7 +76,7 @@ class PromptedLLM(Potential):
         llm,
         prompt_ids=None,
         eos_tokens=None,
-        temperature=1,
+        temperature=1.0,
         token_maps=None,
     ):
         """`
@@ -124,6 +128,7 @@ class PromptedLLM(Potential):
             backend (str, optional): `AsyncLM` backend to use:\n
                 * 'vllm' to instantiate an `AsyncVirtualLM`; ideal for GPU usage\n
                 * 'hf' for an `AsyncTransformer`; ideal for CPU usage\n
+                * 'mlx' for an `AsyncMlxLM`; ideal for Apple silicon usage\n
                 * 'mock' for a `MockAsyncLM`; ideal for testing.\n
                 Defaults to 'vllm' if CUDA is available, otherwise 'hf'.
             eos_tokens (list[bytes], optional): List of tokens to treat as end-of-sequence tokens.
