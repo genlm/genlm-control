@@ -114,11 +114,6 @@ class SMC:
             twist_with_critic=ess_threshold > 0,
         )
 
-        if ModelClass is MultiTokenSequenceModel or issubclass(
-            ModelClass, MultiTokenSequenceModel
-        ):
-            model_kwargs["stop_tokens"] = kwargs.pop("stop_tokens", set())
-
         model = ModelClass(**model_kwargs)
 
         particles = await smc_standard(
@@ -330,115 +325,6 @@ class SequenceModel(Model):
                     twist_amt = await self.critic.score(self.token_ctx)
                 self.score(twist_amt)
             return
-
-    def __repr__(self):
-        return (
-            f"{self.weight:.2f}:\t"
-            + colors.magenta % "["
-            + (colors.magenta % "|").join(escape(y) for y in self.token_ctx)
-            + colors.magenta % "]"
-        )
-
-    def string_for_serialization(self):
-        return "|".join(escape(y) for y in self.token_ctx)
-
-    def immutable_properties(self):
-        return set(["unit_sampler", "critic"])
-
-
-class MultiTokenSequenceModel(Model):
-    def __init__(
-        self,
-        unit_sampler,
-        critic=None,
-        max_tokens=float("inf"),
-        verbosity=0,
-        twist_with_critic=True,
-        stop_tokens=(),
-        patience_init=5,
-        check_syntax=True,
-    ):
-        """
-        Sequence model that grows tokens until a boundary word or grammar terminal, then applies a critic.
-
-        Args:
-        unit_sampler: TokenSampler used to propose next tokens.
-        critic: Optional boundary critic returning.
-        max_tokens: Hard cap on total tokens.
-        stop_tokens: Tokens that define evaluation boundaries (e.g., newline).
-        patience_init: Syntax-error budget before killing the particle.
-        twist_with_critic: If True, apply critic at every boundary; else only at the end.
-        check_syntax: If True, check syntax at each stop token.
-        """
-        super().__init__()
-        self.unit_sampler = unit_sampler
-        self.critic = critic
-        self.max_tokens = int(max_tokens) if max_tokens != float("inf") else 10**9
-        self.verbosity = verbosity
-        self.twist_with_critic = bool(twist_with_critic)
-        self.stop_tokens = set(stop_tokens)
-        self.token_ctx = []
-        self.logp = 0
-        self.patience_init = int(patience_init)
-        self.patience = self.patience_init
-        self._boundary_update = False
-        self.check_syntax = check_syntax
-
-    async def start(self):
-        self.score(0.0)
-
-    async def step(self):
-        self._boundary_update = False
-
-        # Grow until boundary
-        while True:
-            tok = await self.call(self.unit_sampler)
-            self.token_ctx.append(tok)
-            self.max_tokens -= 1
-            if (tok is EOS) or (tok in self.stop_tokens) or (self.max_tokens <= 0):
-                self._boundary_update = True
-                break
-
-        # If boundary is EOS/max-length
-        if (self.token_ctx[-1] is EOS) or (self.max_tokens <= 0):
-            if self.critic:
-                twist_amt = await self.critic.score(self.token_ctx)
-                self.score(twist_amt)
-            self.finish()
-            return
-
-        if self.critic and self.twist_with_critic:
-
-            # TODO: We need to generalize additional boundary conditions here.
-            if self.check_syntax:
-                # this will run prefix() at non-EOS and set last_was_syntax_error
-                twist_amt = await self.critic.score(self.token_ctx)
-                if getattr(self.critic, "last_was_syntax_error", False):
-                    self.patience -= 1
-                    if self.patience <= 0:
-                        self.score(float("-inf"))
-                        self.finish()
-                        return
-                    return  # keep growing
-
-                # no syntax error use the score
-                if twist_amt != float("-inf"):
-                    self.patience = self.patience_init
-                    self.twist(twist_amt)
-                else:
-                    self.score(twist_amt)
-                    self.finish()
-                return
-            else:
-                # if not checking syntax, proceed as before
-                twist_amt = await self.critic.score(self.token_ctx)
-                if twist_amt != float("-inf"):
-                    self.patience = self.patience_init
-                    self.twist(twist_amt)
-                else:
-                    self.score(twist_amt)
-                    self.finish()
-                return
 
     def __repr__(self):
         return (

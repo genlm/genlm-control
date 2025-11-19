@@ -3,16 +3,13 @@ from abc import ABC, abstractmethod
 from genlm.control.constant import EOS
 from genlm.control.sampler.token import TokenSampler
 
-# Currently, UnitSampler is an alias for TokenSampler
-UnitSampler = TokenSampler
-
-class MultiTokenUnitSampler(UnitSampler):
+class MultiTokenUnitSampler(TokenSampler):
     """Unit sampler for multi-token units $x \\in \\mathcal{A}$ where $\\mathcal{A} \\subseteq \\mathcal{B}^*$.
     implements unit sampling by running a sequence sampler for localized potential: 
     $\\varphi_{\\bm{x}} = (\\psi_{\\bm{x}}, \\overrightarrow{\\psi}_{\\bm{x}})$ over subunits $\\mathcal{B}$.
     
     Args:
-        subunit_sampler (UnitSampler): Sampler for subunits $s \\in \\mathcal{B}$
+        subunit_sampler (TokenSampler): Sampler for subunits $s \\in \\mathcal{B}$
         boundary_predicate (callable): Function for determining EOT
         unit_potential (Potential, optional): Additional potential for constrained
             unit generation. If provided, only units with $\\psi_{\\text{unit}}(\\bm{s}) > 0$ are accepted.
@@ -43,9 +40,9 @@ class MultiTokenUnitSampler(UnitSampler):
         max_subunits_per_unit=100,
         include_boundary_in_unit=True, 
     ):
-        if not isinstance(subunit_sampler, UnitSampler):
+        if not isinstance(subunit_sampler, TokenSampler):
             raise TypeError(
-                f"subunit_sampler must be a UnitSampler, got {type(subunit_sampler)}"
+                f"subunit_sampler must be a TokenSampler, got {type(subunit_sampler)}"
             )
         
         # TODO: Currently init with subunit sampler's target
@@ -74,7 +71,6 @@ class MultiTokenUnitSampler(UnitSampler):
         # Update parent's weight and logp
         parent.score(logw)
         parent.logp += logp
-        
         return unit
     
     async def sample(self, unit_context, draw=None):
@@ -114,21 +110,18 @@ class MultiTokenUnitSampler(UnitSampler):
                     full_context, draw
                 )
             except Exception:
-                # If sampling fails, return partial unit with -inf weight
                 return subunit_buffer, float("-inf"), cumulative_logp
             # Accumulate weight and logp
             cumulative_logw += logw_i
             cumulative_logp += logp_i
-            # Add subunit to buffer
             subunit_buffer.append(subunit)
             
-            # Check for EOS (sequence termination, not unit termination)
+            # Check for EOS
             if subunit is EOS:
-                # Sequence ends with EOS
-                # Include EOS in the unit for now (caller can handle it)
+                # TODO make this more flexible
                 return subunit_buffer, cumulative_logw, cumulative_logp
             
-            # Apply unit potential as a twist (constrained generation)
+            # Analogous to twist in SequenceModel.step()
             if self.unit_potential:
                 prefix_logw = await self.unit_potential.prefix(subunit_buffer)
                 if prefix_logw == float("-inf"):
@@ -140,7 +133,7 @@ class MultiTokenUnitSampler(UnitSampler):
                 unit = subunit_buffer
                 # Exclude boundary token from unit
                 if not self.include_boundary_in_unit and unit:
-                    # Remove last token (the boundary marker)
+                    # Remove the boundary marker # TODO: we might want to handle stripping boundary tokens at a different level
                     unit = unit[:-1]
                 # Validate complete unit with unit potential
                 if self.unit_potential:
