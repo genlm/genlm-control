@@ -5,13 +5,14 @@ from .operators import PotentialOps
 from .product import Product
 from .coerce import Coerced
 
-from .built_in import PromptedLLM, WCFG, BoolCFG, WFSA, BoolFSA, JsonSchema, CanonicalTokenization
+from .built_in import PromptedLLM, WCFG, BoolCFG, WFSA, BoolFSA, JsonSchema, CanonicalTokenization, ByteLLM
 
 __all__ = [
     "Potential",
     "PotentialOps",
     "Product",
     "PromptedLLM",
+    "ByteLLM",
     "JsonSchema",
     "WCFG",
     "BoolCFG",
