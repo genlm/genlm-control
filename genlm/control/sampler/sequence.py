@@ -101,20 +101,13 @@ class SMC:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
-
-        # Slightly hacky way to adjust the sequence model based on the token sampler.
-        sm = kwargs.pop("sequence_model", None)
-        ModelClass = sm if sm else SequenceModel
-
-        model_kwargs = dict(
+        model = SequenceModel(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
             max_tokens=max_tokens,
             verbosity=verbosity,
             twist_with_critic=ess_threshold > 0,
         )
-
-        model = ModelClass(**model_kwargs)
 
         particles = await smc_standard(
             model=model,
@@ -123,6 +116,7 @@ class SMC:
             json_file=json_path,
             **kwargs,
         )
+
         return Sequences(*_unpack_particles(particles))
 
     async def cleanup(self):
