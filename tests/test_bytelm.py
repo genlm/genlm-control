@@ -18,7 +18,7 @@ def beam_params(model_name):
 
     llm = load_model_by_name(model_name)
     model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    return BeamParams(K=5, prune_threshold=0.05, eos_tokens={model_eos_token})
+    return BeamParams(K=5, prune_threshold=0.0, eos_tokens={model_eos_token})
 
 
 @pytest.fixture

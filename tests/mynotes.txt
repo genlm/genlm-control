@@ -1,0 +1,379 @@
+
+build a potential that does specific number of characters.
+start w gpt2, others and so on, and see failure rate.
+then template stuff
+
+BIGGER MODEL (3.1 8B)
+
+
+------------
+LEN potential
+
+
+actually Im thinking again, what would a constraint like that tell us even? 
+we have to have it as satisfying a condition in a specific number of characters,
+ otherwise its not very useful? max tokens a constraint or no? 
+
+but this potential is not done correctly since the intermediate t
+arget distribution is non existent (as in it guide the model towards finishing 
+and producing eos after 80 chars ), so thats more like rejection sampling
+
+yeah, now how can it be a penalty that signifies how likely the text being generated will satisfy an arbitrary constraint within the allocated tokens? and where would this be applied or we need to come up with a constraint to test that too 
+---------------------
+is max tokens signify a potential (i.e. is the model aware of
+the number of tokens it has to satisfy a constraint or no)
+
+heal rate
+
+resampling rate
+
+compare diversity
+
+doing SMC over syllables instead of over tokens!
+
+for line resampling SMC, model gets trapped when:
+
+It has 4 syllables on line 3
+It needs exactly 1 more syllable to reach 5
+The most natural next words would give 2+ syllables
+So it finds random character sequences that the syllables library
+counts as 1 syllable (like "hms", "hуш").
+
+------------------
+(DONE) token level SMC loop, resampling
+(DONE) line level resampling (token level smc loop)
+line level SMC loop
+syllable level resampling (token level smc loop)
+syllable level SMC loop
+
+same w char model
+
+test with different haiku
+
+check logprobs and quality
+
+is distribution of prior preserved?  check distribution over logprobs, small, big, 1 particle, distribution to match posterior w KL
+
+-------------
+OUTPUTS
+
+-29.84: [Morning|␣dew|␣falls|␣slow|\n|G|ent|le|␣touch|␣on|␣grass|y|␣earth|\n|Summer|'s|␣peaceful|␣h|mmm]
+-29.69: [Morning|␣dew|␣falls|␣slow|\n|G|ent|le|␣touch|␣on|␣grass|y|␣hill|\n|Summer|'s|␣peaceful|␣h|\xd1\x83\xd1\x88]
+-30.92: [Morning|␣dew|␣falls|␣slow|\n|G|ent|le|␣touch|␣on|␣grass|y|␣hills|\n|Summer|'s|␣peaceful|␣h|mmm]
+-3.47:  [Morning|␣dew|␣falls|␣slow|\n|G|ent|le|␣touch|␣on|␣grass|y|␣hills|\n|Summer|'s|␣calm|␣delight|EOS]
+-30.61: [Morning|␣dew|␣falls|␣slow|\n|G|ent|le|␣touch|␣on|␣grass|y|␣hill|\n|Summer|'s|␣peaceful|␣h|ps]
+-3.47:  [Morning|␣dew|␣falls|␣slow|\n|G|ent|le|␣touch|␣on|␣grass|y|␣earth|\n|Summer|'s|␣warm|␣delight|EOS]
+
+============================================================
+GENERATED HAIKUS
+============================================================
+
+Posterior distribution over decoded sequences:
+Chart {
+  "Misty forest deep\nAncient trees their vigil keep\nNature's quiet hush": 0.65,
+  "Misty forest deep\nAncient trees their vigil keep\nNature's quiet soul": 0.15000000000000002,
+  "Morning dew falls slow\nGentle touch on grassy hills\nSummer's calm delight": 0.1,
+  "Morning dew falls slow\nGentle touch on grassy earth\nSummer's warm delight": 0.1,
+}
+
+------------------------------------------------------------
+VERIFICATION
+------------------------------------------------------------
+
+[1] Probability: 0.6500
+Text:
+Misty forest deep
+Ancient trees their vigil keep
+Nature's quiet hush
+Valid: True
+  Line 1 (5 syllables): Misty forest deep
+  Line 2 (7 syllables): Ancient trees their vigil keep
+  Line 3 (5 syllables): Nature's quiet hush
+
+[2] Probability: 0.1500
+Text:
+Misty forest deep
+Ancient trees their vigil keep
+Nature's quiet soul
+Valid: True
+  Line 1 (5 syllables): Misty forest deep
+  Line 2 (7 syllables): Ancient trees their vigil keep
+  Line 3 (5 syllables): Nature's quiet soul
+
+[3] Probability: 0.1000
+Text:
+Morning dew falls slow
+Gentle touch on grassy hills
+Summer's calm delight
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle touch on grassy hills
+  Line 3 (5 syllables): Summer's calm delight
+Reason: Valid haiku!
+
+[4] Probability: 0.1000
+Text:
+Morning dew falls slow
+Gentle touch on grassy earth
+Summer's warm delight
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle touch on grassy earth
+  Line 3 (5 syllables): Summer's warm delight
+
+======================================================================
+HAIKU GENERATOR - Line Boundary Resampling (Approach A)
+======================================================================
+
+Creating haiku constraint...
+Creating AWRS token sampler...
+Running SMC with LINE-BOUNDARY resampling...
+----------------------------------------------------------------------
+Initialized 20 particles with start weight: 0.00
+Step 2 | Line boundary | Lines: 0 | ESS: 15.6 (0.78) | Sample: 'Mountain mist desc'
+Step 3 | Line boundary | Lines: 0 | ESS: 14.6 (0.73) | Sample: 'Mountain mist descends'
+Step 4 | Line boundary | Lines: 1 | ESS: 13.2 (0.66) | Sample: 'Mountain mist descends\n'
+Step 5 | Line boundary | Lines: 1 | ESS: 13.0 (0.65) | Sample: 'Mountain mist descends\nGolden'
+Step 8 | Line boundary | Lines: 1 | ESS: 12.0 (0.60) | Sample: 'Mountain mist descends\nGolden light on forest'
+Step 9 | Line boundary | Lines: 1 | ESS: 11.1 (0.55) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+Step 10 | Line boundary | Lines: 2 | ESS: 8.3 (0.41) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+  → RESAMPLING (ESS 8.3 < 10.0)
+Step 11 | Line boundary | Lines: 2 | ESS: 18.0 (0.90) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+Step 13 | Line boundary | Lines: 2 | ESS: 13.5 (0.68) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+Step 16 | Line boundary | Lines: 2 | ESS: 1.1 (0.06) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+  → RESAMPLING (ESS 1.1 < 10.0)
+Step 17 | Line boundary | Lines: 2 | ESS: 5.4 (0.27) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+  → RESAMPLING (ESS 5.4 < 10.0)
+Step 18 | Line boundary | Lines: 2 | ESS: 1.0 (0.05) | Sample: 'Mountain mist descends\nGolden light on forest deep'
+  → RESAMPLING (ESS 1.0 < 10.0)
+Step 20: All particles finished
+
+Resampling occurred at steps: [(10, 2), (16, 2), (17, 2), (18, 2)]
+
+======================================================================
+RESULTS
+======================================================================
+
+Generated 7 unique sequences:
+
+[1] Log weight: -0.00
+Text:
+Morning dew falls slow
+Gentle ripples on the pond
+Summer's peaceful hmmm
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle ripples on the pond
+  Line 3 (5 syllables): Summer's peaceful hmmm
+Reason: Valid haiku!
+
+[2] Log weight: -0.00
+Text:
+Morning dew falls slow
+Gentle ripples on the pond
+Summer's peaceful hps
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle ripples on the pond
+  Line 3 (5 syllables): Summer's peaceful hps
+Reason: Valid haiku!
+
+[3] Log weight: -0.00
+Text:
+Morning dew falls slow
+Gentle ripples on the pond
+Summer's peaceful hуш
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle ripples on the pond
+  Line 3 (5 syllables): Summer's peaceful hуш
+Reason: Valid haiku!
+
+[4] Log weight: -0.00
+Text:
+Morning dew falls slow
+Gentle ripples on the pond
+Summer's peaceful hhh
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle ripples on the pond
+  Line 3 (5 syllables): Summer's peaceful hhh
+Reason: Valid haiku!
+
+[5] Log weight: -0.00
+Text:
+Morning dew falls slow
+Gentle ripples on the pond
+Summer's peaceful h2
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Gentle ripples on the pond
+  Line 3 (5 syllables): Summer's peaceful h2
+Reason: Valid haiku!
+
+[6] Log weight: -0.00
+Text:
+Morning dew descends
+Glistening on green grass soft
+Summer's gentle kiss
+Valid: True
+  Line 1 (5 syllables): Morning dew descends
+  Line 2 (7 syllables): Glistening on green grass soft
+  Line 3 (5 syllables): Summer's gentle kiss
+Reason: Valid haiku!
+
+[7] Log weight: -55.82
+Text:
+Mountain mist descends
+Golden light on forest deep
+Nature's peace dwls
+Valid: True
+  Line 1 (5 syllables): Mountain mist descends
+  Line 2 (7 syllables): Golden light on forest deep
+  Line 3 (5 syllables): Nature's peace dwls
+Reason: Valid haiku!
+
+
+
+==========
+
+Running SMC with LINE-BOUNDARY resampling...
+----------------------------------------------------------------------
+Initialized 20 particles with start weight: 0.00
+  Step 0 tokens: 'Mountain'(-0.00), 'Morning'(-0.00), 'Snow'(-0.00), 'Golden'(-0.00), 'Moon'(-0.00), 'Sun'(-0.00)
+Step 0 | Mid-line | Weights: [-0.0, -0.0, 0.0] | 'Mountain'
+  Step 1 tokens: ' peaks'(-0.00), ' dew'(0.00), 'fl'(-0.00), ' sunset'(0.00), 'light'(0.00), 'set'(0.00), ' sunrise'(-0.00)
+Step 1 | Mid-line | Weights: [-0.0, -0.0, 0.0] | 'Mountain peaks'
+  Step 2 tokens: ' rise'(-0.00), ' falls'(-2.76), 'akes'(0.00), ' so'(-0.00), ' on'(0.00), "'s"(0.00), '\n'(-4.57), ' ascend'(-1.16)
+Step 2 | Line boundary | Lines: 0 | ESS: 10.3 (0.52) | Sample: 'Mountain peaks rise'
+  Step 3 tokens: ' \n'(-4.36), ' slow'(-0.00), ' gently'(-0.00), ' high'(0.00), '\n'(-0.96), ' the'(0.00), ' warm'(-0.00), 'Golden'(-0.00)
+Step 3 | Line boundary | Lines: 1 | ESS: 8.2 (0.41) | Sample: 'Mountain peaks rise \n'
+  → RESAMPLING (ESS 8.2 < 10.0)
+  Step 4 tokens: '\n'(-0.17), ' \n'(-8.93), ' sea'(-1.04), ' descent'(-0.35), 'R'(0.00)
+Step 4 | Line boundary | Lines: 1 | ESS: 15.2 (0.76) | Sample: 'Morning dew falls slow\n'
+  Step 5 tokens: 'Golden'(0.00), 'D'(0.00), 'F'(0.00), 'Snow'(0.00), '\n'(-0.09), 'G'(0.00), 'ipples'(-0.00)
+Step 5 | Line boundary | Lines: 1 | ESS: 15.0 (0.75) | Sample: 'Morning dew falls slow\nGolden'
+  Step 6 tokens: ' light'(-0.00), 'ance'(-0.00), 'alling'(0.00), ' sunrise'(-0.00), 'fl'(-0.00), 'R'(0.00), 'ent'(-0.00), 'Golden'(-0.00), ' on'(0.00)
+Step 6 | Mid-line | Weights: [-9.1, -1.7, 0.0] | 'Morning dew falls slow\nGolden light'
+  Step 7 tokens: ' on'(0.00), ' upon'(0.00), ' slowly'(-0.00), 'akes'(0.00), 'ipples'(0.00), 'le'(0.00), ' hues'(-0.00), ' the'(-0.00)
+Step 7 | Mid-line | Weights: [-9.1, -1.7, 0.0] | 'Morning dew falls slow\nGolden light on'
+  Step 8 tokens: ' forest'(0.00), ' my'(-0.00), ' the'(0.00), ' \n'(-1.39), ' gently'(0.00), ' dance'(0.00), ' petals'(-0.00), ' upon'(0.00), ' peaceful'(-0.00)
+Step 8 | Line boundary | Lines: 1 | ESS: 14.6 (0.73) | Sample: 'Morning dew falls slow\nGolden light on forest'
+  Step 9 tokens: ' deep'(-0.00), ' up'(0.00), ' forest'(0.00), 'Nature'(-0.00), ' fall'(-0.00), ' falling'(-0.00), ' upon'(0.00), ' beneath'(0.00), ' grass'(-0.00), ' softly'(-0.00), ' the'(-0.00), ' \n'(-10.92)
+Step 9 | Line boundary | Lines: 1 | ESS: 13.6 (0.68) | Sample: 'Morning dew falls slow\nGolden light on forest deep'
+  Step 10 tokens: '\n'(0.00), 'st'(-12.19), ' deep'(-0.82), "'s"(0.00), ' on'(-0.38), ' \n'(-10.28), ' its'(-0.00), ' the'(0.00), ' sway'(-1.86), ' sea'(0.00), 'Lake'(-0.00)
+Step 10 | Line boundary | Lines: 2 | ESS: 12.1 (0.60) | Sample: 'Morning dew falls slow\nGolden light on forest deep'
+  Step 11 tokens: 'Summer'(0.00), 'Nature'(0.00), 'ret'(-12.46), ' \n'(-5.52), ' beauty'(-0.60), ' p'(-12.90), 'Winter'(0.00), '\n'(-0.00), "'s"(-0.00)
+Step 11 | Line boundary | Lines: 2 | ESS: 9.5 (0.47) | Sample: 'Morning dew falls slow\nGolden light on forest deep'
+  → RESAMPLING (ESS 9.5 < 10.0)
+  Step 12 tokens: "'s"(0.00), ' gl'(-7.22), 'Peace'(0.00), 'Night'(0.00)
+Step 12 | Mid-line | Weights: [-7.2, -0.4, 0.0] | "Morning dew falls slow\nGolden light on forest deep\nSummer's"
+  Step 13 tokens: ' gentle'(-0.00), ' peaceful'(-0.00), ' peace'(-3.89), 'w'(-25.80), 'ful'(-0.00), "'s"(0.00)
+Step 13 | Mid-line | Weights: [-33.0, -2.6, 0.0] | "Morning dew falls slow\nGolden light on forest deep\nSummer's "
+  Step 14 tokens: ' kiss'(0.00), ' h'(0.00), ','(-12.01), ' dw'(-12.63), 'EOS'(0.00), 'ab'(-12.65), ' l'(-12.32), ' twilight'(-5.76), ' night'(-5.07), ' gentle'(0.00)
+Step 14 | Line boundary | Lines: 2 | ESS: 5.1 (0.25) | Sample: 'Morning dew falls slow\nGolden light on forest deep'
+  → RESAMPLING (ESS 5.1 < 10.0)
+  Step 15 tokens: 'EOS'(-0.00), 'уш'(-26.92), 'род'(-27.45), 'ms'(-25.40), 'ps'(-27.89), ' whisper'(0.00), ' ca'(0.00)
+Step 15 | Line boundary | Lines: 2 | ESS: 11.0 (0.55) | Sample: 'Mountain peaks so high\nGolden sunrise slowly \nNatu'
+  Step 16 tokens: 'EOS'(-0.00), 'ress'(0.00)
+Step 16 | Line boundary | Lines: 2 | ESS: 11.0 (0.55) | Sample: 'Mountain peaks so high\nGolden sunrise slowly \nNatu'
+  Step 17 tokens: 'EOS'(-0.00)
+Step 18: All particles finished
+
+Resampling occurred at steps: [(3, 1), (11, 2), (14, 2)]
+
+======================================================================
+RESULTS
+======================================================================
+
+Generated 9 unique sequences:
+
+[1] Log weight: 0.00
+Text:
+Sunset's warm descent
+Golden hues upon the sea
+Night's gentle whisper
+Valid: True
+  Line 1 (5 syllables): Sunset's warm descent
+  Line 2 (7 syllables): Golden hues upon the sea
+  Line 3 (5 syllables): Night's gentle whisper
+
+[2] Log weight: 0.00
+Text:
+Sunset's warm descent
+Golden hues upon the sea
+Night's gentle caress
+Valid: True
+  Line 1 (5 syllables): Sunset's warm descent
+  Line 2 (7 syllables): Golden hues upon the sea
+  Line 3 (5 syllables): Night's gentle caress
+
+[3] Log weight: -0.00
+Text:
+Morning dew falls slow
+Golden light upon the grass
+Summer's gentle kiss
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Golden light upon the grass
+  Line 3 (5 syllables): Summer's gentle kiss
+
+[4] Log weight: -0.00
+Text:
+Morning dew falls slow
+Golden light on forest deep
+Summer's gentle kiss
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Golden light on forest deep
+  Line 3 (5 syllables): Summer's gentle kiss
+
+[5] Log weight: -25.40
+Text:
+Morning dew falls slow
+Golden light on forest deep
+Summer's peaceful hms
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Golden light on forest deep
+  Line 3 (5 syllables): Summer's peaceful hms
+
+[6] Log weight: -26.21
+Text:
+Morning dew falls slow
+Golden light on forest deep
+Summer's peaceful hуш
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Golden light on forest deep
+  Line 3 (5 syllables): Summer's peaceful hуш
+
+[7] Log weight: -27.45
+Text:
+Morning dew falls slow
+Golden light on forest deep
+Summer's peaceful hрод
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Golden light on forest deep
+  Line 3 (5 syllables): Summer's peaceful hрод
+
+[8] Log weight: -27.89
+Text:
+Morning dew falls slow
+Golden light on forest deep
+Summer's peaceful hps
+Valid: True
+  Line 1 (5 syllables): Morning dew falls slow
+  Line 2 (7 syllables): Golden light on forest deep
+  Line 3 (5 syllables): Summer's peaceful hps
+
+[9] Log weight: -33.02
+Text:
+Mountain peaks so high
+Golden sunrise slowly 
+Nature's beauty glw
+Valid: True
+  Line 1 (5 syllables): Mountain peaks so high
+  Line 2 (7 syllables): Golden sunrise slowly
+  Line 3 (5 syllables): Nature's beauty glw
