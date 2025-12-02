@@ -20,7 +20,7 @@ mtl_llm.set_prompt_from_str("Montreal is")
 token_sampler = direct_token_sampler(mtl_llm)
 
 # Run SMC with 5 particles, a maximum of 25 tokens.
-# With no additional constraints, weights are uniform, so we set `ess_treshold` to 0.0
+# With no additional constraints, weights are uniform, so we set `ess_threshold` to 0.0
 sequences = await token_sampler.smc(n_particles=5, max_tokens=25, ess_threshold=0.0)
 
 # Show the posterior over token sequences
