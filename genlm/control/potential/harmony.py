@@ -2,6 +2,8 @@
 from genlm.control.potential import Potential
 from genlm.backend import decode_vocab
 from genlm.control.potential.built_in.llm import TokenMappings
+import numpy as np
+import warnings
 
 
 class HarmonyChat:
@@ -12,6 +14,7 @@ class HarmonyChat:
         "<|channel|>",
         "<|message|>",
         "<|end|>",
+        "<|return|>",
     ]  # Oss we may also want to include here the <|return|> token, which is used to tag the end of the final channel message.
     # Additionally this is required in order to correctly mark the complete status of the final channel in the output.
     # Unfortunately, this is currently not possible as the sampler artificially "swaps" the logits of the END with those of the
@@ -20,20 +23,22 @@ class HarmonyChat:
     def __init__(self, tokenizer):
         """
         This class encodes the Harmony chat Format, and provides the methods to extract the harmony channels from the context.
-        Since it operates on the byte representation of tokens it also provides methods to extract the byte represenattion from the token ids.
+        Since it operates on the byte representation of tokens it also provides methods to extract the byte representation from the token ids.
         """
 
         self.tokenizer = tokenizer  # The tokenizer should support the harmony chat format. otherwise we should throw an error.
 
-        self.byte_vocab, _ = decode_vocab(
+        _byte_vocab, _ = decode_vocab(
             tokenizer
         )  # This is the byte representation of the tokenizer's token. Note that it follows the construction in the Backend.
-        self.eos_tokens = [
-            self.byte_vocab[tokenizer.eos_token_id]
+        _eos_tokens = [
+            _byte_vocab[tokenizer.eos_token_id]
         ]  # This matches the construction described in Prompted LLM.
+
         self.token_maps = TokenMappings.create(
-            decode=self.byte_vocab, eos_tokens=self.eos_tokens
+            decode=_byte_vocab, eos_tokens=_eos_tokens
         )
+        self.potential_vocab = self.token_maps.potential_vocab
         self.token_dict = {}
         for key in HarmonyChat.harmony_chat_keys:  # This completes the token dict with the tokens that may change according to the tokenizer.
             self.token_dict[key] = self.decode_tokens(self.tokenizer.encode(key))
@@ -162,8 +167,11 @@ class HarmonyPotential(Potential):
         self.constrained_channels = constrained_channels
 
         super().__init__(
-            self.harmony_chat.byte_vocab
+            self.harmony_chat.potential_vocab
         )  # is this the right vocab, or should it rather be the llm's?
+
+        if not set(base_potential.vocab) <= set(self.vocab):
+            warnings.warn("The base potential's vocabulary must be a subset of the harmony potential's vocabulary.")
 
     def set_constrained_channels(self, constrained_channels):
         """
@@ -231,5 +239,36 @@ class HarmonyPotential(Potential):
             )
         return log_weight
 
+    async def logw_next(self, context):
+        """
+        Input: A list of byte tokens in bytes format.
+        Output: The sum of log probabilities for the next token logprobs for each possible next-token, including the EOS symbol.
+        """
 
-# TODO: add a method to implement efficient Next_token_logprobs, which does not rely on the base class (this will be significantly faster for potentials like CFG one, which admit fast next-token computations.)
+        end_token = self.harmony_chat.token_dict["<|end|>"][0]
+        channels = self.harmony_chat.extract_harmony_channels_from_tokens(context)  # Extract the channels from the context.
+
+        next_token_weights = self.make_lazy_weights(np.zeros(len(self.vocab_eos)))
+
+        incomplete_channels = {key for key in channels if channels[key] is not None and channels[key]["is_prefix"]}
+        assert len(incomplete_channels) <= 1, "At most one channel can have the 'is_prefix' flag set to true."
+        
+        if len(incomplete_channels) == 0:
+            return next_token_weights # If there are no incomplete channels,\
+                                      # we can return the weights as is. Every possible next token is valid for the harmony format.
+ 
+        key = incomplete_channels.pop()
+        if key is not None and key in self.constrained_channels:
+            if await self.base_potential.prefix(channels[key]["content"]) == float("-inf"):
+                raise ValueError(f"Context {channels[key]['content']!r} has weight zero under `prefix`.")
+            next_token_weights.weights += (await self.base_potential.logw_next(channels[key]["content"])).weights # This should directly return the normalized next-token log weights.
+            EOS_weight = next_token_weights.weights[-1] # Keep track of teh EOS weight.
+
+            if key == "analysis" or key == "commentary": # In this case, the EOS weight needs to be moved to the <|end|> token.
+                idx = next_token_weights.encode[end_token]
+                next_token_weights.weights[idx] = EOS_weight # Move the EOS weight to the <|end|>, which is the token that will be sampled by the llm to close the channel.
+                next_token_weights.weights[-1] = float("-inf") # Set the EOS weight to -inf.
+            elif key == "final": # If the channel is final, the prompted LLM automatically moves the weight of <|return|> to EOS. so we don't have to do anything else.
+                pass
+                
+        return next_token_weights # we return the normalized next-token weights.
