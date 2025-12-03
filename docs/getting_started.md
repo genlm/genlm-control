@@ -9,7 +9,7 @@ First, let's look at basic language model sampling using a [`PromptedLLM`][genlm
 ```python
 from genlm.control import PromptedLLM, direct_token_sampler
 
-# Load gpt2 (or any other HuggingFace model)
+# Load gpt2 (or any other Hugging Face model)
 mtl_llm = PromptedLLM.from_name("gpt2", temperature=0.5, eos_tokens=[b'.'])
 
 # Set the fixed prompt prefix for the language model
