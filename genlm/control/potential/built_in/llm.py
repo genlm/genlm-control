@@ -121,7 +121,7 @@ class PromptedLLM(Potential):
         temperature=1.0,
         **kwargs,
     ):
-        """Create a `PromptedLLM` from a HugginFace model name.
+        """Create a `PromptedLLM` from a HuggingFace model name.
 
         Args:
             name (str): Name of the model to load
