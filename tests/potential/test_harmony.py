@@ -45,7 +45,7 @@ def cleanup_gpu():
 def harmony_examples_path():
     """Path to the harmony chat examples JSON file."""
     test_dir = Path(__file__).parent
-    return test_dir / "harmomy_chat_examples.json"
+    return test_dir / "harmony_chat_examples.json"
 
 
 @pytest.fixture
@@ -269,7 +269,6 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
     ]
     prompt_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
     prompt_str = tokenizer.decode(prompt_ids)
-    print(prompt_str)
     promptedllm.set_prompt_from_str(prompt_str)
 
     # Create harmony potential with constrained final channel
@@ -313,7 +312,7 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
 
     if (
         final_channel["content"][-1] == EOS
-    ):  # Remove EOS if present. this also implies that we can return the final channel as complete (note that awrs automatically replaces teh built in <|return|> character with EOS).
+    ):  # Remove EOS if present. this also implies that we can return the final channel as complete (note that awrs automatically replaces the built in <|return|> character with EOS).
         final_str = b"".join(final_channel["content"][:-1]).decode(
             "utf-8", errors="replace"
         )
@@ -321,49 +320,71 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
         assert log_weight != float("-inf"), (
             f"The generated final channel should be accepted by the grammar: {final_str!r}"
         )
-    else:  # If EOS is not the last token, it means that we can treat the final channel as prefix. CHECK: should this be treated as an error? This is only correct thet the output was truncated due to the max_tokens limit.
+    else:  # If EOS is not the last token, it means that we can treat the final channel as prefix. CHECK: should this be treated as an error? This is only correct if the output was truncated due to the max_tokens limit.
         final_str = b"".join(final_channel["content"]).decode("utf-8", errors="replace")
         log_weight = await BooleanCfg.prefix(final_str)
         assert log_weight != float("-inf"), (
             f"The generated final channel should be a valid prefix of the grammar: {final_str!r}"
         )
 
+
 @pytest.mark.asyncio
 async def test_logw_next_token_END(promptedllm, tokenizer, wcfg):
-    """This method tests that the logw_next method is correctly implemented. in the spcial cases where the mass is concentrated on the end of strinfg token"""
+    """This method tests that the logw_next method is correctly implemented. in the special cases where the mass is concentrated on the end of string token"""
 
     coerced_cfg = wcfg.coerce(promptedllm, f=coerce_bytes_to_chars, prune=False)
     harmony_potential = HarmonyPotential(
-            base_potential=coerced_cfg, llm_tokenizer=tokenizer, constrained_channels=["analysis", "final", "commentary"]
-        )
+        base_potential=coerced_cfg,
+        llm_tokenizer=tokenizer,
+        constrained_channels=["analysis", "final", "commentary"],
+    )
 
     for channel in ["analysis", "final", "commentary"]:
-        chat_complete_final = ( "<|channel|>"+channel+"<|message|>aaabaaa" ) # Here the only valid next-token should be EOS (because of the internal token substitution.)
+        chat_complete_final = (
+            "<|channel|>" + channel + "<|message|>aaabaaa"
+        )  # Here the only valid next-token should be EOS (because of the internal token substitution.)
 
-        chat_complete_final_ids = tokenizer.encode(chat_complete_final, add_special_tokens=False) # string to token ids
-        chat_complete_final_bytes = harmony_potential.harmony_chat.decode_tokens(chat_complete_final_ids) # token ids to bytes # todo --> this naming is ugly and should be fixed 
-        
+        chat_complete_final_ids = tokenizer.encode(
+            chat_complete_final, add_special_tokens=False
+        )  # string to token ids
+        chat_complete_final_bytes = harmony_potential.harmony_chat.decode_tokens(
+            chat_complete_final_ids
+        )  # token ids to bytes.
+
         logw_next_token = await harmony_potential.logw_next(chat_complete_final_bytes)
-        assert logsumexp(logw_next_token.weights) == 0, "The total logprob of the logw_next tokens should be 0"
+        assert logsumexp(logw_next_token.weights) == 0, (
+            "The total logprob of the logw_next tokens should be 0"
+        )
         if channel == "final":
-            assert np.isclose(logw_next_token[EOS], 0), "All the mass should be on the EOS token"
+            assert np.isclose(logw_next_token[EOS], 0), (
+                "All the mass should be on the EOS token"
+            )
         else:
-            assert np.isclose(logw_next_token[b"<|end|>"],0), "All the mass should be on the <|end|> token"
+            assert np.isclose(logw_next_token[b"<|end|>"], 0), (
+                "All the mass should be on the <|end|> token"
+            )
+
 
 @pytest.mark.asyncio
 async def test_logw_next_token_all(promptedllm, tokenizer, wcfg):
     """This method tests that the logw_next method is correctly implemented. In particular,
-    we check that the next token weights matches what we would compute with the naive next prefix weight. """
+    we check that the next token weights matches what we would compute with the naive next prefix weight."""
     string = "aaa"
-    Z = np.log(wcfg.cfg_eos.prefix_grammar(string)) # compute the common normalizing constant 
+    Z = np.log(
+        wcfg.cfg_eos.prefix_grammar(string)
+    )  # compute the common normalizing constant
 
     coerced_cfg = wcfg.coerce(promptedllm, f=coerce_bytes_to_chars, prune=False)
     harmony_potential = HarmonyPotential(
-            base_potential=coerced_cfg, llm_tokenizer=tokenizer, constrained_channels=["analysis", "final", "commentary"]
-        )
+        base_potential=coerced_cfg,
+        llm_tokenizer=tokenizer,
+        constrained_channels=["analysis", "final", "commentary"],
+    )
 
     for channel in ["analysis", "final", "commentary"]:
-        chat_complete_final = ( "<|channel|>"+channel+"<|message|>"+string) # Here the only valid next-token should be EOS (because of teh internal token substittion.)
+        chat_complete_final = (
+            "<|channel|>" + channel + "<|message|>" + string
+        )  # Here the only valid next-token should be EOS (because of the internal token substitution.)
         chat_ids = tokenizer.encode(chat_complete_final, add_special_tokens=False)
         chat_bytes = harmony_potential.harmony_chat.decode_tokens(chat_ids)
 
@@ -371,17 +392,23 @@ async def test_logw_next_token_all(promptedllm, tokenizer, wcfg):
         non_inf_indices = np.where(logw_next_token.weights != float("-inf"))[0]
 
         for index in non_inf_indices:
-            token_string = logw_next_token.decode[index].decode("utf-8", errors="replace")
+            token_string = logw_next_token.decode[index].decode(
+                "utf-8", errors="replace"
+            )
             completion = string + token_string
-            want = np.log(wcfg.cfg_eos.prefix_grammar(completion)) - Z # compute the normalized weights  
+            want = (
+                np.log(wcfg.cfg_eos.prefix_grammar(completion)) - Z
+            )  # compute the normalized weights
             have = logw_next_token.weights[index]
-            assert np.isclose(want, have), f"Token {token_string}. Want : {want}. Have : {have}"
+            assert np.isclose(want, have), (
+                f"Token {token_string}. Want : {want}. Have : {have}"
+            )
 
 
 @pytest.mark.asyncio
 async def test_harmony_sampling_from_product(promptedllm, tokenizer, wcfg):
-    """ Tests sampling from the product potential of HarmonyPotential and the PromptedLLM. Importantly,
-    this tests the logic of th elogw_next method """
+    """Tests sampling from the product potential of HarmonyPotential and the PromptedLLM. Importantly,
+    this tests the logic of the logw_next method"""
     # Skip if model or tokenizer not available
     if promptedllm is None or tokenizer is None:
         pytest.skip("Model or tokenizer not available")
@@ -395,7 +422,6 @@ async def test_harmony_sampling_from_product(promptedllm, tokenizer, wcfg):
     ]
     prompt_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
     prompt_str = tokenizer.decode(prompt_ids)
-    print(prompt_str)
     promptedllm.set_prompt_from_str(prompt_str)
 
     # Create harmony potential with constrained final channel
@@ -404,7 +430,7 @@ async def test_harmony_sampling_from_product(promptedllm, tokenizer, wcfg):
 
     # Run SMC sampling with CUDA error handling
     try:
-        sampler = direct_token_sampler( promptedllm * harmony_cfg)
+        sampler = direct_token_sampler(promptedllm * harmony_cfg)
         sequences = await SMC(sampler)(
             n_particles=1, ess_threshold=0.6, max_tokens=500, verbosity=0
         )
@@ -433,7 +459,7 @@ async def test_harmony_sampling_from_product(promptedllm, tokenizer, wcfg):
 
     if (
         final_channel["content"][-1] == EOS
-    ):  # Remove EOS if present. this also implies that we can return the final channel as complete (note that awrs automatically replaces teh built in <|return|> character with EOS).
+    ):  # Remove EOS if present. this also implies that we can return the final channel as complete (note that awrs automatically replaces the built in <|return|> character with EOS).
         final_str = b"".join(final_channel["content"][:-1]).decode(
             "utf-8", errors="replace"
         )
@@ -441,7 +467,7 @@ async def test_harmony_sampling_from_product(promptedllm, tokenizer, wcfg):
         assert log_weight != float("-inf"), (
             f"The generated final channel should be accepted by the grammar: {final_str!r}"
         )
-    else:  # If EOS is not the last token, it means that we can treat the final channel as prefix. CHECK: should this be treated as an error? This is only correct thet the output was truncated due to the max_tokens limit.
+    else:  # If EOS is not the last token, it means that we can treat the final channel as prefix. CHECK: should this be treated as an error? This is only correct if the output was truncated due to the max_tokens limit.
         final_str = b"".join(final_channel["content"]).decode("utf-8", errors="replace")
         log_weight = await wcfg.prefix(final_str)
         assert log_weight != float("-inf"), (

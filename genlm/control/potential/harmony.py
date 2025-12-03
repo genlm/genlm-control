@@ -15,7 +15,7 @@ class HarmonyChat:
         "<|message|>",
         "<|end|>",
         "<|return|>",
-    ]  # Oss we may also want to include here the <|return|> token, which is used to tag the end of the final channel message.
+    ]  # Note: we may also want to include here the <|return|> token, which is used to tag the end of the final channel message.
     # Additionally this is required in order to correctly mark the complete status of the final channel in the output.
     # Unfortunately, this is currently not possible as the sampler artificially "swaps" the logits of the END with those of the
     # LM's eos token (in this case, <|return|>).
@@ -157,7 +157,7 @@ class HarmonyPotential(Potential):
         """
         Inputs:
             Base Potential: a base potential which is applied to the context channels.
-            llm_tokenizer: a tokenizer of a language model that supports the harmony chat format. NB: we need to verify weather the format is still evolving or not.
+            llm_tokenizer: a tokenizer of a language model that supports the harmony chat format. NB: we need to verify whether the format is still evolving or not.
             Constrained Channels: A list of channels to which the base potential is applied.
         Importantly, for compatibility with the genlm library, we assume that the tokens are represented as bytes.
         """  # Need to adapt the coerce method so that it does not prune the vocabulary -->(This would cause an error when sampling from channels that we do not want to constrain)
@@ -171,7 +171,9 @@ class HarmonyPotential(Potential):
         )  # is this the right vocab, or should it rather be the llm's?
 
         if not set(base_potential.vocab) <= set(self.vocab):
-            warnings.warn("The base potential's vocabulary must be a subset of the harmony potential's vocabulary.")
+            warnings.warn(
+                "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
+            )
 
     def set_constrained_channels(self, constrained_channels):
         """
@@ -203,15 +205,13 @@ class HarmonyPotential(Potential):
                     channels[key]["content"]
                 )  # Is this the right way to treat the complete potentials? I need to check.
 
-        if len(context) > 0:
-            print(f"complete chat -- context: {context[-1]}, log_weight: {log_weight}")
         return log_weight
 
     async def prefix(self, context):
         """
         Input: A list of byte tokens in bytes format.
         Note that each channel to be constrained is extracted from the context.
-        and depending on weather the string is complete or not, the complete or prefix potential is applied.
+        and depending on whether the string is complete or not, the complete or prefix potential is applied.
         Output: The sum of the log probabilities of the constrained channels, according to the base potential.
         If one of the channels is not marked as complete, it is evaluated as a prefix according to the base potential.
         """
@@ -233,10 +233,6 @@ class HarmonyPotential(Potential):
                         channels[key]["content"]
                     )
 
-        if len(context) > 0:
-            print(
-                f"prefix Potential -- context: {context[-1]}, log_weight: {log_weight}"
-            )
         return log_weight
 
     async def logw_next(self, context):
@@ -246,29 +242,51 @@ class HarmonyPotential(Potential):
         """
 
         end_token = self.harmony_chat.token_dict["<|end|>"][0]
-        channels = self.harmony_chat.extract_harmony_channels_from_tokens(context)  # Extract the channels from the context.
+        channels = self.harmony_chat.extract_harmony_channels_from_tokens(
+            context
+        )  # Extract the channels from the context.
 
         next_token_weights = self.make_lazy_weights(np.zeros(len(self.vocab_eos)))
 
-        incomplete_channels = {key for key in channels if channels[key] is not None and channels[key]["is_prefix"]}
-        assert len(incomplete_channels) <= 1, "At most one channel can have the 'is_prefix' flag set to true."
-        
+        incomplete_channels = {
+            key
+            for key in channels
+            if channels[key] is not None and channels[key]["is_prefix"]
+        }
+        assert len(incomplete_channels) <= 1, (
+            "At most one channel can have the 'is_prefix' flag set to true."
+        )
+
         if len(incomplete_channels) == 0:
-            return next_token_weights # If there are no incomplete channels,\
-                                      # we can return the weights as is. Every possible next token is valid for the harmony format.
- 
+            return next_token_weights  # If there are no incomplete channels,\
+            # we can return the weights as is. Every possible next token is valid for the harmony format.
+
         key = incomplete_channels.pop()
         if key is not None and key in self.constrained_channels:
-            if await self.base_potential.prefix(channels[key]["content"]) == float("-inf"):
-                raise ValueError(f"Context {channels[key]['content']!r} has weight zero under `prefix`.")
-            next_token_weights.weights += (await self.base_potential.logw_next(channels[key]["content"])).weights # This should directly return the normalized next-token log weights.
-            EOS_weight = next_token_weights.weights[-1] # Keep track of teh EOS weight.
+            if await self.base_potential.prefix(channels[key]["content"]) == float(
+                "-inf"
+            ):
+                raise ValueError(
+                    f"Context {channels[key]['content']!r} has weight zero under `prefix`."
+                )
+            next_token_weights.weights += (
+                await self.base_potential.logw_next(channels[key]["content"])
+            ).weights  # This should directly return the normalized next-token log weights.
+            EOS_weight = next_token_weights.weights[-1]  # Keep track of the EOS weight.
 
-            if key == "analysis" or key == "commentary": # In this case, the EOS weight needs to be moved to the <|end|> token.
+            if (
+                key == "analysis" or key == "commentary"
+            ):  # In this case, the EOS weight needs to be moved to the <|end|> token.
                 idx = next_token_weights.encode[end_token]
-                next_token_weights.weights[idx] = EOS_weight # Move the EOS weight to the <|end|>, which is the token that will be sampled by the llm to close the channel.
-                next_token_weights.weights[-1] = float("-inf") # Set the EOS weight to -inf.
-            elif key == "final": # If the channel is final, the prompted LLM automatically moves the weight of <|return|> to EOS. so we don't have to do anything else.
+                next_token_weights.weights[idx] = (
+                    EOS_weight  # Move the EOS weight to the <|end|>, which is the token that will be sampled by the llm to close the channel.
+                )
+                next_token_weights.weights[-1] = float(
+                    "-inf"
+                )  # Set the EOS weight to -inf.
+            elif (
+                key == "final"
+            ):  # If the channel is final, the prompted LLM automatically moves the weight of <|return|> to EOS. so we don't have to do anything else.
                 pass
-                
-        return next_token_weights # we return the normalized next-token weights.
+
+        return next_token_weights  # we return the normalized next-token weights.
