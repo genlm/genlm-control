@@ -37,21 +37,9 @@ class TokenSampler(SubModel):
     async def forward(self):
         parent = self.parent  # For some reason, need to hold onto this reference.
         token, logw, logp = await self.sample(parent.token_ctx)
-        ###
-        try:
-            parent.last_logw_incr = logw
-        except Exception:
-            pass
-        ###
         parent.score(logw)
         parent.logp += logp
         return token
-
-    def on_particle_cloned(self, new_parent, src_parent):
-        return
-
-    def on_particle_removed(self, parent):
-        return
 
     async def sample(self, context, draw):
         """Sample a token and weight from the `target`potential's vocabulary.
@@ -195,6 +183,7 @@ class SetTokenSampler(TokenSampler):
         This method should be called when the sampler is no longer needed.
         """
         await self.set_sampler.cleanup()
+
 
 class AWRS(TokenSampler):
     """Samples individual tokens through an adaptive weighted rejection sampling algorithm.
