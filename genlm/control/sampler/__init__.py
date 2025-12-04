@@ -8,6 +8,7 @@ from .unit import (
     FixedLengthBoundary,
     boundary_token_set,
     boundary_fixed_length,
+    flatten_units,
 )
 from genlm.control.potential import Potential
 
@@ -80,4 +81,5 @@ __all__ = [
     "FixedLengthBoundary",
     "boundary_token_set",
     "boundary_fixed_length",
+    "flatten_units",
 ]
