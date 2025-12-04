@@ -38,7 +38,6 @@ def cleanup_gpu():
     yield  # Run test
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
 
 @pytest.fixture
@@ -72,6 +71,8 @@ def tokenizer():
 
 @pytest.fixture
 def promptedllm():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (8, 0):
+        pytest.skip("CUDA not available or compute capability < 8.0")
     return PromptedLLM.from_name(
         model_name, backend="hf"
     )  # We set the prompt with set_prompt_from_string
@@ -256,9 +257,6 @@ def test_harmony_channel_extraction_token_bytes(harmony_examples, tokenizer):
 @pytest.mark.asyncio
 async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, BooleanCfg):
     """Test HarmonyPotential with AWRS and SMC for constrained generation."""
-    # Skip if model or tokenizer not available
-    if promptedllm is None or tokenizer is None:
-        pytest.skip("Model or tokenizer not available")
 
     # Setup prompt using chat template
     messages = [
@@ -409,9 +407,6 @@ async def test_logw_next_token_all(promptedllm, tokenizer, wcfg):
 async def test_harmony_sampling_from_product(promptedllm, tokenizer, wcfg):
     """Tests sampling from the product potential of HarmonyPotential and the PromptedLLM. Importantly,
     this tests the logic of the logw_next method"""
-    # Skip if model or tokenizer not available
-    if promptedllm is None or tokenizer is None:
-        pytest.skip("Model or tokenizer not available")
 
     # Setup prompt using chat template
     messages = [
