@@ -6,26 +6,30 @@ from genlm.backend import load_model_by_name
 from collections import OrderedDict
 
 class ByteLLM(Potential):
-    def __init__(self, llm, beam_params: BeamParams, cache_size: int = 1024, heal: bool = True, heal_max_backoff: int | None = None, heal_max_splits: int | None = None):
+    def __init__(self, llm, beam_params: BeamParams, cache_size: int = 1024, heal: bool = True, heal_max_backoff: int | None = None, heal_max_splits: int | None = None, prune_interval: int = 1, cache_interval: int = 1):
         self.llm = llm
-        # Update beam_params with healing configuration
         self.beam_params = beam_params
         self.beam_params.heal = heal
         self.beam_params.heal_max_backoff = heal_max_backoff
         self.beam_params.heal_max_splits = heal_max_splits
         self.cache_size = cache_size
+        self.prune_interval = prune_interval  # How often to prune (1 = every byte)
+        self.cache_interval = cache_interval  # How often to cache (1 = every byte)
         vocab = [i.to_bytes(1, 'big') for i in range(256)]
         super().__init__(vocabulary=vocab)
         # LRU cache of ByteBeamState keyed by full context bytes (prompt + context)
         self._beam_cache: OrderedDict[bytes, ByteBeamState] = OrderedDict()
         self._initial_beam = None
         self.prompt_bytes = b""
+        # Fast path: cache last accessed beam for sequential access
+        self._last_context = None
+        self._last_beam = None
 
     @classmethod
-    def from_name(cls, name, beam_params: BeamParams, backend=None, cache_size: int = 1024, heal: bool = True, heal_max_backoff: int | None = None, heal_max_splits: int | None = None, **kwargs):
+    def from_name(cls, name, beam_params: BeamParams, backend=None, cache_size: int = 1024, heal: bool = True, heal_max_backoff: int | None = None, heal_max_splits: int | None = None, prune_interval: int = 1, cache_interval: int = 1, **kwargs):
         backend = backend or ("vllm" if torch.cuda.is_available() else "hf")
         llm = load_model_by_name(name, backend=backend, **kwargs)
-        return cls(llm, beam_params, cache_size=cache_size, heal=heal, heal_max_backoff=heal_max_backoff, heal_max_splits=heal_max_splits)
+        return cls(llm, beam_params, cache_size=cache_size, heal=heal, heal_max_backoff=heal_max_backoff, heal_max_splits=heal_max_splits, prune_interval=prune_interval, cache_interval=cache_interval)
 
     def set_prompt_from_str(self, prompt_str: str):
         new_prompt_bytes = prompt_str.encode("utf-8")
@@ -33,37 +37,58 @@ class ByteLLM(Potential):
             self.prompt_bytes = new_prompt_bytes
             self._beam_cache.clear()
             self._initial_beam = None
+            self._last_context = None
+            self._last_beam = None
 
     async def _get_or_create_beam_for_context(self, context):
         context_bytes = b''.join(context)
         full_context_bytes = self.prompt_bytes + context_bytes
+
+        # Fast path: exact cache hit
         if full_context_bytes in self._beam_cache:
-            # Mark as recently used
             self._beam_cache.move_to_end(full_context_bytes)
-            return self._beam_cache[full_context_bytes]
+            beam = self._beam_cache[full_context_bytes]
+            self._last_context = full_context_bytes
+            self._last_beam = beam
+            return beam
 
-        best_prefix_bytes = b""
-        best_beam = None
-        for cached_prefix_bytes, cached_beam in self._beam_cache.items():
-            if full_context_bytes.startswith(cached_prefix_bytes) and len(cached_prefix_bytes) > len(best_prefix_bytes):
-                best_prefix_bytes = cached_prefix_bytes
-                best_beam = cached_beam
+        # Fast path: sequential access from last beam
+        if (self._last_context is not None and
+            full_context_bytes.startswith(self._last_context) and
+            len(full_context_bytes) > len(self._last_context)):
+            best_prefix_bytes = self._last_context
+            best_beam = self._last_beam
+        else:
+            # Search cache for longest prefix match
+            best_prefix_bytes = b""
+            best_beam = None
+            for cached_prefix_bytes, cached_beam in self._beam_cache.items():
+                if full_context_bytes.startswith(cached_prefix_bytes) and len(cached_prefix_bytes) > len(best_prefix_bytes):
+                    best_prefix_bytes = cached_prefix_bytes
+                    best_beam = cached_beam
 
-        if best_beam is None:
-            if self._initial_beam is None:
-                self._initial_beam = await ByteBeamState.initial(self.llm, self.beam_params)
-                if self.prompt_bytes:
-                    self._initial_beam = await self._initial_beam.prefill(self.prompt_bytes)
-                    self._cache_put(self.prompt_bytes, self._initial_beam)
-            best_beam = self._initial_beam
-            best_prefix_bytes = self.prompt_bytes if full_context_bytes.startswith(self.prompt_bytes) else b""
+            if best_beam is None:
+                if self._initial_beam is None:
+                    self._initial_beam = await ByteBeamState.initial(self.llm, self.beam_params)
+                    if self.prompt_bytes:
+                        self._initial_beam = await self._initial_beam.prefill(self.prompt_bytes)
+                        self._cache_put(self.prompt_bytes, self._initial_beam)
+                best_beam = self._initial_beam
+                best_prefix_bytes = self.prompt_bytes if full_context_bytes.startswith(self.prompt_bytes) else b""
 
+        # Advance beam byte-by-byte
         remaining_bytes = full_context_bytes[len(best_prefix_bytes):]
         current_beam = best_beam
         current_prefix_bytes = best_prefix_bytes
-        for byte_val in remaining_bytes:
-            current_beam = await (current_beam.prune() << byte_val)
+
+        for i, byte_val in enumerate(remaining_bytes):
+            # Prune only every N bytes (lazy pruning)
+            if i % self.prune_interval == 0:
+                current_beam = current_beam.prune()
+
+            current_beam = await (current_beam << byte_val)
             current_prefix_bytes += bytes([byte_val])
+
             # Check if beam is empty (happens when healing is disabled or fails)
             if len(current_beam) == 0:
                 raise ValueError(
@@ -71,7 +96,15 @@ class ByteLLM(Potential):
                     f"Context so far: {current_prefix_bytes!r}. "
                     f"Consider enabling healing or increasing beam width K."
                 )
-            self._cache_put(current_prefix_bytes, current_beam)
+
+            # Cache only every N bytes (selective caching)
+            if (i + 1) % self.cache_interval == 0 or i == len(remaining_bytes) - 1:
+                self._cache_put(current_prefix_bytes, current_beam)
+
+        # Update last beam for fast sequential access
+        self._last_context = full_context_bytes
+        self._last_beam = current_beam
+
         return current_beam
 
     def _cache_put(self, key: bytes, beam: ByteBeamState):
@@ -122,3 +155,6 @@ class ByteLLM(Potential):
             await self._initial_beam.cleanup()
         for beam in self._beam_cache.values():
             await beam.cleanup()
+        self._beam_cache.clear()
+        self._last_context = None
+        self._last_beam = None

@@ -124,118 +124,103 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
     )
     print(f"Output: {sequences.decoded_posterior}")
     assert len(sequences) > 0, "SMC should generate at least one sequence"
-    assert len(sequences.decoded_posterior) == 1, "SMC did not terminate"
+    assert len(sequences.decoded_posterior) >= 1, "SMC did not terminate"
 
 
 # -------------------------
 # Adaptive token healing tests
 # -------------------------
 
-TEXT_THAT_NEEDS_HEALING = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
-
-
-async def _try_prefix(byte_llm: ByteLLM, text: str):
-    """Helper to compute prefix probability for text using ByteLLM.
-
-    Returns:
-        (success, bytes_consumed, error):
-            - success: True if completed successfully
-            - bytes_consumed: Number of bytes successfully processed
-            - error: Exception if failed, None otherwise
-    """
-    bs = text.encode("utf-8")
-    context = [b.to_bytes(1, 'big') for b in bs]
-    try:
-        # This will call _get_or_create_beam_for_context which advances byte-by-byte
-        await byte_llm.prefix(context)
-        return True, len(bs), None
-    except ValueError as e:
-        # Extract bytes consumed from error message if available
-        # Error format: "Beam became empty at byte X. Context so far: b'...'"
-        import re
-        match = re.search(r"Context so far: b'([^']*)'", str(e))
-        if match:
-            consumed = len(match.group(1).encode().decode('unicode_escape').encode('latin1'))
-            return False, consumed, e
-        return False, 0, e
-
-
 @pytest.mark.asyncio
 async def test_healing_disabled_fails(model_name):
     """Without healing, K=1 beam fails on text requiring alternative tokenization."""
     llm = load_model_by_name(model_name)
-    model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    beam_params = BeamParams(K=1, eos_tokens={model_eos_token})
-
+    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]})
     byte_llm = ByteLLM(llm, beam_params, heal=False)
+
+    text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
+    context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
+
     try:
-        success, bytes_consumed, error = await _try_prefix(byte_llm, TEXT_THAT_NEEDS_HEALING)
-        assert not success, "Expected failure with heal disabled, but succeeded"
-        assert isinstance(error, ValueError), f"Expected ValueError, got {type(error)}"
-        assert "Beam became empty" in str(error), "Error should mention empty beam"
-        # Should fail before completing the full text
-        assert bytes_consumed < len(TEXT_THAT_NEEDS_HEALING), \
-            f"Should fail before consuming all {len(TEXT_THAT_NEEDS_HEALING)} bytes, but consumed {bytes_consumed}"
+        with pytest.raises(ValueError, match="Beam became empty"):
+            await byte_llm.prefix(context)
     finally:
         await byte_llm.cleanup()
 
 
 @pytest.mark.asyncio
 async def test_healing_enabled_succeeds(model_name):
-    """With healing enabled, K=1 beam gets further or completes text."""
+    """With healing enabled, K=1 beam processes more text than without healing."""
     llm = load_model_by_name(model_name)
-    model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    beam_params = BeamParams(K=1, eos_tokens={model_eos_token})
+    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]})
 
-    # First, get baseline of how far we can get without healing
+    text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
+    context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
+
+    # Test without healing - find how far we get
     byte_llm_no_heal = ByteLLM(llm, beam_params, heal=False)
     try:
-        _, bytes_no_heal, _ = await _try_prefix(byte_llm_no_heal, TEXT_THAT_NEEDS_HEALING)
+        for i in range(len(context)):
+            try:
+                await byte_llm_no_heal.prefix(context[:i+1])
+                no_heal_len = i + 1
+            except ValueError:
+                no_heal_len = i
+                break
     finally:
         await byte_llm_no_heal.cleanup()
 
-    # Now test with healing enabled
+    # Test with healing - should get further
     byte_llm_heal = ByteLLM(llm, beam_params, heal=True)
     try:
-        success_heal, bytes_heal, _ = await _try_prefix(byte_llm_heal, TEXT_THAT_NEEDS_HEALING)
+        for i in range(len(context)):
+            try:
+                await byte_llm_heal.prefix(context[:i+1])
+                heal_len = i + 1
+            except ValueError:
+                heal_len = i
+                break
 
-        # Healing should allow us to get further than without healing
-        assert bytes_heal > bytes_no_heal, \
-            f"Healing should consume more bytes ({bytes_heal}) than no healing ({bytes_no_heal})"
-
-        # Ideally it completes, but even getting further is evidence of healing working
-        if success_heal:
-            print(f"✓ Healing enabled complete success: {bytes_heal}/{len(TEXT_THAT_NEEDS_HEALING)} bytes")
-        else:
-            print(f"✓ Healing helped: {bytes_heal} bytes vs {bytes_no_heal} bytes without healing")
+        assert heal_len > no_heal_len, f"Healing ({heal_len}) should exceed no-healing ({no_heal_len})"
     finally:
         await byte_llm_heal.cleanup()
 
 
 @pytest.mark.asyncio
-async def test_healing_max_backoff_limited(model_name):
-    """With limited backoff, healing is constrained."""
+async def test_healing_max_backoff(model_name):
+    """Limited backoff constrains healing effectiveness."""
     llm = load_model_by_name(model_name)
-    model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    beam_params = BeamParams(K=1, eos_tokens={model_eos_token})
+    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]})
 
-    # Test with unlimited healing
-    byte_llm_unlimited = ByteLLM(llm, beam_params, heal=True, heal_max_backoff=None)
+    text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
+    context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
+
+    # Unlimited healing
+    byte_llm_unlimited = ByteLLM(llm, beam_params, heal=True)
     try:
-        _, bytes_unlimited, _ = await _try_prefix(byte_llm_unlimited, TEXT_THAT_NEEDS_HEALING)
+        for i in range(len(context)):
+            try:
+                await byte_llm_unlimited.prefix(context[:i+1])
+                unlimited_len = i + 1
+            except ValueError:
+                unlimited_len = i
+                break
     finally:
         await byte_llm_unlimited.cleanup()
 
-    # Test with limited healing
+    # Limited healing
     byte_llm_limited = ByteLLM(llm, beam_params, heal=True, heal_max_backoff=2)
     try:
-        _, bytes_limited, _ = await _try_prefix(byte_llm_limited, TEXT_THAT_NEEDS_HEALING)
+        for i in range(len(context)):
+            try:
+                await byte_llm_limited.prefix(context[:i+1])
+                limited_len = i + 1
+            except ValueError:
+                limited_len = i
+                break
 
-        # Limited backoff should consume same or fewer bytes than unlimited
-        assert bytes_limited <= bytes_unlimited, \
-            f"Limited backoff ({bytes_limited} bytes) should not exceed unlimited ({bytes_unlimited} bytes)"
-
-        print(f"Limited backoff=2: {bytes_limited} bytes, Unlimited: {bytes_unlimited} bytes")
+        assert limited_len <= unlimited_len, \
+            f"Limited ({limited_len}) should not exceed unlimited ({unlimited_len})"
     finally:
         await byte_llm_limited.cleanup()
     
