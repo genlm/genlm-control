@@ -150,7 +150,11 @@ class ByteLLM(Potential):
         return self.make_lazy_weights(logws)
 
     async def cleanup(self):
-        """Cleans up resources used by the beam states."""
+        """Cleans up resources used by the beam states.
+
+        This method is called automatically when using ByteLLM as an async context manager.
+        If not using a context manager, you should call this method manually when done.
+        """
         if self._initial_beam:
             await self._initial_beam.cleanup()
         for beam in self._beam_cache.values():
@@ -158,3 +162,12 @@ class ByteLLM(Potential):
         self._beam_cache.clear()
         self._last_context = None
         self._last_beam = None
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - ensures cleanup is called."""
+        await self.cleanup()
+        return False

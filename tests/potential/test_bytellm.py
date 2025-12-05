@@ -223,4 +223,90 @@ async def test_healing_max_backoff(model_name):
             f"Limited ({limited_len}) should not exceed unlimited ({unlimited_len})"
     finally:
         await byte_llm_limited.cleanup()
+
+
+# -------------------------
+# Async context manager tests
+# -------------------------
+
+@pytest.mark.asyncio
+async def test_context_manager_basic(model_name, beam_params):
+    """Test that ByteLLM works as an async context manager."""
+    llm = load_model_by_name(model_name)
+
+    async with ByteLLM(llm, beam_params) as byte_llm:
+        # Verify we can use the instance inside the context
+        assert isinstance(byte_llm, Potential)
+        assert len(byte_llm.vocab) == 256
+
+        # Perform some operations
+        byte_llm.set_prompt_from_str("Hello")
+        logp = await byte_llm.prefix([b" ", b"w", b"o", b"r", b"l", b"d"])
+        assert isinstance(logp, float)
+        assert logp < 0
+
+        # Verify cache was populated
+        assert byte_llm._beam_cache or byte_llm._initial_beam is not None
+
+    # After exiting context, cleanup should have been called
+    # Cache should be cleared
+    assert not byte_llm._beam_cache
+    assert byte_llm._last_context is None
+    assert byte_llm._last_beam is None
+
+
+@pytest.mark.asyncio
+async def test_context_manager_cleanup_on_exception(model_name, beam_params):
+    """Test that cleanup is called even when an exception occurs inside the context."""
+    llm = load_model_by_name(model_name)
+
+    class TestException(Exception):
+        pass
+
+    byte_llm_ref = None
+
+    with pytest.raises(TestException):
+        async with ByteLLM(llm, beam_params) as byte_llm:
+            byte_llm_ref = byte_llm
+
+            # Perform some operations to populate cache
+            byte_llm.set_prompt_from_str("Test")
+            await byte_llm.prefix([b"!"])
+            assert byte_llm._beam_cache or byte_llm._initial_beam is not None
+
+            # Raise an exception
+            raise TestException("Intentional test exception")
+
+    # Cleanup should still have been called despite the exception
+    assert byte_llm_ref is not None
+    assert not byte_llm_ref._beam_cache
+    assert byte_llm_ref._last_context is None
+    assert byte_llm_ref._last_beam is None
+
+
+@pytest.mark.asyncio
+async def test_context_manager_with_smc(model_name, beam_params):
+    """Test that ByteLLM context manager works correctly with SMC sampling."""
+    llm = load_model_by_name(model_name)
+
+    async with ByteLLM(llm, beam_params) as byte_llm:
+        byte_llm.set_prompt_from_str("The answer is:")
+
+        fsa = BoolFSA.from_regex(r" (yes|no)")
+        sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))
+
+        sequences = await sampler.smc(
+            n_particles=5,
+            max_tokens=10,
+            ess_threshold=0.5,
+            verbosity=0,
+        )
+
+        assert len(sequences) > 0
+        # Verify outputs match the constraint
+        for seq in sequences.decoded_posterior.keys():
+            assert "yes" in seq or "no" in seq
+
+    # Cleanup should have been called
+    assert not byte_llm._beam_cache
     
