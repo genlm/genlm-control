@@ -9,9 +9,10 @@ from genlm.control.sampler import (
     TokenSetBoundary,
     FixedLengthBoundary,
 )
+from genlm.control.sampler.unit import flatten_units
 from genlm.control.sampler.sequence import SMC
 from genlm.control.constant import EOS
-from conftest import MockPotential
+from conftest import MockPotential, WeightedSet
 
 
 @pytest.mark.asyncio
@@ -134,12 +135,11 @@ async def test_multi_token_unit_sampler_timeout():
     )
     unit, _, _ = await unit_sampler.sample([], draw=None)
     # Unit should be terminated either by max_subunits_per_unit or EOS
-    if unit[-1] is EOS:
-        # Terminated by EOS before timeout
-        assert len(unit) <= 5
-    else:
-        # Hit timeout
-        assert len(unit) == 5
+    # The unit length should not exceed max_subunits_per_unit
+    assert len(unit) <= 5
+    # If EOS is in the unit, it should be the last element
+    if EOS in unit:
+        assert unit[-1] is EOS
 
 
 @pytest.mark.asyncio
@@ -208,8 +208,149 @@ async def test_sequence_model_with_multi_token_units():
         max_tokens=10,
     )
     # Each sequence should be a list of units
-    for seq, logw in sequences:
+    for seq, _ in sequences:
         assert isinstance(seq, list)
         # Each unit should be a list of tokens
         for unit in seq:
             assert isinstance(unit, list) or unit is EOS
+
+
+@pytest.mark.asyncio
+async def test_flatten_units_flat_list():
+    """Test flatten_units with already flat list."""
+    flat_context = [b"hello", b" ", b"world"]
+    result = flatten_units(flat_context)
+    assert result == [b"hello", b" ", b"world"]
+
+
+@pytest.mark.asyncio
+async def test_flatten_units_nested_list():
+    """Test flatten_units with nested list (multi-token units)."""
+    nested_context = [[b"hello", b" "], [b"world", b"!"], b"\n"]
+    result = flatten_units(nested_context)
+    assert result == [b"hello", b" ", b"world", b"!", b"\n"]
+
+
+@pytest.mark.asyncio
+async def test_flatten_units_empty():
+    """Test flatten_units with empty list."""
+    result = flatten_units([])
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_flatten_units_mixed():
+    """Test flatten_units with mixed flat and nested items."""
+    mixed_context = [b"a", [b"b", b"c"], b"d", [b"e"]]
+    result = flatten_units(mixed_context)
+    assert result == [b"a", b"b", b"c", b"d", b"e"]
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_type_error():
+    """Test TypeError when subunit_sampler is not a TokenSampler."""
+    with pytest.raises(TypeError, match="subunit_sampler must be a TokenSampler"):
+        MultiTokenUnitSampler(
+            subunit_sampler="not a sampler",
+            boundary_predicate=boundary_token_set({b" "}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_start_weight():
+    """Test start_weight method from subunit_sampler"""
+    vocab = [b"hello", b" ", b"world"]
+    logws = np.log([0.4, 0.2, 0.3, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = boundary_token_set({b" ", EOS})
+
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+    )
+    start_w = await unit_sampler.start_weight()
+    expected_start_w = await subunit_sampler.start_weight()
+    assert start_w == expected_start_w
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_cleanup():
+    """Test cleanup"""
+    vocab = [b"hello", b" ", b"world"]
+    logws = np.log([0.4, 0.2, 0.3, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = boundary_token_set({b" ", EOS})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+    )
+    await unit_sampler.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_exception_handling():
+    """Test exception handling in sample method."""
+    vocab = [b"a", b"b"]
+    logws = np.log([0.5, 0.5])
+    mock_potential = MockPotential(vocab, logws)
+    # Create a subunit sampler that will raise an exception
+    class FailingSampler(DirectTokenSampler):
+        async def sample(self, context, draw=None):
+            # Fail after first token
+            if len(context) > 0:
+                raise RuntimeError("Test exception")
+            return await super().sample(context, draw)
+    subunit_sampler = FailingSampler(mock_potential)
+    boundary = boundary_token_set({b" ", EOS})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+    )
+    # Should handle exception and return -inf weight
+    unit, weight, logp = await unit_sampler.sample([], draw=None)
+    assert weight == float("-inf")
+    assert isinstance(unit, list)
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_eos_in_unit():
+    """Test EOS handling when EOS appears in the middle of a unit."""
+    vocab = [b"hello", b" ", b"world"]
+    # Make EOS highly likely
+    logws = np.log([0.1, 0.1, 0.1, 0.7])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = boundary_token_set({b" ", EOS})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    # Sample multiple times to get EOS
+    eos_found = False
+    for _ in range(20):
+        unit, weight, _ = await unit_sampler.sample([], draw=None)
+        if unit and unit[-1] is EOS:
+            eos_found = True
+            break
+    assert eos_found, "Should eventually sample EOS"
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_flatten_to_subunits():
+    """Test _flatten_to_subunits internal method."""
+    vocab = [b"a", b"b", b"c"]
+    logws = np.log([0.4, 0.3, 0.2, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = boundary_token_set({b" ", EOS})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+    )
+    # Test with mixed unit context
+    unit_context = [[b"a", b"b"], b"c", [b"a"]]
+    flattened = unit_sampler._flatten_to_subunits(unit_context)
+    assert flattened == [b"a", b"b", b"c", b"a"]

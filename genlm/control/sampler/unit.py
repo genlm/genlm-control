@@ -32,8 +32,6 @@ class MultiTokenUnitSampler(TokenSampler):
     Args:
         subunit_sampler (TokenSampler): Sampler for subunits $s \\in \\mathcal{B}$
         boundary_predicate (callable): Function for determining EOT
-        unit_potential (Potential, optional): Additional potential for constrained
-            unit generation. If provided, only units with $\\psi_{\\text{unit}}(\\bm{s}) > 0$ are accepted.
         max_subunits_per_unit (int): Safety timeout to prevent non-termination. Default: 100.
         include_boundary_in_unit (bool): Whether to include the boundary token
             in the returned unit. Default: True.
@@ -55,7 +53,6 @@ class MultiTokenUnitSampler(TokenSampler):
         self,
         subunit_sampler,
         boundary_predicate,
-        unit_potential=None,
         max_subunits_per_unit=100,
         include_boundary_in_unit=True,
     ):
@@ -69,7 +66,6 @@ class MultiTokenUnitSampler(TokenSampler):
 
         self.subunit_sampler = subunit_sampler
         self.boundary_predicate = boundary_predicate
-        self.unit_potential = unit_potential
         self.max_subunits_per_unit = max_subunits_per_unit
         self.include_boundary_in_unit = include_boundary_in_unit
 
@@ -149,15 +145,7 @@ class MultiTokenUnitSampler(TokenSampler):
 
             # Check for EOS
             if subunit is EOS:
-                # TODO make this more flexible
                 return subunit_buffer, cumulative_logw, cumulative_logp
-
-            # Analogous to twist in SequenceModel.step()
-            if self.unit_potential:
-                prefix_logw = await self.unit_potential.prefix(subunit_buffer)
-                if prefix_logw == float("-inf"):
-                    # Unit violates constraint; kill this sample
-                    return subunit_buffer, float("-inf"), cumulative_logp
 
             # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
             if self.boundary_predicate(flat_token_context, subunit_buffer):
@@ -165,12 +153,6 @@ class MultiTokenUnitSampler(TokenSampler):
                 # Exclude boundary token from unit if requested
                 if not self.include_boundary_in_unit and unit:
                     unit = unit[:-1]
-                # Validate complete unit with unit potential
-                if self.unit_potential:
-                    complete_logw = await self.unit_potential.complete(unit)
-                    if complete_logw == float("-inf"):
-                        return unit, float("-inf"), cumulative_logp
-                    cumulative_logw += complete_logw
                 return unit, cumulative_logw, cumulative_logp
 
         return subunit_buffer, cumulative_logw, cumulative_logp
@@ -199,9 +181,6 @@ class MultiTokenUnitSampler(TokenSampler):
     async def cleanup(self):
         """Clean up resources."""
         await self.subunit_sampler.cleanup()
-        if self.unit_potential:
-            await self.unit_potential.cleanup()
-
 
 class BoundaryPredicate(ABC):
     """Abstract base class for boundary predicates.
@@ -224,7 +203,7 @@ class BoundaryPredicate(ABC):
         Returns:
             bool: True if $\\bm{s}$ forms a complete unit $x \\in \\mathcal{A}$
         """
-        pass
+        pass # pragma: no cover
 
 
 class TokenSetBoundary(BoundaryPredicate):
