@@ -7,6 +7,7 @@ import pytest
 from pathlib import Path
 from genlm.grammar import CFG, Boolean, Float
 from genlm.control.potential.built_in import WCFG, BoolCFG
+from genlm.control.potential.coerce import Coerced
 
 from genlm.control.potential.built_in.llm import PromptedLLM
 from genlm.control.potential.harmony import HarmonyPotential, HarmonyChat
@@ -68,7 +69,6 @@ def tokenizer():
     except Exception as e:
         pytest.skip(f"Could not load tokenizer: {e}")
 
-
 @pytest.fixture
 def promptedllm():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (8, 0):
@@ -99,7 +99,7 @@ def BooleanCfg():
 
 
 @pytest.mark.asyncio
-async def test_potential_evaluation(wcfg, promptedllm, tokenizer):
+async def test_potential_evaluation(wcfg, tokenizer):
     """
     Tests that the harmony potential are correctly evaluated
     on a given chat and taking a wcfg as the underlying grammar
@@ -110,8 +110,10 @@ async def test_potential_evaluation(wcfg, promptedllm, tokenizer):
 
     cfg_inputs = {"analysis": "aaaabaaaa", "commentary": "bbbbbbbbb", "final": "aaa"}
 
+    potential_vocab = HarmonyChat(tokenizer).potential_vocab # This way we can avoid to load the llm vocabulary.
+    coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
     base_cfg = wcfg.cfg
-    coerced_cfg = wcfg.coerce(promptedllm, f=coerce_bytes_to_chars, prune=False)
+
     harmony_potential = HarmonyPotential(
         base_potential=coerced_cfg, llm_tokenizer=tokenizer
     )
@@ -256,7 +258,8 @@ def test_harmony_channel_extraction_token_bytes(harmony_examples, tokenizer):
 
 @pytest.mark.asyncio
 async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, BooleanCfg):
-    """Test HarmonyPotential with AWRS and SMC for constrained generation."""
+    """Test HarmonyPotential with AWRS and SMC for constrained generation.
+     This checks the correctness of the prefix and complete methods"""
 
     # Setup prompt using chat template
     messages = [
@@ -327,10 +330,11 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
 
 
 @pytest.mark.asyncio
-async def test_logw_next_token_END(promptedllm, tokenizer, wcfg):
+async def test_logw_next_token_END(tokenizer, wcfg):
     """This method tests that the logw_next method is correctly implemented. in the special cases where the mass is concentrated on the end of string token"""
 
-    coerced_cfg = wcfg.coerce(promptedllm, f=coerce_bytes_to_chars, prune=False)
+    potential_vocab = HarmonyChat(tokenizer).potential_vocab # This way we can avoid to load the llm vocabulary.
+    coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
     harmony_potential = HarmonyPotential(
         base_potential=coerced_cfg,
         llm_tokenizer=tokenizer,
@@ -364,7 +368,7 @@ async def test_logw_next_token_END(promptedllm, tokenizer, wcfg):
 
 
 @pytest.mark.asyncio
-async def test_logw_next_token_all(promptedllm, tokenizer, wcfg):
+async def test_logw_next_token_all(tokenizer, wcfg):
     """This method tests that the logw_next method is correctly implemented. In particular,
     we check that the next token weights matches what we would compute with the naive next prefix weight."""
     string = "aaa"
@@ -372,7 +376,8 @@ async def test_logw_next_token_all(promptedllm, tokenizer, wcfg):
         wcfg.cfg_eos.prefix_grammar(string)
     )  # compute the common normalizing constant
 
-    coerced_cfg = wcfg.coerce(promptedllm, f=coerce_bytes_to_chars, prune=False)
+    potential_vocab = HarmonyChat(tokenizer).potential_vocab # This way we can avoid to load the llm vocabulary.
+    coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
     harmony_potential = HarmonyPotential(
         base_potential=coerced_cfg,
         llm_tokenizer=tokenizer,
