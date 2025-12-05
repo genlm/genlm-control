@@ -182,6 +182,7 @@ class MultiTokenUnitSampler(TokenSampler):
         """Clean up resources."""
         await self.subunit_sampler.cleanup()
 
+
 class BoundaryPredicate(ABC):
     """Abstract base class for boundary predicates.
 
@@ -203,7 +204,7 @@ class BoundaryPredicate(ABC):
         Returns:
             bool: True if $\\bm{s}$ forms a complete unit $x \\in \\mathcal{A}$
         """
-        pass # pragma: no cover
+        pass  # pragma: no cover
 
 
 class TokenSetBoundary(BoundaryPredicate):

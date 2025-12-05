@@ -12,7 +12,7 @@ from genlm.control.sampler import (
 from genlm.control.sampler.unit import flatten_units
 from genlm.control.sampler.sequence import SMC
 from genlm.control.constant import EOS
-from conftest import MockPotential, WeightedSet
+from conftest import MockPotential
 
 
 @pytest.mark.asyncio
@@ -295,6 +295,7 @@ async def test_multi_token_unit_sampler_exception_handling():
     vocab = [b"a", b"b"]
     logws = np.log([0.5, 0.5])
     mock_potential = MockPotential(vocab, logws)
+
     # Create a subunit sampler that will raise an exception
     class FailingSampler(DirectTokenSampler):
         async def sample(self, context, draw=None):
@@ -302,6 +303,7 @@ async def test_multi_token_unit_sampler_exception_handling():
             if len(context) > 0:
                 raise RuntimeError("Test exception")
             return await super().sample(context, draw)
+
     subunit_sampler = FailingSampler(mock_potential)
     boundary = boundary_token_set({b" ", EOS})
     unit_sampler = MultiTokenUnitSampler(
