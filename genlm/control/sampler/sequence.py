@@ -311,8 +311,14 @@ class SequenceModel(Model):
         if self.verbosity > 0:
             print(self.__repr__())
 
-        self.max_tokens -= 1
-        if self.max_tokens == 0 or self.token_ctx[-1] is EOS:
+        # Patch for unit samplers: unit is a list of tokens
+        if isinstance(unit, list):
+            tokens_in_unit = len(unit)
+        else:
+            tokens_in_unit = 1
+
+        self.max_tokens -= tokens_in_unit
+        if self.max_tokens <= 0 or self.token_ctx[-1] is EOS:
             self.finish()
             if self.critic:
                 if not self.twist_with_critic:
