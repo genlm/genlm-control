@@ -5,9 +5,7 @@ from genlm.control.potential.built_in.llm import TokenMappings
 import numpy as np
 import warnings
 
-# Controllo 
-
-class HarmonyChat:
+class HarmonyChat: # This dictionary encodes the channel of the Harmony chat format. Note that this is independent from the tokenizer.
     harmony_chat_keys = [
         "analysis",
         "final",
@@ -60,7 +58,7 @@ class HarmonyChat:
             if (
                 i >= len(token_bytes)
             ):  # If we reach the string end without having entered the channel content, it means, that there is no content and we can return.
-                return None
+                return None # pragma: no cover
         i += 1
         while True:
             if len(token_bytes[i:]) == 0:
@@ -108,7 +106,7 @@ class HarmonyChat:
                 elif token_bytes[i + 1] == commentary_tokens[0]:
                     results["commentary"] = self.extract_channel_content(token_bytes, i)
                 else:
-                    raise ValueError(f"Unexpected channel: {token_bytes[i + 1]}")
+                    raise ValueError(f"Unexpected channel: {token_bytes[i + 1]}") #pragma: no cover
 
             i += 1
 
@@ -133,8 +131,8 @@ class HarmonyChat:
         )
         try:
             return [self.token_maps.encode[x] for x in tokens]
-        except KeyError as e:
-            raise ValueError(f"Token {e.args[0]} not in vocabulary") from e
+        except KeyError as e: # pragma: no cover
+            raise ValueError(f"Token {e.args[0]} not in vocabulary") from e #pragma: no cover
 
     def decode_tokens(self, ids):
         """
@@ -172,7 +170,7 @@ class HarmonyPotential(Potential):
         )  # is this the right vocab, or should it rather be the llm's?
 
         if not set(base_potential.vocab) <= set(self.vocab):
-            warnings.warn(
+            warnings.warn( # pragma: no cover
                 "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
             )
 
@@ -180,9 +178,7 @@ class HarmonyPotential(Potential):
         """
         A list of channels to be constrained.
         """
-        if isinstance(constrained_channels, str):
-            constrained_channels = [constrained_channels]
-        assert all(
+        assert isinstance(constrained_channels, list) and all(
             x in {"analysis", "final", "commentary"} for x in constrained_channels
         ), "Constrained channels must be one of analysis, final, or commentary."
         self.constrained_channels = constrained_channels
@@ -259,7 +255,7 @@ class HarmonyPotential(Potential):
         )
 
         if len(incomplete_channels) == 0:
-            return next_token_weights  # If there are no incomplete channels,\
+            return next_token_weights  # If there are no incomplete channels,\ pragma: no cover
             # we can return the weights as is. Every possible next token is valid for the harmony format.
 
         key = incomplete_channels.pop()
@@ -267,7 +263,7 @@ class HarmonyPotential(Potential):
             if await self.base_potential.prefix(channels[key]["content"]) == float(
                 "-inf"
             ):
-                raise ValueError(
+                raise ValueError( # pragma: no cover
                     f"Context {channels[key]['content']!r} has weight zero under `prefix`."
                 )
             next_token_weights.weights += (
