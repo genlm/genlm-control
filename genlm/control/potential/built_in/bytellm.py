@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import numpy as np
 from genlm.control.potential.base import Potential
@@ -33,7 +35,7 @@ class ByteLLM(Potential):
         ```
     """
 
-    def __init__(self, llm, beam_params: BeamParams, cache_size: int = 1024):
+    def __init__(self, llm: Any, beam_params: BeamParams, cache_size: int = 1024):
         self.llm = llm
         self.beam_params = beam_params
         self.cache_size = cache_size
