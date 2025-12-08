@@ -5,16 +5,38 @@ from genlm.bytes import ByteBeamState, BeamParams
 from genlm.backend import load_model_by_name
 from collections import OrderedDict
 
+
 class ByteLLM(Potential):
-    def __init__(self, llm, beam_params: BeamParams, cache_size: int = 1024, heal: bool = True, heal_max_backoff: int | None = None, heal_max_splits: int | None = None, prune_interval: int = 1, cache_interval: int = 1):
+    """A potential representing a language model operating at the byte level using beam search.
+
+    `ByteLLM` wraps a language model and uses beam search to compute log probabilities
+    over byte sequences. This enables constrained generation at the byte level while
+    maintaining coherent token-level probabilities through adaptive token healing.
+
+    This class requires the `genlm-bytes` package. Install with: `pip install genlm-control[bytes]`
+
+    Args:
+        llm: The language model to use (from `genlm.backend`).
+        beam_params (BeamParams): Configuration for beam search, including beam width `K`,
+            `eos_tokens`, and healing parameters (`heal`, `heal_max_backoff`, `heal_max_splits`).
+        cache_size (int): Maximum number of beam states to cache. Defaults to 1024.
+
+    Example:
+        ```python
+        from genlm.bytes import BeamParams
+        from genlm.control import ByteLLM
+
+        beam_params = BeamParams(K=5, eos_tokens={b"<|endoftext|>"}, heal=True)
+        async with ByteLLM.from_name("gpt2", beam_params) as byte_llm:
+            byte_llm.set_prompt_from_str("Hello")
+            logp = await byte_llm.prefix([b" ", b"w", b"o", b"r", b"l", b"d"])
+        ```
+    """
+
+    def __init__(self, llm, beam_params: BeamParams, cache_size: int = 1024):
         self.llm = llm
         self.beam_params = beam_params
-        self.beam_params.heal = heal
-        self.beam_params.heal_max_backoff = heal_max_backoff
-        self.beam_params.heal_max_splits = heal_max_splits
         self.cache_size = cache_size
-        self.prune_interval = prune_interval  # How often to prune (1 = every byte)
-        self.cache_interval = cache_interval  # How often to cache (1 = every byte)
         vocab = [i.to_bytes(1, 'big') for i in range(256)]
         super().__init__(vocabulary=vocab)
         # LRU cache of ByteBeamState keyed by full context bytes (prompt + context)
@@ -26,10 +48,10 @@ class ByteLLM(Potential):
         self._last_beam = None
 
     @classmethod
-    def from_name(cls, name, beam_params: BeamParams, backend=None, cache_size: int = 1024, heal: bool = True, heal_max_backoff: int | None = None, heal_max_splits: int | None = None, prune_interval: int = 1, cache_interval: int = 1, **kwargs):
+    def from_name(cls, name, beam_params: BeamParams, backend=None, cache_size: int = 1024, **kwargs):
         backend = backend or ("vllm" if torch.cuda.is_available() else "hf")
         llm = load_model_by_name(name, backend=backend, **kwargs)
-        return cls(llm, beam_params, cache_size=cache_size, heal=heal, heal_max_backoff=heal_max_backoff, heal_max_splits=heal_max_splits, prune_interval=prune_interval, cache_interval=cache_interval)
+        return cls(llm, beam_params, cache_size=cache_size)
 
     def set_prompt_from_str(self, prompt_str: str):
         new_prompt_bytes = prompt_str.encode("utf-8")
@@ -82,14 +104,10 @@ class ByteLLM(Potential):
         current_prefix_bytes = best_prefix_bytes
 
         for i, byte_val in enumerate(remaining_bytes):
-            # Prune only every N bytes (lazy pruning)
-            if i % self.prune_interval == 0:
-                current_beam = current_beam.prune()
-
+            current_beam = current_beam.prune()
             current_beam = await (current_beam << byte_val)
-            current_prefix_bytes += bytes([byte_val])
+            current_prefix_bytes += remaining_bytes[i:i+1]
 
-            # Check if beam is empty (happens when healing is disabled or fails)
             if len(current_beam) == 0:
                 raise ValueError(
                     f"Beam became empty at byte {byte_val} ({chr(byte_val) if 32 <= byte_val < 127 else f'0x{byte_val:02x}'}). "
@@ -97,9 +115,7 @@ class ByteLLM(Potential):
                     f"Consider enabling healing or increasing beam width K."
                 )
 
-            # Cache only every N bytes (selective caching)
-            if (i + 1) % self.cache_interval == 0 or i == len(remaining_bytes) - 1:
-                self._cache_put(current_prefix_bytes, current_beam)
+            self._cache_put(current_prefix_bytes, current_beam)
 
         # Update last beam for fast sequential access
         self._last_context = full_context_bytes
@@ -111,7 +127,6 @@ class ByteLLM(Potential):
         self._beam_cache[key] = beam
         self._beam_cache.move_to_end(key)
         while len(self._beam_cache) > self.cache_size:
-            # Evict least-recently used
             self._beam_cache.popitem(last=False)
 
     async def prefix(self, context):

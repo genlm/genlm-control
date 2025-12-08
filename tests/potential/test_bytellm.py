@@ -1,8 +1,18 @@
-
 import pytest
 import numpy as np
 import asyncio
-from genlm.bytes import BeamParams
+
+try:
+    from genlm.bytes import BeamParams
+    HAS_GENLM_BYTES = True
+except ImportError:
+    HAS_GENLM_BYTES = False
+
+pytestmark = pytest.mark.skipif(
+    not HAS_GENLM_BYTES,
+    reason="genlm-bytes not installed. Install with: pip install genlm-control[bytes]"
+)
+
 from genlm.backend import load_model_by_name
 from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
 
@@ -97,10 +107,6 @@ async def test_logw_next_values(byte_llm: ByteLLM):
     comma_logp = weights[b',']
     eos_logp = weights[byte_llm.eos]
 
-    print(f"logp(' ' | 'Hello') = {space_logp}")
-    print(f"logp(',' | 'Hello') = {comma_logp}")
-    print(f"logp(EOS | 'Hello') = {eos_logp}")
-
     assert np.isfinite(space_logp), "Logp for space should be finite"
     assert np.isfinite(comma_logp), "Logp for comma should be finite"
     assert np.isfinite(eos_logp), "Logp for EOS should be finite"
@@ -122,7 +128,6 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
         ess_threshold=0.5,
         verbosity=1,
     )
-    print(f"Output: {sequences.decoded_posterior}")
     assert len(sequences) > 0, "SMC should generate at least one sequence"
     assert len(sequences.decoded_posterior) >= 1, "SMC did not terminate"
 
@@ -135,8 +140,8 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
 async def test_healing_disabled_fails(model_name):
     """Without healing, K=1 beam fails on text requiring alternative tokenization."""
     llm = load_model_by_name(model_name)
-    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]})
-    byte_llm = ByteLLM(llm, beam_params, heal=False)
+    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False)
+    byte_llm = ByteLLM(llm, beam_params)
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
@@ -152,13 +157,13 @@ async def test_healing_disabled_fails(model_name):
 async def test_healing_enabled_succeeds(model_name):
     """With healing enabled, K=1 beam processes more text than without healing."""
     llm = load_model_by_name(model_name)
-    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]})
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
 
     # Test without healing - find how far we get
-    byte_llm_no_heal = ByteLLM(llm, beam_params, heal=False)
+    beam_params_no_heal = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False)
+    byte_llm_no_heal = ByteLLM(llm, beam_params_no_heal)
     try:
         for i in range(len(context)):
             try:
@@ -171,7 +176,8 @@ async def test_healing_enabled_succeeds(model_name):
         await byte_llm_no_heal.cleanup()
 
     # Test with healing - should get further
-    byte_llm_heal = ByteLLM(llm, beam_params, heal=True)
+    beam_params_heal = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True)
+    byte_llm_heal = ByteLLM(llm, beam_params_heal)
     try:
         for i in range(len(context)):
             try:
@@ -190,13 +196,13 @@ async def test_healing_enabled_succeeds(model_name):
 async def test_healing_max_backoff(model_name):
     """Limited backoff constrains healing effectiveness."""
     llm = load_model_by_name(model_name)
-    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]})
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
 
     # Unlimited healing
-    byte_llm_unlimited = ByteLLM(llm, beam_params, heal=True)
+    beam_params_unlimited = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True)
+    byte_llm_unlimited = ByteLLM(llm, beam_params_unlimited)
     try:
         for i in range(len(context)):
             try:
@@ -209,7 +215,8 @@ async def test_healing_max_backoff(model_name):
         await byte_llm_unlimited.cleanup()
 
     # Limited healing
-    byte_llm_limited = ByteLLM(llm, beam_params, heal=True, heal_max_backoff=2)
+    beam_params_limited = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True, heal_max_backoff=2)
+    byte_llm_limited = ByteLLM(llm, beam_params_limited)
     try:
         for i in range(len(context)):
             try:

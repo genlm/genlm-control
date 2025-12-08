@@ -12,7 +12,6 @@ __all__ = [
     "PotentialOps",
     "Product",
     "PromptedLLM",
-    "ByteLLM",
     "JsonSchema",
     "WCFG",
     "BoolCFG",
@@ -23,3 +22,6 @@ __all__ = [
     "MultiProcPotential",
     "Coerced",
 ]
+
+if ByteLLM is not None:
+    __all__.append("ByteLLM")
