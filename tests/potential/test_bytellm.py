@@ -4,6 +4,8 @@ import asyncio
 
 try:
     from genlm.bytes import BeamParams
+    from genlm.backend import load_model_by_name
+    from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
 
     HAS_GENLM_BYTES = True
 except ImportError:
@@ -14,9 +16,6 @@ pytestmark = pytest.mark.skipif(
     reason="genlm-bytes not installed. Install with: pip install genlm-control[bytes]",
 )
 
-from genlm.backend import load_model_by_name
-from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
-
 
 @pytest.fixture(scope="module")
 def model_name():
@@ -26,8 +25,6 @@ def model_name():
 @pytest.fixture(scope="module")
 def beam_params(model_name):
     """Provides BeamParams configured with the model's default EOS token."""
-    from genlm.backend import load_model_by_name
-
     llm = load_model_by_name(model_name)
     model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
     return BeamParams(K=5, prune_threshold=0.0, eos_tokens={model_eos_token})
@@ -132,6 +129,69 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
     )
     assert len(sequences) > 0, "SMC should generate at least one sequence"
     assert len(sequences.decoded_posterior) >= 1, "SMC did not terminate"
+
+
+# -------------------------
+# Cache tests
+# -------------------------
+
+
+@pytest.mark.asyncio
+async def test_cache_size_limit(model_name, beam_params):
+    """Test that cache respects the size limit."""
+    llm = load_model_by_name(model_name)
+    cache_size = 5
+    byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
+
+    try:
+        # Process enough bytes to exceed the cache size
+        # Each byte position gets cached, so processing N bytes creates N cache entries
+        text = "Hello World!"
+        for i in range(len(text)):
+            context = [b.to_bytes(1, "big") for b in text[: i + 1].encode("utf-8")]
+            await byte_llm.prefix(context)
+
+        # Cache should not exceed the limit
+        assert len(byte_llm._beam_cache) <= cache_size
+    finally:
+        await byte_llm.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_cache_lru_eviction(model_name, beam_params):
+    """Test that LRU eviction removes oldest entries."""
+    llm = load_model_by_name(model_name)
+    cache_size = 3
+    byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
+
+    try:
+        # Create cache entries for "a", "ab", "abc"
+        await byte_llm.prefix([b"a"])
+        await byte_llm.prefix([b"a", b"b"])
+        await byte_llm.prefix([b"a", b"b", b"c"])
+
+        # All three should be cached
+        assert len(byte_llm._beam_cache) == cache_size
+
+        # Access "a" to make it recently used
+        await byte_llm.prefix([b"a"])
+
+        # Add a new entry "x" - should evict "ab" (least recently used)
+        byte_llm._beam_cache.clear()  # Reset for cleaner test
+        byte_llm._initial_beam = None
+
+        await byte_llm.prefix([b"x"])
+        await byte_llm.prefix([b"x", b"y"])
+        await byte_llm.prefix([b"x", b"y", b"z"])
+
+        # Cache should be at limit
+        assert len(byte_llm._beam_cache) == cache_size
+
+        # Adding one more should trigger eviction
+        await byte_llm.prefix([b"x", b"y", b"z", b"w"])
+        assert len(byte_llm._beam_cache) <= cache_size
+    finally:
+        await byte_llm.cleanup()
 
 
 # -------------------------
