@@ -4,13 +4,14 @@ import asyncio
 
 try:
     from genlm.bytes import BeamParams
+
     HAS_GENLM_BYTES = True
 except ImportError:
     HAS_GENLM_BYTES = False
 
 pytestmark = pytest.mark.skipif(
     not HAS_GENLM_BYTES,
-    reason="genlm-bytes not installed. Install with: pip install genlm-control[bytes]"
+    reason="genlm-bytes not installed. Install with: pip install genlm-control[bytes]",
 )
 
 from genlm.backend import load_model_by_name
@@ -76,7 +77,7 @@ async def test_set_prompt(byte_llm: ByteLLM):
 @pytest.mark.asyncio
 async def test_prefix_and_complete_methods(byte_llm: ByteLLM):
     """Tests the prefix and complete methods for calculating log probabilities."""
-    context = [b'H', b'e', b'l', b'l', b'o']
+    context = [b"H", b"e", b"l", b"l", b"o"]
 
     # --- Test prefix --- #
     logp_hello = await byte_llm.prefix(context)
@@ -92,19 +93,21 @@ async def test_prefix_and_complete_methods(byte_llm: ByteLLM):
     # complete(C) = prefix(C) + logp(EOS|C)
     # So, logp(EOS|C) = complete(C) - prefix(C)
     logp_eos_given_c = complete_logp - logp_hello
-    assert -100 < logp_eos_given_c < 0, f"Implied EOS logp is out of reasonable bounds: {logp_eos_given_c}"
+    assert (
+        -100 < logp_eos_given_c < 0
+    ), f"Implied EOS logp is out of reasonable bounds: {logp_eos_given_c}"
 
 
 @pytest.mark.asyncio
 async def test_logw_next_values(byte_llm: ByteLLM):
     """Tests that logw_next returns sensible, finite values."""
-    context = [b'H', b'e', b'l', b'l', b'o']
+    context = [b"H", b"e", b"l", b"l", b"o"]
     lazy_weights = await byte_llm.logw_next(context)
     weights = lazy_weights.materialize()
 
     # The main point is to ensure we don't get -inf for valid next tokens
-    space_logp = weights[b' ']
-    comma_logp = weights[b',']
+    space_logp = weights[b" "]
+    comma_logp = weights[b","]
     eos_logp = weights[byte_llm.eos]
 
     assert np.isfinite(space_logp), "Logp for space should be finite"
@@ -114,7 +117,6 @@ async def test_logw_next_values(byte_llm: ByteLLM):
 
 @pytest.mark.asyncio
 async def test_bytelm_smc(byte_llm: ByteLLM):
-
     prompt = "Here is my honest opinion:"
     byte_llm.set_prompt_from_str(prompt)
 
@@ -136,15 +138,35 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
 # Adaptive token healing tests
 # -------------------------
 
+
+async def measure_prefix_reach(byte_llm: ByteLLM, context: list) -> int:
+    """Measure how many bytes of context can be processed before failure.
+
+    Returns the number of bytes successfully processed before a ValueError is raised,
+    or len(context) if all bytes are processed successfully.
+    """
+    try:
+        for i in range(len(context)):
+            try:
+                await byte_llm.prefix(context[: i + 1])
+            except ValueError:
+                return i
+        return len(context)
+    finally:
+        await byte_llm.cleanup()
+
+
 @pytest.mark.asyncio
 async def test_healing_disabled_fails(model_name):
     """Without healing, K=1 beam fails on text requiring alternative tokenization."""
     llm = load_model_by_name(model_name)
-    beam_params = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False)
+    beam_params = BeamParams(
+        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False
+    )
     byte_llm = ByteLLM(llm, beam_params)
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
-    context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
+    context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
     try:
         with pytest.raises(ValueError, match="Beam became empty"):
@@ -159,37 +181,23 @@ async def test_healing_enabled_succeeds(model_name):
     llm = load_model_by_name(model_name)
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
-    context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
+    context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
     # Test without healing - find how far we get
-    beam_params_no_heal = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False)
-    byte_llm_no_heal = ByteLLM(llm, beam_params_no_heal)
-    try:
-        for i in range(len(context)):
-            try:
-                await byte_llm_no_heal.prefix(context[:i+1])
-                no_heal_len = i + 1
-            except ValueError:
-                no_heal_len = i
-                break
-    finally:
-        await byte_llm_no_heal.cleanup()
+    beam_params_no_heal = BeamParams(
+        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False
+    )
+    no_heal_len = await measure_prefix_reach(ByteLLM(llm, beam_params_no_heal), context)
 
     # Test with healing - should get further
-    beam_params_heal = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True)
-    byte_llm_heal = ByteLLM(llm, beam_params_heal)
-    try:
-        for i in range(len(context)):
-            try:
-                await byte_llm_heal.prefix(context[:i+1])
-                heal_len = i + 1
-            except ValueError:
-                heal_len = i
-                break
+    beam_params_heal = BeamParams(
+        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True
+    )
+    heal_len = await measure_prefix_reach(ByteLLM(llm, beam_params_heal), context)
 
-        assert heal_len > no_heal_len, f"Healing ({heal_len}) should exceed no-healing ({no_heal_len})"
-    finally:
-        await byte_llm_heal.cleanup()
+    assert (
+        heal_len > no_heal_len
+    ), f"Healing ({heal_len}) should exceed no-healing ({no_heal_len})"
 
 
 @pytest.mark.asyncio
@@ -198,43 +206,34 @@ async def test_healing_max_backoff(model_name):
     llm = load_model_by_name(model_name)
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
-    context = [b.to_bytes(1, 'big') for b in text.encode('utf-8')]
+    context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
     # Unlimited healing
-    beam_params_unlimited = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True)
-    byte_llm_unlimited = ByteLLM(llm, beam_params_unlimited)
-    try:
-        for i in range(len(context)):
-            try:
-                await byte_llm_unlimited.prefix(context[:i+1])
-                unlimited_len = i + 1
-            except ValueError:
-                unlimited_len = i
-                break
-    finally:
-        await byte_llm_unlimited.cleanup()
+    beam_params_unlimited = BeamParams(
+        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True
+    )
+    unlimited_len = await measure_prefix_reach(
+        ByteLLM(llm, beam_params_unlimited), context
+    )
 
     # Limited healing
-    beam_params_limited = BeamParams(K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True, heal_max_backoff=2)
-    byte_llm_limited = ByteLLM(llm, beam_params_limited)
-    try:
-        for i in range(len(context)):
-            try:
-                await byte_llm_limited.prefix(context[:i+1])
-                limited_len = i + 1
-            except ValueError:
-                limited_len = i
-                break
+    beam_params_limited = BeamParams(
+        K=1,
+        eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]},
+        heal=True,
+        heal_max_backoff=2,
+    )
+    limited_len = await measure_prefix_reach(ByteLLM(llm, beam_params_limited), context)
 
-        assert limited_len <= unlimited_len, \
-            f"Limited ({limited_len}) should not exceed unlimited ({unlimited_len})"
-    finally:
-        await byte_llm_limited.cleanup()
+    assert (
+        limited_len <= unlimited_len
+    ), f"Limited ({limited_len}) should not exceed unlimited ({unlimited_len})"
 
 
 # -------------------------
 # Async context manager tests
 # -------------------------
+
 
 @pytest.mark.asyncio
 async def test_context_manager_basic(model_name, beam_params):
@@ -316,4 +315,3 @@ async def test_context_manager_with_smc(model_name, beam_params):
 
     # Cleanup should have been called
     assert not byte_llm._beam_cache
-    

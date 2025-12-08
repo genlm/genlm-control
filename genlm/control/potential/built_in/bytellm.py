@@ -37,7 +37,7 @@ class ByteLLM(Potential):
         self.llm = llm
         self.beam_params = beam_params
         self.cache_size = cache_size
-        vocab = [i.to_bytes(1, 'big') for i in range(256)]
+        vocab = [i.to_bytes(1, "big") for i in range(256)]
         super().__init__(vocabulary=vocab)
         # LRU cache of ByteBeamState keyed by full context bytes (prompt + context)
         self._beam_cache: OrderedDict[bytes, ByteBeamState] = OrderedDict()
@@ -48,7 +48,14 @@ class ByteLLM(Potential):
         self._last_beam = None
 
     @classmethod
-    def from_name(cls, name, beam_params: BeamParams, backend=None, cache_size: int = 1024, **kwargs):
+    def from_name(
+        cls,
+        name,
+        beam_params: BeamParams,
+        backend=None,
+        cache_size: int = 1024,
+        **kwargs,
+    ):
         backend = backend or ("vllm" if torch.cuda.is_available() else "hf")
         llm = load_model_by_name(name, backend=backend, **kwargs)
         return cls(llm, beam_params, cache_size=cache_size)
@@ -63,7 +70,7 @@ class ByteLLM(Potential):
             self._last_beam = None
 
     async def _get_or_create_beam_for_context(self, context):
-        context_bytes = b''.join(context)
+        context_bytes = b"".join(context)
         full_context_bytes = self.prompt_bytes + context_bytes
 
         # Fast path: exact cache hit
@@ -75,9 +82,11 @@ class ByteLLM(Potential):
             return beam
 
         # Fast path: sequential access from last beam
-        if (self._last_context is not None and
-            full_context_bytes.startswith(self._last_context) and
-            len(full_context_bytes) > len(self._last_context)):
+        if (
+            self._last_context is not None
+            and full_context_bytes.startswith(self._last_context)
+            and len(full_context_bytes) > len(self._last_context)
+        ):
             best_prefix_bytes = self._last_context
             best_beam = self._last_beam
         else:
@@ -85,28 +94,38 @@ class ByteLLM(Potential):
             best_prefix_bytes = b""
             best_beam = None
             for cached_prefix_bytes, cached_beam in self._beam_cache.items():
-                if full_context_bytes.startswith(cached_prefix_bytes) and len(cached_prefix_bytes) > len(best_prefix_bytes):
+                if full_context_bytes.startswith(cached_prefix_bytes) and len(
+                    cached_prefix_bytes
+                ) > len(best_prefix_bytes):
                     best_prefix_bytes = cached_prefix_bytes
                     best_beam = cached_beam
 
             if best_beam is None:
                 if self._initial_beam is None:
-                    self._initial_beam = await ByteBeamState.initial(self.llm, self.beam_params)
+                    self._initial_beam = await ByteBeamState.initial(
+                        self.llm, self.beam_params
+                    )
                     if self.prompt_bytes:
-                        self._initial_beam = await self._initial_beam.prefill(self.prompt_bytes)
+                        self._initial_beam = await self._initial_beam.prefill(
+                            self.prompt_bytes
+                        )
                         self._cache_put(self.prompt_bytes, self._initial_beam)
                 best_beam = self._initial_beam
-                best_prefix_bytes = self.prompt_bytes if full_context_bytes.startswith(self.prompt_bytes) else b""
+                best_prefix_bytes = (
+                    self.prompt_bytes
+                    if full_context_bytes.startswith(self.prompt_bytes)
+                    else b""
+                )
 
         # Advance beam byte-by-byte
-        remaining_bytes = full_context_bytes[len(best_prefix_bytes):]
+        remaining_bytes = full_context_bytes[len(best_prefix_bytes) :]
         current_beam = best_beam
         current_prefix_bytes = best_prefix_bytes
 
         for i, byte_val in enumerate(remaining_bytes):
             current_beam = current_beam.prune()
             current_beam = await (current_beam << byte_val)
-            current_prefix_bytes += remaining_bytes[i:i+1]
+            current_prefix_bytes += remaining_bytes[i : i + 1]
 
             if len(current_beam) == 0:
                 raise ValueError(
