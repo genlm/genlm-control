@@ -30,30 +30,63 @@ class TokenMappings(NamedTuple):
     Container for token mappings between bytes and tokens IDs in a language model.
 
     The `decode` and `encode` mappings are generally different from the `PromptedLLM` class (see notes on EOS token handling).
+
+    Handles tokenizers with duplicate byte sequences (multiple token IDs mapping to the same bytes)
+    by deduplicating the potential vocabulary and tracking which token IDs map to each unique byte sequence.
     """
 
     decode: list[bytes]  # token_id -> bytes
-    encode: dict[bytes, int]  # bytes -> token_id
+    encode: dict[bytes, int]  # bytes -> canonical token_id (first occurrence)
     eos_idxs: list[int]  # IDs of EOS tokens
     eos_tokens: list[bytes]  # EOS tokens
-    potential_vocab: list[bytes]  # tokens in the potential's vocabulary
+    potential_vocab: list[bytes]  # unique tokens in the potential's vocabulary (no duplicates)
+    # Maps each potential_vocab index to list of original token IDs that share that byte sequence
+    potential_idx_to_token_ids: list[list[int]]
 
     @classmethod
     def create(cls, decode, eos_tokens):
         if len(set(eos_tokens)) != len(eos_tokens):
             raise ValueError("Duplicate eos tokens")
-        encode = {x: i for i, x in enumerate(decode)}
+
+        eos_tokens_set = set(eos_tokens)
+
+        # Build encode mapping: bytes -> first token_id (canonical)
+        encode = {}
+        for i, x in enumerate(decode):
+            if x not in encode:
+                encode[x] = i
+
         if not all(eos in encode for eos in eos_tokens):
             raise ValueError("EOS token not in language model vocabulary")
         eos_idxs = [encode[eos] for eos in eos_tokens]
-        eos_tokens_set = set(eos_tokens)
-        potential_vocab = [x for x in decode if x not in eos_tokens_set]
+
+        # Build deduplicated potential_vocab and track which token IDs map to each unique byte sequence
+        potential_vocab = []
+        potential_idx_to_token_ids = []
+        bytes_to_potential_idx = {}
+
+        for token_id, byte_seq in enumerate(decode):
+            if byte_seq in eos_tokens_set:
+                continue
+
+            if byte_seq in bytes_to_potential_idx:
+                # This byte sequence already exists - add this token_id to the existing group
+                potential_idx = bytes_to_potential_idx[byte_seq]
+                potential_idx_to_token_ids[potential_idx].append(token_id)
+            else:
+                # New unique byte sequence
+                potential_idx = len(potential_vocab)
+                bytes_to_potential_idx[byte_seq] = potential_idx
+                potential_vocab.append(byte_seq)
+                potential_idx_to_token_ids.append([token_id])
+
         return cls(
             decode=decode,
             encode=encode,
             eos_idxs=eos_idxs,
             eos_tokens=eos_tokens,
             potential_vocab=potential_vocab,
+            potential_idx_to_token_ids=potential_idx_to_token_ids,
         )
 
 
@@ -308,6 +341,9 @@ class PromptedLLM(Potential):
         This function rearranges the log probabilities such that the end-of-sequence (EOS) token's log probability
         is the sum of the log probabilities of `self.eos_tokens`.
 
+        For tokens that have multiple token IDs mapping to the same byte sequence (duplicates),
+        their probabilities are combined using logsumexp.
+
         Args:
             logw_next (torch.tensor): The log probabilities for the next tokens.
 
@@ -317,21 +353,24 @@ class PromptedLLM(Potential):
         # This is ugly, but it's useful for all potentials to adhere to the convention
         # of keeping the EOS token at the end of the weights array.
 
-        # Cache eos_idxs_tensor and non_eos_indices on first use
+        # Cache tensors for potential_idx_to_token_ids on first use
         if (
             not hasattr(self, "_eos_idxs_tensor")
-            or not hasattr(self, "_non_eos_indices")
+            or not hasattr(self, "_potential_idx_token_ids_tensors")
             or self._eos_idxs_tensor.device != logw_next.device
         ):
             self._eos_idxs_tensor = torch.tensor(
                 self.token_maps.eos_idxs, device=logw_next.device
             )
-            all_indices = torch.arange(
-                len(self.token_maps.decode), device=logw_next.device
-            )
-            self._non_eos_indices = all_indices[
-                ~torch.isin(all_indices, self._eos_idxs_tensor)
+            # Pre-compute tensors for each potential vocab entry's token IDs
+            self._potential_idx_token_ids_tensors = [
+                torch.tensor(token_ids, device=logw_next.device)
+                for token_ids in self.token_maps.potential_idx_to_token_ids
             ]
+            # Track which entries have duplicates (more than one token ID)
+            self._has_duplicates = any(
+                len(ids) > 1 for ids in self.token_maps.potential_idx_to_token_ids
+            )
 
         logw_next = logw_next[: len(self.token_maps.decode)]
         logw_next = logw_next.log_softmax(dim=0)
@@ -341,7 +380,27 @@ class PromptedLLM(Potential):
             dtype=logw_next.dtype,
             device=logw_next.device,
         )
-        _logw_next[: len(self.vocab)] = logw_next[self._non_eos_indices]
+
+        # Aggregate log probabilities for each potential vocab entry
+        if self._has_duplicates:
+            # Some tokens have duplicates - need to logsumexp
+            for potential_idx, token_ids_tensor in enumerate(
+                self._potential_idx_token_ids_tensors
+            ):
+                if token_ids_tensor.numel() == 1:
+                    _logw_next[potential_idx] = logw_next[token_ids_tensor[0]]
+                else:
+                    _logw_next[potential_idx] = torch.logsumexp(
+                        logw_next[token_ids_tensor], dim=0
+                    )
+        else:
+            # No duplicates - fast path: direct indexing
+            # Each potential_idx maps to exactly one token_id
+            token_ids = torch.tensor(
+                [ids[0] for ids in self.token_maps.potential_idx_to_token_ids],
+                device=logw_next.device,
+            )
+            _logw_next[: len(self.vocab)] = logw_next[token_ids]
 
         # Special case: if only one EOS idx, just assign directly (avoids cost of logsumexp)
         if self._eos_idxs_tensor.numel() == 1:
