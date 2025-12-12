@@ -353,24 +353,51 @@ class PromptedLLM(Potential):
         # This is ugly, but it's useful for all potentials to adhere to the convention
         # of keeping the EOS token at the end of the weights array.
 
-        # Cache tensors for potential_idx_to_token_ids on first use
+        # Cache tensors on first use (or if device changed)
         if (
             not hasattr(self, "_eos_idxs_tensor")
-            or not hasattr(self, "_potential_idx_token_ids_tensors")
+            or not hasattr(self, "_canonical_token_ids")
             or self._eos_idxs_tensor.device != logw_next.device
         ):
+            device = logw_next.device
             self._eos_idxs_tensor = torch.tensor(
-                self.token_maps.eos_idxs, device=logw_next.device
+                self.token_maps.eos_idxs, device=device
             )
-            # Pre-compute tensors for each potential vocab entry's token IDs
-            self._potential_idx_token_ids_tensors = [
-                torch.tensor(token_ids, device=logw_next.device)
-                for token_ids in self.token_maps.potential_idx_to_token_ids
-            ]
-            # Track which entries have duplicates (more than one token ID)
-            self._has_duplicates = any(
-                len(ids) > 1 for ids in self.token_maps.potential_idx_to_token_ids
+            # Canonical token IDs (first ID for each potential vocab entry) - for vectorized indexing
+            self._canonical_token_ids = torch.tensor(
+                [ids[0] for ids in self.token_maps.potential_idx_to_token_ids],
+                device=device,
             )
+            # Build vectorized structures for duplicate handling
+            duplicate_indices = []
+            duplicate_token_ids = []
+            max_dup_size = 0
+            for potential_idx, token_ids in enumerate(
+                self.token_maps.potential_idx_to_token_ids
+            ):
+                if len(token_ids) > 1:
+                    duplicate_indices.append(potential_idx)
+                    duplicate_token_ids.append(token_ids)
+                    max_dup_size = max(max_dup_size, len(token_ids))
+
+            self._has_duplicates = len(duplicate_indices) > 0
+            if self._has_duplicates:
+                # Vectorized duplicate handling: pad to uniform size for batched logsumexp
+                self._dup_vocab_indices = torch.tensor(duplicate_indices, device=device)
+                # Pad with first element (will be masked out by -inf)
+                padded = [
+                    ids + [ids[0]] * (max_dup_size - len(ids))
+                    for ids in duplicate_token_ids
+                ]
+                self._dup_token_ids = torch.tensor(padded, device=device)
+                # Mask: True for valid entries, False for padding
+                self._dup_mask = torch.tensor(
+                    [
+                        [True] * len(ids) + [False] * (max_dup_size - len(ids))
+                        for ids in duplicate_token_ids
+                    ],
+                    device=device,
+                )
 
         logw_next = logw_next[: len(self.token_maps.decode)]
         logw_next = logw_next.log_softmax(dim=0)
@@ -381,26 +408,19 @@ class PromptedLLM(Potential):
             device=logw_next.device,
         )
 
-        # Aggregate log probabilities for each potential vocab entry
+        # Fast vectorized indexing for all tokens using canonical IDs
+        _logw_next[: len(self.vocab)] = logw_next[self._canonical_token_ids]
+
+        # Fix up tokens with duplicates using fully vectorized batched logsumexp
         if self._has_duplicates:
-            # Some tokens have duplicates - need to logsumexp
-            for potential_idx, token_ids_tensor in enumerate(
-                self._potential_idx_token_ids_tensors
-            ):
-                if token_ids_tensor.numel() == 1:
-                    _logw_next[potential_idx] = logw_next[token_ids_tensor[0]]
-                else:
-                    _logw_next[potential_idx] = torch.logsumexp(
-                        logw_next[token_ids_tensor], dim=0
-                    )
-        else:
-            # No duplicates - fast path: direct indexing
-            # Each potential_idx maps to exactly one token_id
-            token_ids = torch.tensor(
-                [ids[0] for ids in self.token_maps.potential_idx_to_token_ids],
-                device=logw_next.device,
-            )
-            _logw_next[: len(self.vocab)] = logw_next[token_ids]
+            # Gather logprobs for all duplicates: shape (num_dups, max_dup_size)
+            dup_logprobs = logw_next[self._dup_token_ids]
+            # Mask out padding with -inf
+            dup_logprobs = torch.where(self._dup_mask, dup_logprobs, torch.tensor(float("-inf"), device=dup_logprobs.device))
+            # Batched logsumexp across the duplicate dimension
+            combined = torch.logsumexp(dup_logprobs, dim=1)
+            # Scatter back to the output
+            _logw_next[self._dup_vocab_indices] = combined
 
         # Special case: if only one EOS idx, just assign directly (avoids cost of logsumexp)
         if self._eos_idxs_tensor.numel() == 1:
