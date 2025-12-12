@@ -723,9 +723,7 @@ class PatriciaTrie:
                     if node.prefix[i] != value[i]:
                         break
                 else:  # pragma: no cover
-                    assert False, (
-                        f"{value} and {node.prefix} should have a different char at this point."
-                    )
+                    assert False, f"{value} and {node.prefix} should have a different char at this point."
                 split_node(node, i)
                 assert value.startswith(node.prefix)
 
