@@ -1,0 +1,2339 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../getting_started/">
+      
+      
+        <link rel="next" href="../samplers/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.0">
+    
+    
+      
+        <title>Potentials - GenLM Control</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.618322db.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#potentials" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="GenLM Control" class="md-header__button md-logo" aria-label="GenLM Control" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            GenLM Control
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Potentials
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/genlm/genlm-control" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="GenLM Control" class="md-nav__button md-logo" aria-label="GenLM Control" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    GenLM Control
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/genlm/genlm-control" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    API Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_2_1" id="__nav_2_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    genlm
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_2_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    genlm
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_1_1" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/genlm/control/__init__/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    control
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2_1_1" id="__nav_2_1_1_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_1_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_1_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    control
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/constant/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    constant
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_1_1_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/genlm/control/potential/__init__/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    potential
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2_1_1_2" id="__nav_2_1_1_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_2_1_1_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_1_1_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    potential
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/autobatch/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    autobatch
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/base/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    base
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_1_1_2_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/genlm/control/potential/built_in/__init__/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    built_in
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2_1_1_2_3" id="__nav_2_1_1_2_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="5" aria-labelledby="__nav_2_1_1_2_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_1_1_2_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    built_in
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/built_in/bytellm/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    bytellm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/built_in/canonical/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    canonical
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/built_in/json/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    json
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/built_in/llm/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    llm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/built_in/wcfg/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    wcfg
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/built_in/wfsa/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    wfsa
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/coerce/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    coerce
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/multi_proc/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    multi_proc
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/operators/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    operators
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/product/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    product
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/stateful/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    stateful
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/streaming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    streaming
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/potential/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_1_1_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/genlm/control/sampler/__init__/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    sampler
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2_1_1_3" id="__nav_2_1_1_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="4" aria-labelledby="__nav_2_1_1_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_1_1_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    sampler
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/sampler/sequence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    sequence
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/sampler/set/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    set
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/sampler/token/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    token
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/typing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    typing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/util/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    util
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/genlm/control/viz/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    viz
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting_started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Potentials
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Potentials
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#key-concepts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key concepts
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Key concepts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#vocabulary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vocabulary
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#weight-assignment" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weight assignment
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#next-token-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Next-token weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#batch-methods" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Batch methods
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#built-in-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Built-in potentials
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Built-in potentials">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#language-models" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Language models
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#finite-state-automata" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Finite-state automata
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#context-free-grammars" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context-free grammars
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom potentials
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom potentials">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#creating-a-custom-potential" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Creating a custom potential
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#common-pitfalls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Common pitfalls
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#testing-your-custom-potential" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Testing your custom potential
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#complex-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Complex usage
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Complex usage">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#products-of-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Products of potentials
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#coerced-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Coerced potentials
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance-optimizations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance optimizations
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#formalization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Formalization
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Formalization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#correspondance-with-the-potential-class" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Correspondance with the Potential class
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../samplers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Samplers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#key-concepts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key concepts
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Key concepts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#vocabulary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vocabulary
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#weight-assignment" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weight assignment
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#next-token-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Next-token weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#batch-methods" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Batch methods
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#built-in-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Built-in potentials
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Built-in potentials">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#language-models" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Language models
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#finite-state-automata" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Finite-state automata
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#context-free-grammars" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context-free grammars
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom potentials
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom potentials">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#creating-a-custom-potential" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Creating a custom potential
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#common-pitfalls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Common pitfalls
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#testing-your-custom-potential" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Testing your custom potential
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#complex-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Complex usage
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Complex usage">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#products-of-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Products of potentials
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#coerced-potentials" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Coerced potentials
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance-optimizations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance optimizations
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#formalization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Formalization
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Formalization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#correspondance-with-the-potential-class" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Correspondance with the Potential class
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="potentials">Potentials</h1>
+<p><a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/__init__/#genlm.control.potential">Potentials</a> are the core object in <code>genlm-control</code>. A potential encodes constraints or preferences by assigning non-negative weights to sequences of tokens.</p>
+<p>Potentials guide text generation by:</p>
+<ul>
+<li>Acting as components of <a href="../samplers/"><strong>samplers</strong></a>, which serve to propose new tokens at each step of the generation process.</li>
+<li>Serving as <strong>critics</strong>, which serve to reweight sequences based on whether they satisfy the constraint encoded by the potential at each step of the generation process.</li>
+</ul>
+<h2 id="key-concepts">Key concepts</h2>
+<h3 id="vocabulary">Vocabulary</h3>
+<p>Each potential has a <strong>vocabulary</strong> which defines the set of tokens it operates on. Most built-in potentials operate on vocabularies whose tokens are <code>bytes</code> or <code>int</code> objects (the latter often representing individual bytes).</p>
+<h3 id="weight-assignment">Weight assignment</h3>
+<p>Potentials assign weights to sequences of tokens from their vocabulary. These weights are always non-negative real numbers, though they are computed in log space for numerical stability.</p>
+<p>A potential defines two core weighting functions:</p>
+<ol>
+<li>
+<p><code>complete</code> - Assigns weights to sequences that are considered "finished" or "complete". For example, a potential enforcing grammatical correctness would assign positive weights to grammatically valid sentences and zero weights (negative infinity in log space) to invalid ones.</p>
+</li>
+<li>
+<p><code>prefix</code> - Assigns weights to partial sequences that could potentially be extended into valid complete sequences. For example, a potential enforcing grammatical correctness would assign positive weights to prefixes of grammatically valid sequences.</p>
+<p>Given a complete method, there are many possible prefix methods that could be used, providing as much or as little information as desired. The key requirement is that if a prefix has zero weight, then all of its extensions and completions must also have zero weight - in other words, prefix cannot rule out sequences that could later become valid.</p>
+</li>
+</ol>
+<p>The relationship between complete and prefix weights is formalized in the <a href="#formalization">Formalization</a> section.</p>
+<h3 id="next-token-weights">Next-token weights</h3>
+<p>Potentials also implement a <code>logw_next</code> method, which computes weights for each possible next token in the potential's vocabulary (and a reserved end-of-sequence token) given a context sequence. These weights are crucial for controlled text generation as they can be used to guide the selection of the next token at each step.</p>
+<p>The <code>logw_next</code> method is implemented by default in terms of the <code>complete</code> and <code>prefix</code> methods. Potentials will often override this method to provide a more efficient implementation. However, <code>logw_next</code> must satisfy a contract with <code>complete</code>/<code>prefix</code>, specified in <a href="#formalization">Formalization</a>.</p>
+<h3 id="batch-methods">Batch methods</h3>
+<p>For improved performance with large batches of inputs, potentials support batch operations:</p>
+<ul>
+<li><code>batch_complete(contexts)</code></li>
+<li><code>batch_prefix(contexts)</code></li>
+<li><code>batch_logw_next(contexts)</code></li>
+<li><code>batch_score(contexts)</code></li>
+</ul>
+<p>By default, these methods simply call the corresponding non-batch method for all inputs, but potentials can override them to provide more efficient implementations. They can be used in conjunction with <a href="../performance/#auto-batching">auto batching</a> for improved performance during generation.</p>
+<h2 id="built-in-potentials">Built-in potentials</h2>
+<p><code>genlm-control</code> comes with a number of built-in potentials that can be used in controlled text generation.</p>
+<h3 id="language-models">Language models</h3>
+<p><a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/built_in/llm/#genlm.control.potential.built_in.llm.PromptedLLM"><code>PromptedLLM</code></a> represents a language model conditioned on a fixed prompt prefix.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Load GPT-2 with temperature 0.5</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">PromptedLLM</span><span class="o">.</span><span class="n">from_name</span><span class="p">(</span><span class="s2">&quot;gpt2&quot;</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.5</span><span class="p">)</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="c1"># Set a prompt prefix that all generations will be conditioned on</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">llm</span><span class="o">.</span><span class="n">set_prompt_from_str</span><span class="p">(</span><span class="s2">&quot;Montreal is&quot;</span><span class="p">)</span>
+</code></pre></div>
+<p><code>PromptedLLM</code>s have a vocabulary of <code>bytes</code> tokens, obtained from the language model's tokenizer.</p>
+<h3 id="finite-state-automata">Finite-state automata</h3>
+<p><code>genlm-control</code> provides two <a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/built_in/wfsa/#genlm.control.potential.built_in.wfsa">FSA implementations</a>:</p>
+<ol>
+<li>
+<p><code>WFSA</code> (Weighted Finite-State Automata) - For weighted constraints:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Create a WFSA from a regex pattern</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="c1"># Transitions are automatically normalized to form probability distributions</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="n">wfsa</span> <span class="o">=</span> <span class="n">WFSA</span><span class="o">.</span><span class="n">from_regex</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;\sthe\s(best|worst).*😎&quot;</span><span class="p">)</span>
+</code></pre></div></p>
+</li>
+<li>
+<p><code>BoolFSA</code> (Boolean Finite-State Automata) - For hard constraints:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Create a boolean FSA from a regex pattern</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="c1"># Transitions are binary (0 or -inf in log space)</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">fsa</span> <span class="o">=</span> <span class="n">BoolFSA</span><span class="o">.</span><span class="n">from_regex</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;\sthe\s(best|worst).*😎&quot;</span><span class="p">)</span>
+</code></pre></div></p>
+</li>
+</ol>
+<p>Both FSAs:</p>
+<ul>
+<li>Support regex patterns with standard syntax</li>
+<li>Operate on byte-level sequences by default</li>
+<li>Can be combined with other potentials via products</li>
+</ul>
+<h3 id="context-free-grammars">Context-free grammars</h3>
+<p>Similar to FSAs, <code>genlm-control</code> provides two <a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/built_in/wcfg/#genlm.control.potential.built_in.wcfg">CFG implementations</a>:</p>
+<ol>
+<li>
+<p><code>WCFG</code> (Weighted Context-Free Grammar).
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">cfg</span> <span class="o">=</span> <span class="n">WCFG</span><span class="o">.</span><span class="n">from_string</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="s2">    1.0: S -&gt; NP VP</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="s2">    0.5: NP -&gt; the N</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="s2">    0.5: NP -&gt; a N</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="s2">    1.0: VP -&gt; V NP</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="s2">    0.5: N -&gt; cat</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="s2">    0.5: N -&gt; dog</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="s2">    0.5: V -&gt; saw</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="s2">    0.5: V -&gt; chased</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+</code></pre></div></p>
+</li>
+<li>
+<p><code>BoolCFG</code> (Boolean Context-Free Grammar).
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Create a boolean CFG from a Lark grammar string</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">cfg</span> <span class="o">=</span> <span class="n">BoolCFG</span><span class="o">.</span><span class="n">from_lark</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="s2">    start: np vp</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="s2">    np: (&quot;the&quot; | &quot;a&quot;) WS n</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="s2">    vp: WS v WS np</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="s2">    n: &quot;cat&quot; | &quot;dog&quot;</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="s2">    v: &quot;saw&quot; | &quot;chased&quot;</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="s2">    </span><span class="si">%i</span><span class="s2">mport common.WS</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+</code></pre></div></p>
+</li>
+</ol>
+<p><code>BoolCFG</code>s support grammar specification via <a href="https://lark-parser.readthedocs.io/en/latest/grammar.html">Lark syntax</a>.</p>
+<p>Both CFGs:</p>
+<ul>
+<li>Use Earley parsing for efficient recognition</li>
+<li>Can be combined with other potentials</li>
+<li>Operate on byte-level sequences by default</li>
+</ul>
+<blockquote>
+<p><strong>Note:</strong> It is recommended to specify grammars via lark syntax. The <code>from_string</code> method is provided for convenience, but it is not as flexible and robust.</p>
+</blockquote>
+<h2 id="custom-potentials">Custom potentials</h2>
+<p>You can create custom potentials to implement specialized constraints or preferences that aren't covered by the built-in options.</p>
+<h3 id="creating-a-custom-potential">Creating a custom potential</h3>
+<p>To define a custom potential:</p>
+<ol>
+<li>Create a subclass of <code>Potential</code></li>
+<li>Implement the <code>complete</code> and <code>prefix</code> methods</li>
+<li>Optionally override <code>logw_next</code> and the batch methods for performance optimization</li>
+</ol>
+<p>When implementing custom potentials, the key is understanding the relationship between <code>complete</code> and <code>prefix</code>. Consider the following example of a potential that only allows sequences of a given length:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">class</span><span class="w"> </span><span class="nc">LengthPotential</span><span class="p">(</span><span class="n">Potential</span><span class="p">):</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot; A potential that only allows sequences of a given length. &quot;&quot;&quot;</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vocabulary</span><span class="p">,</span> <span class="n">length</span><span class="p">):</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>        <span class="c1"># Initialize the superclass with the potential&#39;s vocabulary.</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">vocabulary</span><span class="p">)</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">length</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">complete</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>        <span class="c1"># Note: 0.0 = log(1.0) and float(&#39;-inf&#39;) = log(0.0)</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>        <span class="k">return</span> <span class="mf">0.0</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">context</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">length</span> <span class="k">else</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">)</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>
+<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>        <span class="c1"># Note: 0.0 = log(1.0) and float(&#39;-inf&#39;) = log(0.0)</span>
+<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>        <span class="k">return</span> <span class="mf">0.0</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">context</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">length</span> <span class="k">else</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">)</span>
+<a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>
+<a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="n">length_potential</span> <span class="o">=</span> <span class="n">LengthPotential</span><span class="p">(</span><span class="n">vocabulary</span><span class="o">=</span><span class="p">[</span><span class="sa">b</span><span class="s1">&#39;the&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;a&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;cat&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;dog&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;saw&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;chased&#39;</span><span class="p">],</span> <span class="n">length</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+</code></pre></div>
+<p>This example illustrates the key difference between <code>complete</code> and <code>prefix</code>: the <code>complete</code> method only allows sequences of exactly the target length, while the <code>prefix</code> method allows any sequence that could potentially reach the target length (i.e., any sequence not exceeding the target length).</p>
+<h3 id="common-pitfalls">Common pitfalls</h3>
+<p>When implementing custom potentials, be aware of these common issues:</p>
+<ol>
+<li>
+<p><strong>Inconsistent complete/prefix relationship</strong> - If your <code>prefix</code> method assigns zero weight to a sequence, all extensions must also have zero weight.</p>
+</li>
+<li>
+<p><strong>Inefficient implementations</strong> - For complex potentials, consider overriding <code>logw_next</code> with a more efficient implementation than the default.</p>
+</li>
+<li>
+<p><strong>Not handling async properly</strong> - All potential methods are asynchronous. Make sure to use <code>await</code> when calling them and define your methods with <code>async def</code>.</p>
+</li>
+</ol>
+<h3 id="testing-your-custom-potential">Testing your custom potential</h3>
+<p>Potentials automatically inherit from the <a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/testing/#genlm.control.potential.testing"><code>PotentialTests</code></a> mixin, which provides a number of tests for validating the correctness of the potential's implementation.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># These will raise an exception if the potential implementation does not satisfy the properties</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="k">await</span> <span class="n">potential</span><span class="o">.</span><span class="n">assert_logw_next_consistency</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="k">await</span> <span class="n">potential</span><span class="o">.</span><span class="n">assert_autoreg_fact</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="k">await</span> <span class="n">potential</span><span class="o">.</span><span class="n">assert_batch_consistency</span><span class="p">(</span><span class="n">contexts</span><span class="p">)</span>
+</code></pre></div>
+<h2 id="complex-usage">Complex usage</h2>
+<h3 id="products-of-potentials">Products of potentials</h3>
+<p>The <a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/product/#genlm.control.potential.product"><code>Product</code></a> class allows you to combine two potentials. A <code>Product</code> is itself is a potential, meaning that it implements all potential methods and that it is possible to chain products to combine more than two potentials.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="c1"># Example: Prompt intersection</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="n">mtl_llm</span> <span class="o">=</span> <span class="n">PromptedLLM</span><span class="o">.</span><span class="n">from_name</span><span class="p">(</span><span class="s2">&quot;gpt2&quot;</span><span class="p">)</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">mtl_llm</span><span class="o">.</span><span class="n">set_prompt_from_str</span><span class="p">(</span><span class="s2">&quot;Montreal is&quot;</span><span class="p">)</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="n">bos_llm</span> <span class="o">=</span> <span class="n">mtl_llm</span><span class="o">.</span><span class="n">spawn</span><span class="p">()</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="n">bos_llm</span><span class="o">.</span><span class="n">set_prompt_from_str</span><span class="p">(</span><span class="s2">&quot;Boston is&quot;</span><span class="p">)</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="c1"># Create product using multiplication operator</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="n">product</span> <span class="o">=</span> <span class="n">mtl_llm</span> <span class="o">*</span> <span class="n">bos_llm</span>
+</code></pre></div>
+<p>The product potential operates on the intersection of the two potentials' vocabularies. For a product potential:</p>
+<ul>
+<li>The vocabulary <span class="arithmatex">\(\A\)</span> is the intersection of the two potentials' vocabularies: <span class="arithmatex">\(\A = \A_1 \cap \A_2\)</span>.</li>
+<li>The prefix potential <span class="arithmatex">\(\prefix\)</span> is the product (sum in log space) of the individual prefix potentials: <span class="arithmatex">\(\log \prefix(\xx) = \log \prefix_1(\xx) + \log \prefix_2(\xx)\)</span>.</li>
+<li>The complete potential <span class="arithmatex">\(\complete\)</span> is the product (sum in log space) of the individual complete potentials: <span class="arithmatex">\(\log \complete(\xx) = \log \complete_1(\xx) + \log \complete_2(\xx)\)</span>.</li>
+<li>The next-token potential <span class="arithmatex">\(\pot(\cdot \mid \xx)\)</span> is the product (sum in log space) of the individual next-token potentials: <span class="arithmatex">\(\log \pot(x \mid \xx) = \log \pot_1(x \mid \xx) + \log \pot_2(x \mid \xx)\)</span> for <span class="arithmatex">\(x \in (\A_1 \cap \A_2) \cup \{\eos\}\)</span></li>
+</ul>
+<blockquote>
+<p><strong>Warning:</strong> Be careful when taking products of potentials with minimal vocabulary overlap, as the resulting potential will only operate on tokens present in both vocabularies. A warning will be raised if the vocabulary overlap is less than 10% of either potential's vocabulary.</p>
+</blockquote>
+<h3 id="coerced-potentials">Coerced potentials</h3>
+<p>The <a class="autorefs autorefs-internal" href="../reference/genlm/control/potential/coerce/#genlm.control.potential.coerce"><code>Coerced</code></a> class allows you to adapt a potential to work with a different vocabulary using a coercion function. The coercion function must map between sequences in the new vocabulary and sequences in the potential's original vocabulary. This is particularly useful when combining potentials that operate on different types of tokens.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Example: Coercing a byte-level FSA to work with a language model&#39;s tokens</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">fsa</span> <span class="o">=</span> <span class="n">BoolFSA</span><span class="o">.</span><span class="n">from_regex</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;\sthe\s(best|worst).*&quot;</span><span class="p">)</span>  <span class="c1"># Works on bytes</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">PromptedLLM</span><span class="o">.</span><span class="n">from_name</span><span class="p">(</span><span class="s2">&quot;gpt2&quot;</span><span class="p">)</span>  <span class="c1"># Works on byte sequences</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="c1"># Coerce the FSA to work with the LLM&#39;s tokens by joining tokens into bytes</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="n">coerced_fsa</span> <span class="o">=</span> <span class="n">fsa</span><span class="o">.</span><span class="n">coerce</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">f</span><span class="o">=</span><span class="sa">b</span><span class="s1">&#39;&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">)</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="c1"># Now we can combine them using the product operator!</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="n">product</span> <span class="o">=</span> <span class="n">llm</span> <span class="o">*</span> <span class="n">coerced_fsa</span>
+</code></pre></div>
+<p>Common use cases for coercion include:</p>
+<ul>
+<li>Adapting byte-level constraints (like FSAs) to work with token-level language models (which have vocabularies of byte <em>sequences</em>)</li>
+<li>Implementing constraints that operate on processed versions of the tokens (e.g., lowercase text)</li>
+<li>Converting between different tokenization schemes</li>
+</ul>
+<blockquote>
+<p><strong>Performance Note:</strong> The coercion operation can impact performance, especially when mapping from a coarser token type to a finer token type (e.g., byte sequences to individual bytes). To sample tokens from a coerced product, consider using specialized samplers (e.g., <code>eager_token_sampler</code>, <code>topk_token_sampler</code>).</p>
+</blockquote>
+<h3 id="performance-optimizations">Performance optimizations</h3>
+<p><code>genlm-control</code> provides a number of performance optimizations for potentials, described in the <a href="../performance/">performance</a> section.</p>
+<h2 id="formalization">Formalization</h2>
+<p>This section provides a formal definition of potentials and the relationships between their complete, prefix, and next-token potentials.</p>
+<p><strong>Notation</strong> Let <span class="arithmatex">\(\A\)</span> be a vocabulary of tokens and <span class="arithmatex">\(\eos\)</span> a specialized end-of-sequence token. Let <span class="arithmatex">\(\A^*\)</span> denote the set of all sequences of tokens which can be built from <span class="arithmatex">\(\A\)</span> (including the empty sequence <span class="arithmatex">\(\epsilon\)</span>) and <span class="arithmatex">\(\A^*{\eos} = \{\xx\eos : \xx \in \A^*\}\)</span> the set of <span class="arithmatex">\(\eos\)</span>-terminated sequences. We refer to <span class="arithmatex">\(\A^*\)</span> as the set of <em>prefix</em> sequences and <span class="arithmatex">\(\A^*{\eos}\)</span> the set of <em>complete</em> sequences.</p>
+<p>A potential <span class="arithmatex">\(\pot\)</span> is a function <span class="arithmatex">\(\pot: \A^* \cup\A^*{\eos} \rightarrow \mathbb{R}_{\geq 0}\)</span> which assigns a non-negative real number to prefix and complete sequences from its vocabulary <span class="arithmatex">\(\A\)</span>:</p>
+<div class="arithmatex">\[
+\pot(\xx) = \begin{cases}
+    \prefix(\xx) &amp; \text{if } \xx \in \A^* \\
+    \complete(\yy) &amp; \text{if } \xx = \yy\eos, \yy \in \A^*
+\end{cases}
+\]</div>
+<p>where</p>
+<ul>
+<li><span class="arithmatex">\(\prefix : \A^* \rightarrow \mathbb{R}_{\geq 0}\)</span> is the <strong>prefix potential</strong></li>
+<li><span class="arithmatex">\(\complete : \A^* \rightarrow \mathbb{R}_{\geq 0}\)</span> is the <strong>complete potential</strong></li>
+</ul>
+<p>The complete and prefix potentials are related by the following equality:</p>
+<div class="arithmatex">\[
+\prefix(\xx) = 0 \implies \complete(\xx\yy) = 0 \, \forall \xx,\yy \text{ such that } \xx\yy \in \A^*
+\]</div>
+<p>Intuitively, this means that the prefix potential cannot rule out a sequence which can later on turn out to be valid according to the complete potential.</p>
+<p>Finally, we define the <strong>next-token weights function</strong> <span class="arithmatex">\(\pot(x \mid \xx) : \A \cup \{\eos\} \rightarrow \mathbb{R}_{\geq 0}\)</span>, which assigns a non-negative real number to each token <span class="arithmatex">\(x \in \A \cup \{\eos\}\)</span> given a sequence <span class="arithmatex">\(\xx \in \A^*\)</span>:</p>
+<div class="arithmatex">\[
+\pot(x \mid \xx) = \frac{\pot(\xx x)}{\prefix(\xx)} = \begin{cases}
+    \frac{\prefix(\xx x)}{\prefix(\xx)} &amp; \text{if } x \in \A \\
+    \frac{\complete(\xx)}{\prefix(\xx)} &amp; \text{if } x = \eos
+\end{cases}
+\]</div>
+<p><span class="arithmatex">\(\pot(\cdot \mid \xx)\)</span> is related to the complete and prefix potentials according to the following autoregressive factorization:</p>
+<div class="arithmatex">\[
+\frac{\complete(\xx)}{\prefix(\epsilon)} = \pot(\eos \mid \xx) \prod_{x \in \xx} \pot(x \mid \xx)
+\]</div>
+<h3 id="correspondance-with-the-potential-class">Correspondance with the <code>Potential</code> class</h3>
+<p>Each of the quantities above directly corresponds to a method or attribute of the <code>Potential</code> class:</p>
+<table>
+<thead>
+<tr>
+<th>Method/Attribute</th>
+<th>Mathematical Quantity</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vocab</code></td>
+<td><span class="arithmatex">\(\A\)</span></td>
+<td>The vocabulary of the potential.</td>
+</tr>
+<tr>
+<td><code>eos</code></td>
+<td><span class="arithmatex">\(\eos\)</span></td>
+<td>The end-of-sequence token.</td>
+</tr>
+<tr>
+<td><code>vocab_eos</code></td>
+<td><span class="arithmatex">\(\A \cup \{\eos\}\)</span></td>
+<td>The vocabulary of the potential including the end-of-sequence token.</td>
+</tr>
+<tr>
+<td><code>complete(self, context)</code></td>
+<td><span class="arithmatex">\(\log \complete(\xx)\)</span></td>
+<td>The complete potential for a given sequence.</td>
+</tr>
+<tr>
+<td><code>prefix(self, context)</code></td>
+<td><span class="arithmatex">\(\log \prefix(\xx)\)</span></td>
+<td>The prefix potential for a given sequence.</td>
+</tr>
+<tr>
+<td><code>logw_next(self, context)</code></td>
+<td><span class="arithmatex">\(\log \pot(\cdot \mid \xx)\)</span></td>
+<td>The next-token potential for a given prefix sequence.</td>
+</tr>
+<tr>
+<td><code>score(self, context)</code></td>
+<td><span class="arithmatex">\(\log \pot(\xx)\)</span></td>
+<td>The potential, dispatching to <code>complete</code> for eos-terminated sequences and <code>prefix</code> otherwise.</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": [], "search": "../assets/javascripts/workers/search.7a47a382.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.e71a0d61.min.js"></script>
+      
+        <script src="../javascripts/mathjax.js"></script>
+      
+        <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+      
+        <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+      
+    
+  </body>
+</html>
