@@ -25,6 +25,7 @@ __all__ = [
     "SMC",
     "Potential",
     "PromptedLLM",
+    "ByteLLM",
     "WCFG",
     "BoolCFG",
     "WFSA",
@@ -37,6 +38,3 @@ __all__ = [
     "topk_token_sampler",
     "InferenceVisualizer",
 ]
-
-if ByteLLM is not None:
-    __all__.append("ByteLLM")

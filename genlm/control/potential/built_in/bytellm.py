@@ -15,8 +15,6 @@ class ByteLLM(Potential):
     over byte sequences. This enables constrained generation at the byte level while
     maintaining coherent token-level probabilities through adaptive token healing.
 
-    This class requires the `genlm-bytes` package. Install with: `pip install genlm-control[bytes]`
-
     Args:
         llm: The language model to use (from `genlm.backend`).
         beam_params (BeamParams): Configuration for beam search, including beam width `K`,
