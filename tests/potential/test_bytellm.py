@@ -2,19 +2,9 @@ import pytest
 import numpy as np
 import asyncio
 
-try:
-    from genlm.bytes import BeamParams
-    from genlm.backend import load_model_by_name
-    from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
-
-    HAS_GENLM_BYTES = True
-except ImportError:
-    HAS_GENLM_BYTES = False
-
-pytestmark = pytest.mark.skipif(
-    not HAS_GENLM_BYTES,
-    reason="genlm-bytes not installed. Install with: pip install genlm-control[bytes]",
-)
+from genlm.bytes import BeamParams
+from genlm.backend import load_model_by_name
+from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
 
 
 @pytest.fixture(scope="module")

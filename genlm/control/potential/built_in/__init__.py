@@ -3,11 +3,7 @@ from .wcfg import WCFG, BoolCFG
 from .wfsa import WFSA, BoolFSA
 from .json import JsonSchema
 from .canonical import CanonicalTokenization
-
-try:
-    from .bytellm import ByteLLM
-except ImportError:
-    ByteLLM = None
+from .bytellm import ByteLLM
 
 __all__ = [
     "PromptedLLM",

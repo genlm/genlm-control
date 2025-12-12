@@ -21,9 +21,6 @@ jobs:
           python-version: 3.11.5
           cache: 'pip'
 
-      # - name: Clear pip cache
-      #   run: |
-      #     pip cache purge
       - name: Install UV
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -33,7 +30,7 @@ jobs:
           uv venv venv
           source venv/bin/activate
           uv pip install -e .[test]
-          pytest tests --cov=genlm/control --cov-report=json --ignore=tests/test_mlx.py --ignore=tests/potential/test_bytellm.py
+          pytest tests --cov=genlm/control --cov-report=json --ignore=tests/test_mlx.py
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
@@ -67,39 +64,6 @@ jobs:
           source venv/bin/activate
           uv pip install -e ".[test,mlx]"
           pytest tests/test_mlx.py --cov=genlm/control --cov-report=json
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          fail_ci_if_error: false
-          disable_search: true
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage.json
-          slug: genlm/genlm-control
-
-  test-bytes:
-    runs-on: ubuntu-22.04
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - uses: actions/setup-python@v4
-        with:
-          python-version: 3.11.5
-          cache: 'pip'
-
-      - name: Install UV
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-
-      - name: Run ByteLLM Tests
-        run: |
-          uv venv venv
-          source venv/bin/activate
-          uv pip install -e ".[test,bytes]"
-          pytest tests/potential/test_bytellm.py --cov=genlm/control --cov-report=json
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
