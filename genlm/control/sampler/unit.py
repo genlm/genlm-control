@@ -415,7 +415,7 @@ class CFGBoundary(BoundaryPredicate):
         """
         try:
             return self.parser.parse(text)
-        except:
+        except LarkError:
             return None
 
     def __repr__(self):
