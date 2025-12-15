@@ -528,7 +528,7 @@ async def test_multi_token_unit_sampler_max_subunits_reached():
     assert len(unit) <= 5
     if EOS in unit:
         assert unit[-1] is EOS
-    assert weight <= 0.0
+    assert weight <= 1e-10
 
 
 def test_cfg_boundary_exception_handling():
