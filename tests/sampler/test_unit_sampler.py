@@ -10,6 +10,7 @@ from genlm.control.sampler import (
     FixedLengthBoundary,
 )
 from genlm.control.sampler.unit import flatten_units
+from genlm.control.sampler import CFGBoundary
 from genlm.control.sampler.sequence import SMC
 from genlm.control.constant import EOS
 from conftest import MockPotential
@@ -311,7 +312,7 @@ async def test_multi_token_unit_sampler_exception_handling():
         boundary_predicate=boundary,
     )
     # Should handle exception and return -inf weight
-    unit, weight, logp = await unit_sampler.sample([], draw=None)
+    unit, weight, _ = await unit_sampler.sample([], draw=None)
     assert weight == float("-inf")
     assert isinstance(unit, list)
 
@@ -356,3 +357,143 @@ async def test_multi_token_unit_sampler_flatten_to_subunits():
     unit_context = [[b"a", b"b"], b"c", [b"a"]]
     flattened = unit_sampler._flatten_to_subunits(unit_context)
     assert flattened == [b"a", b"b", b"c", b"a"]
+
+
+def test_cfg_boundary_import():
+    """Test that CFGBoundary is available."""
+    from genlm.control.sampler import CFGBoundary
+
+    assert CFGBoundary is not None
+
+
+@pytest.mark.asyncio
+async def test_cfg_boundary_simple_arithmetic():
+    """Test CFGBoundary with simple arithmetic grammar."""
+    # Simple arithmetic grammar
+    grammar = """
+        start: expr
+        expr: NUMBER
+            | expr "+" NUMBER
+        NUMBER: /[0-9]+/
+    """
+    boundary = CFGBoundary(grammar, complete_rules={"start"}, min_length=1)
+    assert boundary([], [b"5"]) is True
+    assert boundary([], [b"1", b"+", b"2"]) is True
+    assert boundary([], [b"1", b"+"]) is False
+    assert boundary([], [b"+"]) is False
+    assert boundary([], []) is False
+
+
+@pytest.mark.asyncio
+async def test_cfg_boundary_min_length():
+    """Test CFGBoundary min_length parameter."""
+    grammar = """
+        start: "a"+
+    """
+    boundary = CFGBoundary(grammar, min_length=3)
+    assert boundary([], [b"a"]) is False
+    assert boundary([], [b"a", b"a"]) is False
+    assert boundary([], [b"a", b"a", b"a"]) is True
+    assert boundary([], [b"a", b"a", b"a", b"a"]) is True
+
+
+@pytest.mark.asyncio
+async def test_cfg_boundary_complete_rules_none():
+    """Test CFGBoundary with complete_rules=None (any parse is complete)."""
+    grammar = """
+        start: word+
+        word: /[a-z]+/
+    """
+    boundary = CFGBoundary(grammar, complete_rules=None, min_length=1)
+    assert boundary([], [b"hello"]) is True
+    assert boundary([], [b"hello", b"world"]) is True
+    assert boundary([], [b"123"]) is False
+
+
+@pytest.mark.asyncio
+async def test_cfg_boundary_with_eos():
+    """Test CFGBoundary handles EOS tokens correctly."""
+    grammar = """
+        start: "x"+
+    """
+    boundary = CFGBoundary(grammar, min_length=1)
+    assert boundary([], [b"x", EOS]) is True
+    assert boundary([], [b"x", b"x", EOS]) is True
+    assert boundary([], [EOS]) is False
+
+
+@pytest.mark.asyncio
+async def test_cfg_boundary_integration():
+    """Test CFGBoundary integrated with MultiTokenUnitSampler."""
+    # Grammar: parentheses must be balanced
+    grammar = """
+        start: atom
+        atom: "(" atom ")"
+            | "x"
+    """
+    boundary = CFGBoundary(grammar, complete_rules={"start"}, min_length=1)
+    vocab = [b"(", b")", b"x"]
+    logws = np.log([0.3, 0.3, 0.3, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=20,
+    )
+    unit, _, _ = await unit_sampler.sample([], draw=None)
+    assert isinstance(unit, list)
+    assert len(unit) > 0
+    text = b"".join(t for t in unit if isinstance(t, bytes) and t is not EOS).decode(
+        "utf-8"
+    )
+    is_complete = boundary([], unit)
+    is_at_limit = len(unit) >= 20 or (unit and unit[-1] is EOS)
+    assert is_complete or is_at_limit, f"Unit should be complete or at limit: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_cfg_boundary_lalr_parser():
+    """Test CFGBoundary with LALR parser (faster but no ambiguity support)."""
+    grammar = """
+        start: item+
+        item: "a" | "b"
+    """
+    boundary = CFGBoundary(grammar, parser_type="lalr", min_length=1)
+    assert boundary([], [b"a"]) is True
+    assert boundary([], [b"a", b"b"]) is True
+    assert boundary([], [b"c"]) is False
+
+
+def test_cfg_boundary_invalid_grammar():
+    """Test CFGBoundary raises error with invalid grammar."""
+    invalid_grammar = """
+        start: undefined_rule
+    """
+    with pytest.raises(ValueError, match="Failed to create Lark parser"):
+        CFGBoundary(invalid_grammar)
+
+
+def test_cfg_boundary_get_parse_tree():
+    """Test CFGBoundary.get_parse_tree helper method."""
+    grammar = """
+        start: "a"+
+    """
+    boundary = CFGBoundary(grammar, min_length=1)
+    tree = boundary.get_parse_tree("aaa")
+    assert tree is not None
+    assert tree.data == "start"
+    tree = boundary.get_parse_tree("bbb")
+    assert tree is None
+
+
+def test_cfg_boundary_repr():
+    """Test CFGBoundary string representation."""
+    grammar = 'start: "x"'
+    boundary1 = CFGBoundary(grammar, start_rule="start", complete_rules={"start"})
+    assert "CFGBoundary" in repr(boundary1)
+    assert "start" in repr(boundary1)
+    assert "complete_rules" in repr(boundary1)
+    boundary2 = CFGBoundary(grammar, complete_rules=None)
+    assert "CFGBoundary" in repr(boundary2)
+    assert "complete_rules" not in repr(boundary2)

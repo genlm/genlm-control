@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 
 from genlm.control.constant import EOS
 from genlm.control.sampler.token import TokenSampler
+from lark import Lark
+from lark.exceptions import LarkError
 
 
 def flatten_units(context):
@@ -289,3 +291,135 @@ def boundary_fixed_length(length):
         >>> boundary([b"a"] * 10)  # True
     """
     return FixedLengthBoundary(length)
+
+
+class CFGBoundary(BoundaryPredicate):
+    """Boundary predicate using Lark parser for context-free grammar-based boundaries.
+
+    This uses Lark's parser to determine when a sequence of subunits forms a
+    syntactically complete unit according to a context-free grammar.
+
+    A unit can be marked as complete when:
+    - The subunit buffer parses successfully
+    - The parse tree's root matches one of the complete_rules
+
+    Args:
+        grammar_text (str): Lark grammar specification
+        start_rule (str): Starting rule for parsing (default: "start")
+        complete_rules (set or None): Set of rule names that constitute complete units.
+                                      If None, any successful parse is complete.
+                                      If provided, only parses with matching root are complete.
+        min_length (int): Minimum buffer length before attempting to parse (default: 2)
+        parser_type (str): Lark parser type: 'earley' (default, supports ambiguity) or 'lalr' (faster)
+        ambiguity (str): How to handle ambiguous grammars: 'explicit' (default) or 'resolve'
+        encoding (str): Text encoding for token decoding (default: "utf-8")
+        decode_errors (str): How to handle decode errors (default: "ignore")
+
+    Example:
+        >>> # Simple arithmetic grammar
+        >>> grammar = '''
+        ...     start: expr
+        ...     expr: term | expr "+" term
+        ...     term: NUMBER
+        ...     NUMBER: /[0-9]+/
+        ... '''
+        >>> boundary = CFGBoundary(grammar, complete_rules={"start"})
+        >>> boundary([], [b"1", b"+", b"2"])  # True (complete expression)
+        >>> boundary([], [b"1", b"+"])        # False (incomplete)
+    """
+
+    def __init__(
+        self,
+        grammar_text,
+        start_rule="start",
+        complete_rules=None,
+        min_length=2,
+        parser_type="earley",
+        ambiguity="explicit",
+        encoding="utf-8",
+        decode_errors="ignore",
+    ):
+        self.grammar_text = grammar_text
+        self.start_rule = start_rule
+        self.complete_rules = set(complete_rules) if complete_rules else None
+        self.min_length = min_length
+        self.encoding = encoding
+        self.decode_errors = decode_errors
+        try:
+            if parser_type == "earley":
+                self.parser = Lark(
+                    grammar_text,
+                    start=start_rule,
+                    parser=parser_type,
+                    ambiguity=ambiguity,
+                )
+            else:
+                self.parser = Lark(grammar_text, start=start_rule, parser=parser_type)
+        except Exception as e:
+            raise ValueError(f"Failed to create Lark parser: {e}") from e
+
+    def __call__(self, unit_context, subunit_buffer):
+        """Check if buffer forms a complete syntactic unit.
+
+        Args:
+            unit_context: Previous completed units (ignored)
+            subunit_buffer: Current sequence of subunits to check
+
+        Returns:
+            bool: True if buffer parses successfully and meets criteria
+        """
+        if not subunit_buffer or len(subunit_buffer) < self.min_length:
+            return False
+
+        try:
+            text = self._tokens_to_text(subunit_buffer)
+
+            if not text or len(text) < self.min_length:
+                return False
+
+            tree = self.parser.parse(text)
+            if self.complete_rules is None:
+                return True
+
+            root_rule = tree.data
+            return root_rule in self.complete_rules
+
+        except LarkError:
+            return False  # not a complete unit
+        except Exception:
+            return False  # catch other errors
+
+    def _tokens_to_text(self, tokens):
+        """Convert token buffer to text string.
+
+        Args:
+            tokens: List of tokens (bytes objects or lists)
+
+        Returns:
+            str: Decoded text
+        """
+        # Join byte tokens, filtering out EOS
+        token_bytes = b"".join(
+            t for t in tokens if isinstance(t, bytes) and t is not EOS
+        )
+        return token_bytes.decode(self.encoding, errors=self.decode_errors)
+
+    def get_parse_tree(self, text):
+        """Get the parse tree for a given text.
+
+        Args:
+            text (str): String to parse
+
+        Returns:
+            Lark Tree object or None if parsing fails
+        """
+        try:
+            return self.parser.parse(text)
+        except:
+            return None
+
+    def __repr__(self):
+        rules_str = (
+            f", complete_rules={self.complete_rules}" if self.complete_rules else ""
+        )
+        return f"CFGBoundary(start={self.start_rule!r}{rules_str})"
