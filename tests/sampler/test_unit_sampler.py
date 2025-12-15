@@ -1,5 +1,6 @@
 import pytest
 import numpy as np
+import unittest.mock as mock
 
 from genlm.control.sampler import (
     DirectTokenSampler,
@@ -8,6 +9,7 @@ from genlm.control.sampler import (
     boundary_fixed_length,
     TokenSetBoundary,
     FixedLengthBoundary,
+    BoundaryPredicate,
 )
 from genlm.control.sampler.unit import flatten_units
 from genlm.control.sampler import CFGBoundary
@@ -497,3 +499,50 @@ def test_cfg_boundary_repr():
     boundary2 = CFGBoundary(grammar, complete_rules=None)
     assert "CFGBoundary" in repr(boundary2)
     assert "complete_rules" not in repr(boundary2)
+
+
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_max_subunits_reached():
+    """Test MultiTokenUnitSampler when max_subunits_per_unit is reached without boundary."""
+
+    # Create a boundary that never returns True
+    class NeverCompleteBoundary(BoundaryPredicate):
+        def __call__(self, unit_context, subunit_buffer):
+            return False
+
+        def __repr__(self):
+            return "NeverCompleteBoundary()"
+
+    vocab = [b"a", b"b", b"c"]
+    logws = np.log([0.4, 0.3, 0.2, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = NeverCompleteBoundary()
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=5,
+        include_boundary_in_unit=True,
+    )
+    unit, weight, _ = await unit_sampler.sample([], draw=None)
+    assert len(unit) <= 5
+    if EOS in unit:
+        assert unit[-1] is EOS
+    assert weight <= 0.0
+
+
+def test_cfg_boundary_exception_handling():
+    """Test CFGBoundary handles exceptions gracefully."""
+    grammar = 'start: "x"'
+    boundary = CFGBoundary(
+        grammar, start_rule="start", complete_rules={"start"}, min_length=1
+    )
+    result = boundary([], [bytes([ord("x")])])
+    assert result is True
+    result = boundary([], [])
+    assert result is False
+    with mock.patch.object(
+        boundary.parser, "parse", side_effect=ValueError("Unexpected error")
+    ):
+        result = boundary([], [bytes([ord("x")])])
+        assert result is False

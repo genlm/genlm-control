@@ -152,7 +152,7 @@ class MultiTokenUnitSampler(TokenSampler):
             # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
             if self.boundary_predicate(flat_token_context, subunit_buffer):
                 unit = subunit_buffer
-                # Exclude boundary token from unit if requested
+                # Exclude boundary token from unit
                 if not self.include_boundary_in_unit and unit:
                     unit = unit[:-1]
                 return unit, cumulative_logw, cumulative_logp
