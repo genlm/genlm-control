@@ -22,6 +22,8 @@ from genlm.control import direct_token_sampler
 
 model_name = "unsloth/gpt-oss-20b-BF16"
 
+torch.cuda.empty_cache()
+
 
 def coerce_bytes_to_chars(bytes_tokens):
     """Convert a sequence of bytes tokens to a list of characters."""
@@ -69,10 +71,16 @@ def tokenizer():
     except Exception as e:
         pytest.skip(f"Could not load tokenizer: {e}")
 
+
 @pytest.fixture
 def promptedllm():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (8, 0):
         pytest.skip("CUDA not available or compute capability < 8.0")
+    elif (
+        torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()
+    ) / 1e9 < 40:
+        pytest.skip("Not enough GPU memory free")
+
     return PromptedLLM.from_name(
         model_name, backend="hf"
     )  # We set the prompt with set_prompt_from_string
@@ -110,7 +118,9 @@ async def test_potential_evaluation(wcfg, tokenizer):
 
     cfg_inputs = {"analysis": "aaaabaaaa", "commentary": "bbbbbbbbb", "final": "aaa"}
 
-    potential_vocab = HarmonyChat(tokenizer).potential_vocab # This way we can avoid to load the llm vocabulary.
+    potential_vocab = HarmonyChat(
+        tokenizer
+    ).potential_vocab  # This way we can avoid to load the llm vocabulary.
     coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
     base_cfg = wcfg.cfg
 
@@ -150,6 +160,21 @@ async def test_potential_evaluation(wcfg, tokenizer):
         )
 
 
+def test_harmony_failure_cases(tokenizer):
+    """
+    Test that the HarmonyPotential raises an error for invalid chat formats.
+    """
+    harmony_chat = HarmonyChat(tokenizer)
+    with pytest.raises(ValueError):  # invalid syntax
+        harmony_chat.extract_harmony_channels_from_string(
+            "<|channel|>analysis<|end|>aaabbb<|end|>"
+        )
+    with pytest.raises(ValueError):  # invalid channel
+        harmony_chat.extract_harmony_channels_from_string(
+            "<|channel|>astronomy<|message|>aaabbb<|end|>"
+        )
+
+
 def test_harmony_channel_extraction(harmony_examples, tokenizer):
     """
     Test that HarmonyPotential correctly extracts channels from harmony chat examples.
@@ -162,13 +187,9 @@ def test_harmony_channel_extraction(harmony_examples, tokenizer):
         full_response = sample["full_response"]
         expected_channels = sample["channels"]
 
-        # Tokenize the full response
-        token_ids = tokenizer.encode(full_response, add_special_tokens=False)
-        token_bytes = harmony_chat.decode_tokens(token_ids)
-
-        # Extract channels using HarmonyPotential
-        extracted_channels = harmony_chat.extract_harmony_channels_from_tokens(
-            token_bytes
+        # Extract the channels
+        extracted_channels = harmony_chat.extract_harmony_channels_from_string(
+            full_response, add_special_tokens=False
         )
 
         # Check each channel
@@ -220,13 +241,9 @@ def test_harmony_channel_extraction_token_bytes(harmony_examples, tokenizer):
         full_response = sample["full_response"]
         expected_channels = sample["channels"]
 
-        # Tokenize the full response
-        token_ids = tokenizer.encode(full_response, add_special_tokens=False)
-        token_bytes = harmony_chat.decode_tokens(token_ids)
-
-        # Extract channels
-        extracted_channels = harmony_chat.extract_harmony_channels_from_tokens(
-            token_bytes
+        # Extract the chat channels
+        extracted_channels = harmony_chat.extract_harmony_channels_from_string(
+            full_response, add_special_tokens=False
         )
 
         # For each expected channel, verify the extracted token IDs match
@@ -259,9 +276,9 @@ def test_harmony_channel_extraction_token_bytes(harmony_examples, tokenizer):
 @pytest.mark.asyncio
 async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, BooleanCfg):
     """Test HarmonyPotential with AWRS and SMC for constrained generation.
-     This checks the correctness of the prefix and complete methods"""
+    This checks that the entire pipeline that uses teh prefix and complete methods works properly"""
 
-    # Setup prompt using chat template
+    # Create the prompt with the chat template
     messages = [
         {
             "role": "user",
@@ -317,10 +334,12 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
         final_str = b"".join(final_channel["content"][:-1]).decode(
             "utf-8", errors="replace"
         )
+
         log_weight = await BooleanCfg.complete(final_str)
         assert log_weight != float("-inf"), (
             f"The generated final channel should be accepted by the grammar: {final_str!r}"
         )
+
     else:  # If EOS is not the last token, it means that we can treat the final channel as prefix. CHECK: should this be treated as an error? This is only correct if the output was truncated due to the max_tokens limit.
         final_str = b"".join(final_channel["content"]).decode("utf-8", errors="replace")
         log_weight = await BooleanCfg.prefix(final_str)
@@ -333,7 +352,9 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
 async def test_logw_next_token_END(tokenizer, wcfg):
     """This method tests that the logw_next method is correctly implemented. in the special cases where the mass is concentrated on the end of string token"""
 
-    potential_vocab = HarmonyChat(tokenizer).potential_vocab # This way we can avoid to load the llm vocabulary.
+    potential_vocab = HarmonyChat(
+        tokenizer
+    ).potential_vocab  # This way we can avoid to load the llm vocabulary.
     coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
     harmony_potential = HarmonyPotential(
         base_potential=coerced_cfg,
@@ -376,7 +397,9 @@ async def test_logw_next_token_all(tokenizer, wcfg):
         wcfg.cfg_eos.prefix_grammar(string)
     )  # compute the common normalizing constant
 
-    potential_vocab = HarmonyChat(tokenizer).potential_vocab # This way we can avoid to load the llm vocabulary.
+    potential_vocab = HarmonyChat(
+        tokenizer
+    ).potential_vocab  # This way we can avoid to load the llm vocabulary.
     coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
     harmony_potential = HarmonyPotential(
         base_potential=coerced_cfg,
