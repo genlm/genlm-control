@@ -14,14 +14,6 @@ class HarmonyChat:
     methods to extract the byte representation from the token ids.
     """
 
-    harmony_chat_keys = [
-        "analysis",
-        "final",
-        "commentary",
-        "<|channel|>",
-        "<|message|>",
-        "<|end|>",
-    ]  # Note, we omit the <|return|> token of the Harmony chat format, as PromptedLLM automatically move all its mass to EOS.
 
     def __init__(self, tokenizer):
         """
@@ -66,38 +58,26 @@ class HarmonyChat:
             decode=_byte_vocab, eos_tokens=_eos_tokens
         )
         self.potential_vocab = self.token_maps.potential_vocab
-        self.token_dict = {}
-        for key in HarmonyChat.harmony_chat_keys:  # This completes the token dict with the tokens that may change according to the tokenizer.
-            self.token_dict[key] = self.decode_tokens(self.tokenizer.encode(key))
 
-    def extract_channel_content(self, token_bytes, start_idx):
+        # We encode the special tokens that are needed in harmony as instance variables.
+        self.end_token = self.decode_tokens(self.tokenizer.encode("<|end|>"))[0]
+        self.message_token = self.decode_tokens(self.tokenizer.encode("<|message|>"))[0]
+        self.channel_token = self.decode_tokens(self.tokenizer.encode("<|channel|>"))[0]
+        self.analysis_tokens = self.decode_tokens(self.tokenizer.encode("analysis")) # The following tokens (analysis, commentary, final) are not reserved, and therefore they are not guaranteed to be single tokens.
+        self.final_tokens = self.decode_tokens(self.tokenizer.encode("final"))
+        self.commentary_tokens = self.decode_tokens(self.tokenizer.encode("commentary"))
+
+    def extract_channel_content(self, token_bytes, i):
         """Extract content between start_idx and end_token."""
-        end_token = self.token_dict["<|end|>"][0]
-        message_token = self.token_dict["<|message|>"][0]
-        channel_token = self.token_dict["<|channel|>"][0]
-
-        if (
-            message_token in token_bytes[start_idx:]
-        ):  # we look for the <|message|> token which opens the actual content field.
-            i = token_bytes.index(
-                message_token, start_idx
-            )  # i denotes the position of the <|message|> token.
-            if (
-                channel_token in token_bytes[start_idx + 1 : i]
-                or end_token in token_bytes[start_idx + 1 : i]
-            ):  # the format of the chat must follow "<|channel|> channel_type <|message|> channel_content <|end|>",
-                raise ValueError(" invalid token after the <|channel|> token")
-        else:
-            if (
-                channel_token in token_bytes[start_idx + 1 :]
-                or end_token in token_bytes[start_idx + 1 :]
-            ):  # the format of the chat must follow "<|channel|> channel_type <|message|> channel_content <|end|>",
-                raise ValueError(" invalid token after the <|channel|> token")
+       
+        if i >= len(token_bytes):
             return None
+        if token_bytes[i] != self.message_token:
+            raise ValueError(f"Message token expected after the channel type declaration, but got {token_bytes[i]}")
 
         i += 1
-        if end_token in token_bytes[i:]:
-            end_position = token_bytes.index(end_token, i)
+        if self.end_token in token_bytes[i:]:
+            end_position = token_bytes.index(self.end_token, i)
             content = token_bytes[i:end_position]
             is_prefix = False
         else:
@@ -116,29 +96,31 @@ class HarmonyChat:
         Returns:
             Dictionary with extracted channel contents
         """
-        analysis_tokens = self.token_dict["analysis"]
-        final_tokens = self.token_dict["final"]
-        commentary_tokens = self.token_dict["commentary"]
-        channel_token = self.token_dict["<|channel|>"][
-            0
-        ]  # This is always a reserved single token.
 
         results = {"analysis": None, "final": None, "commentary": None}
 
         for i, token in enumerate(token_bytes[:-2]):
             # The harmony format assumes that the <|channel|> token is immediately followed by the channel type, thus we can stop before the last two tokens.
             # Look for <|channel|> token followed by analysis/final/commentary.
-            if token == channel_token:
-                # Check what channel follows.
-                if token_bytes[i + 1] == analysis_tokens[0]:
-                    results["analysis"] = self.extract_channel_content(token_bytes, i)
-                elif token_bytes[i + 1] == final_tokens[0]:
-                    results["final"] = self.extract_channel_content(token_bytes, i)
-                elif token_bytes[i + 1] == commentary_tokens[0]:
-                    results["commentary"] = self.extract_channel_content(token_bytes, i)
-                else:
+            if token == self.channel_token:
+                j = i + 1
+                # Check wheter the analysis, final or commentary tokens follow the channel opening.
+                if len(token_bytes) >= j + len(self.analysis_tokens) \
+                    and token_bytes[j : j + len(self.analysis_tokens)] == self.analysis_tokens:
+                    results["analysis"] = self.extract_channel_content(token_bytes, j + len(self.analysis_tokens)) # TODO: simplify the extract_channel_content field as we can directly check that the next token is the <|end|> token.
+                elif len(token_bytes) >= j + len(self.final_tokens) and\
+                    token_bytes[j : j + len(self.final_tokens)] == self.final_tokens:
+                    results["final"] = self.extract_channel_content(token_bytes, j + len(self.final_tokens))
+                elif len(token_bytes) >= j + len(self.commentary_tokens) and \
+                    token_bytes[j : j + len(self.commentary_tokens)] == self.commentary_tokens:
+                    results["commentary"] = self.extract_channel_content(token_bytes, j + len(self.commentary_tokens))
+                elif len(token_bytes) < j + len(self.analysis_tokens) \
+                    and len(token_bytes) < j + len(self.final_tokens) \
+                    and len(token_bytes) < j + len(self.commentary_tokens): # This means that there is not enough tokens left to extract the channel content.
+                    continue 
+                else: # In this case, it means that the channel is not valid.
                     raise ValueError(
-                        f"Unexpected channel: {token_bytes[i + 1]}"
+                        f"Unexpected channel: {token_bytes[j]}"
                     )  # pragma: no cover
 
         return results
@@ -196,7 +178,7 @@ class HarmonyChat:
 
 
 class HarmonyPotential(Potential):
-    def __init__(self, base_potential, llm_tokenizer, constrained_channels=[]):
+    def __init__(self, base_potential, llm_tokenizer, constrained_channels=None):
         """
         Inputs:
             Base Potential: a base potential which is applied to the context channels.
@@ -207,7 +189,7 @@ class HarmonyPotential(Potential):
 
         self.base_potential = base_potential
         self.harmony_chat = HarmonyChat(llm_tokenizer)
-        self.constrained_channels = constrained_channels
+        self.constrained_channels = constrained_channels or [] # default to empty list if no channels are provided.
 
         super().__init__(self.harmony_chat.potential_vocab)
 
@@ -279,7 +261,6 @@ class HarmonyPotential(Potential):
         Output: The sum of log probabilities for the next token logprobs for each possible next-token, including the EOS symbol.
         """
 
-        end_token = self.harmony_chat.token_dict["<|end|>"][0]
         channels = self.harmony_chat.extract_harmony_channels_from_tokens(
             context
         )  # Extract the channels from the context.
@@ -315,7 +296,7 @@ class HarmonyPotential(Potential):
             if (
                 key == "analysis" or key == "commentary"
             ):  # In this case, the EOS weight needs to be moved to the <|end|> token.
-                idx = next_token_weights.encode[end_token]
+                idx = next_token_weights.encode[self.harmony_chat.end_token]
                 next_token_weights.weights[idx] = (
                     EOS_weight  # Move the EOS weight to the <|end|>, which is the token that will be sampled by the llm to close the channel.
                 )
