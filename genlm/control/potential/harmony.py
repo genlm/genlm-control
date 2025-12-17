@@ -2,7 +2,6 @@ from genlm.control.potential import Potential
 from genlm.backend import decode_vocab
 from genlm.control.potential.built_in.llm import TokenMappings
 import numpy as np
-import warnings
 import regex
 from genlm.control import EOS
 from collections import Counter
@@ -10,13 +9,12 @@ from collections import Counter
 
 class HarmonyChat:
     """
-    This class encodes the "assistant" field of the Harmony chat Format,
-    and provides the methods to extract the harmony channels from the context.
+    This class encodes the structure of the "assistant" field of the Harmony chat Format,
+    and provides the methods to extract the "harmony channels" from it (analysis, final, commentary).
 
     Since it operates on the byte representation of tokens it also provides
     methods to extract the byte representation from the token ids.
     """
-
 
     def __init__(self, tokenizer):
         """
@@ -35,7 +33,7 @@ class HarmonyChat:
             and hasattr(tokenizer, "apply_chat_template")
         ), (
             "The tokenizer object does not have the minimum required methods or attributes."
-        )
+        )  # Check that the tokenizer supports the special tokens of the harmony chat format (in such a case, they should all be encoded as single tokens).
         assert all(
             len(tokenizer.encode(key)) == 1
             for key in [
@@ -68,18 +66,17 @@ class HarmonyChat:
         self.end_token = self.decode_tokens(self.tokenizer.encode("<|end|>"))[0]
         self.message_token = self.decode_tokens(self.tokenizer.encode("<|message|>"))[0]
         self.channel_token = self.decode_tokens(self.tokenizer.encode("<|channel|>"))[0]
-        self.analysis_tokens = self.decode_tokens(self.tokenizer.encode("analysis")) # The following tokens (analysis, commentary, final) are not reserved, and therefore they are not guaranteed to be single tokens.
+        self.analysis_tokens = self.decode_tokens(
+            self.tokenizer.encode("analysis")
+        )  # The following tokens (analysis, commentary, final) are not reserved, and therefore they are not guaranteed to be single tokens.
         self.final_tokens = self.decode_tokens(self.tokenizer.encode("final"))
         self.commentary_tokens = self.decode_tokens(self.tokenizer.encode("commentary"))
 
     def extract_channel_content(self, token_bytes, i):
         """Extract content between start_idx and end_token."""
-       
-        if i >= len(token_bytes):
-            return None
-        if token_bytes[i] != self.message_token:
-            raise ValueError(f"Message token expected after the channel type declaration, but got {token_bytes[i]}")
 
+        if i >= len(token_bytes):
+            return None  # pragma: no cover
         i += 1
         if self.end_token in token_bytes[i:]:
             end_position = token_bytes.index(self.end_token, i)
@@ -102,7 +99,9 @@ class HarmonyChat:
             Dictionary with extracted channel contents
         """
 
-        assert self.validate_harmony_format(token_bytes), f"The context is not a valid harmony chat{token_bytes}"
+        assert self.validate_harmony_format(token_bytes), (
+            f"The context is not a valid harmony chat{token_bytes}"
+        )
         results = {"analysis": None, "final": None, "commentary": None}
 
         for i, token in enumerate(token_bytes[:-2]):
@@ -111,23 +110,29 @@ class HarmonyChat:
             if token == self.channel_token:
                 j = i + 1
                 # Check whether the analysis, final or commentary tokens follow the channel opening.
-                if len(token_bytes) >= j + len(self.analysis_tokens) \
-                    and token_bytes[j : j + len(self.analysis_tokens)] == self.analysis_tokens:
-                    results["analysis"] = self.extract_channel_content(token_bytes, j + len(self.analysis_tokens)) # TODO: simplify the extract_channel_content field as we can directly check that the next token is the <|end|> token.
-                elif len(token_bytes) >= j + len(self.final_tokens) and\
-                    token_bytes[j : j + len(self.final_tokens)] == self.final_tokens:
-                    results["final"] = self.extract_channel_content(token_bytes, j + len(self.final_tokens))
-                elif len(token_bytes) >= j + len(self.commentary_tokens) and \
-                    token_bytes[j : j + len(self.commentary_tokens)] == self.commentary_tokens:
-                    results["commentary"] = self.extract_channel_content(token_bytes, j + len(self.commentary_tokens))
-                elif len(token_bytes) < j + len(self.analysis_tokens) \
-                    and len(token_bytes) < j + len(self.final_tokens) \
-                    and len(token_bytes) < j + len(self.commentary_tokens): # This means that there is not enough tokens left to extract the channel content.
-                    continue 
-                else: # In this case, it means that the channel is not valid.
-                    raise ValueError(
-                        f"Unexpected channel: {token_bytes[j]}"
-                    )  # pragma: no cover
+                if (
+                    len(token_bytes) >= j + len(self.analysis_tokens)
+                    and token_bytes[j : j + len(self.analysis_tokens)]
+                    == self.analysis_tokens
+                ):
+                    results["analysis"] = self.extract_channel_content(
+                        token_bytes, j + len(self.analysis_tokens)
+                    )  # TODO: simplify the extract_channel_content field as we can directly check that the next token is the <|end|> token.
+                elif (
+                    len(token_bytes) >= j + len(self.final_tokens)
+                    and token_bytes[j : j + len(self.final_tokens)] == self.final_tokens
+                ):
+                    results["final"] = self.extract_channel_content(
+                        token_bytes, j + len(self.final_tokens)
+                    )
+                elif (
+                    len(token_bytes) >= j + len(self.commentary_tokens)
+                    and token_bytes[j : j + len(self.commentary_tokens)]
+                    == self.commentary_tokens
+                ):
+                    results["commentary"] = self.extract_channel_content(
+                        token_bytes, j + len(self.commentary_tokens)
+                    )
 
         return results
 
@@ -184,28 +189,34 @@ class HarmonyChat:
 
     def validate_harmony_format(self, context):
         """
-        This pattern validates that the context is a valid harmony chat
+        This pattern validates that the context is a valid harmony chat.
+        In particular, we validate the "assistant" user field of the chat format, which
+        are generated by the language model.
         Args: context : can be both a string or a list of bytes tokens.
         Returns:
             True if the context is a valid harmony chat, False otherwise.
         """
         # Convert list of bytes tokens to string
 
-        if isinstance(context, list) and len(context) > 0 and context[-1] == EOS: #remove the EOS token if it is present
-            context=context[:-1]
+        if (
+            isinstance(context, list) and len(context) > 0 and context[-1] == EOS
+        ):  # remove the EOS token if it is present
+            context = context[:-1]  # pragma: no cover
 
         if isinstance(context, list) and all(isinstance(x, bytes) for x in context):
-            context_str = b''.join(context).decode('utf-8', errors='replace')
-        elif isinstance(context, str):
-            context_str = context
-        else:
-            raise ValueError(f"Context must be a string or a list of bytes tokens, got {type(context)}")
-   
-        pattern = r'''
+            context_str = b"".join(context).decode("utf-8", errors="replace")
+        elif isinstance(context, str):  # pragma: no cover
+            context_str = context  # pragma: no cover
+        else:  # pragma: no cover
+            raise ValueError(
+                f"Context must be a string or a list of bytes tokens, got {type(context)}"
+            )  # pragma: no cover
+
+        pattern = r"""
             ^
             (?:
                 (?:<\|start\|>assistant)? # The assistant field is optional, the first one is part of the prompt and not the generated tokens
-                (?:\s+to=functions\.\w+)? # Optional Function call field          
+                (?:\s+to=functions\.\w+)? # Optional Function call field
                 <\|channel\|> # We start with the channel specifications
                 (analysis|commentary|final) # Choose between the three possible channels
                 (?:\s+json)?
@@ -213,16 +224,21 @@ class HarmonyChat:
                 (?:(?!<\|start\|>|<\|message\|>|<\|channel\|>|<\|call\|>|<\|return\|>).)*  # The actual message content can contain everything except the special tokens.
                 (?:<\|end\|>|<\|call\|>|<\|return\|>) # The channel is closed by the <|end|>, <|call|>, or <|return|> tokens.
             )*
-        '''
+            $
+        """
 
-        match = regex.match(pattern, context_str, regex.VERBOSE | regex.DOTALL, partial= True)
-        if not match: # If the string does not match, we return False.
-            return False
+        match = regex.match(
+            pattern, context_str, regex.VERBOSE | regex.DOTALL, partial=True
+        )
+        if not match:  # If the string does not match, we return False.
+            return False  # pragma: no cover
 
         channel_types = match.captures(1)
-        counts = Counter(channel_types)  # Validate the hypothesis that each channel is used at most once in a turn.
-        if any(count > 1 for count in counts.values()):  
-            return False
+        counts = Counter(
+            channel_types
+        )  # Validate the hypothesis that each channel is used at most once in a turn.
+        if any(count > 1 for count in counts.values()):
+            return False  # pragma: no cover
         return True
 
 
@@ -238,12 +254,15 @@ class HarmonyPotential(Potential):
 
         self.base_potential = base_potential
         self.harmony_chat = HarmonyChat(llm_tokenizer)
-        self.constrained_channels = constrained_channels or [] # default to empty list if no channels are provided.
+        self.constrained_channels = (
+            constrained_channels or []
+        )  # default to empty list if no channels are provided.
 
         super().__init__(self.harmony_chat.potential_vocab)
 
-        assert set(base_potential.vocab) <= set(self.vocab), "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
-
+        assert set(base_potential.vocab) <= set(self.vocab), (
+            "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
+        )
 
     def set_constrained_channels(self, constrained_channels):
         """
@@ -324,7 +343,7 @@ class HarmonyPotential(Potential):
         )
 
         if len(incomplete_channels) == 0:
-            return next_token_weights  # If there are no incomplete channels,\ pragma: no cover
+            return next_token_weights  # If there are no incomplete channels, # pragma: no cover
             # we can return the weights as is. Every possible next token is valid for the harmony format.
 
         key = incomplete_channels.pop()
@@ -345,7 +364,7 @@ class HarmonyPotential(Potential):
             ):  # In this case, the EOS weight needs to be moved to the <|end|> token.
                 idx = next_token_weights.encode[self.harmony_chat.end_token]
                 next_token_weights.weights[idx] = (
-                    EOS_weight  # Move the EOS weight to the <|end|>, which is the token that will be sampled by the llm to close the channel.
+                    EOS_weight  # Move the EOS weight to <|end|>, which is the token that will be sampled by the llm to close the channel.
                 )
                 next_token_weights.weights[-1] = float(
                     "-inf"

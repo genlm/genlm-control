@@ -165,11 +165,11 @@ def test_harmony_failure_cases(tokenizer):
     Test that the HarmonyPotential raises an error for invalid chat formats.
     """
     harmony_chat = HarmonyChat(tokenizer)
-    with pytest.raises(ValueError):  # invalid syntax
+    with pytest.raises(AssertionError):  # invalid syntax
         harmony_chat.extract_harmony_channels_from_string(
             "<|channel|>analysis<|end|>aaabbb<|end|>"
         )
-    with pytest.raises(ValueError):  # invalid channel
+    with pytest.raises(AssertionError):  # invalid channel
         harmony_chat.extract_harmony_channels_from_string(
             "<|channel|>astronomy<|message|>aaabbb<|end|>"
         )
