@@ -25,6 +25,7 @@ dependencies = [
     "torch",
     "json-stream",
     "jsonschema[format-nongpl]",
+    "regex"
 ]
 
 [project.optional-dependencies]
