@@ -3,6 +3,9 @@ from genlm.backend import decode_vocab
 from genlm.control.potential.built_in.llm import TokenMappings
 import numpy as np
 import warnings
+import regex
+from genlm.control import EOS
+from collections import Counter
 
 
 class HarmonyChat:
@@ -36,9 +39,11 @@ class HarmonyChat:
         assert all(
             len(tokenizer.encode(key)) == 1
             for key in [
+                "<|start|>",
                 "<|channel|>",
                 "<|message|>",
                 "<|end|>",
+                "<|return|>",
             ]
         ), (
             "The tokenizer does not appear to support the harmony chat format, or does not support the specific format of the current implementation(gpt-oss, August 2025)."
@@ -97,6 +102,7 @@ class HarmonyChat:
             Dictionary with extracted channel contents
         """
 
+        assert self.validate_harmony_format(token_bytes), f"The context is not a valid harmony chat{token_bytes}"
         results = {"analysis": None, "final": None, "commentary": None}
 
         for i, token in enumerate(token_bytes[:-2]):
@@ -104,7 +110,7 @@ class HarmonyChat:
             # Look for <|channel|> token followed by analysis/final/commentary.
             if token == self.channel_token:
                 j = i + 1
-                # Check wheter the analysis, final or commentary tokens follow the channel opening.
+                # Check whether the analysis, final or commentary tokens follow the channel opening.
                 if len(token_bytes) >= j + len(self.analysis_tokens) \
                     and token_bytes[j : j + len(self.analysis_tokens)] == self.analysis_tokens:
                     results["analysis"] = self.extract_channel_content(token_bytes, j + len(self.analysis_tokens)) # TODO: simplify the extract_channel_content field as we can directly check that the next token is the <|end|> token.
@@ -176,6 +182,49 @@ class HarmonyChat:
         assert all(isinstance(x, int) for x in ids), "Token IDs must be integers"
         return [self.token_maps.decode[x] for x in ids]
 
+    def validate_harmony_format(self, context):
+        """
+        This pattern validates that the context is a valid harmony chat
+        Args: context : can be both a string or a list of bytes tokens.
+        Returns:
+            True if the context is a valid harmony chat, False otherwise.
+        """
+        # Convert list of bytes tokens to string
+
+        if isinstance(context, list) and len(context) > 0 and context[-1] == EOS: #remove the EOS token if it is present
+            context=context[:-1]
+
+        if isinstance(context, list) and all(isinstance(x, bytes) for x in context):
+            context_str = b''.join(context).decode('utf-8', errors='replace')
+        elif isinstance(context, str):
+            context_str = context
+        else:
+            raise ValueError(f"Context must be a string or a list of bytes tokens, got {type(context)}")
+   
+        pattern = r'''
+            ^
+            (?:
+                (?:<\|start\|>assistant)? # The assistant field is optional, the first one is part of the prompt and not the generated tokens
+                (?:\s+to=functions\.\w+)? # Optional Function call field          
+                <\|channel\|> # We start with the channel specifications
+                (analysis|commentary|final) # Choose between the three possible channels
+                (?:\s+json)?
+                <\|message\|> # The message content begins
+                (?:(?!<\|start\|>|<\|message\|>|<\|channel\|>|<\|call\|>|<\|return\|>).)*  # The actual message content can contain everything except the special tokens.
+                (?:<\|end\|>|<\|call\|>|<\|return\|>) # The channel is closed by the <|end|>, <|call|>, or <|return|> tokens.
+            )*
+        '''
+
+        match = regex.match(pattern, context_str, regex.VERBOSE | regex.DOTALL, partial= True)
+        if not match: # If the string does not match, we return False.
+            return False
+
+        channel_types = match.captures(1)
+        counts = Counter(channel_types)  # Validate the hypothesis that each channel is used at most once in a turn.
+        if any(count > 1 for count in counts.values()):  
+            return False
+        return True
+
 
 class HarmonyPotential(Potential):
     def __init__(self, base_potential, llm_tokenizer, constrained_channels=None):
@@ -193,10 +242,8 @@ class HarmonyPotential(Potential):
 
         super().__init__(self.harmony_chat.potential_vocab)
 
-        if not set(base_potential.vocab) <= set(self.vocab):
-            warnings.warn(  # pragma: no cover
-                "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
-            )
+        assert set(base_potential.vocab) <= set(self.vocab), "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
+
 
     def set_constrained_channels(self, constrained_channels):
         """
@@ -249,7 +296,7 @@ class HarmonyPotential(Potential):
                     log_weight += await self.base_potential.prefix(
                         channels[key]["content"]
                     )
-                else:  # Note that to compute the prefix weight, we alos accumulate the weight of the channels that have been completed so far.
+                else:  # Note that to compute the prefix weight, we also accumulate the weight of the channels that have been completed so far.
                     log_weight += await self.base_potential.complete(
                         channels[key]["content"]
                     )

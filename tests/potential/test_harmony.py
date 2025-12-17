@@ -229,50 +229,6 @@ def test_harmony_channel_extraction(harmony_examples, tokenizer):
                 )
 
 
-def test_harmony_channel_extraction_token_bytes(harmony_examples, tokenizer):
-    """
-    Same as above, but at a byte level
-    """
-    samples = harmony_examples["samples"]
-    harmony_chat = HarmonyChat(tokenizer=tokenizer)
-
-    for sample in samples:
-        sample_id = sample["sample_id"]
-        full_response = sample["full_response"]
-        expected_channels = sample["channels"]
-
-        # Extract the chat channels
-        extracted_channels = harmony_chat.extract_harmony_channels_from_string(
-            full_response, add_special_tokens=False
-        )
-
-        # For each expected channel, verify the extracted token IDs match
-        for channel_name in ["analysis", "final", "commentary"]:
-            expected = expected_channels.get(channel_name)
-            extracted = extracted_channels.get(channel_name)
-
-            if expected is None:
-                assert extracted is None, (
-                    f"Sample {sample_id}: {channel_name} should be None"
-                )
-            else:
-                assert extracted is not None, (
-                    f"Sample {sample_id}: {channel_name} should not be None"
-                )
-
-                # Compare token IDs directly
-                expected_token_bytes = harmony_chat.decode_tokens(expected["token_ids"])
-                extracted_token_bytes = extracted["content"]
-
-                assert extracted_token_bytes == expected_token_bytes, (
-                    f"Sample {sample_id}, {channel_name}: Token ID mismatch.\n"
-                    f"Expected length: {len(expected_token_bytes)}, "
-                    f"Got length: {len(extracted_token_bytes)}\n"
-                    f"First 20 expected: {expected_token_bytes[:20]}\n"
-                    f"First 20 got: {extracted_token_bytes[:20]}"
-                )
-
-
 @pytest.mark.asyncio
 async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, BooleanCfg):
     """Test HarmonyPotential with AWRS and SMC for constrained generation.
