@@ -1,5 +1,15 @@
 from .constant import EOS, EOT
-from .potential import Potential, PromptedLLM, BoolCFG, BoolFSA, WFSA, WCFG, JsonSchema, CanonicalTokenization
+from .potential import (
+    Potential,
+    PromptedLLM,
+    ByteLLM,
+    BoolCFG,
+    BoolFSA,
+    WFSA,
+    WCFG,
+    JsonSchema,
+    CanonicalTokenization,
+)
 from .sampler import (
     SMC,
     direct_token_sampler,
@@ -15,6 +25,7 @@ __all__ = [
     "SMC",
     "Potential",
     "PromptedLLM",
+    "ByteLLM",
     "WCFG",
     "BoolCFG",
     "WFSA",
