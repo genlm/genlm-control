@@ -343,24 +343,6 @@ async def test_multi_token_unit_sampler_eos_in_unit():
     assert eos_found, "Should eventually sample EOS"
 
 
-@pytest.mark.asyncio
-async def test_multi_token_unit_sampler_flatten_to_subunits():
-    """Test _flatten_to_subunits internal method."""
-    vocab = [b"a", b"b", b"c"]
-    logws = np.log([0.4, 0.3, 0.2, 0.1])
-    mock_potential = MockPotential(vocab, logws)
-    subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", EOS})
-    unit_sampler = MultiTokenUnitSampler(
-        subunit_sampler=subunit_sampler,
-        boundary_predicate=boundary,
-    )
-    # Test with mixed unit context
-    unit_context = [[b"a", b"b"], b"c", [b"a"]]
-    flattened = unit_sampler._flatten_to_subunits(unit_context)
-    assert flattened == [b"a", b"b", b"c", b"a"]
-
-
 def test_cfg_boundary_import():
     """Test that CFGBoundary is available."""
     from genlm.control.sampler import CFGBoundary

@@ -84,7 +84,7 @@ class MultiTokenUnitSampler(TokenSampler):
 
         # Flatten parent.token_ctx before passing to sample
         # This ensures sample() always works with a flat list
-        flat_context = self._flatten_to_subunits(parent.token_ctx)
+        flat_context = flatten_units(parent.token_ctx)
 
         # Sample multi-token unit using flat context
         unit, logw, logp = await self.sample(flat_context, draw=None)
@@ -158,27 +158,6 @@ class MultiTokenUnitSampler(TokenSampler):
                 return unit, cumulative_logw, cumulative_logp
 
         return subunit_buffer, cumulative_logw, cumulative_logp
-
-    def _flatten_to_subunits(self, unit_context):
-        """Convert unit sequence $\\bm{x} \\in \\mathcal{A}^*$ to subunit sequence $\\in \\mathcal{B}^*$.
-
-        Args:
-            unit_context (list): List of units, where each unit is either:
-                - A list of subunits (for multi-token units)
-                - A single token (for single-token units)
-
-        Returns:
-            list: Flattened sequence of subunits
-        """
-        subunits = []
-        for unit in unit_context:
-            if isinstance(unit, list):
-                # Multi-token unit: extend with all subunits
-                subunits.extend(unit)
-            else:
-                # Single-token unit: append directly
-                subunits.append(unit)
-        return subunits
 
     async def cleanup(self):
         """Clean up resources."""
