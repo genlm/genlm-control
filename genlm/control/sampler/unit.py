@@ -63,7 +63,8 @@ class MultiTokenUnitSampler(TokenSampler):
                 f"subunit_sampler must be a TokenSampler, got {type(subunit_sampler)}"
             )
 
-        # TODO: Currently init with subunit sampler's target
+        # Initialized with subunit sampler's target
+        # We may want to add support for different samplers in the future
         super().__init__(target=subunit_sampler.target)
 
         self.subunit_sampler = subunit_sampler
@@ -138,7 +139,9 @@ class MultiTokenUnitSampler(TokenSampler):
                 subunit, logw_i, logp_i = await self.subunit_sampler.sample(
                     full_context, draw
                 )
-            except Exception:
+            except (RuntimeError, OSError, TimeoutError):
+                # Expected failures (network, timeout, system errors)
+                # Return current buffer with -inf weight to discard this sample
                 return subunit_buffer, float("-inf"), cumulative_logp
             # Accumulate weight and logp
             cumulative_logw += logw_i
@@ -239,39 +242,6 @@ class FixedLengthBoundary(BoundaryPredicate):
         return f"FixedLengthBoundary({self.length})"
 
 
-def boundary_token_set(tokens):
-    """Create a boundary predicate from a set of boundary tokens.
-
-    Args:
-        tokens: Set or iterable of tokens that mark unit boundaries
-
-    Returns:
-        TokenSetBoundary: Boundary predicate instance
-
-    Example:
-        >>> boundary = boundary_token_set({b" ", b"\\n", b".", b","})
-        >>> boundary([b"hello", b" "])  # True (ends with whitespace)
-    """
-    return TokenSetBoundary(tokens)
-
-
-def boundary_fixed_length(length):
-    """Create a boundary predicate for fixed-length units.
-
-    Args:
-        length (int): Number of subunits per unit
-
-    Returns:
-        FixedLengthBoundary: Boundary predicate instance
-
-    Example:
-        >>> boundary = boundary_fixed_length(10)
-        >>> boundary([b"a"] * 9)   # False
-        >>> boundary([b"a"] * 10)  # True
-    """
-    return FixedLengthBoundary(length)
-
-
 class CFGBoundary(BoundaryPredicate):
     """Boundary predicate using Lark parser for context-free grammar-based boundaries.
 
@@ -364,9 +334,8 @@ class CFGBoundary(BoundaryPredicate):
             return root_rule in self.complete_rules
 
         except LarkError:
-            return False  # not a complete unit
-        except Exception:
-            return False  # catch other errors
+            # Parse failed: not a complete unit
+            return False
 
     def _tokens_to_text(self, tokens):
         """Convert token buffer to text string.

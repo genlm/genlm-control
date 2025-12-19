@@ -5,8 +5,6 @@ import unittest.mock as mock
 from genlm.control.sampler import (
     DirectTokenSampler,
     MultiTokenUnitSampler,
-    boundary_token_set,
-    boundary_fixed_length,
     TokenSetBoundary,
     FixedLengthBoundary,
     BoundaryPredicate,
@@ -26,7 +24,7 @@ async def test_multi_token_unit_sampler_basic():
     logws = np.log([0.4, 0.1, 0.3, 0.1, 0.1])
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", b"!", EOS})
+    boundary = TokenSetBoundary({b" ", b"!", EOS})
     # Unit sampler samples words according to boundary
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -53,7 +51,7 @@ async def test_multi_token_unit_sampler_fixed_length():
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
     # 3 tokens per unit
-    boundary = boundary_fixed_length(3)
+    boundary = FixedLengthBoundary(3)
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
@@ -77,7 +75,7 @@ async def test_multi_token_unit_sampler_with_context():
 
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", EOS})
+    boundary = TokenSetBoundary({b" ", EOS})
 
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -103,7 +101,7 @@ async def test_multi_token_unit_sampler_exclude_boundary():
 
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" "})
+    boundary = TokenSetBoundary({b" "})
     # Exclude boundary token from unit
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -129,7 +127,7 @@ async def test_multi_token_unit_sampler_timeout():
     subunit_sampler = DirectTokenSampler(mock_potential)
 
     # Boundary that's never satisfied
-    boundary = boundary_token_set({b"NEVER"})
+    boundary = TokenSetBoundary({b"NEVER"})
 
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -198,7 +196,7 @@ async def test_sequence_model_with_multi_token_units():
 
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", b"!", EOS})
+    boundary = TokenSetBoundary({b" ", b"!", EOS})
 
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -255,7 +253,7 @@ async def test_multi_token_unit_sampler_type_error():
     with pytest.raises(TypeError, match="subunit_sampler must be a TokenSampler"):
         MultiTokenUnitSampler(
             subunit_sampler="not a sampler",
-            boundary_predicate=boundary_token_set({b" "}),
+            boundary_predicate=TokenSetBoundary({b" "}),
         )
 
 
@@ -266,7 +264,7 @@ async def test_multi_token_unit_sampler_start_weight():
     logws = np.log([0.4, 0.2, 0.3, 0.1])
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", EOS})
+    boundary = TokenSetBoundary({b" ", EOS})
 
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -284,7 +282,7 @@ async def test_multi_token_unit_sampler_cleanup():
     logws = np.log([0.4, 0.2, 0.3, 0.1])
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", EOS})
+    boundary = TokenSetBoundary({b" ", EOS})
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
@@ -294,29 +292,44 @@ async def test_multi_token_unit_sampler_cleanup():
 
 @pytest.mark.asyncio
 async def test_multi_token_unit_sampler_exception_handling():
-    """Test exception handling in sample method."""
+    """Test exception handling in sample method for expected errors."""
     vocab = [b"a", b"b"]
-    logws = np.log([0.5, 0.5])
+    logws = np.log([0.4, 0.4, 0.2])  # Include EOS
     mock_potential = MockPotential(vocab, logws)
 
-    # Create a subunit sampler that will raise an exception
+    # Create a subunit sampler that will raise an expected exception
     class FailingSampler(DirectTokenSampler):
         async def sample(self, context, draw=None):
-            # Fail after first token
+            # Fail after first token with a runtime error (expected failure type)
             if len(context) > 0:
-                raise RuntimeError("Test exception")
+                raise RuntimeError("Simulated sampling failure")
             return await super().sample(context, draw)
 
     subunit_sampler = FailingSampler(mock_potential)
-    boundary = boundary_token_set({b" ", EOS})
+    boundary = TokenSetBoundary({b" ", EOS})
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
     )
-    # Should handle exception and return -inf weight
+    # Should handle RuntimeError gracefully and return -inf weight
     unit, weight, _ = await unit_sampler.sample([], draw=None)
     assert weight == float("-inf")
     assert isinstance(unit, list)
+
+    # Verify TypeError
+    class BuggySampler(DirectTokenSampler):
+        async def sample(self, context, draw=None):
+            if len(context) > 0:
+                raise TypeError("Programming error: wrong type")
+            return await super().sample(context, draw)
+
+    buggy_subunit_sampler = BuggySampler(mock_potential)
+    buggy_unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=buggy_subunit_sampler,
+        boundary_predicate=boundary,
+    )
+    with pytest.raises(TypeError, match="Programming error"):
+        await buggy_unit_sampler.sample([], draw=None)
 
 
 @pytest.mark.asyncio
@@ -327,7 +340,7 @@ async def test_multi_token_unit_sampler_eos_in_unit():
     logws = np.log([0.1, 0.1, 0.1, 0.7])
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = boundary_token_set({b" ", EOS})
+    boundary = TokenSetBoundary({b" ", EOS})
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
@@ -514,7 +527,9 @@ async def test_multi_token_unit_sampler_max_subunits_reached():
 
 
 def test_cfg_boundary_exception_handling():
-    """Test CFGBoundary handles exceptions gracefully."""
+    """Test CFGBoundary handles LarkError."""
+    from lark.exceptions import LarkError
+
     grammar = 'start: "x"'
     boundary = CFGBoundary(
         grammar, start_rule="start", complete_rules={"start"}, min_length=1
@@ -524,7 +539,14 @@ def test_cfg_boundary_exception_handling():
     result = boundary([], [])
     assert result is False
     with mock.patch.object(
-        boundary.parser, "parse", side_effect=ValueError("Unexpected error")
+        boundary.parser, "parse", side_effect=LarkError("Parse failed")
     ):
         result = boundary([], [bytes([ord("x")])])
         assert result is False
+
+    # Other exceptions
+    with mock.patch.object(
+        boundary.parser, "parse", side_effect=ValueError("Unexpected error")
+    ):
+        with pytest.raises(ValueError, match="Unexpected error"):
+            boundary([], [bytes([ord("x")])])
