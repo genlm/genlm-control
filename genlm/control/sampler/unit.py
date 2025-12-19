@@ -31,24 +31,30 @@ class MultiTokenUnitSampler(TokenSampler):
     """Unit sampler for multi-token units $x \\in \\mathcal{A}$ where $\\mathcal{A} \\subseteq \\mathcal{B}^*$.
     implements unit sampling by running a sequence sampler for localized potential:
     $\\varphi_{\\bm{x}} = (\\psi_{\\bm{x}}, \\overrightarrow{\\psi}_{\\bm{x}})$ over subunits $\\mathcal{B}$.
+
     Args:
         subunit_sampler (TokenSampler): Sampler for subunits $s \\in \\mathcal{B}$
-        boundary_predicate (callable): Function for determining EOT
+        boundary_predicate (BoundaryPredicate): Predicate for determining unit completion.
+            Controls both when a unit is complete and how to finalize it via `finalize_unit()`.
         max_subunits_per_unit (int): Safety timeout to prevent non-termination. Default: 100.
-        include_boundary_in_unit (bool): Whether to include the boundary token
-            in the returned unit. Default: True.
 
     Example:
         >>> # Sample word-level units (multi-token)
         >>> llm = PromptedLLM.from_name("gpt2")
         >>> subunit_sampler = DirectTokenSampler(llm)
-        >>> def word_boundary(buf):
-                return buf and buf[-1] in {b" ", b"\\n"}
+        >>>
+        >>> # Include boundary tokens (default - preserves context)
+        >>> boundary = TokenSetBoundary({b" ", b"\\n"})
         >>> unit_sampler = MultiTokenUnitSampler(
         ...     subunit_sampler=subunit_sampler,
-        ...     boundary_predicate=word_boundary,
+        ...     boundary_predicate=boundary,
         ...     max_subunits_per_unit=50
         ... )
+        >>> # Units will be words WITH trailing space: [b"hello", b" "]
+        >>>
+        >>> # Exclude boundary tokens if you want clean semantic units
+        >>> boundary = TokenSetBoundary({b" "}, include_boundary=False)
+        >>> # Units will be words WITHOUT space: [b"hello"]
     """
 
     def __init__(
@@ -56,7 +62,6 @@ class MultiTokenUnitSampler(TokenSampler):
         subunit_sampler,
         boundary_predicate,
         max_subunits_per_unit=100,
-        include_boundary_in_unit=True,
     ):
         if not isinstance(subunit_sampler, TokenSampler):
             raise TypeError(
@@ -70,7 +75,6 @@ class MultiTokenUnitSampler(TokenSampler):
         self.subunit_sampler = subunit_sampler
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
-        self.include_boundary_in_unit = include_boundary_in_unit
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
@@ -154,10 +158,8 @@ class MultiTokenUnitSampler(TokenSampler):
 
             # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
             if self.boundary_predicate(flat_token_context, subunit_buffer):
-                unit = subunit_buffer
-                # Exclude boundary token from unit
-                if not self.include_boundary_in_unit and unit:
-                    unit = unit[:-1]
+                # Let the predicate finalize the unit (e.g., remove delimiter tokens)
+                unit = self.boundary_predicate.finalize_unit(subunit_buffer)
                 return unit, cumulative_logw, cumulative_logp
 
         return subunit_buffer, cumulative_logw, cumulative_logp
@@ -174,7 +176,11 @@ class BoundaryPredicate(ABC):
     forms a complete unit $x \\in \\mathcal{A}$.
 
     `__call__` method receives unit context and subunit buffer, allowing predicates
-    to be stateless and context-aware
+    to be stateless and context-aware.
+
+    `finalize_unit` method transforms the buffer into the final unit after boundary
+    detection, allowing predicates to control what tokens are included (e.g., removing
+    delimiter tokens).
     """
 
     @abstractmethod
@@ -190,6 +196,23 @@ class BoundaryPredicate(ABC):
         """
         pass  # pragma: no cover
 
+    def finalize_unit(self, subunit_buffer):
+        """Transform buffer into final unit after boundary detected.
+
+        Called after `__call__` returns True. Override to customize which tokens
+        are included in the final unit (e.g., to remove delimiter tokens).
+
+        Args:
+            subunit_buffer (list): The buffer that triggered the boundary
+
+        Returns:
+            list: The final unit to return
+
+        Note:
+            Default implementation returns the entire buffer unchanged.
+        """
+        return subunit_buffer
+
 
 class TokenSetBoundary(BoundaryPredicate):
     """Stateless boundary predicate based on token membership.
@@ -198,21 +221,44 @@ class TokenSetBoundary(BoundaryPredicate):
 
     Args:
         boundary_tokens: Set or iterable of tokens that mark unit boundaries
+        include_boundary: Whether to include the boundary token in the final unit.
+            Default: True (keeps boundary token for proper context conditioning)
 
     Example:
-        >>> boundary = TokenSetBoundary({b" ", b"\\n", b".", b","})
+        >>> # Include boundary (default - keeps context for next unit)
+        >>> boundary = TokenSetBoundary({b" ", b"\\n"})
         >>> boundary([], [b"hello", b" "])  # True (ends with whitespace)
-        >>> boundary([], [b"hello"])         # False (no boundary token)
+        >>> # After finalize_unit: [b"hello", b" "]
+        >>>
+        >>> # Exclude boundary (for semantic units without delimiters)
+        >>> boundary = TokenSetBoundary({b" "}, include_boundary=False)
+        >>> # After finalize_unit: [b"hello"]
     """
 
-    def __init__(self, boundary_tokens):
+    def __init__(self, boundary_tokens, include_boundary=True):
         self.boundary_tokens = set(boundary_tokens)
+        self.include_boundary = include_boundary
 
     def __call__(self, unit_context, subunit_buffer):
         """Check boundary (ignore unit_context for stateless predicate)."""
         return subunit_buffer and subunit_buffer[-1] in self.boundary_tokens
 
+    def finalize_unit(self, subunit_buffer):
+        """Finalize the unit, optionally removing the boundary token.
+
+        Args:
+            subunit_buffer (list): Buffer ending with a boundary token
+
+        Returns:
+            list: Buffer with or without the boundary token, based on include_boundary
+        """
+        if self.include_boundary or not subunit_buffer:
+            return subunit_buffer
+        return subunit_buffer[:-1]
+
     def __repr__(self):
+        if not self.include_boundary:
+            return f"TokenSetBoundary({self.boundary_tokens!r}, include_boundary=False)"
         return f"TokenSetBoundary({self.boundary_tokens!r})"
 
 

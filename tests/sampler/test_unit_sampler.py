@@ -36,7 +36,8 @@ async def test_multi_token_unit_sampler_basic():
     # Unit should be a list of tokens
     assert isinstance(unit, list)
     assert len(unit) > 0
-    # Unit must end with a boundary token
+    # By default, TokenSetBoundary includes boundary token (preserves context)
+    # Unit should end with boundary token or EOS
     assert unit[-1] in {b" ", b"!", EOS}
     # Weight should be finite
     assert weight != float("-inf")
@@ -95,24 +96,23 @@ async def test_multi_token_unit_sampler_with_context():
 
 @pytest.mark.asyncio
 async def test_multi_token_unit_sampler_exclude_boundary():
-    """Test excluding boundary token from unit."""
+    """Test TokenSetBoundary with include_boundary=False to exclude delimiter."""
     vocab = [b"hello", b" ", b"world"]
     logws = np.log([0.4, 0.2, 0.3, 0.1])
 
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = TokenSetBoundary({b" "})
-    # Exclude boundary token from unit
+    # Explicitly exclude boundary token for clean semantic units
+    boundary = TokenSetBoundary({b" "}, include_boundary=False)
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
         max_subunits_per_unit=10,
-        include_boundary_in_unit=False,
     )
     # Sample a unit
     unit, _, _ = await unit_sampler.sample([], draw=None)
-    # Unit should NOT end with boundary token (if boundary was reached)
-    if len(unit) > 0:
+    # Unit should NOT end with boundary token (we excluded it)
+    if len(unit) > 0 and unit[-1] is not EOS:
         assert unit[-1] not in {b" "}
 
 
@@ -152,7 +152,7 @@ async def test_boundary_predicate_classes():
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
 
-    # Test TokenSetBoundary
+    # Test TokenSetBoundary (default: includes boundary)
     boundary = TokenSetBoundary({b" ", b"!", EOS})
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
@@ -163,6 +163,7 @@ async def test_boundary_predicate_classes():
     unit, _, _ = await unit_sampler.sample([], draw=None)
     assert isinstance(unit, list)
     assert len(unit) > 0
+    # Default behavior: boundary token is included
     assert unit[-1] in {b" ", b"!", EOS}
     # Test FixedLengthBoundary
     boundary2 = FixedLengthBoundary(3)
@@ -186,6 +187,36 @@ async def test_boundary_predicate_validation():
 
     with pytest.raises(ValueError, match="Length must be positive"):
         FixedLengthBoundary(-5)
+
+
+@pytest.mark.asyncio
+async def test_boundary_predicate_finalize_unit():
+    """Test finalize_unit behavior for different boundary predicates."""
+    # TokenSetBoundary with include_boundary=True (default) - keeps boundary
+    token_boundary_keep = TokenSetBoundary({b" ", b"\n"})
+    buffer = [b"hello", b" "]
+    finalized = token_boundary_keep.finalize_unit(buffer)
+    assert finalized == [b"hello", b" "]
+
+    # TokenSetBoundary with include_boundary=False - removes boundary
+    token_boundary_remove = TokenSetBoundary({b" ", b"\n"}, include_boundary=False)
+    buffer = [b"hello", b" "]
+    finalized = token_boundary_remove.finalize_unit(buffer)
+    assert finalized == [b"hello"]
+
+    # FixedLengthBoundary should keep all tokens (no boundary concept)
+    fixed_boundary = FixedLengthBoundary(10)
+    buffer = [b"a"] * 10
+    finalized = fixed_boundary.finalize_unit(buffer)
+    assert finalized == buffer
+    assert len(finalized) == 10
+
+    # CFGBoundary should keep all tokens (complete parsed unit)
+    grammar = 'start: "x"+'
+    cfg_boundary = CFGBoundary(grammar, min_length=1)
+    buffer = [b"x", b"x", b"x"]
+    finalized = cfg_boundary.finalize_unit(buffer)
+    assert finalized == buffer
 
 
 @pytest.mark.asyncio
@@ -294,7 +325,7 @@ async def test_multi_token_unit_sampler_cleanup():
 async def test_multi_token_unit_sampler_exception_handling():
     """Test exception handling in sample method for expected errors."""
     vocab = [b"a", b"b"]
-    logws = np.log([0.4, 0.4, 0.2])  # Include EOS
+    logws = np.log([0.499, 0.499, 0.002])  # EOS very unlikely, won't be sampled first
     mock_potential = MockPotential(vocab, logws)
 
     # Create a subunit sampler that will raise an expected exception
@@ -306,10 +337,12 @@ async def test_multi_token_unit_sampler_exception_handling():
             return await super().sample(context, draw)
 
     subunit_sampler = FailingSampler(mock_potential)
+    # Boundary that's never hit (no b" " in vocab, EOS won't be sampled)
     boundary = TokenSetBoundary({b" ", EOS})
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
+        max_subunits_per_unit=3,
     )
     # Should handle RuntimeError gracefully and return -inf weight
     unit, weight, _ = await unit_sampler.sample([], draw=None)
@@ -318,10 +351,13 @@ async def test_multi_token_unit_sampler_exception_handling():
 
     # Verify TypeError
     class BuggySampler(DirectTokenSampler):
+        def __init__(self, potential):
+            super().__init__(potential)
+            self.call_count = 0
+
         async def sample(self, context, draw=None):
-            if len(context) > 0:
-                raise TypeError("Programming error: wrong type")
-            return await super().sample(context, draw)
+            self.call_count += 1
+            raise TypeError("Programming error: wrong type")
 
     buggy_subunit_sampler = BuggySampler(mock_potential)
     buggy_unit_sampler = MultiTokenUnitSampler(
@@ -517,7 +553,6 @@ async def test_multi_token_unit_sampler_max_subunits_reached():
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
         max_subunits_per_unit=5,
-        include_boundary_in_unit=True,
     )
     unit, weight, _ = await unit_sampler.sample([], draw=None)
     assert len(unit) <= 5
