@@ -254,25 +254,29 @@ async def test_vllm_backend():
         engine_opts={"dtype": "float", "gpu_memory_utilization": 0.5},
     )
 
-    llm.set_prompt_from_str("hello")
-    context = llm.tokenize(" world!")
+    try:
+        llm.set_prompt_from_str("hello")
+        context = llm.tokenize(" world!")
 
-    await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await llm.assert_batch_consistency(
-        [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
-    )
+        await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
+        await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
+        await llm.assert_batch_consistency(
+            [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
+        )
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
-    assert new_llm.token_maps.eos_idxs == [0]
-    assert new_llm.token_maps.decode[0] == b"!"
+        new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
+        assert new_llm.token_maps.eos_idxs == [0]
+        assert new_llm.token_maps.decode[0] == b"!"
 
-    context = llm.tokenize(" world")
-    await new_llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await new_llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await new_llm.assert_batch_consistency(
-        [context, llm.tokenize(" worlds")], rtol=1e-3, atol=1e-3
-    )
+        context = llm.tokenize(" world")
+        await new_llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
+        await new_llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
+        await new_llm.assert_batch_consistency(
+            [context, llm.tokenize(" worlds")], rtol=1e-3, atol=1e-3
+        )
+    finally:
+        # Clean up vLLM GPU memory
+        llm.model.cleanup()
 
 
 def test_llm_repr(llm):
