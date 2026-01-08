@@ -1,6 +1,14 @@
-from .token import DirectTokenSampler, SetTokenSampler, AWRS
+from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
 from .sequence import SMC, SequenceModel
+from .unit import (
+    MultiTokenUnitSampler,
+    BoundaryPredicate,
+    TokenSetBoundary,
+    FixedLengthBoundary,
+    CFGBoundary,
+    flatten_units,
+)
 from genlm.control.potential import Potential
 
 
@@ -62,7 +70,14 @@ __all__ = [
     "EagerSetSampler",
     "TopKSetSampler",
     "SetTokenSampler",
+    "TokenSampler",
     "Importance",
     "SMC",
     "SequenceModel",
+    "MultiTokenUnitSampler",
+    "BoundaryPredicate",
+    "TokenSetBoundary",
+    "FixedLengthBoundary",
+    "CFGBoundary",
+    "flatten_units",
 ]
