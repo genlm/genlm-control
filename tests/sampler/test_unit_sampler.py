@@ -88,8 +88,10 @@ async def test_multi_token_unit_sampler_with_context():
         [b"hello", b" "],
         [b"world", b" "],
     ]
-    # Sample next unit
-    unit, weight, logp = await unit_sampler.sample(unit_context, draw=None)
+    flat_context = [token for unit in unit_context for token in unit]
+    unit, weight, logp = await unit_sampler.sample(
+        flat_context, unit_context=unit_context, draw=None
+    )
     assert isinstance(unit, list)
     assert len(unit) > 0
 

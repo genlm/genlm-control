@@ -91,8 +91,10 @@ class MultiTokenUnitSampler(TokenSampler):
         # This ensures sample() always works with a flat list
         flat_context = flatten_units(parent.token_ctx)
 
-        # Sample multi-token unit using flat context
-        unit, logw, logp = await self.sample(flat_context, draw=None)
+        # Sample multi-token unit, passing both flat context and structured unit context
+        unit, logw, logp = await self.sample(
+            flat_context, unit_context=parent.token_ctx, draw=None
+        )
 
         # Update parent's weight and logp
         parent.score(logw)
@@ -108,7 +110,7 @@ class MultiTokenUnitSampler(TokenSampler):
 
         return unit
 
-    async def sample(self, flat_token_context, draw=None):
+    async def sample(self, flat_token_context, unit_context=None, draw=None):
         """Sample a multi-token unit by running sequence sampling for $\\varphi_{\\bm{x}}$.
         SIS for the localized potential:
 
@@ -119,6 +121,8 @@ class MultiTokenUnitSampler(TokenSampler):
         Args:
             flat_token_context (list): Flat sequence of all previously sampled tokens.
                 This is pre-flattened by forward() to ensure compatibility with potentials.
+            unit_context (list, optional): Structured sequence of previously sampled units.
+                Used by boundary predicates that need context. Defaults to [].
             draw (callable, optional): Sampling function passed to subunit_sampler
 
         Returns:
@@ -128,8 +132,11 @@ class MultiTokenUnitSampler(TokenSampler):
                     weighted w.r.t. $\\psi(x \\mid \\bm{x})$
                 - logp: Sum of log-probabilities of sampling choices
         """
-        subunit_context = flat_token_context
+        if unit_context is None:
+            unit_context = []
+
         subunit_buffer = []
+        current_context = list(flat_token_context)
 
         # Accumulate weights
         cumulative_logw = 0.0
@@ -138,31 +145,35 @@ class MultiTokenUnitSampler(TokenSampler):
         # Sequential sampling until EOT
         for _ in range(self.max_subunits_per_unit):
             # Sample next subunit $(s_i, w_i) \\sim q_{\\text{sub}}(\\cdot \\mid \\bm{s}_{<i})$
-            full_context = subunit_context + subunit_buffer
             try:
                 subunit, logw_i, logp_i = await self.subunit_sampler.sample(
-                    full_context, draw
+                    current_context, draw
                 )
             except (RuntimeError, OSError, TimeoutError):
                 # Expected failures (network, timeout, system errors)
                 # Return current buffer with -inf weight to discard this sample
                 return subunit_buffer, float("-inf"), cumulative_logp
+
             # Accumulate weight and logp
             cumulative_logw += logw_i
             cumulative_logp += logp_i
+
+            # Add to both buffer and context
             subunit_buffer.append(subunit)
+            current_context.append(subunit)
 
             # Check for EOS
             if subunit is EOS:
                 return subunit_buffer, cumulative_logw, cumulative_logp
 
             # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
-            if self.boundary_predicate(flat_token_context, subunit_buffer):
+            if self.boundary_predicate(unit_context, subunit_buffer):
                 # Let the predicate finalize the unit (e.g., remove delimiter tokens)
                 unit = self.boundary_predicate.finalize_unit(subunit_buffer)
                 return unit, cumulative_logw, cumulative_logp
 
-        return subunit_buffer, cumulative_logw, cumulative_logp
+        # Max subunits exceeded: we return -inf weight to reject incomplete/invalid unit
+        return subunit_buffer, float("-inf"), cumulative_logp
 
     async def cleanup(self):
         """Clean up resources."""
