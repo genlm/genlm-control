@@ -18,7 +18,8 @@ class ByteLLM(Potential):
     Args:
         llm: The language model to use (from `genlm.backend`).
         beam_params (BeamParams): Configuration for beam search, including beam width `K`,
-            `eos_tokens`, and healing parameters (`heal`, `heal_max_backoff`, `heal_max_splits`).
+            `eos_tokens` (list of EOS byte sequences), and healing parameters
+            (`heal`, `heal_max_backoff`, `heal_max_splits`).
         cache_size (int): Maximum number of beam states to cache. Defaults to 1024.
 
     Example:
@@ -26,7 +27,7 @@ class ByteLLM(Potential):
         from genlm.bytes import BeamParams
         from genlm.control import ByteLLM
 
-        beam_params = BeamParams(K=5, eos_tokens={b"<|endoftext|>"}, heal=True)
+        beam_params = BeamParams(K=5, eos_tokens=[b"<|endoftext|>"], heal=True)
         async with ByteLLM.from_name("gpt2", beam_params) as byte_llm:
             byte_llm.set_prompt_from_str("Hello")
             logp = await byte_llm.prefix([b" ", b"w", b"o", b"r", b"l", b"d"])

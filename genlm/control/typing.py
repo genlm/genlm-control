@@ -41,6 +41,13 @@ class TokenType:
                 and element_type.type is str
             ):
                 return True
+            if (
+                hasattr(self.type, "__name__")
+                and self.type.__name__ == "Token"
+                and isinstance(element_type, Atomic)
+                and element_type.type is int
+            ):
+                return True
 
         return False
 

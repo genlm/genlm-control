@@ -55,10 +55,25 @@ class Coerced(Potential):
         self.f = f
 
         if prune:
+            # Extract byte_strings from Token objects in potential.vocab for comparison
+            if potential.vocab and hasattr(potential.vocab[0], "byte_string"):
+                potential_bytes = {tok.byte_string for tok in potential.vocab}
+            else:
+                potential_bytes = set(potential.vocab)
+
+            # Check if target_vocab contains Token objects
+            has_token_objects = target_vocab and hasattr(target_vocab[0], "byte_string")
+
             tokens = []
             for target_token in target_vocab:
-                base_token = f([target_token])
-                if set(base_token) <= set(potential.vocab):
+                # If target_token is a Token object, extract byte_string for the coercion function
+                if has_token_objects:
+                    target_token_for_f = [target_token.byte_string]
+                else:
+                    target_token_for_f = [target_token]
+
+                base_token = f(target_token_for_f)
+                if set(base_token) <= potential_bytes:
                     tokens.append(target_token)
         else:
             tokens = target_vocab
@@ -66,23 +81,39 @@ class Coerced(Potential):
         if not tokens:
             raise ValueError("No valid tokens found in target vocabulary")
 
+        # Store whether vocab contains Token objects for efficient extraction
+        self._has_token_vocab = tokens and hasattr(tokens[0], "byte_string")
+
         super().__init__(tokens)
 
+    def _extract_bytes(self, context):
+        """Extract byte_strings from Token objects in context for the coercion function."""
+        if not self._has_token_vocab:
+            return context
+
+        return [
+            tok.byte_string if hasattr(tok, "byte_string") else tok for tok in context
+        ]
+
     def _batch_f(self, contexts):
-        return [self.f(context) for context in contexts]
+        return [self.f(self._extract_bytes(context)) for context in contexts]
 
     async def complete(self, context):
-        return await self.potential.complete(context=self.f(context))
+        return await self.potential.complete(
+            context=self.f(self._extract_bytes(context))
+        )
 
     async def prefix(self, context):
-        return await self.potential.prefix(context=self.f(context))
+        return await self.potential.prefix(context=self.f(self._extract_bytes(context)))
 
     async def logw_next(self, context):
         Ws = self.alloc_logws()
-        ctx = self.f(context)
+        ctx = self.f(self._extract_bytes(context))
         ctx_w = await self.potential.prefix(ctx)
         Ws[-1] = await self.potential.complete(ctx) - ctx_w
-        exts = [self.f(chain(context, [x])) for x in self.vocab]  # slow!!
+        exts = [
+            self.f(self._extract_bytes(list(chain(context, [x])))) for x in self.vocab
+        ]  # slow!!
         Ws[:-1] = await self.potential.batch_prefix(exts) - ctx_w
         return self.make_lazy_weights(Ws)
 

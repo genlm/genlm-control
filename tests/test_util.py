@@ -172,13 +172,19 @@ def test_lazy_weights_items():
 def test_load_trie():
     vocab = ["a", "b", "c"]
     trie = load_trie(vocab, backend="sequential")
-    assert trie.decode == vocab
+    assert [token.byte_string for token in trie.decode] == [
+        v.encode("utf-8") for v in vocab
+    ]
 
     trie = load_trie(vocab, backend="parallel")
-    assert trie.decode == vocab
+    assert [token.byte_string for token in trie.decode] == [
+        v.encode("utf-8") for v in vocab
+    ]
 
     trie = load_trie(vocab)
-    assert trie.decode == vocab
+    assert [token.byte_string for token in trie.decode] == [
+        v.encode("utf-8") for v in vocab
+    ]
 
 
 def test_lazy_weights_repr():

@@ -2,6 +2,7 @@ import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.potential.base import Potential
+from genlm.backend.tokenization import Token
 
 
 def load_model_by_name(name, backend, **kwargs):
@@ -27,32 +28,65 @@ def load_model_by_name(name, backend, **kwargs):
 
 class TokenMappings(NamedTuple):
     """
-    Container for token mappings between bytes and tokens IDs in a language model.
+    Container for token mappings in a language model.
 
-    The `decode` and `encode` mappings are generally different from the `PromptedLLM` class (see notes on EOS token handling).
+    Attributes:
+        decode: All Token objects in the vocabulary (indexed by token_id)
+        eos_idxs: Token IDs for EOS tokens
+        eos_tokens: EOS tokens as byte strings
+        eos_token_objs: Actual EOS Token objects
+        potential_vocab: Vocabulary excluding EOS tokens
     """
 
-    decode: list[bytes]  # token_id -> bytes
-    encode: dict[bytes, int]  # bytes -> token_id
-    eos_idxs: list[int]  # IDs of EOS tokens
-    eos_tokens: list[bytes]  # EOS tokens
-    potential_vocab: list[bytes]  # tokens in the potential's vocabulary
+    decode: list[Token]
+    eos_idxs: list[int]
+    eos_tokens: list[bytes]
+    eos_token_objs: list[Token]
+    potential_vocab: list[Token]
 
     @classmethod
     def create(cls, decode, eos_tokens):
+        """Create TokenMappings from a vocabulary and EOS tokens.
+
+        Args:
+            decode: List of Token objects representing the full vocabulary
+            eos_tokens: List of byte strings representing EOS tokens
+        """
         if len(set(eos_tokens)) != len(eos_tokens):
             raise ValueError("Duplicate eos tokens")
-        encode = {x: i for i, x in enumerate(decode)}
-        if not all(eos in encode for eos in eos_tokens):
-            raise ValueError("EOS token not in language model vocabulary")
-        eos_idxs = [encode[eos] for eos in eos_tokens]
+
         eos_tokens_set = set(eos_tokens)
-        potential_vocab = [x for x in decode if x not in eos_tokens_set]
+
+        eos_byte_to_token = {}  # byte_string -> Token object (first match)
+        potential_vocab = []
+
+        for token in decode:
+            if token.byte_string in eos_tokens_set:
+                if token.byte_string in eos_byte_to_token:
+                    warnings.warn(
+                        f"Multiple tokens with EOS byte_string {token.byte_string!r}. "
+                        f"Using first match (token_id={eos_byte_to_token[token.byte_string].token_id}).",
+                        UserWarning,
+                    )
+                else:
+                    eos_byte_to_token[token.byte_string] = token
+            else:
+                potential_vocab.append(token)
+
+        # Verify all EOS tokens were found
+        missing = eos_tokens_set - set(eos_byte_to_token.keys())
+        if missing:
+            raise ValueError("EOS token not in language model vocabulary")
+
+        # Build lists in order of eos_tokens input
+        eos_token_objs = [eos_byte_to_token[eos] for eos in eos_tokens]
+        eos_idxs = [t.token_id for t in eos_token_objs]
+
         return cls(
             decode=decode,
-            encode=encode,
             eos_idxs=eos_idxs,
             eos_tokens=eos_tokens,
+            eos_token_objs=eos_token_objs,
             potential_vocab=potential_vocab,
         )
 
@@ -103,10 +137,11 @@ class PromptedLLM(Potential):
                 )
             self.token_maps = token_maps
         else:
+            byte_vocab = self.model.byte_vocab
+            default_eos = byte_vocab[self.model.tokenizer.eos_token_id].byte_string
             self.token_maps = TokenMappings.create(
-                decode=self.model.byte_vocab,
-                eos_tokens=eos_tokens
-                or [self.model.byte_vocab[self.model.tokenizer.eos_token_id]],
+                decode=byte_vocab,
+                eos_tokens=eos_tokens or [default_eos],
             )
 
         super().__init__(vocabulary=self.token_maps.potential_vocab)
@@ -161,10 +196,10 @@ class PromptedLLM(Potential):
     @property
     def prompt(self):
         """
-        Get the current prompt as a list of byte sequences corresponding to the prompt token IDs.
+        Get the current prompt as Token objects.
 
         Returns:
-            (list[bytes]|None): The current prompt as a list of bytes sequences or None if no prompt_ids are set.
+            (list[Token]|None): The current prompt as Token objects, or None if no prompt_ids are set.
         """
         if not self.prompt_ids:
             return  # pragma: no cover
@@ -194,46 +229,74 @@ class PromptedLLM(Potential):
 
         self.prompt_ids = self.model.tokenizer.encode(prompt_str)
 
+    def _find_token_id_for_bytes(self, byte_string):
+        """Find token_id for a byte_string (first match for duplicates). O(n) - deprecated path."""
+        for token in self.token_maps.decode:
+            if token.byte_string == byte_string:
+                return token.token_id
+        return None
+
     def encode_tokens(self, tokens):
-        """Encode a list of byte tokens to a list of token IDs in
-        the underlying language model's vocabulary.
+        """Encode a list of Token objects to token IDs.
 
         Args:
-            tokens (list[bytes]): List of byte tokens to encode
+            tokens (list[Token]): List of Token objects
 
         Returns:
             (list[int]): A list of token IDs corresponding to the input tokens.
 
         Raises:
-            ValueError: If any token is not in the vocabulary
+            ValueError: If any token is not in the vocabulary.
+
+        Note:
+            Passing bytes is deprecated. Use Token objects from llm.tokenize().
         """
-        try:
-            return [self.token_maps.encode[x] for x in tokens]
-        except KeyError as e:
-            raise ValueError(f"Token {e.args[0]} not in vocabulary") from e
+        if not tokens:
+            return []
+
+        result = []
+        warned = False
+        for item in tokens:
+            if isinstance(item, Token):
+                result.append(item.token_id)
+            else:
+                if not warned:
+                    warnings.warn(
+                        "Passing bytes to encode_tokens is deprecated. "
+                        "Use Token objects for precise control. ",
+                        DeprecationWarning,
+                        stacklevel=3,
+                    )
+                    warned = True
+                token_id = self._find_token_id_for_bytes(item)
+                if token_id is None:
+                    raise ValueError(f"Token {item!r} not in vocabulary")
+                result.append(token_id)
+        return result
 
     def decode_tokens(self, ids):
         """
-        Decode a list of token IDs in the language model's vocabulary to a list of byte tokens.
+        Decode a list of token IDs to Token objects.
 
         Args:
             ids (list[int]): A list of token IDs in the language model's vocabulary.
 
         Returns:
-            (list[bytes]): A list of byte tokens corresponding to the input token IDs.
+            (list[Token]): Token objects corresponding to the input token IDs.
         """
         return [self.token_maps.decode[x] for x in ids]
 
     def tokenize(self, context_str):
-        """Tokenize a string to a list of `bytes` objects, each corresponding to a token in the vocabulary.
+        """Tokenize a string to a list of Token objects.
 
-        Uses the language model's tokenizer to map `context_str` to a list of token IDs, and then decodes the token IDs to bytes.
+        Uses the language model's tokenizer to map `context_str` to token IDs,
+        then returns the corresponding Token objects.
 
         Args:
             context_str (str): A string to encode
 
         Returns:
-            (List[bytes]): A list of byte tokens corresponding to the input string.
+            (list[Token]): Token objects corresponding to the input string.
         """
         return self.decode_tokens(self.model.tokenizer.encode(context_str))
 
@@ -242,7 +305,7 @@ class PromptedLLM(Potential):
         Compute the log probability of `context` given the prompt.
 
         Args:
-            context (list[bytes]): A sequence of bytes tokens.
+            context (list[bytes] | list[Token]): A sequence of byte tokens or Token objects.
 
         Returns:
             (float): The log probability of `context`.
@@ -275,7 +338,7 @@ class PromptedLLM(Potential):
         Compute the log probability of `context` given the prompt.
 
         Args:
-            context (list[bytes]): A sequence of bytes tokens.
+            context (list[bytes] | list[Token]): A sequence of byte tokens or Token objects.
 
         Returns:
             (float): The log probability of `context`.
@@ -289,7 +352,7 @@ class PromptedLLM(Potential):
         If the model has multiple eos tokens, their probabilities will be summed.
 
         Args:
-            context (list[bytes]): A sequence of bytes tokens.
+            context (list[bytes] | list[Token]): A sequence of byte tokens or Token objects.
 
         Returns:
             (float): The log probability of the context.
@@ -355,15 +418,14 @@ class PromptedLLM(Potential):
         """Get log probabilities for next tokens given the prompt and `context`.
 
         Args:
-            context (List[bytes]): A sequence of bytes tokens.
+            context (list[bytes] | list[Token]): A sequence of byte tokens or Token objects.
 
         Returns:
-            (LazyWeights): Log probabilities for next tokens and EOS.
+            (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
+        context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
-            await self.model.next_token_logprobs(
-                self.prompt_ids + self.encode_tokens(context)
-            )
+            await self.model.next_token_logprobs(self.prompt_ids + context_ids)
         )
         return self._process_logw_next(logw_next)
 
@@ -371,14 +433,15 @@ class PromptedLLM(Potential):
         """Get log probabilities for next tokens given the prompt and `context`, for a batch of contexts.
 
         Args:
-            contexts (list[list[bytes]]): A list of sequences of bytes tokens.
+            contexts (list[list[bytes]] | list[list[Token]]): A list of sequences of byte tokens or Token objects.
 
         Returns:
-            (List[LazyWeights]): Log probabilities for next tokens and EOS for each context.
+            (list[LazyWeights]): Log probabilities for next tokens and EOS for each context. Keys are Token objects.
         """
+        context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
             await self.model.batch_next_token_logprobs(
-                [self.prompt_ids + self.encode_tokens(context) for context in contexts]
+                [self.prompt_ids + context_ids for context_ids in context_ids_batch]
             )
         )
         return [self._process_logw_next(logw_next) for logw_next in logw_nexts]

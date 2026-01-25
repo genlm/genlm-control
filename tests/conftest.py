@@ -69,6 +69,21 @@ def mock_params(draw, max_w=1e3):
 def iter_item_params(draw, max_iter_w=1e3, max_item_w=1e3):
     iter_vocab, iter_next_token_ws, context = draw(mock_params(max_iter_w))
 
+    # Convert iter_vocab to bytes for trie
+    iter_vocab_bytes = []
+    for item in iter_vocab:
+        if isinstance(item, str):
+            iter_vocab_bytes.append(item.encode("utf-8"))
+        elif isinstance(item, bytes):
+            iter_vocab_bytes.append(item)
+        else:
+            iter_vocab_bytes.append(bytes(item))
+    iter_vocab = iter_vocab_bytes
+
+    # Convert context to bytes
+    context = [
+        item.encode("utf-8") if isinstance(item, str) else item for item in context
+    ]
     item_vocab = set()
     for items in iter_vocab:
         item_vocab.update(items)

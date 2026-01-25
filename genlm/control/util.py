@@ -28,10 +28,13 @@ class LazyWeights:
             log (bool, optional): Indicates if the weights are in log space. Defaults to True.
 
         Raises:
-            AssertionError: If the lengths of weights and decode or encode do not match.
+            AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
         assert len(weights) == len(decode)
-        assert len(encode) == len(decode)
+        # encode can have multiple keys per token (e.g., Token and bytes), so >= is correct
+        assert len(encode) >= len(
+            decode
+        ), f"encode must have at least as many entries as decode: {len(encode)} >= {len(decode)}"
 
         self.weights = weights
         self.encode = encode
@@ -44,13 +47,24 @@ class LazyWeights:
 
         Args:
             token (Any): The token for which to retrieve the weight.
+                Can be a Token object (direct lookup) or bytes (searches by byte_string).
 
         Returns:
             (float): The weight of the token, or -inf/0 if the token is not found.
         """
-        if token not in self.encode:
-            return float("-inf") if self.is_log else 0
-        return self.weights[self.encode[token]]
+        if token in self.encode:
+            return self.weights[self.encode[token]]
+
+        # If token is bytes, search for a Token with matching byte_string
+        if isinstance(token, bytes):
+            for vocab_token in self.decode:
+                if (
+                    hasattr(vocab_token, "byte_string")
+                    and vocab_token.byte_string == token
+                ):
+                    return self.weights[self.encode[vocab_token]]
+
+        return float("-inf") if self.is_log else 0
 
     def __len__(self):
         return len(self.weights)
@@ -207,7 +221,7 @@ def load_trie(V, backend=None, **kwargs):
     Load a TokenCharacterTrie.
 
     Args:
-        V (list): The vocabulary.
+        V (list[Token] | list[bytes] | list[str]): The vocabulary.
         backend (str, optional): The backend to use for trie construction. Defaults to None.
         **kwargs (dict): Additional arguments for the trie construction.
 
@@ -215,6 +229,17 @@ def load_trie(V, backend=None, **kwargs):
         (TokenCharacterTrie): A trie instance.
     """
     import torch
+    from genlm.backend.tokenization import Token
+
+    # Convert pure bytes/strings vocabularies to Token objects
+    if V and all(isinstance(item, (bytes, str)) for item in V):
+        V = [
+            Token(
+                token_id=i,
+                byte_string=item if isinstance(item, bytes) else item.encode("utf-8"),
+            )
+            for i, item in enumerate(V)
+        ]
 
     if backend is None:
         backend = "parallel" if torch.cuda.is_available() else "sequential"

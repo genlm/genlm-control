@@ -223,7 +223,12 @@ class Sequences:
         for sequence, w in zip(self.contexts, np.exp(self.log_weights)):
             if sequence and isinstance(sequence[-1], EndOfSequence):
                 try:
-                    string_sequence = b"".join(sequence[:-1]).decode("utf-8")
+                    # Extract byte_string from Token objects or use bytes directly
+                    byte_sequence = [
+                        tok.byte_string if hasattr(tok, "byte_string") else tok
+                        for tok in sequence[:-1]
+                    ]
+                    string_sequence = b"".join(byte_sequence).decode("utf-8")
                     posterior[string_sequence] += w
                 except UnicodeDecodeError:
                     pass

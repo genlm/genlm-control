@@ -128,11 +128,18 @@ class FastCanonicalityFilterBPE:
             mask = np.ones(self.V, dtype=bool)
         else:
             (_, last_token) = context
+            # Extract byte_string from Token object
+            last_token_bytes = (
+                last_token.byte_string
+                if hasattr(last_token, "byte_string")
+                else last_token
+            )
+
             try:
-                left_id = self._encode[last_token]  # Get the ID of the last token
+                left_id = self._encode[last_token_bytes]  # Get the ID of the last token
             except KeyError as e:
                 raise KeyError(
-                    f"Last token {last_token!r} not found in encode map."
+                    f"Last token {last_token_bytes!r} not found in encode map."
                 ) from e
 
             mask = self._vectorized_conflicting_next_tokens(
@@ -234,16 +241,22 @@ class FastCanonicalityFilterBPE:
 
     @classmethod
     def from_tokenizer(cls, tokenizer, eos_token_ids=None):
-        _decode, _ = decode_vocab(tokenizer)
-        if len(_decode) != len(set(_decode)):
+        _decode_tokens, _ = decode_vocab(tokenizer)  # Returns (List[Token], List[str])
+
+        # Extract byte strings and check for duplicates
+        byte_strings = [token.byte_string for token in _decode_tokens]
+        if len(byte_strings) != len(set(byte_strings)):
             raise ValueError(
                 "Duplicate byte sequences found in vocabulary. Cannot create unique byte->ID mapping (_encode)."
             )
 
         _merges = _extract_bpe_merges(tokenizer)
 
-        # Build _encode (bytes -> token_id map) from _decode
-        _encode = {b: i for i, b in enumerate(_decode) if b is not None}
+        # Build _encode (bytes -> token_id map) from Token objects
+        _encode = {token.byte_string: token.token_id for token in _decode_tokens}
+
+        # For _decode, we keep Token objects to maintain token_id information
+        _decode = _decode_tokens
 
         # Build _encode_byte (single byte -> token_id map)
         _encode_byte = [None] * 256
@@ -278,6 +291,7 @@ class CanonicalTokenization(Potential):
 
         # IMPORTANT: In the base Potential class, EOS will be added to vocab automatically
         # So we should NOT add it ourselves to the vocabulary we pass to super().__init__
+        # Use Token objects directly as vocabulary to maintain token_id information
         vocabulary = self.canonicality_filter._decode
         super().__init__(vocabulary)
 
@@ -401,7 +415,14 @@ class CanonicalTokenization(Potential):
             # print("percent of mask: ", np.sum(mask)*100 / len(mask))
 
             # Find token_id in the canonicality filter's vocabulary
-            token_id = self.canonicality_filter._encode[current_token]
+            # Extract byte_string from Token object
+            current_token_bytes = (
+                current_token.byte_string
+                if hasattr(current_token, "byte_string")
+                else current_token
+            )
+
+            token_id = self.canonicality_filter._encode[current_token_bytes]
             if not mask[token_id]:
                 return False
 

@@ -44,8 +44,8 @@ class Potential(ABC, PotentialOps, PotentialTests):
             vocabulary (list): List of tokens that make up the vocabulary.
             token_type (TokenType, optional): Optional TokenType of all elements of the vocabulary.
                 If None, will be inferred from vocabulary.
-            eos (EndOfSequence, optional): Special token to use as end-of-sequence. Defaults to `EOS`.
-                In general, this should not be set by users.
+            eos: Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
+                For Token-based vocabularies (e.g., LLM), this should be a Token object.
 
         Raises:
             ValueError: If vocabulary is empty.
@@ -62,10 +62,10 @@ class Potential(ABC, PotentialOps, PotentialTests):
         if not all(token_type.check(x) for x in vocabulary):
             raise TypeError(f"Tokens in vocabulary must be of type {token_type}.")
 
-        if eos and not isinstance(eos, EndOfSequence):
-            raise ValueError(f"EOS must be an instance of EndOfSequence, got {eos!r}.")
+        if eos is not None and not isinstance(eos, EndOfSequence):
+            raise ValueError("EOS must be an instance of EndOfSequence")
 
-        self.eos = eos or EOS
+        self.eos = eos if eos is not None else EOS
 
         self.token_type = token_type
         self.vocab = vocabulary
