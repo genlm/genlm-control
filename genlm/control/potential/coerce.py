@@ -55,9 +55,14 @@ class Coerced(Potential):
         self.f = f
 
         if prune:
-            # Extract byte_strings from Token objects in potential.vocab for comparison
+            # Extract items from potential.vocab for comparison
+            # For Token objects, extract byte values from byte_string to match set() behavior
             if potential.vocab and hasattr(potential.vocab[0], "byte_string"):
-                potential_bytes = {tok.byte_string for tok in potential.vocab}
+                potential_bytes = set()
+                for tok in potential.vocab:
+                    potential_bytes.update(
+                        tok.byte_string
+                    )  # Add byte values (integers)
             else:
                 potential_bytes = set(potential.vocab)
 

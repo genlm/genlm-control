@@ -44,8 +44,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
             vocabulary (list): List of tokens that make up the vocabulary.
             token_type (TokenType, optional): Optional TokenType of all elements of the vocabulary.
                 If None, will be inferred from vocabulary.
-            eos: Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
-                For Token-based vocabularies (e.g., LLM), this should be a Token object.
+            eos (EndOfSequence, optional): Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
 
         Raises:
             ValueError: If vocabulary is empty.

@@ -287,3 +287,38 @@ def test_llm_repr(llm):
 def test_prompt_warning(llm):
     with pytest.warns(UserWarning):
         llm.set_prompt_from_str("hello ")
+
+
+def test_encode_tokens_with_bytes(llm):
+    """Test that encode_tokens works with bytes (deprecated path) and issues warning."""
+    token = llm.vocab[0]
+    byte_string = token.byte_string
+
+    with pytest.warns(
+        DeprecationWarning, match="Passing bytes to encode_tokens is deprecated"
+    ):
+        result = llm.encode_tokens([byte_string])
+
+    assert result == [token.token_id]
+
+
+def test_encode_tokens_invalid_bytes(llm):
+    """Test that encode_tokens raises error for invalid bytes."""
+    with pytest.raises(ValueError, match="Token .* not in vocabulary"):
+        llm.encode_tokens([b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"])
+
+
+def test_duplicate_eos_byte_string_warning():
+    """Test that TokenMappings warns when multiple tokens have the same EOS byte_string."""
+    from genlm.backend.tokenization import Token
+    from genlm.control.potential.built_in.llm import TokenMappings
+
+    decode = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"hello"),
+        Token(token_id=3, byte_string=b"foo"),
+    ]
+
+    with pytest.warns(UserWarning, match="Multiple tokens with EOS byte_string"):
+        TokenMappings.create(decode=decode, eos_tokens=[b"hello"])

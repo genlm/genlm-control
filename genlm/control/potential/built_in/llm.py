@@ -49,8 +49,8 @@ class TokenMappings(NamedTuple):
         """Create TokenMappings from a vocabulary and EOS tokens.
 
         Args:
-            decode: List of Token objects representing the full vocabulary
-            eos_tokens: List of byte strings representing EOS tokens
+            decode (list[Token]): List of Token objects representing the full vocabulary.
+            eos_tokens (list[bytes]): List of byte strings representing EOS tokens.
         """
         if len(set(eos_tokens)) != len(eos_tokens):
             raise ValueError("Duplicate eos tokens")
