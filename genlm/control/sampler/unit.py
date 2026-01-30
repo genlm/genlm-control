@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any, Iterable, Optional
 
 from genlm.control.constant import EOS
 from genlm.control.sampler.token import TokenSampler
@@ -205,7 +206,7 @@ class BoundaryPredicate(ABC):
     """
 
     @abstractmethod
-    def __call__(self, unit_context, subunit_buffer):
+    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
         """Check if subunit buffer forms a complete unit.
 
         Args:
@@ -217,7 +218,7 @@ class BoundaryPredicate(ABC):
         """
         pass  # pragma: no cover
 
-    def finalize_unit(self, subunit_buffer):
+    def finalize_unit(self, subunit_buffer: list) -> list:
         """Transform buffer into final unit after boundary detected.
 
         Called after `__call__` returns True. Override to customize which tokens
@@ -249,14 +250,14 @@ class TokenSetBoundary(BoundaryPredicate):
         >>> # Unit will be [b"hello", b" "] - boundary token included
     """
 
-    def __init__(self, boundary_tokens):
+    def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
 
-    def __call__(self, unit_context, subunit_buffer):
+    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
         """Check boundary (ignore unit_context for stateless predicate)."""
-        return subunit_buffer and subunit_buffer[-1] in self.boundary_tokens
+        return bool(subunit_buffer and subunit_buffer[-1] in self.boundary_tokens)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"TokenSetBoundary({self.boundary_tokens!r})"
 
 
@@ -273,16 +274,16 @@ class FixedLengthBoundary(BoundaryPredicate):
         >>> boundary([], [b"a"] * 10)  # True
     """
 
-    def __init__(self, length):
+    def __init__(self, length: int):
         if length <= 0:
             raise ValueError(f"Length must be positive, got {length}")
         self.length = length
 
-    def __call__(self, unit_context, subunit_buffer):
+    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
         """Check boundary (ignores unit_context for stateless predicate)."""
         return len(subunit_buffer) >= self.length
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"FixedLengthBoundary({self.length})"
 
 
@@ -351,7 +352,7 @@ class CFGBoundary(BoundaryPredicate):
         except Exception as e:
             raise ValueError(f"Failed to create Lark parser: {e}") from e
 
-    def __call__(self, unit_context, subunit_buffer):
+    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
         """Check if buffer forms a complete syntactic unit.
 
         Args:
@@ -381,7 +382,7 @@ class CFGBoundary(BoundaryPredicate):
             # Parse failed: not a complete unit
             return False
 
-    def _tokens_to_text(self, tokens):
+    def _tokens_to_text(self, tokens: list) -> str:
         """Convert token buffer to text string.
 
         Args:
@@ -396,7 +397,7 @@ class CFGBoundary(BoundaryPredicate):
         )
         return token_bytes.decode(self.encoding, errors=self.decode_errors)
 
-    def get_parse_tree(self, text):
+    def get_parse_tree(self, text: str) -> Optional[Any]:
         """Get the parse tree for a given text.
 
         Args:
@@ -410,7 +411,7 @@ class CFGBoundary(BoundaryPredicate):
         except LarkError:
             return None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         rules_str = (
             f", complete_rules={self.complete_rules}" if self.complete_rules else ""
         )
