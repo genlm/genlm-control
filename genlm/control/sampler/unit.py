@@ -28,14 +28,28 @@ def flatten_units(context):
 
 
 class MultiTokenUnitSampler(TokenSampler):
-    """Unit sampler for multi-token units $x \\in \\mathcal{A}$ where $\\mathcal{A} \\subseteq \\mathcal{B}^*$.
-    implements unit sampling by running a sequence sampler for localized potential:
-    $\\varphi_{\\bm{x}} = (\\psi_{\\bm{x}}, \\overrightarrow{\\psi}_{\\bm{x}})$ over subunits $\\mathcal{B}$.
+    """Sampler that groups multiple tokens into larger units.
+
+    This sampler enables generation at a coarser granularity than individual tokens
+    by repeatedly sampling tokens until a boundary condition is met. Common use cases:
+
+    - **Word-level sampling**: Group tokens until a word boundary (e.g., whitespace)
+    - **Sentence-level sampling**: Group tokens until punctuation marks
+    - **Grammar-based units**: Group tokens completing a grammar terminal
+
+    The sampler delegates to a `subunit_sampler` (typically a token-level sampler)
+    and accumulates samples until the `boundary_predicate` signals completion. The final
+    weight is the product of weights from each individual token sample. This ensures that
+    sampling remains properly weighted w.r.t. the target potential.
+
+    **Weight calculation**: If sampling a unit requires $n$ token samples with weights
+    $w_1, w_2, \\ldots, w_n$, the unit weight is $w = \\prod_{i=1}^{n} w_i$ (or
+    $\\log w = \\sum_{i=1}^{n} \\log w_i$ in log-space).
 
     Args:
         subunit_sampler (TokenSampler): Sampler for subunits $s \\in \\mathcal{B}$
-        boundary_predicate (BoundaryPredicate): Predicate for determining unit completion.
-            Controls both when a unit is complete and how to finalize it via `finalize_unit()`.
+        boundary_predicate (BoundaryPredicate): Determines when a sequence of tokens forms
+            a complete unit. Also controls how to finalize the unit via `finalize_unit()`.
         max_subunits_per_unit (int): Safety timeout to prevent non-termination. Default: 100.
 
     Example:
@@ -43,7 +57,7 @@ class MultiTokenUnitSampler(TokenSampler):
         >>> llm = PromptedLLM.from_name("gpt2")
         >>> subunit_sampler = DirectTokenSampler(llm)
         >>>
-        >>> # Include boundary tokens (default - preserves context)
+        >>> # Word boundaries at whitespace
         >>> boundary = TokenSetBoundary({b" ", b"\\n"})
         >>> unit_sampler = MultiTokenUnitSampler(
         ...     subunit_sampler=subunit_sampler,
@@ -51,10 +65,6 @@ class MultiTokenUnitSampler(TokenSampler):
         ...     max_subunits_per_unit=50
         ... )
         >>> # Units will be words WITH trailing space: [b"hello", b" "]
-        >>>
-        >>> # Exclude boundary tokens if you want clean semantic units
-        >>> boundary = TokenSetBoundary({b" "}, include_boundary=False)
-        >>> # Units will be words WITHOUT space: [b"hello"]
     """
 
     def __init__(
@@ -232,44 +242,21 @@ class TokenSetBoundary(BoundaryPredicate):
 
     Args:
         boundary_tokens: Set or iterable of tokens that mark unit boundaries
-        include_boundary: Whether to include the boundary token in the final unit.
-            Default: True (keeps boundary token for proper context conditioning)
 
     Example:
-        >>> # Include boundary (default - keeps context for next unit)
         >>> boundary = TokenSetBoundary({b" ", b"\\n"})
         >>> boundary([], [b"hello", b" "])  # True (ends with whitespace)
-        >>> # After finalize_unit: [b"hello", b" "]
-        >>>
-        >>> # Exclude boundary (for semantic units without delimiters)
-        >>> boundary = TokenSetBoundary({b" "}, include_boundary=False)
-        >>> # After finalize_unit: [b"hello"]
+        >>> # Unit will be [b"hello", b" "] - boundary token included
     """
 
-    def __init__(self, boundary_tokens, include_boundary=True):
+    def __init__(self, boundary_tokens):
         self.boundary_tokens = set(boundary_tokens)
-        self.include_boundary = include_boundary
 
     def __call__(self, unit_context, subunit_buffer):
         """Check boundary (ignore unit_context for stateless predicate)."""
         return subunit_buffer and subunit_buffer[-1] in self.boundary_tokens
 
-    def finalize_unit(self, subunit_buffer):
-        """Finalize the unit, optionally removing the boundary token.
-
-        Args:
-            subunit_buffer (list): Buffer ending with a boundary token
-
-        Returns:
-            list: Buffer with or without the boundary token, based on include_boundary
-        """
-        if self.include_boundary or not subunit_buffer:
-            return subunit_buffer
-        return subunit_buffer[:-1]
-
     def __repr__(self):
-        if not self.include_boundary:
-            return f"TokenSetBoundary({self.boundary_tokens!r}, include_boundary=False)"
         return f"TokenSetBoundary({self.boundary_tokens!r})"
 
 

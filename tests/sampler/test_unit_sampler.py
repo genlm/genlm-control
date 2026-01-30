@@ -97,28 +97,6 @@ async def test_multi_token_unit_sampler_with_context():
 
 
 @pytest.mark.asyncio
-async def test_multi_token_unit_sampler_exclude_boundary():
-    """Test TokenSetBoundary with include_boundary=False to exclude delimiter."""
-    vocab = [b"hello", b" ", b"world"]
-    logws = np.log([0.4, 0.2, 0.3, 0.1])
-
-    mock_potential = MockPotential(vocab, logws)
-    subunit_sampler = DirectTokenSampler(mock_potential)
-    # Explicitly exclude boundary token for clean semantic units
-    boundary = TokenSetBoundary({b" "}, include_boundary=False)
-    unit_sampler = MultiTokenUnitSampler(
-        subunit_sampler=subunit_sampler,
-        boundary_predicate=boundary,
-        max_subunits_per_unit=10,
-    )
-    # Sample a unit
-    unit, _, _ = await unit_sampler.sample([], draw=None)
-    # Unit should NOT end with boundary token (we excluded it)
-    if len(unit) > 0 and unit[-1] is not EOS:
-        assert unit[-1] not in {b" "}
-
-
-@pytest.mark.asyncio
 async def test_multi_token_unit_sampler_timeout():
     """Test that timeout prevents infinite loops."""
     # Create potential where boundary is never reached
@@ -194,26 +172,20 @@ async def test_boundary_predicate_validation():
 @pytest.mark.asyncio
 async def test_boundary_predicate_finalize_unit():
     """Test finalize_unit behavior for different boundary predicates."""
-    # TokenSetBoundary with include_boundary=True (default) - keeps boundary
-    token_boundary_keep = TokenSetBoundary({b" ", b"\n"})
+    # TokenSetBoundary always keeps boundary tokens
+    token_boundary = TokenSetBoundary({b" ", b"\n"})
     buffer = [b"hello", b" "]
-    finalized = token_boundary_keep.finalize_unit(buffer)
+    finalized = token_boundary.finalize_unit(buffer)
     assert finalized == [b"hello", b" "]
 
-    # TokenSetBoundary with include_boundary=False - removes boundary
-    token_boundary_remove = TokenSetBoundary({b" ", b"\n"}, include_boundary=False)
-    buffer = [b"hello", b" "]
-    finalized = token_boundary_remove.finalize_unit(buffer)
-    assert finalized == [b"hello"]
-
-    # FixedLengthBoundary should keep all tokens (no boundary concept)
+    # FixedLengthBoundary keeps all tokens
     fixed_boundary = FixedLengthBoundary(10)
     buffer = [b"a"] * 10
     finalized = fixed_boundary.finalize_unit(buffer)
     assert finalized == buffer
     assert len(finalized) == 10
 
-    # CFGBoundary should keep all tokens (complete parsed unit)
+    # CFGBoundary keeps all tokens (complete parsed unit)
     grammar = 'start: "x"+'
     cfg_boundary = CFGBoundary(grammar, min_length=1)
     buffer = [b"x", b"x", b"x"]
@@ -587,3 +559,215 @@ def test_cfg_boundary_exception_handling():
     ):
         with pytest.raises(ValueError, match="Unexpected error"):
             boundary([], [bytes([ord("x")])])
+
+
+@pytest.mark.asyncio
+async def test_weight_accumulation_single_token_unit():
+    """Test that a single-token unit has the correct weight.
+
+    When a unit consists of exactly one token (immediate boundary hit),
+    the unit weight should equal that token's individual weight.
+    """
+    # Vocabulary with space as boundary token
+    vocab = [b"a", b" "]
+    # Weights: a=0.3, space=0.6, EOS=0.1
+    logws = np.log([0.3, 0.6, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = TokenSetBoundary({b" "})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+
+    # Create deterministic draw function to always pick space (index 1)
+    def draw_space(probs):
+        return vocab[1]
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_space)
+    # Unit should be just the space token
+    assert unit == [b" "]
+    expected_logw = np.log(0.3 + 0.6 + 0.1)
+    assert np.isclose(logw, expected_logw, atol=1e-10)
+    expected_logp = np.log(0.6)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_weight_accumulation_two_token_unit():
+    """Test that a two-token unit has weight = product of individual weights.
+
+    When sampling [token1, token2], the unit weight should be w1 * w2.
+    """
+    vocab = [b"h", b" "]
+    # Weights chosen for easy verification: h=0.4, space=0.5, EOS=0.1
+    logws = np.log([0.4, 0.5, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+
+    boundary = TokenSetBoundary({b" "})
+
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    sample_sequence = iter([b"h", b" "])
+
+    def draw_sequence(probs):
+        return next(sample_sequence)
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_sequence)
+    # Unit should be [h, space]
+    assert unit == [b"h", b" "]
+    Z = 0.4 + 0.5 + 0.1
+    expected_logw = 2 * np.log(Z)
+    assert np.isclose(logw, expected_logw, atol=1e-10)
+    # logp = log(p(h)) + log(p(space)) = log(0.4) + log(0.5)
+    expected_logp = np.log(0.4) + np.log(0.5)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_weight_accumulation_three_token_unit():
+    """Test weight accumulation for a three-token unit with non-uniform weights."""
+    vocab = [b"a", b"b", b" "]
+    # Non-uniform weights that don't sum to 1: a=0.2, b=0.3, space=0.4, EOS=0.1
+    logws = np.log([0.2, 0.3, 0.4, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = TokenSetBoundary({b" "})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    sample_sequence = iter([b"a", b"b", b" "])
+
+    def draw_sequence(probs):
+        return next(sample_sequence)
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_sequence)
+    # Unit should be [a, b, space]
+    assert unit == [b"a", b"b", b" "]
+    Z = 0.2 + 0.3 + 0.4 + 0.1
+    expected_logw = 3 * np.log(Z)
+    assert np.isclose(logw, expected_logw, atol=1e-10)
+    # logp = log(0.2) + log(0.3) + log(0.4)
+    expected_logp = np.log(0.2) + np.log(0.3) + np.log(0.4)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_weight_accumulation_with_non_unit_normalizing_constant():
+    """Test weight accumulation when Z != 1."""
+    vocab = [b"x", b" "]
+    # Weights that sum to 10: x=3, space=5, EOS=2
+    logws = np.log([3.0, 5.0, 2.0])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = TokenSetBoundary({b" "})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    # Sample x twice, then space
+    sample_sequence = iter([b"x", b"x", b" "])
+
+    def draw_sequence(probs):
+        return next(sample_sequence)
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_sequence)
+    assert unit == [b"x", b"x", b" "]
+    Z = 3.0 + 5.0 + 2.0
+    expected_logw = 3 * np.log(Z)
+    assert np.isclose(logw, expected_logw, atol=1e-10)
+    expected_logp = 2 * np.log(3.0 / Z) + np.log(5.0 / Z)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_weight_accumulation_eos_terminates():
+    """Test that EOS terminates the unit and weight is correctly accumulated."""
+    vocab = [b"a", b"b"]
+    logws = np.log([0.3, 0.3, 0.4])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    # Boundary that won't be hit by a or b
+    boundary = TokenSetBoundary({b" "})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    # Sample a, then EOS
+    sample_sequence = iter([b"a", EOS])
+
+    def draw_sequence(probs):
+        return next(sample_sequence)
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_sequence)
+    assert unit == [b"a", EOS]
+    Z = 0.3 + 0.3 + 0.4
+    expected_logw = 2 * np.log(Z)
+    assert np.isclose(logw, expected_logw, atol=1e-10)
+    expected_logp = np.log(0.3) + np.log(0.4)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_weight_accumulation_fixed_length_boundary():
+    """Test weight accumulation with FixedLengthBoundary."""
+    vocab = [b"1", b"2", b"3"]
+    # Weights: 1=0.2, 2=0.3, 3=0.4, EOS=0.1
+    logws = np.log([0.2, 0.3, 0.4, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = FixedLengthBoundary(3)
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    sample_sequence = iter([b"1", b"2", b"3"])
+
+    def draw_sequence(probs):
+        return next(sample_sequence)
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_sequence)
+    assert unit == [b"1", b"2", b"3"]
+    Z = 0.2 + 0.3 + 0.4 + 0.1
+    expected_logw = 3 * np.log(Z)
+    assert np.isclose(logw, expected_logw, atol=1e-10)
+    expected_logp = np.log(0.2) + np.log(0.3) + np.log(0.4)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_weight_is_negative_infinity_on_max_subunits():
+    """Test that weight is -inf when max_subunits_per_unit is exceeded without boundary."""
+    vocab = [b"a", b"b"]
+    logws = np.log([0.4, 0.4, 0.2])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    # Boundary that will never be satisfied
+    boundary = TokenSetBoundary({b"NEVER"})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=3,
+    )
+
+    def draw_a(probs):
+        return b"a"
+
+    unit, logw, logp = await unit_sampler.sample([], draw=draw_a)
+    assert len(unit) == 3
+    assert all(t == b"a" for t in unit)
+    assert logw == float("-inf")
+    # logp should still be accumulated correctly
+    Z = 0.4 + 0.4 + 0.2
+    expected_logp = 3 * np.log(0.4 / Z)
+    assert np.isclose(logp, expected_logp, atol=1e-10)
