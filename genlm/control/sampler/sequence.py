@@ -382,33 +382,21 @@ class EnsembleSMC(SMC):
         Returns:
             SequencesExt: Sequences with individual model weights.
         """
-        try:
-            original_max_tokens = self.model.max_tokens
-            original_verbosity = self.model.verbosity
-            original_twist_with_critic = self.model.twist_with_critic
-            self.model.max_tokens = max_tokens
-            self.model.verbosity = verbosity
-            self.model.twist_with_critic = ess_threshold > 0
+        sequences = await super().__call__(
+            n_particles=n_particles,
+            ess_threshold=ess_threshold,
+            max_tokens=max_tokens,
+            verbosity=verbosity,
+            json_path=json_path,
+            **kwargs,
+        )
 
-            particles = await smc_standard(
-                model=self.model,
-                n_particles=n_particles,
-                ess_threshold=ess_threshold,
-                json_file=json_path,
-                **kwargs,
-            )
-        finally:
-            self.model.max_tokens = original_max_tokens
-            self.model.verbosity = original_verbosity
-            self.model.twist_with_critic = original_twist_with_critic
-
-        # Extract individual model weights if available
         log_prefix_weights_1 = []
         log_prefix_weights_2 = []
 
         if hasattr(self.unit_sampler, "particle_prefix_log_prob_1"):
-            for p in particles:
-                ctx_tuple = tuple(p.token_ctx)
+            for ctx in sequences.contexts:
+                ctx_tuple = tuple(ctx)
                 log_prefix_weights_1.append(
                     self.unit_sampler.particle_prefix_log_prob_1.get(
                         ctx_tuple, float("-inf")
@@ -416,27 +404,17 @@ class EnsembleSMC(SMC):
                 )
 
         if hasattr(self.unit_sampler, "particle_prefix_log_prob_2"):
-            for p in particles:
-                ctx_tuple = tuple(p.token_ctx)
+            for ctx in sequences.contexts:
+                ctx_tuple = tuple(ctx)
                 log_prefix_weights_2.append(
                     self.unit_sampler.particle_prefix_log_prob_2.get(
                         ctx_tuple, float("-inf")
                     )
                 )
 
-        contexts, logws = map(
-            list,
-            zip(
-                *[
-                    (p.token_ctx, float("-inf") if np.isnan(p.weight) else p.weight)
-                    for p in particles
-                ]
-            ),
-        )
-
         return SequencesExt(
-            contexts,
-            logws,
+            sequences.contexts,
+            sequences.log_weights,
             log_prefix_weights_1,
             log_prefix_weights_2,
         )

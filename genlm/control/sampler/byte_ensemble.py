@@ -196,7 +196,7 @@ class ByteEnsembleTokenSampler(TokenSampler):
         max_tokens: int,
         critic=None,
         **kwargs,
-    ) -> "SequencesExt":
+    ):
         """Run Sequential Monte Carlo inference with byte-level ensemble.
 
         This method requires EnsembleSMC to be available in the sampler.sequence module.

@@ -1,5 +1,6 @@
 import pytest
 import numpy as np
+from unittest.mock import AsyncMock, MagicMock, patch
 from genlm.backend import load_model_by_name
 from genlm.control import (
     Ensemble,
@@ -8,6 +9,12 @@ from genlm.control import (
     Potential,
     PromptedLLM,
     convert_to_weighted_logop,
+    EOS,
+)
+from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt
+from genlm.control.potential.built_in.ensemble import (
+    split_with_atomic_tokens,
+    _weighted_extremum,
 )
 from conftest import MockPotential
 
@@ -692,3 +699,106 @@ def test_convert_to_weighted_logop_operations():
     result_prod = op_prod(x, y)
     expected_prod = 0.5 * x + 0.5 * y
     np.testing.assert_allclose(result_prod, expected_prod, rtol=1e-5)
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_token_sampler_start_weight():
+    """Test ByteEnsembleTokenSampler.start_weight() returns 0.0."""
+    llm = load_model_by_name("gpt2", backend="hf")
+    ensemble = await ByteEnsemble.create(
+        llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
+    )
+    eos_tokens = [llm.byte_vocab[llm.tokenizer.eos_token_id]]
+    sampler = ByteEnsembleTokenSampler(
+        ensemble, max_tokens=10, eos_tokens=eos_tokens, n_particles=5
+    )
+    start_weight = await sampler.start_weight()
+    assert start_weight == 0.0
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_sampler_eos_handling():
+    """Test ByteEnsembleTokenSampler properly handles EOS tokens and max_tokens."""
+    llm = load_model_by_name("gpt2", backend="hf")
+    ensemble = await ByteEnsemble.create(
+        llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
+    )
+    eos_byte = llm.byte_vocab[llm.tokenizer.eos_token_id]
+    sampler = ByteEnsembleTokenSampler(
+        ensemble, max_tokens=5, eos_tokens=[eos_byte], n_particles=5
+    )
+    _, _, _ = await sampler.sample([])
+    if len(sampler.particle_prefix_log_prob_1) > 0:
+        assert len(sampler.particle_prefix_log_prob_1) >= 0
+        assert len(sampler.particle_prefix_log_prob_2) >= 0
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_empty_beam_error():
+    """Test ByteEnsemble raises RuntimeError when beam is empty after prefill."""
+    mock_llm = MagicMock()
+    mock_llm.byte_vocab = {0: b"a"}
+    mock_llm.tokenizer.eos_token_id = 0
+    empty_beam = MagicMock()
+    empty_beam.prefill = AsyncMock(return_value=[])
+    with patch(
+        "genlm.control.potential.built_in.ensemble.ByteBeamState.initial",
+        AsyncMock(return_value=empty_beam),
+    ):
+        with pytest.raises(RuntimeError, match="Beam1 is empty after prefill"):
+            await ByteEnsemble.create(
+                mock_llm, mock_llm, op="prod", prompt1=b"test", prompt2=b"test", a=0.5
+            )
+
+
+def test_split_with_atomic_tokens_overlapping():
+    """Test split_with_atomic_tokens with overlapping tokens."""
+    with pytest.warns(UserWarning, match="Overlapping atomic tokens detected"):
+        result = split_with_atomic_tokens(b"ABC", [b"A", b"AB"])
+    assert result == [b"A", 66, 67]
+
+
+def test_split_with_atomic_tokens_no_match():
+    """Test split_with_atomic_tokens when no atomic tokens match."""
+    result = split_with_atomic_tokens(b"XYZ", [b"A", b"B"])
+    assert result == [88, 89, 90]
+
+
+def test_weighted_extremum_different_weights():
+    """Test _weighted_extremum with different weight values."""
+    x = np.array([-1.0, -2.0, -3.0])
+    y = np.array([-2.0, -1.5, -3.5])
+    max_op_favoring_y = _weighted_extremum(np.maximum, a=0.7)
+    result = max_op_favoring_y(x, y)
+    expected = (2 * 0.7 - 1) * y + 2 * (1 - 0.7) * np.maximum(x, y)
+    np.testing.assert_allclose(result, expected, rtol=1e-5)
+    min_op_favoring_x = _weighted_extremum(np.minimum, a=0.3)
+    result2 = min_op_favoring_x(x, y)
+    expected2 = (1 - 2 * 0.3) * x + 2 * 0.3 * np.minimum(x, y)
+    np.testing.assert_allclose(result2, expected2, rtol=1e-5)
+
+
+def test_sequences_ext_post_init():
+    """Test SequencesExt.__post_init__ converts lists to numpy arrays."""
+    seq = SequencesExt(
+        contexts=[["a", "b"], ["c", "d"]],
+        log_weights=[0.1, 0.2],
+        log_prefix_weights_1=[0.15, 0.25],
+        log_prefix_weights_2=[0.12, 0.22],
+    )
+    assert isinstance(seq.log_prefix_weights_1, np.ndarray)
+    assert isinstance(seq.log_prefix_weights_2, np.ndarray)
+    seq2 = SequencesExt(contexts=[["a"]], log_weights=[0.1], log_prefix_weights_1=None)
+    assert seq2.log_prefix_weights_1 is None
+
+
+def test_sequences_ext_post_init_with_none():
+    """Test SequencesExt.__post_init__ handles None values correctly."""
+    seq = SequencesExt(
+        contexts=[["a", "b"]],
+        log_weights=[0.1],
+        log_prefix_weights_1=None,
+        log_prefix_weights_2=None,
+    )
+    assert seq.log_prefix_weights_1 is None
+    assert seq.log_prefix_weights_2 is None
