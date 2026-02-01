@@ -418,7 +418,6 @@ def _weighted_extremum(func, a: float):
     return lambda x, y: extremum(x, y, a)
 
 
-# Map operation names to their power values
 _POWER_MEANS = {
     "pm5": -5.0,
     "pm2.5": -2.5,
@@ -492,11 +491,10 @@ def convert_to_weighted_logop(
 
     log_a, log_1_minus_a = np.log(a), np.log(1 - a)
 
-    # Power means - all follow the same pattern
+    # Ensemble operations
     if op in _POWER_MEANS:
         return _power_mean(_POWER_MEANS[op], a)
 
-    # Basic operations
     operations = {
         "sum": lambda x, y: logsumexp([x + log_a, y + log_1_minus_a], axis=0),
         "prod": lambda x, y: a * x + (1 - a) * y,
@@ -508,7 +506,6 @@ def convert_to_weighted_logop(
     if op in operations:
         return operations[op]
 
-    # If we get here, operation is invalid
     valid_ops = list(operations.keys()) + list(_POWER_MEANS.keys())
     raise ValueError(
         f"Invalid operation: {op}. Must be one of {', '.join(repr(o) for o in valid_ops)}."
