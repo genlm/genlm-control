@@ -102,7 +102,11 @@ class ByteEnsembleTokenSampler(TokenSampler):
         self.prefix_cache_2[()] = 0.0
 
     async def start_weight(self) -> float:
-        """Compute the weight of the empty sequence."""
+        """Compute the weight of the empty sequence.
+
+        Returns:
+            float: Log weight of the empty sequence (always 0.0)
+        """
         return 0.0
 
     async def sample(self, context: List[int], draw=None) -> Tuple[int, float, float]:
@@ -192,7 +196,7 @@ class ByteEnsembleTokenSampler(TokenSampler):
         max_tokens: int,
         critic=None,
         **kwargs,
-    ):
+    ) -> "SequencesExt":
         """Run Sequential Monte Carlo inference with byte-level ensemble.
 
         This method requires EnsembleSMC to be available in the sampler.sequence module.
@@ -202,11 +206,11 @@ class ByteEnsembleTokenSampler(TokenSampler):
             n_particles (int): Number of particles to maintain
             ess_threshold (float): ESS threshold for resampling (0-1)
             max_tokens (int): Maximum tokens per sequence
-            critic (Potential, optional): Critic potential for guided sampling
+            critic (Potential): Critic potential for guided sampling
             **kwargs: Additional arguments passed to SMC
 
         Returns:
-            Sequences or SequencesExt: Generated sequences with weights
+            SequencesExt: Generated sequences with weights
 
         Raises:
             ImportError: If required SMC components are not available

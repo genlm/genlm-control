@@ -1,7 +1,7 @@
 import asyncio
 import warnings
 import numpy as np
-from typing import Callable, List, Literal, Union
+from typing import Any, Callable, List, Literal, Tuple, Union
 from collections import defaultdict
 
 from arsenal.maths import logsumexp
@@ -18,12 +18,12 @@ class Ensemble(Potential):
     (e.g., weighted geometric mean, arithmetic mean, min, max, etc.).
 
     Args:
-        p1: First potential (language model)
-        p2: Second potential (language model)
-        op: Operation name (e.g., "sum", "prod", "min", "max", "harmonic", or power means)
-        a: Weighting parameter between 0 and 1 (default 0.5 for equal weighting).
-           When a=0.5, models are weighted equally. For a != 0.5, the combination
-           is weighted: a * model1 + (1-a) * model2
+        p1 (Potential): First potential (language model)
+        p2 (Potential): Second potential (language model)
+        op (str): Operation name (e.g., "sum", "prod", "min", "max", "harmonic", or power means)
+        a (float): Weighting parameter between 0 and 1 (default 0.5 for equal weighting).
+            When a=0.5, models are weighted equally. For a != 0.5, the combination
+            is weighted: a * model1 + (1-a) * model2
 
     Attributes:
         p1: First potential
@@ -54,7 +54,13 @@ class Ensemble(Potential):
         log weights from each model, or use batch_logw_next for batched operations.
     """
 
-    def __init__(self, p1, p2, op, a=0.5):
+    def __init__(
+        self,
+        p1: Potential,
+        p2: Potential,
+        op: str,
+        a: float = 0.5,
+    ):
         self.p1 = p1
         self.p2 = p2
         self.op = convert_to_weighted_logop(op, a)
@@ -75,51 +81,51 @@ class Ensemble(Potential):
         self.p2_vocab_idxs = [self.p2.lookup[x] for x in self.vocab_eos]
         assert self.p1_vocab_idxs == self.p2_vocab_idxs
 
-    async def prefix(self, context):
+    async def prefix(self, context: List[str]) -> float:
         """Compute log weights for the prefix using both potentials.
 
         Args:
-            context: The context tokens
+            context (List[str]): The context tokens
 
         Returns:
-            Combined log weight from both potentials using the ensemble operation
+            float: Combined log weight from both potentials using the ensemble operation
         """
         p1_logw, p2_logw = await asyncio.gather(
             self.p1.prefix(context), self.p2.prefix(context)
         )
         return self.op(p1_logw, p2_logw)
 
-    async def complete(self, context):
+    async def complete(self, context: List[str]) -> float:
         """Compute completion log weights using both potentials.
 
         Args:
-            context: The context tokens
+            context (List[str]): The context tokens
 
         Returns:
-            Combined completion log weight from both potentials
+            float: Combined completion log weight from both potentials
         """
         p1_logw, p2_logw = await asyncio.gather(
             self.p1.complete(context), self.p2.complete(context)
         )
         return self.op(p1_logw, p2_logw)
 
-    async def logws_next(self, context):
+    async def logws_next(self, context: List[str]) -> Tuple[Any, Any]:
         """Get log weights from both potentials separately.
 
         This method returns the log weights from both underlying potentials
         without combining them. Useful for custom combination logic.
 
         Args:
-            context: The context tokens
+            context (List[str]): The context tokens
 
         Returns:
-            Tuple of (p1_logw_next, p2_logw_next)
+            Tuple[Any, Any]: Tuple of (p1_logw_next, p2_logw_next)
         """
         return await asyncio.gather(
             self.p1.logw_next(context), self.p2.logw_next(context)
         )
 
-    async def logw_next(self, context):
+    async def logw_next(self, context: List[str]):
         """Not implemented for Ensemble class.
 
         Raises:
@@ -127,7 +133,7 @@ class Ensemble(Potential):
         """
         raise NotImplementedError("logw_next is not implemented for Ensemble class.")
 
-    async def batch_logw_next(self, contexts):
+    async def batch_logw_next(self, contexts: List[List[str]]) -> List[Any]:
         """Batched version of logw_next for Ensemble.
 
         This enables batching when multiple particles need to be extended during SMC,
@@ -135,11 +141,11 @@ class Ensemble(Potential):
         batch_logw_next support.
 
         Args:
-            contexts: List of context token sequences
+            contexts (List[List[str]]): List of context token sequences
 
         Returns:
-            List of LazyWeights objects, one per context, containing the combined
-            log weights from both potentials
+            List[Any]: List of LazyWeights objects, one per context, containing the combined
+                log weights from both potentials
 
         Note:
             This method is only used if the Ensemble is wrapped in AutoBatchedPotential or
@@ -267,7 +273,14 @@ class ByteEnsemble(Potential):
     """
 
     def __init__(
-        self, p1, p2, op: Callable, data_dict_1, data_dict_2, vocab, eos_tokens
+        self,
+        p1: Any,
+        p2: Any,
+        op: Callable,
+        data_dict_1: dict,
+        data_dict_2: dict,
+        vocab: List[int],
+        eos_tokens: List[bytes],
     ):
         self.p1 = p1
         self.p2 = p2
@@ -280,8 +293,8 @@ class ByteEnsemble(Potential):
     @classmethod
     async def create(
         cls,
-        llm1,
-        llm2,
+        llm1: Any,
+        llm2: Any,
         op: str,
         prompt1: bytes,
         prompt2: bytes,
@@ -289,19 +302,19 @@ class ByteEnsemble(Potential):
         K: int = 5,
         prune_threshold: float = 0.0,
         verbose: bool = False,
-    ):
+    ) -> "ByteEnsemble":
         """Factory method to initialize beam states from prompts and return a ByteEnsemble instance.
 
         Args:
-            llm1: First language model (from genlm.backend)
-            llm2: Second language model (from genlm.backend)
-            op: Operation name ('sum', 'prod', 'min', 'max', 'harmonic', or power means)
-            prompt1: Prompt bytes for first model
-            prompt2: Prompt bytes for second model
-            a: Weighting parameter between 0 and 1 (default 0.5 for equal weighting)
-            K: Beam width for beam search (default 5)
-            prune_threshold: Threshold for pruning low-probability beams (default 0.0)
-            verbose: Whether to print verbose beam search output (default False)
+            llm1 (Any): First language model (from genlm.backend)
+            llm2 (Any): Second language model (from genlm.backend)
+            op (str): Operation name ('sum', 'prod', 'min', 'max', 'harmonic', or power means)
+            prompt1 (bytes): Prompt bytes for first model
+            prompt2 (bytes): Prompt bytes for second model
+            a (float): Weighting parameter between 0 and 1 (default 0.5 for equal weighting)
+            K (int): Beam width for beam search (default 5)
+            prune_threshold (float): Threshold for pruning low-probability beams (default 0.0)
+            verbose (bool): Whether to print verbose beam search output (default False)
 
         Returns:
             ByteEnsemble: Initialized ensemble with beam states ready for sampling
@@ -368,7 +381,9 @@ class ByteEnsemble(Potential):
                 if len(k) < min_len:
                     del d[k]
 
-    async def get_beam_states(self, context: List[int]):
+    async def get_beam_states(
+        self, context: List[int]
+    ) -> Tuple["ByteBeamState", "ByteBeamState"]:
         """Fetch beam states for the current context.
 
         This method provides direct access to the underlying beam states, which
@@ -382,7 +397,7 @@ class ByteEnsemble(Potential):
 
         Raises:
             KeyError: If context not found in cache (beam states must be populated
-                     by ByteEnsembleTokenSampler during sampling)
+                by ByteEnsembleTokenSampler during sampling)
         """
         ctx_bytes = bytes(context)
         await self._cleanup_cache()
@@ -390,22 +405,28 @@ class ByteEnsemble(Potential):
         beam2 = self.data_dict_2[ctx_bytes]
         return beam1, beam2
 
-    async def prefix(self, context: List[int]):
+    async def prefix(self, context: List[int]) -> None:
         """Compute prefix weight (not fully implemented).
 
         ByteEnsemble is designed to be used with ByteEnsembleTokenSampler which
         manages weights separately. This method is a stub to satisfy the Potential interface.
+
+        Args:
+            context (List[int]): The context as list of byte values
 
         Returns:
             None
         """
         return None
 
-    async def complete(self, context: List[int]):
+    async def complete(self, context: List[int]) -> None:
         """Compute completion weight (not fully implemented).
 
         ByteEnsemble is designed to be used with ByteEnsembleTokenSampler which
         manages weights separately. This method is a stub to satisfy the Potential interface.
+
+        Args:
+            context (List[int]): The context as list of byte values
 
         Returns:
             None
@@ -418,6 +439,13 @@ def _power_mean(p: float, a: float):
 
     M_p(x, y; a) = (a * exp(p*x) + (1-a) * exp(p*y))^(1/p)
     In log space: (1/p) * logsumexp([log(a) + p*x, log(1-a) + p*y])
+
+    Args:
+        p (float): Power parameter for the power mean
+        a (float): Weighting parameter between 0 and 1
+
+    Returns:
+        Callable: Function that computes weighted power mean in log space
     """
     log_a, log_1_minus_a = np.log(a), np.log(1 - a)
     return lambda x, y: (1.0 / p) * logsumexp(
@@ -426,7 +454,15 @@ def _power_mean(p: float, a: float):
 
 
 def _weighted_extremum(func, a: float):
-    """Create a weighted min/max operator."""
+    """Create a weighted min/max operator.
+
+    Args:
+        func (Callable): The extremum function (np.minimum or np.maximum)
+        a (float): Weighting parameter between 0 and 1
+
+    Returns:
+        Callable: Function that computes weighted extremum
+    """
 
     def extremum(x, y, a):
         if a <= 0.5:
@@ -476,7 +512,7 @@ def convert_to_weighted_logop(
         "p5",
     ],
     a: float = 0.5,
-):
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
     """Convert a string operation to its weighted log-space equivalent.
 
     This function takes an operation name and a weighting parameter and returns
@@ -484,17 +520,17 @@ def convert_to_weighted_logop(
     weighted operation.
 
     Args:
-        op: Operation name. Supported operations include:
+        op (str): Operation name. Supported operations include:
             - Means: "sum" (arithmetic), "prod" (geometric), "harmonic"
             - Extrema: "min", "max"
             - Power means: "pm5", "pm2.5", "p-2", "pm1.5", "pm0.5", "pm0.25",
-                          "p0.25", "p0.5", "p1.5", "p2", "p2.5", "p3", "p5"
-        a: Weighting parameter between 0 and 1. When a=0.5, equal weighting.
-           For weighted operations: a * model1 + (1-a) * model2
+                        "p0.25", "p0.5", "p1.5", "p2", "p2.5", "p3", "p5"
+        a (float): Weighting parameter between 0 and 1. When a=0.5, equal weighting.
+            For weighted operations: a * model1 + (1-a) * model2
 
     Returns:
-        A function that takes two log-probability arrays and returns their
-        weighted combination in log space.
+        Callable[[np.ndarray, np.ndarray], np.ndarray]: A function that takes two
+            log-probability arrays and returns their weighted combination in log space.
 
     Raises:
         ValueError: If a is not between 0 and 1, or if op is not recognized.

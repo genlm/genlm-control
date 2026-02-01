@@ -362,25 +362,25 @@ class EnsembleSMC(SMC):
 
     async def __call__(
         self,
-        n_particles,
-        ess_threshold,
-        max_tokens,
-        verbosity=0,
-        json_path=None,
+        n_particles: int,
+        ess_threshold: float,
+        max_tokens: int,
+        verbosity: int = 0,
+        json_path: str = None,
         **kwargs,
-    ):
+    ) -> "SequencesExt":
         """Generate sequences using SMC with ensemble weight tracking.
 
         Args:
             n_particles (int): Number of particles to maintain.
             ess_threshold (float): ESS threshold for resampling (0-1).
             max_tokens (int): Maximum tokens to generate.
-            verbosity (int, optional): Verbosity level (0=silent, 1=verbose).
-            json_path (str, optional): Path to save inference visualization data.
+            verbosity (int): Verbosity level (0=silent, 1=verbose).
+            json_path (str): Path to save inference visualization data.
             **kwargs: Additional arguments for smc_standard.
 
         Returns:
-            (SequencesExt): Sequences with individual model weights.
+            SequencesExt: Sequences with individual model weights.
         """
         try:
             original_max_tokens = self.model.max_tokens

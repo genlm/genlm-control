@@ -311,7 +311,7 @@ async def test_ensemble_warns_on_different_vocabularies():
     p2 = MockPotential(vocab=vocab2, next_token_logws=logws2)
     with pytest.warns(UserWarning, match="different vocabularies"):
         with pytest.raises((KeyError, AssertionError)):
-            ensemble = Ensemble(p1, p2, op="prod", a=0.5)
+            _ = Ensemble(p1, p2, op="prod", a=0.5)
 
 
 @pytest.mark.asyncio
