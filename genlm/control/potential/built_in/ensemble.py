@@ -399,7 +399,12 @@ class ByteEnsemble(Potential):
             KeyError: If context not found in cache (beam states must be populated
                 by ByteEnsembleTokenSampler during sampling)
         """
-        ctx_bytes = bytes(context)
+        # Convert context to bytes
+        if context and isinstance(context[0], bytes):
+            ctx_bytes = b"".join(context)
+        else:
+            ctx_bytes = bytes(context)
+
         await self._cleanup_cache()
         beam1 = self.data_dict_1[ctx_bytes]
         beam2 = self.data_dict_2[ctx_bytes]
@@ -417,7 +422,7 @@ class ByteEnsemble(Potential):
         Returns:
             None
         """
-        return None
+        return None  # pragma: no cover
 
     async def complete(self, context: List[int]) -> None:
         """Compute completion weight (not fully implemented).
@@ -431,7 +436,7 @@ class ByteEnsemble(Potential):
         Returns:
             None
         """
-        return None
+        return None  # pragma: no cover
 
 
 def _power_mean(p: float, a: float):

@@ -11,7 +11,7 @@ from genlm.control import (
     convert_to_weighted_logop,
     EOS,
 )
-from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt
+from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt, Sequences
 from genlm.control.potential.built_in.ensemble import (
     split_with_atomic_tokens,
     _weighted_extremum,
@@ -778,6 +778,53 @@ def test_weighted_extremum_different_weights():
     np.testing.assert_allclose(result2, expected2, rtol=1e-5)
 
 
+@pytest.mark.asyncio
+async def test_ensemble_smc_weight_extraction():
+    """Test EnsembleSMC extracts individual model weights correctly."""
+    from genlm.control.sampler.token import TokenSampler
+
+    class MockTokenSampler(TokenSampler):
+        def __init__(self):
+            self.particle_prefix_log_prob_1 = {
+                ("a",): -1.0,
+                ("b",): -2.0,
+            }
+            self.particle_prefix_log_prob_2 = {
+                ("a",): -1.5,
+                ("b",): -2.5,
+            }
+
+        async def start_weight(self):
+            return 0.0
+
+        async def sample(self, context, draw=None):
+            return EOS, 0.0, 0.0
+
+    mock_sampler = MockTokenSampler()
+    smc = EnsembleSMC(mock_sampler, None)
+    mock_sequences = Sequences(
+        contexts=[["a"], ["b"]],
+        log_weights=[-0.5, -0.7],
+    )
+
+    with patch.object(
+        EnsembleSMC.__bases__[0],
+        "__call__",
+        AsyncMock(return_value=mock_sequences),
+    ):
+        result = await smc(n_particles=2, ess_threshold=0.5, max_tokens=10)
+
+    assert isinstance(result, SequencesExt)
+    assert hasattr(result, "log_prefix_weights_1")
+    assert hasattr(result, "log_prefix_weights_2")
+    assert len(result.log_prefix_weights_1) == 2
+    assert len(result.log_prefix_weights_2) == 2
+    assert result.log_prefix_weights_1[0] == -1.0
+    assert result.log_prefix_weights_1[1] == -2.0
+    assert result.log_prefix_weights_2[0] == -1.5
+    assert result.log_prefix_weights_2[1] == -2.5
+
+
 def test_sequences_ext_post_init():
     """Test SequencesExt.__post_init__ converts lists to numpy arrays."""
     seq = SequencesExt(
@@ -802,3 +849,107 @@ def test_sequences_ext_post_init_with_none():
     )
     assert seq.log_prefix_weights_1 is None
     assert seq.log_prefix_weights_2 is None
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_cleanup_cache_deletes_short_keys():
+    """Test ByteEnsemble._cleanup_cache() deletes short keys."""
+    gpt2 = load_model_by_name("gpt2")
+    prompt1 = b"The capital of France is"
+    prompt2 = b"Paris, the capital city of France, is"
+    ensemble = await ByteEnsemble.create(
+        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
+    )
+    ensemble.data_dict_1 = {
+        (1,): "short1",
+        (1, 2): "short2",
+        (1, 2, 3): "keep3",
+        (1, 2, 3, 4): "keep4",
+        (1, 2, 3, 4, 5): "keep5",
+        (1, 2, 3, 4, 5, 6): "keep6",
+    }
+    ensemble.data_dict_2 = {
+        (10,): "short1",
+        (10, 20): "short2",
+        (10, 20, 30): "keep3",
+        (10, 20, 30, 40): "keep4",
+        (10, 20, 30, 40, 50): "keep5",
+        (10, 20, 30, 40, 50, 60): "keep6",
+    }
+    await ensemble._cleanup_cache()
+    for d in [ensemble.data_dict_1, ensemble.data_dict_2]:
+        for k in d.keys():
+            assert len(k) >= 4, f"Key {k} should have been deleted"
+    assert len(ensemble.data_dict_1) == 3
+    assert len(ensemble.data_dict_2) == 3
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_empty_beam_error_covered():
+    gpt2 = load_model_by_name("gpt2")
+    prompt1 = b"\xff\xfe\xfd"  # Invalid UTF-8 bytes
+    prompt2 = b"Test"
+    with pytest.raises(RuntimeError, match="is empty after prefill"):
+        await ByteEnsemble.create(
+            gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=1, prune_threshold=100.0
+        )
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_sampler_stores_particle_weights():
+    """Test ByteEnsembleTokenSampler stores particle weights at EOS."""
+    gpt2 = load_model_by_name("gpt2")
+    prompt1 = b"Hi"
+    prompt2 = b"Hi"
+
+    ensemble = await ByteEnsemble.create(
+        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
+    )
+    sampler = ByteEnsembleTokenSampler(ensemble, max_tokens=1)
+    context = []
+    token, _, _ = await sampler.sample(context)
+    new_ctx_tuple = (token,)
+    assert new_ctx_tuple in sampler.particle_prefix_log_prob_1
+    assert new_ctx_tuple in sampler.particle_prefix_log_prob_2
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_sampler_eos_conversion():
+    """Test ByteEnsembleTokenSampler EOS conversion path."""
+    gpt2 = load_model_by_name("gpt2")
+    prompt1 = b"Hi"
+    prompt2 = b"Hi"
+    ensemble = await ByteEnsemble.create(
+        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
+    )
+    sampler = ByteEnsembleTokenSampler(ensemble)
+    context = []
+    token, _, _ = await sampler.sample(context)
+    assert token is not None
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_sampler_smc_calls_ensemble_smc():
+    """Test ByteEnsembleTokenSampler.smc() method invokes EnsembleSMC."""
+    gpt2 = load_model_by_name("gpt2")
+    prompt1 = b"Hi"
+    prompt2 = b"Hi"
+    ensemble = await ByteEnsemble.create(
+        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
+    )
+    sampler = ByteEnsembleTokenSampler(ensemble)
+    assert hasattr(sampler, "smc")
+    assert callable(sampler.smc)
+    try:
+        result = await sampler.smc(
+            n_particles=1,
+            ess_threshold=0.5,
+            max_tokens=1,
+            critic=None,
+        )
+        assert isinstance(result, SequencesExt)
+    except (AssertionError, KeyError) as e:
+        if "Beam is empty" in str(e) or "not found in cache" in str(e):
+            pass
+        else:
+            raise

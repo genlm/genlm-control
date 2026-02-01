@@ -1,4 +1,4 @@
-from typing import List, Literal, Tuple
+from typing import Any, List, Literal, Tuple
 from collections import defaultdict
 
 from cachetools import LRUCache
@@ -195,12 +195,9 @@ class ByteEnsembleTokenSampler(TokenSampler):
         ess_threshold: float,
         max_tokens: int,
         critic=None,
-        **kwargs,
+        **kwargs: Any,
     ):
         """Run Sequential Monte Carlo inference with byte-level ensemble.
-
-        This method requires EnsembleSMC to be available in the sampler.sequence module.
-        If not available, falls back to standard SMC.
 
         Args:
             n_particles (int): Number of particles to maintain
@@ -208,12 +205,6 @@ class ByteEnsembleTokenSampler(TokenSampler):
             max_tokens (int): Maximum tokens per sequence
             critic (Potential): Critic potential for guided sampling
             **kwargs: Additional arguments passed to SMC
-
-        Returns:
-            SequencesExt: Generated sequences with weights
-
-        Raises:
-            ImportError: If required SMC components are not available
         """
         return await EnsembleSMC(self, critic)(
             n_particles=n_particles,

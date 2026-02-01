@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Any
 from genlm.grammar import Float
 from arsenal.maths import logsumexp
 from functools import cached_property
@@ -367,7 +368,7 @@ class EnsembleSMC(SMC):
         max_tokens: int,
         verbosity: int = 0,
         json_path: str = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> "SequencesExt":
         """Generate sequences using SMC with ensemble weight tracking.
 
