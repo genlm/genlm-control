@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Any
 from genlm.grammar import Float
 from arsenal.maths import logsumexp
 from functools import cached_property
@@ -346,3 +347,103 @@ def _unpack_particles(particles):
         ),
     )
     return contexts, logws
+
+
+class EnsembleSMC(SMC):
+    """EnsembleSMC is a specialized version of SMC for ensemble sampling.
+
+    This class extends SMC to track individual model weights when using
+    ByteEnsemble with ByteEnsembleTokenSampler. It returns SequencesExt
+    which includes log_prefix_weights_1 and log_prefix_weights_2.
+
+    Args:
+        unit_sampler (TokenSampler): The sampler that generates tokens.
+        critic (Potential, optional): A potential function that guides the generation process.
+    """
+
+    async def __call__(
+        self,
+        n_particles: int,
+        ess_threshold: float,
+        max_tokens: int,
+        verbosity: int = 0,
+        json_path: str = None,
+        **kwargs: Any,
+    ) -> "SequencesExt":
+        """Generate sequences using SMC with ensemble weight tracking.
+
+        Args:
+            n_particles (int): Number of particles to maintain.
+            ess_threshold (float): ESS threshold for resampling (0-1).
+            max_tokens (int): Maximum tokens to generate.
+            verbosity (int): Verbosity level (0=silent, 1=verbose).
+            json_path (str): Path to save inference visualization data.
+            **kwargs: Additional arguments for smc_standard.
+
+        Returns:
+            SequencesExt: Sequences with individual model weights.
+        """
+        sequences = await super().__call__(
+            n_particles=n_particles,
+            ess_threshold=ess_threshold,
+            max_tokens=max_tokens,
+            verbosity=verbosity,
+            json_path=json_path,
+            **kwargs,
+        )
+
+        log_prefix_weights_1 = []
+        log_prefix_weights_2 = []
+
+        if hasattr(self.unit_sampler, "particle_prefix_log_prob_1"):
+            for ctx in sequences.contexts:
+                ctx_tuple = tuple(ctx)
+                log_prefix_weights_1.append(
+                    self.unit_sampler.particle_prefix_log_prob_1.get(
+                        ctx_tuple, float("-inf")
+                    )
+                )
+
+        if hasattr(self.unit_sampler, "particle_prefix_log_prob_2"):
+            for ctx in sequences.contexts:
+                ctx_tuple = tuple(ctx)
+                log_prefix_weights_2.append(
+                    self.unit_sampler.particle_prefix_log_prob_2.get(
+                        ctx_tuple, float("-inf")
+                    )
+                )
+
+        return SequencesExt(
+            sequences.contexts,
+            sequences.log_weights,
+            log_prefix_weights_1,
+            log_prefix_weights_2,
+        )
+
+
+@dataclass
+class SequencesExt(Sequences):
+    """Extended Sequences container for ensemble sampling.
+
+    This class extends Sequences to track individual model weights
+    when using ByteEnsemble with ByteEnsembleTokenSampler.
+
+    Args:
+        contexts (list): List of token sequences.
+        log_weights (list): Log importance weights for each sequence.
+        log_prefix_weights_1 (list): Log weights from first model.
+        log_prefix_weights_2 (list): Log weights from second model.
+    """
+
+    log_prefix_weights_1: list = None
+    log_prefix_weights_2: list = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.log_prefix_weights_1 is not None:
+            if not isinstance(self.log_prefix_weights_1, np.ndarray):
+                self.log_prefix_weights_1 = np.array(self.log_prefix_weights_1)
+
+        if self.log_prefix_weights_2 is not None:
+            if not isinstance(self.log_prefix_weights_2, np.ndarray):
+                self.log_prefix_weights_2 = np.array(self.log_prefix_weights_2)

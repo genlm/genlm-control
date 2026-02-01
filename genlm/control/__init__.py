@@ -9,13 +9,20 @@ from .potential import (
     WCFG,
     JsonSchema,
     CanonicalTokenization,
+    Ensemble,
+    convert_to_weighted_logop,
+    ByteEnsemble,
 )
 from .sampler import (
     SMC,
+    EnsembleSMC,
+    Sequences,
+    SequencesExt,
     direct_token_sampler,
     eager_token_sampler,
     topk_token_sampler,
     AWRS,
+    ByteEnsembleTokenSampler,
 )
 from .viz import InferenceVisualizer
 
@@ -23,6 +30,9 @@ __all__ = [
     "EOS",
     "EOT",
     "SMC",
+    "EnsembleSMC",
+    "Sequences",
+    "SequencesExt",
     "Potential",
     "PromptedLLM",
     "ByteLLM",
@@ -37,4 +47,8 @@ __all__ = [
     "eager_token_sampler",
     "topk_token_sampler",
     "InferenceVisualizer",
+    "Ensemble",
+    "convert_to_weighted_logop",
+    "ByteEnsemble",
+    "ByteEnsembleTokenSampler",
 ]
