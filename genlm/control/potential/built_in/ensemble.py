@@ -7,6 +7,7 @@ from collections import defaultdict
 from arsenal.maths import logsumexp
 
 from genlm.control.potential.base import Potential
+from genlm.bytes import ByteBeamState, BeamParams
 
 
 class Ensemble(Potential):
@@ -57,6 +58,16 @@ class Ensemble(Potential):
         self.p1 = p1
         self.p2 = p2
         self.op = convert_to_weighted_logop(op, a)
+
+        # Warn if potentials have different vocabularies
+        if set(p1.vocab) != set(p2.vocab):
+            warnings.warn(
+                "Ensemble is being used with potentials that have different vocabularies. "
+                "Consider using ByteEnsemble instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         vocab = list(set(p1.vocab + p2.vocab))
         super().__init__(vocabulary=vocab)
 
@@ -188,7 +199,7 @@ def split_with_atomic_tokens(
                     f"Overlapping atomic tokens detected: {token1!r} and {token2!r}. "
                     "Only the shortest matching prefix will be used."
                 )
-                break  # One warning is enough
+                break
 
     result = []
     i = 0
@@ -268,7 +279,16 @@ class ByteEnsemble(Potential):
 
     @classmethod
     async def create(
-        cls, llm1, llm2, op: str, prompt1: bytes, prompt2: bytes, a: float = 0.5
+        cls,
+        llm1,
+        llm2,
+        op: str,
+        prompt1: bytes,
+        prompt2: bytes,
+        a: float = 0.5,
+        K: int = 5,
+        prune_threshold: float = 0.0,
+        verbose: bool = False,
     ):
         """Factory method to initialize beam states from prompts and return a ByteEnsemble instance.
 
@@ -279,6 +299,9 @@ class ByteEnsemble(Potential):
             prompt1: Prompt bytes for first model
             prompt2: Prompt bytes for second model
             a: Weighting parameter between 0 and 1 (default 0.5 for equal weighting)
+            K: Beam width for beam search (default 5)
+            prune_threshold: Threshold for pruning low-probability beams (default 0.0)
+            verbose: Whether to print verbose beam search output (default False)
 
         Returns:
             ByteEnsemble: Initialized ensemble with beam states ready for sampling
@@ -286,17 +309,13 @@ class ByteEnsemble(Potential):
         Raises:
             RuntimeError: If beam states become empty after prefill
         """
-        from genlm.bytes import ByteBeamState, BeamParams
 
-        # Use reasonable beam parameters - K=5 with moderate pruning
-        # K=1 was too aggressive and caused empty beams
-        beam_params = BeamParams(K=5, prune_threshold=0.0, verbose=False)
+        beam_params = BeamParams(K=K, prune_threshold=prune_threshold, verbose=verbose)
         data_dict_1 = defaultdict()
         data_dict_2 = defaultdict()
 
         async def setup():
             # Initialize beams sequentially to avoid overwhelming vLLM with concurrent requests
-            # This can help prevent "Background loop has errored" errors
             beam1 = await ByteBeamState.initial(llm1, beam_params)
             beam2 = await ByteBeamState.initial(llm2, beam_params)
             # Prefill sequentially as well to reduce concurrent load

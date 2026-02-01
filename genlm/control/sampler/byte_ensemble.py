@@ -7,6 +7,7 @@ from arsenal.maths import logsumexp
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.util import fast_sample_logprobs
 from genlm.control.constant import EOS
+from genlm.control.sampler.sequence import EnsembleSMC
 
 
 class ByteEnsembleTokenSampler(TokenSampler):
@@ -210,8 +211,6 @@ class ByteEnsembleTokenSampler(TokenSampler):
         Raises:
             ImportError: If required SMC components are not available
         """
-        from genlm.control.sampler.sequence import EnsembleSMC
-
         return await EnsembleSMC(self, critic)(
             n_particles=n_particles,
             ess_threshold=ess_threshold,
