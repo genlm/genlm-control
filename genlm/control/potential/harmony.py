@@ -1,21 +1,24 @@
-from genlm.control.potential import Potential
-from genlm.backend import decode_vocab
-from genlm.control.potential.built_in.llm import TokenMappings
-from genlm.control.util import LazyWeights
+import asyncio
+from collections import Counter
+from typing import Any, Union
+
 import numpy as np
 import regex
+
 from genlm.control import EOS
-from collections import Counter
-from typing import Any, Union, Optional
+from genlm.control.potential import Potential
+from genlm.control.potential.built_in.llm import TokenMappings
+from genlm.control.util import LazyWeights
+from genlm.backend import decode_vocab
 
 
 class HarmonyChat:
     """
-    This class encodes the structure of the "assistant" field of the Harmony chat Format,
-    and provides the methods to extract the "harmony channels" from it (analysis, final, commentary).
+    This class encodes the structure of the "assistant" field of the Harmony chat format,
+    and provides methods to extract the "harmony channels" from it (analysis, final, commentary).
 
-    Since it operates on the byte representation of tokens it also provides
-    methods to extract the byte representation from the token ids.
+    Since it operates on the byte representation of tokens, it also provides
+    methods to extract the byte representation from the token IDs.
     """
 
     def __init__(self, tokenizer: Any) -> None:
@@ -28,31 +31,31 @@ class HarmonyChat:
                 as single tokens.
 
         """
-        # Check that the tokenizer object has the minimum required methods:
-        assert (
-            hasattr(tokenizer, "encode")
-            and hasattr(tokenizer, "decode")
-            and hasattr(tokenizer, "apply_chat_template")
-        ), (
-            "The tokenizer object does not have the minimum required methods or attributes."
-        )  # Check that the tokenizer supports the special tokens of the harmony chat format (in such a case, they should all be encoded as single tokens).
-        assert all(
-            len(tokenizer.encode(key)) == 1
-            for key in [
-                "<|start|>",
-                "<|channel|>",
-                "<|message|>",
-                "<|end|>",
-                "<|return|>",
-            ]
-        ), (
-            "The tokenizer does not appear to support the harmony chat format, or does not support the specific format of the current implementation(gpt-oss, August 2025)."
+        # Check that the tokenizer object has the minimum required methods.
+        assert hasattr(tokenizer, "encode"), "Tokenizer is missing the 'encode' method."
+        assert hasattr(tokenizer, "decode"), "Tokenizer is missing the 'decode' method."
+        assert hasattr(tokenizer, "apply_chat_template"), (
+            "Tokenizer is missing the 'apply_chat_template' method."
         )
+
+        # Check that the tokenizer supports the special tokens of the harmony chat format
+        # (in which case they should all be encoded as single tokens).
+        for token in [
+            "<|start|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|end|>",
+            "<|return|>",
+        ]:
+            assert len(tokenizer.encode(token)) == 1, (
+                f"Token {token!r} is not encoded as a single token. "
+                "The tokenizer does not appear to support the harmony chat format."
+            )
 
         self.tokenizer = tokenizer
         _byte_vocab, _ = decode_vocab(
             tokenizer
-        )  # This is the byte representation of the tokenizer's token. Note that it follows the same schema of PromptedLLM.
+        )  # Byte representation of each token. Follows the same schema as PromptedLLM.
         _eos_tokens = [
             _byte_vocab[
                 tokenizer.eos_token_id
@@ -64,7 +67,7 @@ class HarmonyChat:
         )
         self.potential_vocab = self.token_maps.potential_vocab
 
-        # We encode the special tokens that are needed in harmony as instance variables.
+        # Store the byte representation of special tokens needed for harmony channel parsing.
         self.end_token = self.decode_tokens(self.tokenizer.encode("<|end|>"))[0]
         self.message_token = self.decode_tokens(self.tokenizer.encode("<|message|>"))[0]
         self.channel_token = self.decode_tokens(self.tokenizer.encode("<|channel|>"))[0]
@@ -76,8 +79,17 @@ class HarmonyChat:
 
     def extract_channel_content(
         self, token_bytes: list[bytes], i: int
-    ) -> Optional[dict[str, Union[list[bytes], bool]]]:
-        """Extract content between start_idx and end_token."""
+    ) -> dict[str, Union[list[bytes], bool]] | None:
+        """Extract content between the ``<|message|>`` token at position ``i`` and the next ``<|end|>`` token.
+
+        Args:
+            token_bytes (list[bytes]): The full token sequence.
+            i (int): Index of the ``<|message|>`` token.
+
+        Returns:
+            (dict | None): A dict with keys ``"content"`` (list of byte tokens) and
+                ``"is_prefix"`` (bool), or ``None`` if ``i`` is out of bounds.
+        """
 
         if i >= len(token_bytes):
             return None  # pragma: no cover
@@ -94,19 +106,22 @@ class HarmonyChat:
 
     def extract_harmony_channels_from_tokens(
         self, token_bytes: list[bytes]
-    ) -> dict[str, Optional[dict[str, Union[list[bytes], bool]]]]:
-        """
-        Extract analysis, final, and commentary content from token IDs.
+    ) -> dict[str, dict[str, Union[list[bytes], bool]] | None]:
+        """Extract analysis, final, and commentary content from token bytes.
 
         Args:
-            token_bytes: List of token IDs
+            token_bytes (list[bytes]): List of byte tokens.
 
         Returns:
-            Dictionary with extracted channel contents
+            (dict): A dictionary mapping channel names to their extracted content,
+                or ``None`` if the channel is not present.
+
+        Raises:
+            AssertionError: If the token bytes do not form a valid harmony chat.
         """
 
         assert self.validate_harmony_format(token_bytes), (
-            f"The context is not a valid harmony chat{token_bytes}"
+            f"The context is not a valid harmony chat: {token_bytes}"
         )
         results = {"analysis": None, "final": None, "commentary": None}
 
@@ -123,7 +138,7 @@ class HarmonyChat:
                 ):
                     results["analysis"] = self.extract_channel_content(
                         token_bytes, j + len(self.analysis_tokens)
-                    )  # TODO: simplify the extract_channel_content field as we can directly check that the next token is the <|end|> token.
+                    )
                 elif (
                     len(token_bytes) >= j + len(self.final_tokens)
                     and token_bytes[j : j + len(self.final_tokens)] == self.final_tokens
@@ -144,35 +159,35 @@ class HarmonyChat:
 
     def extract_harmony_channels_from_string(
         self, string: str, add_special_tokens: bool = False
-    ) -> dict[str, Optional[dict[str, Union[list[bytes], bool]]]]:
-        """
-        Extract analysis, final, and commentary content from a string.
-        Uses the tokenizer to map from string to token ids and from token ids to token bytes.
-        Then calls the "extract_harmony_channels_from_tokens" method.
+    ) -> dict[str, dict[str, Union[list[bytes], bool]] | None]:
+        """Extract analysis, final, and commentary content from a string.
+
+        Uses the tokenizer to map from string to token IDs and from token IDs to token bytes,
+        then calls :meth:`extract_harmony_channels_from_tokens`.
 
         Args:
-        string: The harmony chat format string to extract channels from
-        add_special_tokens: Whether to add special tokens during encoding (default: False)
+            string (str): The harmony chat format string to extract channels from.
+            add_special_tokens (bool): Whether to add special tokens during encoding.
 
         Returns:
-            Dictionary with extracted channel contents (same format as extract_harmony_channels_from_tokens)
+            (dict): A dictionary mapping channel names to their extracted content
+                (same format as :meth:`extract_harmony_channels_from_tokens`).
         """
         token_ids = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
         token_bytes = self.decode_tokens(token_ids)
         return self.extract_harmony_channels_from_tokens(token_bytes)
 
     def encode_tokens(self, tokens: list[bytes]) -> list[int]:
-        """Encode a list of byte tokens to a list of token IDs in
-        the underlying language model's vocabulary.
+        """Encode a list of byte tokens to token IDs in the language model's vocabulary.
 
         Args:
-            tokens (list[bytes]): List of byte tokens to encode
+            tokens (list[bytes]): List of byte tokens to encode.
 
         Returns:
             (list[int]): A list of token IDs corresponding to the input tokens.
 
         Raises:
-            ValueError: If any token is not in the vocabulary
+            ValueError: If any token is not in the vocabulary.
         """
         assert all(isinstance(x, bytes) for x in tokens), "Tokens must be bytes"
         try:
@@ -183,8 +198,7 @@ class HarmonyChat:
             ) from e  # pragma: no cover
 
     def decode_tokens(self, ids: list[int]) -> list[bytes]:
-        """
-        Decode a list of token IDs in the language model's vocabulary to a list of byte tokens.
+        """Decode a list of token IDs to byte tokens.
 
         Args:
             ids (list[int]): A list of token IDs in the language model's vocabulary.
@@ -196,19 +210,20 @@ class HarmonyChat:
         return [self.token_maps.decode[x] for x in ids]
 
     def validate_harmony_format(self, context: Union[str, list[bytes]]) -> bool:
-        """
-        This pattern validates that the context is a valid harmony chat.
-        In particular, we validate the "assistant" user field of the chat format, which
-        are generated by the language model.
-        Args: context : can be both a string or a list of bytes tokens.
-        Returns:
-            True if the context is a valid harmony chat, False otherwise.
-        """
-        # Convert list of bytes tokens to string
+        """Validate that the context is a valid harmony chat.
 
+        Validates the "assistant" field of the chat format, which is generated
+        by the language model.
+
+        Args:
+            context (str | list[bytes]): A string or a list of byte tokens.
+
+        Returns:
+            (bool): ``True`` if the context is a valid harmony chat, ``False`` otherwise.
+        """
         if (
             isinstance(context, list) and len(context) > 0 and context[-1] == EOS
-        ):  # remove the EOS token if it is present
+        ):  # Remove the EOS token if present.
             context = context[:-1]  # pragma: no cover
 
         if isinstance(context, list) and all(isinstance(x, bytes) for x in context):
@@ -244,32 +259,58 @@ class HarmonyChat:
         channel_types = match.captures(1)
         counts = Counter(
             channel_types
-        )  # Validate the hypothesis that each channel is used at most once in a turn.
+        )  # Validate that each channel is used at most once in a turn.
         if any(count > 1 for count in counts.values()):
             return False  # pragma: no cover
         return True
 
 
+VALID_CHANNELS = {"analysis", "final", "commentary"}
+
+
 class HarmonyPotential(Potential):
+    """A potential that applies a base constraint to specific channels of the Harmony chat format.
+
+    The Harmony chat format structures LLM output into named channels (analysis, final, commentary).
+    This potential extracts the content of specified channels and evaluates them under a base
+    potential, leaving unconstrained channels free.
+
+    Attributes:
+        base_potential (Potential): The potential applied to constrained channel contents.
+        harmony_chat (HarmonyChat): Parser for the Harmony chat format.
+        constrained_channels (list[str]): Channels to which the base potential is applied.
+    """
+
     def __init__(
         self,
         base_potential: Potential,
         llm_tokenizer: Any,
-        constrained_channels: Optional[list[str]] = None,
+        constrained_channels: list[str],
     ) -> None:
+        """Initialize the HarmonyPotential.
+
+        Args:
+            base_potential (Potential): A base potential applied to the constrained channels.
+            llm_tokenizer: A tokenizer that supports the harmony chat format.
+            constrained_channels (list[str]): A non-empty list of channels to constrain.
+                Each element must be one of ``"analysis"``, ``"final"``, or ``"commentary"``.
+
+        Raises:
+            ValueError: If ``constrained_channels`` is empty or contains invalid channel names.
+            AssertionError: If the base potential's vocabulary is not a subset of the
+                harmony potential's vocabulary.
         """
-        Inputs:
-            Base Potential: a base potential which is applied to the context channels.
-            llm_tokenizer: a tokenizer of a language model that supports the harmony chat format. NB: we need to verify whether the format is still evolving or not.
-            Constrained Channels: A list of channels to which the base potential is applied.
-        Importantly, for compatibility with the genlm library, we assume that the tokens are represented as bytes.
-        """  # Need to adapt the coerce method so that it does not prune the vocabulary -->(This would cause an error when sampling from channels that we do not want to constrain)
+        if not constrained_channels:
+            raise ValueError("constrained_channels must be a non-empty list.")
+        invalid = set(constrained_channels) - VALID_CHANNELS
+        if invalid:
+            raise ValueError(
+                f"Invalid channel names: {invalid}. Must be one of {VALID_CHANNELS}."
+            )
 
         self.base_potential = base_potential
         self.harmony_chat = HarmonyChat(llm_tokenizer)
-        self.constrained_channels = (
-            constrained_channels or []
-        )  # default to empty list if no channels are provided.
+        self.constrained_channels = constrained_channels
 
         super().__init__(self.harmony_chat.potential_vocab)
 
@@ -277,75 +318,88 @@ class HarmonyPotential(Potential):
             "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
         )
 
-    def set_constrained_channels(self, constrained_channels: list[str]) -> None:
-        """
-        A list of channels to be constrained.
-        """
-        assert isinstance(constrained_channels, list) and all(
-            x in {"analysis", "final", "commentary"} for x in constrained_channels
-        ), "Constrained channels must be one of analysis, final, or commentary."
-        self.constrained_channels = constrained_channels
-
     async def complete(self, context: list[bytes]) -> float:
-        """
-        Input: a list of bytes tokens.
-        The Log probability of the constrained channels of the context.
-        To each context we apply the complete potential, as if the string was completed.
-        """
-        channels = self.harmony_chat.extract_harmony_channels_from_tokens(
-            context
-        )  # Extract the channels from the context.
+        """Compute the log weight of the constrained channels as complete sequences.
 
-        log_weight = (
-            0  # Note that if no channel to be constrained is detected we return 0
-        )
-        for key in channels:
-            if channels[key] is not None and key in self.constrained_channels:
-                log_weight += await self.base_potential.complete(
-                    channels[key]["content"]
-                )  # We accumulate in log space the product of all the channels to be constrained.
-                # Note that we don't care whether the channel is marked as complete.
-                # In fact if the content of the channels to be constrained is not a complete valid string
-                # the complete potential should be -inf.
+        Args:
+            context (list[bytes]): A list of byte tokens.
 
-        return log_weight
+        Returns:
+            (float): The sum (in log space) of the base potential's complete weight for each
+                constrained channel. Returns 0 if no constrained channel is present.
+        """
+        channels = self.harmony_chat.extract_harmony_channels_from_tokens(context)
+
+        coroutines = [
+            self.base_potential.complete(channels[key]["content"])
+            for key in channels
+            if channels[key] is not None and key in self.constrained_channels
+        ]
+        if not coroutines:
+            return 0.0
+        results = await asyncio.gather(*coroutines)
+        return sum(results)
 
     async def prefix(self, context: list[bytes]) -> float:
+        """Compute the log weight of the constrained channels as a prefix.
+
+        Each constrained channel is evaluated with the base potential: completed
+        channels use ``complete``, while the currently open channel uses ``prefix``.
+
+        Args:
+            context (list[bytes]): A list of byte tokens.
+
+        Returns:
+            (float): The sum (in log space) of the base potential's weight for each
+                constrained channel. Returns 0 if no constrained channel is present.
         """
-        Input: A list of byte tokens in bytes format.
-        Note that each channel to be constrained is extracted from the context.
-        and depending on whether the string is complete or not, the complete or prefix potential is applied.
-        Output: The sum of the log probabilities of the constrained channels, according to the base potential.
-        If one of the channels is not marked as complete, it is evaluated as a prefix according to the base potential.
-        """
-        channels = self.harmony_chat.extract_harmony_channels_from_tokens(
-            context
-        )  # Extract the channels from the context.
-        log_weight = 0
+        channels = self.harmony_chat.extract_harmony_channels_from_tokens(context)
+        coroutines = []
         for key in channels:
             if channels[key] is not None and key in self.constrained_channels:
                 if channels[key]["is_prefix"]:
-                    log_weight += await self.base_potential.prefix(
-                        channels[key]["content"]
+                    coroutines.append(
+                        self.base_potential.prefix(channels[key]["content"])
                     )
-                else:  # Note that to compute the prefix weight, we also accumulate the weight of the channels that have been completed so far.
-                    log_weight += await self.base_potential.complete(
-                        channels[key]["content"]
+                else:
+                    # Completed channels also contribute to the prefix weight.
+                    coroutines.append(
+                        self.base_potential.complete(channels[key]["content"])
                     )
-        return log_weight
+        if not coroutines:
+            return 0.0
+        results = await asyncio.gather(*coroutines)
+        return sum(results)
 
     async def logw_next(self, context: list[bytes]) -> LazyWeights:
-        """
-        Input: A list of byte tokens in bytes format.
-        Output: The sum of log probabilities for the next token logprobs for each possible next-token, including the EOS symbol.
+        """Compute next-token log weights for each possible next token, including EOS.
+
+        Args:
+            context (list[bytes]): A list of byte tokens.
+
+        Returns:
+            (LazyWeights): Weights of each token in the vocabulary and EOS.
+
+        Note:
+            In the harmony chat format, the analysis and commentary channels are
+            closed by the ``<|end|>`` token, while the final channel is closed by
+            ``<|return|>`` (which also closes the chat and halts generation).
+
+            The base potential uses the built-in EOS symbol to represent "the
+            constrained string ends here." We need to remap this to the token
+            the LLM actually emits to close the channel:
+
+            - **analysis/commentary**: Move the base potential's EOS weight to the
+              ``<|end|>`` token and set EOS to -inf, since generation must not halt
+              mid-turn.
+            - **final**: No remapping needed, because ``PromptedLLM`` already moves
+              ``<|return|>`` probability to EOS, so the base potential and the LLM
+              are already aligned.
         """
 
-        channels = self.harmony_chat.extract_harmony_channels_from_tokens(
-            context
-        )  # Extract the channels from the context.
+        channels = self.harmony_chat.extract_harmony_channels_from_tokens(context)
 
         next_token_weights = self.make_lazy_weights(np.zeros(len(self.vocab_eos)))
-
         incomplete_channels = {
             key
             for key in channels
@@ -356,8 +410,7 @@ class HarmonyPotential(Potential):
         )
 
         if len(incomplete_channels) == 0:
-            return next_token_weights  # If there are no incomplete channels, # pragma: no cover
-            # we can return the weights as is. Every possible next token is valid for the harmony format.
+            return next_token_weights  # pragma: no cover
 
         key = incomplete_channels.pop()
         if key is not None and key in self.constrained_channels:
@@ -367,24 +420,22 @@ class HarmonyPotential(Potential):
                 raise ValueError(  # pragma: no cover
                     f"Context {channels[key]['content']!r} has weight zero under `prefix`."
                 )
+
             next_token_weights.weights += (
                 await self.base_potential.logw_next(channels[key]["content"])
-            ).weights  # This should directly return the normalized next-token log weights.
-            EOS_weight = next_token_weights.weights[-1]  # Keep track of the EOS weight.
+            ).weights
 
-            if (
-                key == "analysis" or key == "commentary"
-            ):  # In this case, the EOS weight needs to be moved to the <|end|> token.
+            if key == "analysis" or key == "commentary":
+                # The base potential's EOS weight represents "string is complete."
+                # Remap it to <|end|> (which the LLM emits to close these channels)
+                # and set EOS to -inf to prevent the LLM from halting mid-turn.
+                eos_weight = next_token_weights.weights[-1]
                 idx = next_token_weights.encode[self.harmony_chat.end_token]
-                next_token_weights.weights[idx] = (
-                    EOS_weight  # Move the EOS weight to <|end|>, which is the token that will be sampled by the llm to close the channel.
-                )
-                next_token_weights.weights[-1] = float(
-                    "-inf"
-                )  # Set the EOS weight to -inf.
-            elif (
-                key == "final"
-            ):  # If the channel is final, the prompted LLM automatically moves the weight of <|return|> to EOS. so we don't have to do anything else.
-                pass
+                next_token_weights.weights[idx] = eos_weight
+                next_token_weights.weights[-1] = float("-inf")
 
-        return next_token_weights  # we return the normalized next-token weights.
+            # For the final channel, no remapping is needed: PromptedLLM already
+            # maps <|return|> to EOS, so the base potential's EOS weight is
+            # already aligned with the LLM's halting token.
+
+        return next_token_weights

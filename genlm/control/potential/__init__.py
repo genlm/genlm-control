@@ -4,8 +4,17 @@ from .multi_proc import MultiProcPotential
 from .operators import PotentialOps
 from .product import Product
 from .coerce import Coerced
+from .harmony import HarmonyPotential, HarmonyChat
 
-from .built_in import PromptedLLM, WCFG, BoolCFG, WFSA, BoolFSA, JsonSchema, CanonicalTokenization
+from .built_in import (
+    PromptedLLM,
+    WCFG,
+    BoolCFG,
+    WFSA,
+    BoolFSA,
+    JsonSchema,
+    CanonicalTokenization,
+)
 
 __all__ = [
     "Potential",
@@ -21,4 +30,6 @@ __all__ = [
     "AutoBatchedPotential",
     "MultiProcPotential",
     "Coerced",
+    "HarmonyPotential",
+    "HarmonyChat",
 ]
