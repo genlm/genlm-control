@@ -82,7 +82,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
     ####################
 
     @abstractmethod
-    async def complete(self, context):
+    async def complete(self, context) -> float:
         """Assess the weight of `context` as a complete sequence.
 
         Args:
@@ -91,10 +91,10 @@ class Potential(ABC, PotentialOps, PotentialTests):
         Returns:
             (float): Log weight of the context under the language.
         """
-        pass  # pragma: no cover
+        return 0.0  # pragma: no cover
 
     @abstractmethod
-    async def prefix(self, context):
+    async def prefix(self, context) -> float:
         """Assess the weight of `context` as a prefix.
 
         Args:
@@ -103,7 +103,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
         Returns:
             (float): Log weight of the context as a prefix.
         """
-        pass  # pragma: no cover
+        return 0.0  # pragma: no cover
 
     async def score(self, context):
         """Assess the weight of `context` based on EOS-termination.

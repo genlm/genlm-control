@@ -212,8 +212,9 @@ BAD_WHITESPACE = regex.compile(rb"(?:\n\s*\n)")
 VALID_JSON_START = regex.compile(rb'^[ \n]{0,2}\[|\{|"|(-?[0-9])|[nft]')
 
 
-def JsonSchema(schema):
-    Draft7Validator.check_schema(schema)
+def JsonSchema(schema, validate=True):
+    if validate:
+        Draft7Validator.check_schema(schema)
     return ParserPotential(json_schema_parser(schema)) * FullValidatorJsonSchema(schema)
 
 
@@ -722,9 +723,7 @@ class PatriciaTrie:
                     if node.prefix[i] != value[i]:
                         break
                 else:  # pragma: no cover
-                    assert False, (
-                        f"{value} and {node.prefix} should have a different char at this point."
-                    )
+                    assert False, f"{value} and {node.prefix} should have a different char at this point."
                 split_node(node, i)
                 assert value.startswith(node.prefix)
 

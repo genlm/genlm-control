@@ -111,9 +111,9 @@ def test_empty_context_mask(llm):  # Use the llm fixture
 
     assert isinstance(mask, np.ndarray), "Mask should be a numpy array"
     assert mask.dtype == bool, "Mask dtype should be boolean"
-    assert len(mask) == filter_instance.V, (
-        f"Mask length ({len(mask)}) should equal vocab size ({filter_instance.V})"
-    )
+    assert (
+        len(mask) == filter_instance.V
+    ), f"Mask length ({len(mask)}) should equal vocab size ({filter_instance.V})"
     assert np.all(mask), "Mask should be all True for an empty context"
 
 
@@ -148,14 +148,14 @@ async def test_logw_next_canonical(canonical_potential):
     non_canonical_next_bytes = b"tion"
     logw = await canonical_potential.logw_next(context)
     # Assert canonical next token is allowed (weight is not -inf)
-    assert logw[canonical_next_bytes] != float("-inf"), (
-        f"Canonical next token {canonical_next_bytes!r} should be allowed"
-    )
+    assert logw[canonical_next_bytes] != float(
+        "-inf"
+    ), f"Canonical next token {canonical_next_bytes!r} should be allowed"
 
     # Assert non-canonical next token is disallowed (weight is -inf)
-    assert logw[non_canonical_next_bytes] == float("-inf"), (
-        f"Non-canonical next token {non_canonical_next_bytes!r} should be disallowed"
-    )
+    assert logw[non_canonical_next_bytes] == float(
+        "-inf"
+    ), f"Non-canonical next token {non_canonical_next_bytes!r} should be disallowed"
 
 
 @pytest.mark.asyncio
@@ -173,17 +173,17 @@ async def test_set_overrides(canonical_potential):
 
     # Test override (198, 198) -> \n\n
     logw_198 = await canonical_potential.logw_next([token_198_bytes])
-    assert logw_198[token_198_bytes] != float("-inf"), (
-        "Override (198, 198) failed in logw_next"
-    )
+    assert logw_198[token_198_bytes] != float(
+        "-inf"
+    ), "Override (198, 198) failed in logw_next"
     assert (
         await canonical_potential.complete([token_198_bytes, token_198_bytes]) == 0.0
     ), "Override (198, 198) failed in complete"
 
     logw_2637 = await canonical_potential.logw_next([token_2637_bytes])
-    assert logw_2637[token_82_bytes] != float("-inf"), (
-        "Override (2637, 82) failed in logw_next"
-    )
+    assert logw_2637[token_82_bytes] != float(
+        "-inf"
+    ), "Override (2637, 82) failed in logw_next"
     assert (
         await canonical_potential.complete([token_2637_bytes, token_82_bytes]) == 0.0
     ), "Override (2637, 82) failed in complete"
@@ -235,16 +235,18 @@ def test_from_llm_extract_merges_slow_tokenizer():
     filter_instance = FastCanonicalityFilterBPE.from_tokenizer(
         mock_llm.model.tokenizer, mock_llm.token_maps.eos_idxs
     )
-    assert filter_instance._merges, (
-        "Merges should be extracted from the slow GPT2 tokenizer."
-    )
+    assert (
+        filter_instance._merges
+    ), "Merges should be extracted from the slow GPT2 tokenizer."
     # Check a known merge (example: 'a' + 't' -> 'at')
     g_id = tokenizer.encode("a")[0]
     t_id = tokenizer.encode("t")[0]
     gt_id = tokenizer.encode("at")[0]
-    assert (g_id, t_id, gt_id) in filter_instance._merges, (
-        "Known merge (a, t) not found in extracted merges."
-    )
+    assert (
+        g_id,
+        t_id,
+        gt_id,
+    ) in filter_instance._merges, "Known merge (a, t) not found in extracted merges."
 
 
 def test_from_llm_extract_merges_fallback():
@@ -257,9 +259,9 @@ def test_from_llm_extract_merges_fallback():
     mock_llm = MockLLM(tokenizer)
 
     # Assert that MockLLM skipped its super init due to the unsupported tokenizer
-    assert mock_llm.token_maps is None, (
-        "MockLLM should have token_maps=None for unsupported tokenizer"
-    )
+    assert (
+        mock_llm.token_maps is None
+    ), "MockLLM should have token_maps=None for unsupported tokenizer"
 
     # Directly calling from_tokenizer should still raise the ValueError from decode_vocab
     with pytest.raises(ValueError, match="Could not decode byte representation"):

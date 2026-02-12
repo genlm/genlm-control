@@ -7,13 +7,22 @@ from .coerce import Coerced
 from .harmony import HarmonyPotential, HarmonyChat
 
 from .built_in import (
+    (
     PromptedLLM,
+    ByteLLM,
+   
     WCFG,
+   
     BoolCFG,
+   
     WFSA,
+   
     BoolFSA,
+   
     JsonSchema,
+   
     CanonicalTokenization,
+),
 )
 
 __all__ = [
@@ -21,6 +30,7 @@ __all__ = [
     "PotentialOps",
     "Product",
     "PromptedLLM",
+    "ByteLLM",
     "JsonSchema",
     "WCFG",
     "BoolCFG",
