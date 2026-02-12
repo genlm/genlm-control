@@ -13,12 +13,22 @@ from genlm.backend import decode_vocab
 
 
 class HarmonyChat:
-    """
-    This class encodes the structure of the "assistant" field of the Harmony chat format,
-    and provides methods to extract the "harmony channels" from it (analysis, final, commentary).
+    """Encodes the structure of the "assistant" field of the Harmony chat format.
 
-    Since it operates on the byte representation of tokens, it also provides
-    methods to extract the byte representation from the token IDs.
+    Provides methods to extract the "harmony channels" (analysis, final, commentary)
+    from it. Since it operates on the byte representation of tokens, it also provides
+    methods to convert between token IDs and byte representations.
+
+    Attributes:
+        tokenizer: The tokenizer used to encode and decode tokens.
+        token_maps (TokenMappings): Mappings between token IDs and byte representations.
+        potential_vocab (list[bytes]): The byte vocabulary used by potentials.
+        end_token (bytes): Byte representation of the ``<|end|>`` token.
+        message_token (bytes): Byte representation of the ``<|message|>`` token.
+        channel_token (bytes): Byte representation of the ``<|channel|>`` token.
+        analysis_tokens (list[bytes]): Byte representation of the ``"analysis"`` string.
+        final_tokens (list[bytes]): Byte representation of the ``"final"`` string.
+        commentary_tokens (list[bytes]): Byte representation of the ``"commentary"`` string.
     """
 
     def __init__(self, tokenizer: Any) -> None:
