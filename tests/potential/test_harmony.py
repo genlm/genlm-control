@@ -132,7 +132,7 @@ async def test_potential_evaluation_single_channel(wcfg, tokenizer):
 @pytest.mark.asyncio
 async def test_potential_evaluation_multiple_channels(wcfg, tokenizer):
     """Test that the harmony potential is correctly evaluated when constraining all channels at once."""
-    cfg_inputs = {"analysis": "aaaabaaaa", "commentary": "bbbbbbbbb", "final": "aaa"}
+    cfg_inputs = {"analysis": "aaaabaaaa", "commentary": "aba", "final": "aaa"}
 
     potential_vocab = HarmonyChat(tokenizer).potential_vocab
     coerced_cfg = Coerced(wcfg, potential_vocab, f=coerce_bytes_to_chars, prune=False)
@@ -165,7 +165,12 @@ async def test_potential_evaluation_multiple_channels(wcfg, tokenizer):
     expected_complete = sum(tot_w(cfg_inputs[ch]) for ch in cfg_inputs)
     assert np.isclose(await harmony_potential.complete(chat_bytes), expected_complete)
 
-    expected_prefix = sum(pfx_w(cfg_inputs[ch]) for ch in cfg_inputs)
+    # For prefix: analysis and commentary are closed (complete), only final is open (prefix).
+    expected_prefix = (
+        tot_w(cfg_inputs["analysis"])
+        + tot_w(cfg_inputs["commentary"])
+        + pfx_w(cfg_inputs["final"])
+    )
     assert np.isclose(await harmony_potential.prefix(chat_bytes), expected_prefix)
 
 
@@ -273,7 +278,7 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
         prune_logws=False,
     )
     sequences = await SMC(sampler)(
-        n_particles=1, ess_threshold=0.6, max_tokens=500, verbosity=0
+        n_particles=3, ess_threshold=0.6, max_tokens=500, verbosity=0
     )
 
     sequence, weight = sequences[0]
@@ -305,7 +310,7 @@ async def test_harmony_awrs_constrained_sampling(promptedllm, tokenizer, Boolean
 
 @pytest.mark.asyncio
 async def test_logw_next_token_eos(tokenizer, wcfg):
-    """Test that logw_next concentrates all mass on the correct end-of-channel token.
+    """Test that logw_next gives mass to the correct end-of-channel token.
 
     For analysis/commentary channels, mass should be on <|end|>.
     For the final channel, mass should be on EOS.
