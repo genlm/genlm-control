@@ -3,7 +3,7 @@ import numpy as np
 import scipy.sparse as sp
 from collections import defaultdict
 from genlm.control.potential.base import Potential
-from genlm.backend.tokenization import decode_vocab
+from genlm.backend.tokenization import decode_vocab, Token
 from genlm.control.potential.built_in.llm import PromptedLLM
 
 VERYLARGE = 10000000
@@ -128,10 +128,9 @@ class FastCanonicalityFilterBPE:
             mask = np.ones(self.V, dtype=bool)
         else:
             (_, last_token) = context
-            # Extract byte_string from Token object
             last_token_bytes = (
                 last_token.byte_string
-                if hasattr(last_token, "byte_string")
+                if isinstance(last_token, Token)
                 else last_token
             )
 
@@ -415,10 +414,9 @@ class CanonicalTokenization(Potential):
             # print("percent of mask: ", np.sum(mask)*100 / len(mask))
 
             # Find token_id in the canonicality filter's vocabulary
-            # Extract byte_string from Token object
             current_token_bytes = (
                 current_token.byte_string
-                if hasattr(current_token, "byte_string")
+                if isinstance(current_token, Token)
                 else current_token
             )
 

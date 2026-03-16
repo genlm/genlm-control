@@ -5,6 +5,7 @@ from arsenal.datastructures import LocatorMaxHeap
 from abc import ABC, abstractmethod
 
 from genlm.control.util import load_async_trie
+from genlm.backend.tokenization import Token
 
 
 class SetSampler(ABC):
@@ -70,12 +71,12 @@ class TrieSetSampler(SetSampler):
         self.iter_potential = iter_potential
         self.item_potential = item_potential
 
-        # Coercion function: flatten iter tokens to item tokens
-        # Handles Token objects by extracting byte_string
+        # Coercion function: flatten iter tokens to item tokens (byte integers).
+        # Token.byte_string is bytes; extending with bytes appends individual byte ints.
         def coerce_fn(context):
             result = []
             for items in context:
-                if hasattr(items, "byte_string"):
+                if isinstance(items, Token):
                     result.extend(items.byte_string)
                 else:
                     result.extend(items)
@@ -99,7 +100,7 @@ class TrieSetSampler(SetSampler):
 
         # Get word2leaf key for each token
         def get_word_key(token):
-            if hasattr(token, "byte_string"):
+            if isinstance(token, Token):
                 return (token.byte_string, token.token_id)
             return token
 

@@ -1,4 +1,5 @@
 from genlm.control.potential import Potential
+from genlm.backend.tokenization import Token
 from itertools import chain
 import asyncio
 
@@ -55,30 +56,28 @@ class Coerced(Potential):
         self.f = f
 
         if prune:
-            # Extract items from potential.vocab for comparison
-            # For Token objects, extract byte values from byte_string to match set() behavior
-            if potential.vocab and hasattr(potential.vocab[0], "byte_string"):
-                potential_bytes = set()
+            # Build the set of items that exist in the base potential's vocabulary.
+            # For Token-based vocabs, we collect individual byte values (ints) since
+            # the coercion function f (typically b"".join) produces bytes, and
+            # set(bytes_obj) yields the set of byte-value ints it contains.
+            if potential.vocab and isinstance(potential.vocab[0], Token):
+                potential_items = set()
                 for tok in potential.vocab:
-                    potential_bytes.update(
-                        tok.byte_string
-                    )  # Add byte values (integers)
+                    potential_items.update(tok.byte_string)
             else:
-                potential_bytes = set(potential.vocab)
+                potential_items = set(potential.vocab)
 
-            # Check if target_vocab contains Token objects
-            has_token_objects = target_vocab and hasattr(target_vocab[0], "byte_string")
+            has_token_objects = target_vocab and isinstance(target_vocab[0], Token)
 
             tokens = []
             for target_token in target_vocab:
-                # If target_token is a Token object, extract byte_string for the coercion function
                 if has_token_objects:
                     target_token_for_f = [target_token.byte_string]
                 else:
                     target_token_for_f = [target_token]
 
                 base_token = f(target_token_for_f)
-                if set(base_token) <= potential_bytes:
+                if set(base_token) <= potential_items:
                     tokens.append(target_token)
         else:
             tokens = target_vocab
@@ -87,7 +86,7 @@ class Coerced(Potential):
             raise ValueError("No valid tokens found in target vocabulary")
 
         # Store whether vocab contains Token objects for efficient extraction
-        self._has_token_vocab = tokens and hasattr(tokens[0], "byte_string")
+        self._has_token_vocab = tokens and isinstance(tokens[0], Token)
 
         super().__init__(tokens)
 
@@ -97,7 +96,7 @@ class Coerced(Potential):
             return context
 
         return [
-            tok.byte_string if hasattr(tok, "byte_string") else tok for tok in context
+            tok.byte_string if isinstance(tok, Token) else tok for tok in context
         ]
 
     def _batch_f(self, contexts):

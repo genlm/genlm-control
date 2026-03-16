@@ -3,6 +3,7 @@ from genlm.grammar import Float, Log
 from arsenal.maths import logsumexp
 
 from genlm.control.constant import EndOfSequence
+from genlm.backend.tokenization import Token
 
 
 class LazyWeights:
@@ -31,10 +32,7 @@ class LazyWeights:
             AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
         assert len(weights) == len(decode)
-        # encode can have multiple keys per token (e.g., Token and bytes), so >= is correct
-        assert len(encode) >= len(
-            decode
-        ), f"encode must have at least as many entries as decode: {len(encode)} >= {len(decode)}"
+        assert len(encode) == len(decode)
 
         self.weights = weights
         self.encode = encode
@@ -55,13 +53,10 @@ class LazyWeights:
         if token in self.encode:
             return self.weights[self.encode[token]]
 
-        # If token is bytes, search for a Token with matching byte_string
+        # Fallback: if token is bytes, search for a Token with matching byte_string
         if isinstance(token, bytes):
             for vocab_token in self.decode:
-                if (
-                    hasattr(vocab_token, "byte_string")
-                    and vocab_token.byte_string == token
-                ):
+                if isinstance(vocab_token, Token) and vocab_token.byte_string == token:
                     return self.weights[self.encode[vocab_token]]
 
         return float("-inf") if self.is_log else 0

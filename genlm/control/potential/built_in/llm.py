@@ -57,21 +57,18 @@ class TokenMappings(NamedTuple):
 
         eos_tokens_set = set(eos_tokens)
 
+        # First pass: find the first Token for each EOS byte_string
         eos_byte_to_token = {}  # byte_string -> Token object (first match)
-        potential_vocab = []
-
         for token in decode:
             if token.byte_string in eos_tokens_set:
-                if token.byte_string in eos_byte_to_token:
+                if token.byte_string not in eos_byte_to_token:
+                    eos_byte_to_token[token.byte_string] = token
+                else:
                     warnings.warn(
                         f"Multiple tokens with EOS byte_string {token.byte_string!r}. "
                         f"Using first match (token_id={eos_byte_to_token[token.byte_string].token_id}).",
                         UserWarning,
                     )
-                else:
-                    eos_byte_to_token[token.byte_string] = token
-            else:
-                potential_vocab.append(token)
 
         # Verify all EOS tokens were found
         missing = eos_tokens_set - set(eos_byte_to_token.keys())
@@ -81,6 +78,12 @@ class TokenMappings(NamedTuple):
         # Build lists in order of eos_tokens input
         eos_token_objs = [eos_byte_to_token[eos] for eos in eos_tokens]
         eos_idxs = [t.token_id for t in eos_token_objs]
+
+        # Second pass: build potential_vocab excluding only the designated EOS Token objects
+        eos_token_ids = set(eos_idxs)
+        potential_vocab = [
+            token for token in decode if token.token_id not in eos_token_ids
+        ]
 
         return cls(
             decode=decode,

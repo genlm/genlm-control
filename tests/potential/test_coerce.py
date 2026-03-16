@@ -115,29 +115,10 @@ def test_coerced_no_prune():
     assert set(c.vocab) == {b"aa", b"bb", b"aab", b"aad"}
 
 
-class MockToken:
-    """Mock Token object with byte_string attribute."""
-
-    def __init__(self, token_id, byte_string):
-        self.token_id = token_id
-        self.byte_string = byte_string
-
-    def __repr__(self):
-        return f"MockToken({self.token_id}, {self.byte_string!r})"
-
-    def __hash__(self):
-        return hash((self.token_id, self.byte_string))
-
-    def __eq__(self, other):
-        if isinstance(other, MockToken):
-            return (
-                self.token_id == other.token_id
-                and self.byte_string == other.byte_string
-            )
-        return False
+from genlm.backend.tokenization import Token
 
 
-class MockTokenPotential(Potential):
+class TokenPotential(Potential):
     """Mock potential with Token-based vocabulary."""
 
     def __init__(self, tokens):
@@ -153,14 +134,14 @@ class MockTokenPotential(Potential):
 def test_coerced_with_token_vocab():
     """Test Coerced with Token-based potential vocabulary (exercises byte_string extraction)."""
     tokens = [
-        MockToken(0, b"a"),
-        MockToken(1, b"b"),
-        MockToken(2, b"c"),
+        Token(0, b"a"),
+        Token(1, b"b"),
+        Token(2, b"c"),
     ]
-    p = MockTokenPotential(tokens)
+    p = TokenPotential(tokens)
     target = [b"aa", b"bb", b"aab", b"aad"]
     c = Coerced(p, target, f=b"".join, prune=True)
 
     assert len(c.vocab) == 3
     assert set(c.vocab) == {b"aa", b"bb", b"aab"}
-    assert hasattr(p.vocab[0], "byte_string")
+    assert isinstance(p.vocab[0], Token)
