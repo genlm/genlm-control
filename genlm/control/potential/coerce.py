@@ -56,27 +56,20 @@ class Coerced(Potential):
         self.f = f
 
         if prune:
-            # Build the set of items that exist in the base potential's vocabulary.
-            # For Token-based vocabs, we collect individual byte values (ints) since
-            # the coercion function f (typically b"".join) produces bytes, and
-            # set(bytes_obj) yields the set of byte-value ints it contains.
+            # When vocab contains Token objects (bytes subclass), the coercion
+            # function f (typically b"".join) produces bytes. set(bytes) yields
+            # int byte values, so we need potential_items to also be int byte
+            # values for the subset check to work.
             if potential.vocab and isinstance(potential.vocab[0], Token):
-                potential_items = set()
-                for tok in potential.vocab:
-                    potential_items.update(tok.byte_string)
+                potential_items = set(
+                    byte_val for tok in potential.vocab for byte_val in tok.byte_string
+                )
             else:
                 potential_items = set(potential.vocab)
 
-            has_token_objects = target_vocab and isinstance(target_vocab[0], Token)
-
             tokens = []
             for target_token in target_vocab:
-                if has_token_objects:
-                    target_token_for_f = [target_token.byte_string]
-                else:
-                    target_token_for_f = [target_token]
-
-                base_token = f(target_token_for_f)
+                base_token = f([target_token])
                 if set(base_token) <= potential_items:
                     tokens.append(target_token)
         else:
@@ -85,39 +78,23 @@ class Coerced(Potential):
         if not tokens:
             raise ValueError("No valid tokens found in target vocabulary")
 
-        # Store whether vocab contains Token objects for efficient extraction
-        self._has_token_vocab = tokens and isinstance(tokens[0], Token)
-
         super().__init__(tokens)
 
-    def _extract_bytes(self, context):
-        """Extract byte_strings from Token objects in context for the coercion function."""
-        if not self._has_token_vocab:
-            return context
-
-        return [
-            tok.byte_string if isinstance(tok, Token) else tok for tok in context
-        ]
-
     def _batch_f(self, contexts):
-        return [self.f(self._extract_bytes(context)) for context in contexts]
+        return [self.f(context) for context in contexts]
 
     async def complete(self, context):
-        return await self.potential.complete(
-            context=self.f(self._extract_bytes(context))
-        )
+        return await self.potential.complete(context=self.f(context))
 
     async def prefix(self, context):
-        return await self.potential.prefix(context=self.f(self._extract_bytes(context)))
+        return await self.potential.prefix(context=self.f(context))
 
     async def logw_next(self, context):
         Ws = self.alloc_logws()
-        ctx = self.f(self._extract_bytes(context))
+        ctx = self.f(context)
         ctx_w = await self.potential.prefix(ctx)
         Ws[-1] = await self.potential.complete(ctx) - ctx_w
-        exts = [
-            self.f(self._extract_bytes(list(chain(context, [x])))) for x in self.vocab
-        ]  # slow!!
+        exts = [self.f(chain(context, [x])) for x in self.vocab]  # slow!!
         Ws[:-1] = await self.potential.batch_prefix(exts) - ctx_w
         return self.make_lazy_weights(Ws)
 

@@ -71,18 +71,7 @@ class TrieSetSampler(SetSampler):
         self.iter_potential = iter_potential
         self.item_potential = item_potential
 
-        # Coercion function: flatten iter tokens to item tokens (byte integers).
-        # Token.byte_string is bytes; extending with bytes appends individual byte ints.
-        def coerce_fn(context):
-            result = []
-            for items in context:
-                if isinstance(items, Token):
-                    result.extend(items.byte_string)
-                else:
-                    result.extend(items)
-            return result
-
-        self.f = coerce_fn
+        self.f = lambda context: [item for items in context for item in items]
 
         super().__init__(
             iter_potential * item_potential.coerce(iter_potential, f=self.f)
@@ -294,7 +283,7 @@ class TopKSetSampler(TrieSetSampler):
         W = Float.chart()
 
         # initial conditions
-        (token, node) = ((), self.trie.root)
+        token, node = ((), self.trie.root)
         agenda[token, node, False] = max_logws[node]
         W[node] = 0
 

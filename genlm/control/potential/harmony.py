@@ -44,9 +44,9 @@ class HarmonyChat:
         # Check that the tokenizer object has the minimum required methods.
         assert hasattr(tokenizer, "encode"), "Tokenizer is missing the 'encode' method."
         assert hasattr(tokenizer, "decode"), "Tokenizer is missing the 'decode' method."
-        assert hasattr(tokenizer, "apply_chat_template"), (
-            "Tokenizer is missing the 'apply_chat_template' method."
-        )
+        assert hasattr(
+            tokenizer, "apply_chat_template"
+        ), "Tokenizer is missing the 'apply_chat_template' method."
 
         # Check that the tokenizer supports the special tokens of the harmony chat format
         # (in which case they should all be encoded as single tokens).
@@ -130,9 +130,9 @@ class HarmonyChat:
             AssertionError: If the token bytes do not form a valid harmony chat.
         """
 
-        assert self.validate_harmony_format(token_bytes), (
-            f"The context is not a valid harmony chat: {token_bytes}"
-        )
+        assert self.validate_harmony_format(
+            token_bytes
+        ), f"The context is not a valid harmony chat: {token_bytes}"
         results = {"analysis": None, "final": None, "commentary": None}
 
         for i, token in enumerate(token_bytes[:-2]):
@@ -206,15 +206,16 @@ class HarmonyChat:
             if isinstance(item, Token):
                 result.append(item.token_id)
             elif isinstance(item, bytes):
-                # Fallback: linear scan for byte string match
-                found = False
-                for tok in self.token_maps.decode:
-                    if tok.byte_string == item:
-                        result.append(tok.token_id)
-                        found = True
-                        break
-                if not found:  # pragma: no cover
+                # Fallback: cached lookup by byte_string (first match)
+                if not hasattr(self, "_bytes_to_token_id"):
+                    self._bytes_to_token_id = {}
+                    for tok in self.token_maps.decode:
+                        if tok.byte_string not in self._bytes_to_token_id:
+                            self._bytes_to_token_id[tok.byte_string] = tok.token_id
+                tid = self._bytes_to_token_id.get(item)
+                if tid is None:  # pragma: no cover
                     raise ValueError(f"Token {item!r} not in vocabulary")
+                result.append(tid)
             else:  # pragma: no cover
                 raise TypeError(f"Expected Token or bytes, got {type(item)}")
         return result
@@ -253,9 +254,7 @@ class HarmonyChat:
         if isinstance(context, list) and all(
             isinstance(x, (bytes, Token)) for x in context
         ):
-            byte_parts = [
-                x.byte_string if isinstance(x, Token) else x for x in context
-            ]
+            byte_parts = [x.byte_string if isinstance(x, Token) else x for x in context]
             context_str = b"".join(byte_parts).decode("utf-8", errors="replace")
         elif isinstance(context, str):  # pragma: no cover
             context_str = context  # pragma: no cover
@@ -343,9 +342,9 @@ class HarmonyPotential(Potential):
 
         super().__init__(self.harmony_chat.potential_vocab)
 
-        assert set(base_potential.vocab) <= set(self.vocab), (
-            "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
-        )
+        assert set(base_potential.vocab) <= set(
+            self.vocab
+        ), "The base potential's vocabulary must be a subset of the harmony potential's vocabulary."
 
     async def complete(self, context: list[bytes]) -> float:
         """Compute the log weight of the constrained channels as complete sequences.
@@ -434,9 +433,9 @@ class HarmonyPotential(Potential):
             for key in channels
             if channels[key] is not None and channels[key]["is_prefix"]
         }
-        assert len(incomplete_channels) <= 1, (
-            "At most one channel can have the 'is_prefix' flag set to true."
-        )
+        assert (
+            len(incomplete_channels) <= 1
+        ), "At most one channel can have the 'is_prefix' flag set to true."
 
         if len(incomplete_channels) == 0:
             return next_token_weights  # pragma: no cover

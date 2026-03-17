@@ -7,7 +7,6 @@ from arsenal import colors
 
 from llamppl import Model
 from llamppl import smc_standard
-from genlm.backend.tokenization import Token
 
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence
@@ -224,11 +223,7 @@ class Sequences:
         for sequence, w in zip(self.contexts, np.exp(self.log_weights)):
             if sequence and isinstance(sequence[-1], EndOfSequence):
                 try:
-                    byte_sequence = [
-                        tok.byte_string if isinstance(tok, Token) else tok
-                        for tok in sequence[:-1]
-                    ]
-                    string_sequence = b"".join(byte_sequence).decode("utf-8")
+                    string_sequence = b"".join(sequence[:-1]).decode("utf-8")
                     posterior[string_sequence] += w
                 except UnicodeDecodeError:
                     pass

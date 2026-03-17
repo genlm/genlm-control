@@ -53,10 +53,19 @@ class LazyWeights:
         if token in self.encode:
             return self.weights[self.encode[token]]
 
-        # Fallback: if token is bytes, search for a Token with matching byte_string
-        if isinstance(token, bytes):
+        # Fallback: if token is plain bytes (not Token), search by byte_string content.
+        # This supports old code that indexes by bytes; returns the first match.
+        if isinstance(token, bytes) and not isinstance(token, Token):
+            import warnings
+
             for vocab_token in self.decode:
                 if isinstance(vocab_token, Token) and vocab_token.byte_string == token:
+                    warnings.warn(
+                        "Indexing LazyWeights by bytes is deprecated. "
+                        "Use Token objects instead (e.g. from llm.tokenize()).",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
                     return self.weights[self.encode[vocab_token]]
 
         return float("-inf") if self.is_log else 0
@@ -226,8 +235,14 @@ def load_trie(V, backend=None, **kwargs):
     import torch
     from genlm.backend.tokenization import Token
 
-    # Convert pure bytes/strings vocabularies to Token objects
-    if V and all(isinstance(item, (bytes, str)) for item in V):
+    # Convert pure bytes/strings vocabularies to Token objects.
+    # Skip if V already contains Token objects (Token subclasses bytes,
+    # so we must check Token first).
+    if (
+        V
+        and not isinstance(V[0], Token)
+        and all(isinstance(item, (bytes, str)) for item in V)
+    ):
         V = [
             Token(
                 token_id=i,

@@ -5,6 +5,52 @@ from genlm.control.potential.base import Potential
 from genlm.backend.tokenization import Token
 
 
+class _TokenEncodeDict(dict):
+    """A dict mapping Token→int that also accepts bytes keys (deprecated).
+
+    Primary keys are Token objects (hashed by token_id). When a plain bytes key
+    is used, falls back to a cached bytes→token_id lookup and emits a
+    DeprecationWarning.
+    """
+
+    def __init__(self, token_dict):
+        super().__init__(token_dict)
+        self._bytes_fallback = None
+
+    def _build_bytes_fallback(self):
+        if self._bytes_fallback is None:
+            self._bytes_fallback = {}
+            for token, idx in super().items():
+                if isinstance(token, Token):
+                    bs = token.byte_string
+                    if bs not in self._bytes_fallback:
+                        self._bytes_fallback[bs] = idx
+
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            if isinstance(key, bytes) and not isinstance(key, Token):
+                self._build_bytes_fallback()
+                if key in self._bytes_fallback:
+                    warnings.warn(
+                        "Indexing token_maps.encode by bytes is deprecated. "
+                        "Use Token objects instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                    return self._bytes_fallback[key]
+            raise
+
+    def __contains__(self, key):
+        if super().__contains__(key):
+            return True
+        if isinstance(key, bytes) and not isinstance(key, Token):
+            self._build_bytes_fallback()
+            return key in self._bytes_fallback
+        return False
+
+
 def load_model_by_name(name, backend, **kwargs):
     if backend == "vllm":
         from genlm.backend.llm import AsyncVirtualLM  # pragma: no cover
@@ -32,6 +78,8 @@ class TokenMappings(NamedTuple):
 
     Attributes:
         decode: All Token objects in the vocabulary (indexed by token_id)
+        encode: Mapping from Token to its position in decode (for backwards compat,
+            also accepts bytes lookup via Token's bytes subclassing)
         eos_idxs: Token IDs for EOS tokens
         eos_tokens: EOS tokens as byte strings
         eos_token_objs: Actual EOS Token objects
@@ -39,6 +87,7 @@ class TokenMappings(NamedTuple):
     """
 
     decode: list[Token]
+    encode: dict[Token, int]
     eos_idxs: list[int]
     eos_tokens: list[bytes]
     eos_token_objs: list[Token]
@@ -85,8 +134,11 @@ class TokenMappings(NamedTuple):
             token for token in decode if token.token_id not in eos_token_ids
         ]
 
+        encode = _TokenEncodeDict({token: i for i, token in enumerate(decode)})
+
         return cls(
             decode=decode,
+            encode=encode,
             eos_idxs=eos_idxs,
             eos_tokens=eos_tokens,
             eos_token_objs=eos_token_objs,
@@ -233,11 +285,19 @@ class PromptedLLM(Potential):
         self.prompt_ids = self.model.tokenizer.encode(prompt_str)
 
     def _find_token_id_for_bytes(self, byte_string):
-        """Find token_id for a byte_string (first match for duplicates). O(n) - deprecated path."""
-        for token in self.token_maps.decode:
-            if token.byte_string == byte_string:
-                return token.token_id
-        return None
+        """Find token_id for a byte_string (first match for duplicates).
+
+        Uses a lazily-built cache for O(1) lookup. For duplicate byte strings,
+        returns the first token_id encountered in the vocabulary.
+        """
+        if not hasattr(self, "_bytes_to_token_id"):
+            # Build reverse map: bytes → first token_id. Later entries don't
+            # overwrite, so the first match wins (consistent with old behavior).
+            self._bytes_to_token_id = {}
+            for token in self.token_maps.decode:
+                if token.byte_string not in self._bytes_to_token_id:
+                    self._bytes_to_token_id[token.byte_string] = token.token_id
+        return self._bytes_to_token_id.get(byte_string)
 
     def encode_tokens(self, tokens):
         """Encode a list of Token objects to token IDs.
