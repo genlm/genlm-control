@@ -21,7 +21,6 @@ import numpy as np
 from collections import Counter
 
 from genlm.backend.llm import MockAsyncLM
-from genlm.backend.tokenization import Token
 from genlm.control import PromptedLLM, BoolFSA, AWRS
 
 MODELS_WITH_DUPLICATES = [
