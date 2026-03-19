@@ -308,6 +308,52 @@ def test_encode_tokens_invalid_bytes(llm):
         llm.encode_tokens([b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"])
 
 
+def test_token_encode_dict_getitem_bytes(llm):
+    """Test _TokenEncodeDict.__getitem__ with bytes key (deprecated path)."""
+    token = llm.vocab[0]
+    with pytest.warns(DeprecationWarning, match="Indexing token_maps.encode by bytes is deprecated"):
+        idx = llm.token_maps.encode[token.byte_string]
+    assert idx == llm.token_maps.encode[token]
+
+
+def test_token_encode_dict_getitem_missing(llm):
+    """Test _TokenEncodeDict.__getitem__ raises KeyError for missing key."""
+    with pytest.raises(KeyError):
+        llm.token_maps.encode[b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"]
+
+
+def test_token_encode_dict_contains_token(llm):
+    """Test _TokenEncodeDict.__contains__ with Token key."""
+    token = llm.vocab[0]
+    assert token in llm.token_maps.encode
+
+
+def test_token_encode_dict_contains_bytes(llm):
+    """Test _TokenEncodeDict.__contains__ with bytes key (deprecated fallback)."""
+    token = llm.vocab[0]
+    assert token.byte_string in llm.token_maps.encode
+
+
+def test_token_encode_dict_contains_missing(llm):
+    """Test _TokenEncodeDict.__contains__ returns False for missing key."""
+    assert b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345" not in llm.token_maps.encode
+
+
+def test_find_token_id_for_bytes(llm):
+    """Test _find_token_id_for_bytes returns first match and caches."""
+    token = llm.vocab[0]
+    tid = llm._find_token_id_for_bytes(token.byte_string)
+    assert tid == token.token_id
+    # Second call uses cache
+    tid2 = llm._find_token_id_for_bytes(token.byte_string)
+    assert tid2 == tid
+
+
+def test_find_token_id_for_bytes_missing(llm):
+    """Test _find_token_id_for_bytes returns None for missing bytes."""
+    assert llm._find_token_id_for_bytes(b"THIS_DOES_NOT_EXIST_12345") is None
+
+
 def test_duplicate_eos_byte_string_warning():
     """Test that TokenMappings warns when multiple tokens have the same EOS byte_string."""
     from genlm.backend.tokenization import Token
