@@ -16,6 +16,7 @@ Models tested:
 """
 
 import pytest
+import torch
 import numpy as np
 from collections import Counter
 
@@ -234,9 +235,7 @@ async def test_coerced_logw_next_has_duplicate_tokens(llm):
 
 
 # ---------------------------------------------------------------------------
-# Coerce path: previously failed with
-#   TypeError: sequence item 0: expected a bytes-like object, Token found
-# because b"".join received Token objects instead of bytes.
+# Coerce path
 # ---------------------------------------------------------------------------
 
 
@@ -400,3 +399,91 @@ def test_spawn_new_eos_with_duplicate_byte_string(llm):
         assert any(
             v.token_id == t.token_id for v in new_llm.vocab
         ), f"Token({t.token_id}) wrongly excluded from vocab"
+
+
+# ---------------------------------------------------------------------------
+# Fewer logits than vocab entries: real models may output fewer logits than
+# len(tokenizer) when the tokenizer has added tokens beyond the model's
+# embedding matrix (e.g. Gemma: len(tokenizer)=262145, vocab_size=262144).
+# ---------------------------------------------------------------------------
+
+
+class TruncatedMockAsyncLM(MockAsyncLM):
+    """Mock that returns fewer logits than len(byte_vocab), like a real HF model
+    whose config.vocab_size < len(tokenizer)."""
+
+    def __init__(self, tokenizer, truncate_by=1):
+        super().__init__(tokenizer)
+        self._truncate_by = truncate_by
+
+    def _get_logprobs(self, token_ids):
+        seed = sum([(i + 1) * t for i, t in enumerate(token_ids)])
+        self._rng.seed(seed)
+        n_logits = len(self.byte_vocab) - self._truncate_by
+        logits = torch.from_numpy(
+            self._rng.rand(n_logits).astype(np.float32)
+        )
+        return torch.log_softmax(logits, dim=-1)
+
+
+@pytest.fixture(scope="module")
+def truncated_mock_llm(model_name):
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except OSError:
+        pytest.skip(f"Model {model_name} not available")
+    return TruncatedMockAsyncLM(tokenizer, truncate_by=1)
+
+
+@pytest.fixture(scope="module")
+def truncated_llm(truncated_mock_llm):
+    return PromptedLLM(truncated_mock_llm)
+
+
+def test_byte_vocab_includes_all_tokens(mock_llm):
+    """byte_vocab should include ALL tokens from the tokenizer, including added
+    tokens beyond the model's embedding matrix. These tokens are part of the
+    vocabulary even if the model can't produce logits for them."""
+    assert len(mock_llm.byte_vocab) == len(mock_llm.tokenizer)
+
+
+@pytest.mark.asyncio
+async def test_logw_next_with_fewer_logits(truncated_llm):
+    """logw_next must not crash when the model returns fewer logits than
+    len(token_maps.decode). Tokens without logits should get -inf.
+
+    This reproduces the bug where real HF models (e.g. Gemma) have
+    config.vocab_size < len(tokenizer).
+    """
+    truncated_llm.set_prompt_from_str("Hello")
+    lw = await truncated_llm.logw_next([])
+    assert len(lw) > 0
+    assert np.any(np.isfinite(lw.weights))
+
+
+@pytest.mark.asyncio
+async def test_smc_with_fewer_logits(truncated_llm):
+    """Full SMC should work even when model returns fewer logits."""
+    truncated_llm.set_prompt_from_str("The answer is")
+    fsa = BoolFSA.from_regex(r" (yes|no)")
+    coerced = fsa.coerce(truncated_llm, f=b"".join)
+    sampler = AWRS(truncated_llm, coerced)
+
+    result = await sampler.smc(n_particles=3, ess_threshold=0.5, max_tokens=10)
+    assert len(result.contexts) == 3
+
+
+def test_token_id_index_invariant(mock_llm):
+    """Token IDs must equal their position index in byte_vocab.
+
+    This invariant is assumed by the logit padding in _process_logw_next:
+    when the model returns fewer logits than len(byte_vocab), we pad with -inf
+    at the end, which is only correct if the extra tokens are at the highest
+    indices.
+    """
+    for i, token in enumerate(mock_llm.byte_vocab):
+        assert token.token_id == i, (
+            f"byte_vocab[{i}].token_id={token.token_id}, expected {i}"
+        )

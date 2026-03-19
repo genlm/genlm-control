@@ -459,7 +459,35 @@ class PromptedLLM(Potential):
                 ~torch.isin(all_indices, self._eos_idxs_tensor)
             ]
 
-        logw_next = logw_next[: len(self.token_maps.decode)]
+        # The model may produce fewer logits than len(token_maps.decode) when
+        # the tokenizer has added tokens beyond the model's embedding matrix
+        # (e.g. Gemma's <image_soft_token>). Pad with -inf so these tokens
+        # are unscorable but still present in the vocabulary.
+        # We assert that HF models always produce logits for token indices
+        # 0..vocab_size-1, and added tokens are at indices >= vocab_size.
+        n_decode = len(self.token_maps.decode)
+        n_logits = len(logw_next)
+        if n_logits < n_decode:
+            # Verify (once) that token IDs in the model's logit range are
+            # contiguous 0..n_logits-1, so padding the tail is safe.
+            if not hasattr(self, "_logit_padding_verified"):
+                for i in range(n_logits):
+                    if self.token_maps.decode[i].token_id != i:
+                        raise ValueError(
+                            f"Token ID / index mismatch at position {i}: "
+                            f"decode[{i}].token_id={self.token_maps.decode[i].token_id}. "
+                            f"Padding assumes added tokens are at indices >= vocab_size."
+                        )
+                self._logit_padding_verified = True
+            pad = torch.full(
+                (n_decode - n_logits,),
+                float("-inf"),
+                dtype=logw_next.dtype,
+                device=logw_next.device,
+            )
+            logw_next = torch.cat([logw_next, pad])
+
+        logw_next = logw_next[:n_decode]
         logw_next = logw_next.log_softmax(dim=0)
         _logw_next = torch.full(
             (len(self.vocab) + 1,),
