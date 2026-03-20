@@ -11,7 +11,7 @@ Potentials guide text generation by:
 
 ### Vocabulary
 
-Each potential has a **vocabulary** which defines the set of tokens it operates on. Most built-in potentials operate on vocabularies whose tokens are `bytes` or `int` objects (the latter often representing individual bytes).
+Each potential has a **vocabulary** which defines the set of tokens it operates on. Language model potentials (`PromptedLLM`) use `Token` objects (which carry both a `token_id` and `byte_string`). Constraint potentials (FSAs, CFGs) typically operate on `int` objects representing individual bytes.
 
 ### Weight assignment
 
@@ -60,7 +60,7 @@ llm = PromptedLLM.from_name("gpt2", temperature=0.5)
 llm.set_prompt_from_str("Montreal is")
 ```
 
-`PromptedLLM`s have a vocabulary of `bytes` tokens, obtained from the language model's tokenizer.
+`PromptedLLM`s have a vocabulary of `Token` objects, obtained from the language model's tokenizer. Each `Token` carries a `token_id` and a `byte_string`, and subclasses `bytes` for backwards compatibility. Note that multiple tokens can share the same byte string.
 
 ### Finite-state automata
 

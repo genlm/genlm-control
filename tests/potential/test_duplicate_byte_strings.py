@@ -15,13 +15,17 @@ Models tested:
 - EleutherAI/llemma_7b (96 duplicate byte strings)
 """
 
+import warnings
+
 import pytest
 import torch
 import numpy as np
 from collections import Counter
+from transformers import AutoTokenizer
 
 from genlm.backend.llm import MockAsyncLM
 from genlm.control import PromptedLLM, BoolFSA, AWRS
+from genlm.control.potential.built_in.llm import TokenMappings
 
 MODELS_WITH_DUPLICATES = [
     "google/gemma-3-1b-pt",
@@ -119,7 +123,6 @@ async def test_duplicate_tokens_get_independent_weights(llm):
     counts = Counter(byte_strings)
     dup_bs = next(bs for bs, cnt in counts.items() if cnt > 1)
     dup_tokens = [t for t in llm.vocab if t.byte_string == dup_bs]
-    assert len(dup_tokens) >= 2
 
     lw = await llm.logw_next([])
 
@@ -238,19 +241,14 @@ async def test_coerced_logw_next_has_duplicate_tokens(llm):
 # ---------------------------------------------------------------------------
 
 
-def test_coerce_fsa(llm):
-    """Coercing a BoolFSA onto an LLM with duplicate byte strings should succeed."""
-    fsa = BoolFSA.from_regex(r" (yes|no)")
-    coerced = fsa.coerce(llm, f=b"".join)
-    assert len(coerced.vocab) > 0
-
-
 @pytest.mark.asyncio
 async def test_coerced_logw_next(llm):
-    """logw_next on a coerced FSA should return valid weights."""
+    """Coercing a BoolFSA onto an LLM with duplicate byte strings should succeed
+    and logw_next should return valid weights."""
     llm.set_prompt_from_str("The answer is")
     fsa = BoolFSA.from_regex(r" (yes|no)")
     coerced = fsa.coerce(llm, f=b"".join)
+    assert len(coerced.vocab) > 0
     lw = await coerced.logw_next([])
     assert len(lw) > 0
     assert not np.all(np.isinf(lw.weights))
@@ -331,8 +329,6 @@ def test_encode_tokens_distinguishes_duplicate_tokens(llm):
 def test_encode_tokens_bytes_fallback_returns_first_match(llm):
     """The deprecated bytes path returns the first matching token_id.
     This is ambiguous for duplicates — users should use Token objects instead."""
-    import warnings
-
     byte_strings = [t.byte_string for t in llm.vocab]
     counts = Counter(byte_strings)
     dup_bs = next(bs for bs, cnt in counts.items() if cnt > 1)
@@ -354,8 +350,6 @@ def test_encode_tokens_bytes_fallback_returns_first_match(llm):
 def test_eos_duplicate_keeps_non_eos_in_vocab(mock_llm):
     """If the EOS byte_string also appears as a non-EOS token (different token_id),
     only the designated EOS token should be excluded from potential_vocab."""
-    from genlm.control.potential.built_in.llm import TokenMappings
-
     decode = mock_llm.byte_vocab
     eos_byte = decode[mock_llm.tokenizer.eos_token_id].byte_string
 
@@ -363,8 +357,6 @@ def test_eos_duplicate_keeps_non_eos_in_vocab(mock_llm):
     eos_dupes = [t for t in decode if t.byte_string == eos_byte]
     if len(eos_dupes) < 2:
         pytest.skip("This model's EOS byte_string has no duplicate")
-
-    import warnings
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -427,8 +419,6 @@ class TruncatedMockAsyncLM(MockAsyncLM):
 
 @pytest.fixture(scope="module")
 def truncated_mock_llm(model_name):
-    from transformers import AutoTokenizer
-
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     except OSError:

@@ -30,7 +30,7 @@ sequences.posterior
 sequences.decoded_posterior
 ```
 
-Note: Sequences are lists of `bytes` objects because each token in the language model's vocabulary is represented as a bytes object.
+Note: Sequences are lists of `Token` objects. Each `Token` carries a `token_id` and a `byte_string`, and subclasses `bytes` for backwards compatibility (so `b"".join(sequence)` still works).
 
 ## Prompt Intersection
 

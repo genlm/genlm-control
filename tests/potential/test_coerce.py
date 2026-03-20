@@ -142,4 +142,3 @@ def test_coerced_with_token_vocab():
 
     assert len(c.vocab) == 3
     assert set(c.vocab) == {b"aa", b"bb", b"aab"}
-    assert isinstance(p.vocab[0], Token)

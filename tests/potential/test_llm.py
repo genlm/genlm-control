@@ -4,7 +4,9 @@ import numpy as np
 from arsenal.maths import logsumexp
 from hypothesis import given, strategies as st, settings, reject
 
+from genlm.backend.tokenization import Token
 from genlm.control.potential.built_in import PromptedLLM
+from genlm.control.potential.built_in.llm import TokenMappings
 
 # pytest.mark.asyncio seems to cause issues with hypothesis
 # and the vllm backend, so we use asyncio.run here.
@@ -356,9 +358,6 @@ def test_find_token_id_for_bytes_missing(llm):
 
 def test_duplicate_eos_byte_string_warning():
     """Test that TokenMappings warns when multiple tokens have the same EOS byte_string."""
-    from genlm.backend.tokenization import Token
-    from genlm.control.potential.built_in.llm import TokenMappings
-
     decode = [
         Token(token_id=0, byte_string=b"hello"),
         Token(token_id=1, byte_string=b"world"),
