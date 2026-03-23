@@ -360,7 +360,7 @@ def test_eos_duplicate_keeps_non_eos_in_vocab(mock_llm):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        tm = TokenMappings.create(decode=decode, eos_tokens=[eos_byte])
+        tm = TokenMappings.create(decode=decode, eos_byte_strings=[eos_byte])
 
     # The non-EOS duplicate must still be in potential_vocab
     non_eos_dupes = [t for t in eos_dupes if t.token_id not in set(tm.eos_idxs)]
@@ -377,7 +377,7 @@ def test_spawn_new_eos_with_duplicate_byte_string(llm):
     counts = Counter(byte_strings)
     dup_bs = next(bs for bs, cnt in counts.items() if cnt > 1)
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[dup_bs])
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[dup_bs])
 
     # Only ONE token should be excluded (the first match)
     assert len(new_llm.token_maps.eos_idxs) == 1

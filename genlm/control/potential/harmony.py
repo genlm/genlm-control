@@ -66,14 +66,14 @@ class HarmonyChat:
         _byte_vocab, _ = decode_vocab(
             tokenizer
         )  # Byte representation of each token. Follows the same schema as PromptedLLM.
-        _eos_tokens = [
+        _eos_byte_strings = [
             _byte_vocab[
                 tokenizer.eos_token_id
             ].byte_string  # for gpt-oss, this is the <|return|> token.
         ]
 
         self.token_maps = TokenMappings.create(
-            decode=_byte_vocab, eos_tokens=_eos_tokens
+            decode=_byte_vocab, eos_byte_strings=_eos_byte_strings
         )
         self.potential_vocab = self.token_maps.potential_vocab
 

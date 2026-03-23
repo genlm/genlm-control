@@ -25,20 +25,20 @@ class MockAsyncTransformer:  # Mock the backend LLM object
 
 
 class MockLLM(PromptedLLM):
-    def __init__(self, tokenizer, model_name="mock_model", eos_tokens=None):
+    def __init__(self, tokenizer, model_name="mock_model", eos_byte_strings=None):
         # Create the mock backend object
         mock_backend_llm = MockAsyncTransformer(tokenizer)
 
         # Call the parent PromptedLLM initializer
-        # Use provided eos_tokens if available, otherwise extract from tokenizer
-        if eos_tokens is None:
+        # Use provided eos_byte_strings if available, otherwise extract from tokenizer
+        if eos_byte_strings is None:
             eos_token_bytes = (
                 tokenizer.eos_token.encode("utf-8") if tokenizer.eos_token else None
             )
             eos_token_list = [eos_token_bytes] if eos_token_bytes else []
         else:
-            # Assume provided eos_tokens are already bytes or handle conversion if needed
-            eos_token_list = eos_tokens
+            # Assume provided eos_byte_strings are already bytes or handle conversion if needed
+            eos_token_list = eos_byte_strings
 
         # Need to handle cases where byte_vocab is None for unsupported tokenizers
         if mock_backend_llm.byte_vocab is None:
@@ -52,7 +52,7 @@ class MockLLM(PromptedLLM):
             )
             self.token_maps = None  # Indicate maps aren't properly initialized
         else:
-            super().__init__(llm=mock_backend_llm, eos_tokens=eos_token_list)
+            super().__init__(llm=mock_backend_llm, eos_byte_strings=eos_token_list)
             # The super init should handle setting up self.model and self.token_maps
 
 
@@ -63,7 +63,7 @@ def llm():
 
 @pytest.fixture(scope="module")
 def llm_with_multiple_eos(llm):
-    return llm.spawn_new_eos(eos_tokens=[b".", b" city", b"\n", b" "])
+    return llm.spawn_new_eos(eos_byte_strings=[b".", b" city", b"\n", b" "])
 
 
 @pytest.fixture(scope="module")

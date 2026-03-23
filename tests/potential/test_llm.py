@@ -111,7 +111,7 @@ async def test_properties(llm, pre_prompt, context, temp):
     await llm.assert_logw_next_consistency(context, top=10, rtol=0.01, atol=1e-3)
     await llm.assert_autoreg_fact(context, rtol=0.01, atol=1e-3)
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!", b"?"])
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!", b"?"])
     await new_llm.assert_logw_next_consistency(context, top=10, rtol=0.01, atol=1e-3)
     await new_llm.assert_autoreg_fact(context, rtol=0.01, atol=1e-3)
 
@@ -150,15 +150,15 @@ def eos_test_params(draw):
 @given(eos_test_params())
 async def test_new_eos_tokens(llm, params):
     with pytest.raises(
-        ValueError, match="Cannot reset eos_tokens after initialization"
+        ValueError, match="Cannot reset eos_byte_strings after initialization"
     ):
-        llm.eos_tokens = []
+        llm.eos_byte_strings = []
 
     eos_token_ids, context_ids, prompt_ids = params
     llm.prompt_ids = prompt_ids
-    eos_tokens = [llm.token_maps.decode[x].byte_string for x in eos_token_ids]
-    new_llm = llm.spawn_new_eos(eos_tokens=eos_tokens)
-    assert new_llm.eos_tokens == eos_tokens
+    eos_bs = [llm.token_maps.decode[x].byte_string for x in eos_token_ids]
+    new_llm = llm.spawn_new_eos(eos_byte_strings=eos_bs)
+    assert new_llm.eos_byte_strings == eos_bs
 
     new_llm.temperature = 1.0
 
@@ -166,7 +166,7 @@ async def test_new_eos_tokens(llm, params):
     assert new_llm.token_maps.eos_idxs == eos_token_ids
     vocab_bytes = {token.byte_string for token in new_llm.vocab}
     decode_bytes = {token.byte_string for token in new_llm.token_maps.decode}
-    assert decode_bytes - set(eos_tokens) == vocab_bytes
+    assert decode_bytes - set(eos_bs) == vocab_bytes
 
     context = new_llm.decode_tokens(context_ids)
     have = await new_llm.complete(context)
@@ -178,21 +178,21 @@ def test_invalid_eos_tokens(llm):
     # Test EOS token not in vocabulary
     invalid_eos = [b"THIS_TOKEN_DOES_NOT_EXIST"]
     with pytest.raises(ValueError, match="EOS token not in language model vocabulary"):
-        llm.spawn_new_eos(eos_tokens=invalid_eos)
+        llm.spawn_new_eos(eos_byte_strings=invalid_eos)
 
     # Test duplicate EOS tokens
     duplicate_eos = [
         llm.token_maps.decode[0].byte_string,
         llm.token_maps.decode[0].byte_string,
     ]
-    with pytest.raises(ValueError, match="Duplicate eos tokens"):
-        llm.spawn_new_eos(eos_tokens=duplicate_eos)
+    with pytest.raises(ValueError, match="Duplicate eos byte strings"):
+        llm.spawn_new_eos(eos_byte_strings=duplicate_eos)
 
-    # Test attempting to modify eos_tokens directly
+    # Test attempting to modify eos_byte_strings directly
     with pytest.raises(
-        ValueError, match="Cannot reset eos_tokens after initialization"
+        ValueError, match="Cannot reset eos_byte_strings after initialization"
     ):
-        llm.eos_tokens = [llm.token_maps.decode[0].byte_string]
+        llm.eos_byte_strings = [llm.token_maps.decode[0].byte_string]
 
 
 def test_invalid_token_encoding(llm):
@@ -225,7 +225,7 @@ def test_spawn(llm):
     assert new_llm.token_maps == llm.token_maps
     assert new_llm.vocab == llm.vocab
 
-    new_llm = llm.spawn(eos_tokens=[b"!"], temperature=1.0)
+    new_llm = llm.spawn(eos_byte_strings=[b"!"], temperature=1.0)
     assert new_llm.token_maps.eos_idxs == [0]
     assert new_llm.temperature == 1.0
     assert new_llm.prompt_ids == llm.prompt_ids
@@ -234,12 +234,12 @@ def test_spawn(llm):
 
 def test_providing_eos_tokens_and_token_maps(llm):
     with pytest.raises(
-        ValueError, match="eos_tokens must not be provided when token_maps is provided."
+        ValueError, match="eos_byte_strings must not be provided when token_maps is provided."
     ):
         PromptedLLM(
             llm.model,
             prompt_ids=llm.prompt_ids,
-            eos_tokens=[b"!"],
+            eos_byte_strings=[b"!"],
             token_maps=llm.token_maps,
         )
 
@@ -270,7 +270,7 @@ async def test_vllm_backend():
         [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
     )
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
     assert new_llm.token_maps.eos_idxs == [0]
     assert new_llm.token_maps.decode[0].byte_string == b"!"
 
@@ -366,4 +366,4 @@ def test_duplicate_eos_byte_string_warning():
     ]
 
     with pytest.warns(UserWarning, match="Multiple tokens with EOS byte_string"):
-        TokenMappings.create(decode=decode, eos_tokens=[b"hello"])
+        TokenMappings.create(decode=decode, eos_byte_strings=[b"hello"])

@@ -5,6 +5,23 @@ from genlm.control.potential.base import Potential
 from genlm.backend.tokenization import Token
 
 
+def _compat_eos_tokens(eos_byte_strings, kwargs):
+    """Handle deprecated ``eos_tokens`` kwarg, forwarding to ``eos_byte_strings``."""
+    old = kwargs.pop("eos_tokens", None)
+    if old is not None:
+        if eos_byte_strings is not None:
+            raise TypeError(
+                "Cannot specify both 'eos_byte_strings' and the deprecated 'eos_tokens'."
+            )
+        warnings.warn(
+            "'eos_tokens' is deprecated, use 'eos_byte_strings' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return old
+    return eos_byte_strings
+
+
 class _TokenEncodeDict(dict):
     """A dict mapping Token→int that also accepts bytes keys (deprecated).
 
@@ -81,7 +98,7 @@ class TokenMappings(NamedTuple):
         encode: Mapping from Token to its position in decode (for backwards compat,
             also accepts bytes lookup via Token's bytes subclassing)
         eos_idxs: Token IDs for EOS tokens
-        eos_tokens: EOS tokens as byte strings
+        eos_byte_strings: EOS tokens as byte strings
         eos_token_objs: Actual EOS Token objects
         potential_vocab: Vocabulary excluding EOS tokens
     """
@@ -89,27 +106,28 @@ class TokenMappings(NamedTuple):
     decode: list[Token]
     encode: dict[Token, int]
     eos_idxs: list[int]
-    eos_tokens: list[bytes]
+    eos_byte_strings: list[bytes]
     eos_token_objs: list[Token]
     potential_vocab: list[Token]
 
     @classmethod
-    def create(cls, decode, eos_tokens):
+    def create(cls, decode, eos_byte_strings=None, **kwargs):
         """Create TokenMappings from a vocabulary and EOS tokens.
 
         Args:
             decode (list[Token]): List of Token objects representing the full vocabulary.
-            eos_tokens (list[bytes]): List of byte strings representing EOS tokens.
+            eos_byte_strings (list[bytes]): List of byte strings representing EOS tokens.
         """
-        if len(set(eos_tokens)) != len(eos_tokens):
-            raise ValueError("Duplicate eos tokens")
+        eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
+        if len(set(eos_byte_strings)) != len(eos_byte_strings):
+            raise ValueError("Duplicate eos byte strings")
 
-        eos_tokens_set = set(eos_tokens)
+        eos_byte_strings_set = set(eos_byte_strings)
 
         # First pass: find the first Token for each EOS byte_string
         eos_byte_to_token = {}  # byte_string -> Token object (first match)
         for token in decode:
-            if token.byte_string in eos_tokens_set:
+            if token.byte_string in eos_byte_strings_set:
                 if token.byte_string not in eos_byte_to_token:
                     eos_byte_to_token[token.byte_string] = token
                 else:
@@ -120,12 +138,12 @@ class TokenMappings(NamedTuple):
                     )
 
         # Verify all EOS tokens were found
-        missing = eos_tokens_set - set(eos_byte_to_token.keys())
+        missing = eos_byte_strings_set - set(eos_byte_to_token.keys())
         if missing:
             raise ValueError("EOS token not in language model vocabulary")
 
-        # Build lists in order of eos_tokens input
-        eos_token_objs = [eos_byte_to_token[eos] for eos in eos_tokens]
+        # Build lists in order of eos_byte_strings input
+        eos_token_objs = [eos_byte_to_token[eos] for eos in eos_byte_strings]
         eos_idxs = [t.token_id for t in eos_token_objs]
 
         # Second pass: build potential_vocab excluding only the designated EOS Token objects
@@ -140,7 +158,7 @@ class TokenMappings(NamedTuple):
             decode=decode,
             encode=encode,
             eos_idxs=eos_idxs,
-            eos_tokens=eos_tokens,
+            eos_byte_strings=eos_byte_strings,
             eos_token_objs=eos_token_objs,
             potential_vocab=potential_vocab,
         )
@@ -152,7 +170,7 @@ class PromptedLLM(Potential):
     `PromptedLLM`s operate on byte sequences.
 
     Notes on EOS Token Handling:\n
-    - Tokens to treat as end-of-sequence tokens are specified via the `eos_tokens` argument.\n
+    - Tokens to treat as end-of-sequence tokens are specified via the `eos_byte_strings` argument.\n
     - These tokens are excluded from the potential's vocabulary and as such do not appear in the `vocab` attribute.\n
         This means they cannot appear in any input contexts to the potential nor in the output of `logw_next`. They can be used in the prompt however.\n
     - The log probability assigned to the `genlm.control`'s reserved `EOS` token is the sum of the log probabilities of all the specified EOS tokens.\n
@@ -164,9 +182,10 @@ class PromptedLLM(Potential):
         self,
         llm,
         prompt_ids=None,
-        eos_tokens=None,
+        eos_byte_strings=None,
         temperature=1.0,
         token_maps=None,
+        **kwargs,
     ):
         """`
         Initializes the PromptedLLM potential.
@@ -175,20 +194,21 @@ class PromptedLLM(Potential):
             llm (AsyncLM): The language model to use.
             prompt_ids (list[int], optional): Optional prompt to use as a prompt prefix for all input contexts.
                 Must be a list of token IDs. Defaults to None. The prompt ids can be set post-init via `prompt` or `prompt_ids`.
-            eos_tokens (list[bytes], optional): List of tokens to treat as end-of-sequence tokens.
+            eos_byte_strings (list[bytes], optional): List of tokens to treat as end-of-sequence tokens.
                 Defaults to the EOS token of the language model's tokenizer.
             temperature (float, optional): The temperature to apply to the language model's logits. Defaults to 1.
             token_maps (TokenMappings, optional): A precomputed mapping of tokens to token IDs with the potential's vocabulary.
-                If provided, `eos_tokens` must not be provided. Defaults to None, which constructs a TokenMappings from the language model's byte vocabulary and the EOS tokens.
+                If provided, `eos_byte_strings` must not be provided. Defaults to None, which constructs a TokenMappings from the language model's byte vocabulary and the EOS tokens.
         """
+        eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         self.model = llm
         self.prompt_ids = prompt_ids or []
         self.temperature = temperature
 
         if token_maps is not None:
-            if eos_tokens is not None:
+            if eos_byte_strings is not None:
                 raise ValueError(
-                    "eos_tokens must not be provided when token_maps is provided."
+                    "eos_byte_strings must not be provided when token_maps is provided."
                 )
             self.token_maps = token_maps
         else:
@@ -196,7 +216,7 @@ class PromptedLLM(Potential):
             default_eos = byte_vocab[self.model.tokenizer.eos_token_id].byte_string
             self.token_maps = TokenMappings.create(
                 decode=byte_vocab,
-                eos_tokens=eos_tokens or [default_eos],
+                eos_byte_strings=eos_byte_strings or [default_eos],
             )
 
         super().__init__(vocabulary=self.token_maps.potential_vocab)
@@ -206,7 +226,7 @@ class PromptedLLM(Potential):
         cls,
         name,
         backend=None,
-        eos_tokens=None,
+        eos_byte_strings=None,
         prompt_ids=None,
         temperature=1.0,
         **kwargs,
@@ -221,7 +241,7 @@ class PromptedLLM(Potential):
                 * 'mlx' for an `AsyncMlxLM`; ideal for Apple silicon usage\n
                 * 'mock' for a `MockAsyncLM`; ideal for testing.\n
                 Defaults to 'vllm' if CUDA is available, otherwise 'hf'.
-            eos_tokens (list[bytes], optional): List of tokens to treat as end-of-sequence tokens.
+            eos_byte_strings (list[bytes], optional): List of tokens to treat as end-of-sequence tokens.
                 Defaults to the EOS token of the language model's tokenizer.
             prompt_ids (list[int], optional): Optional prompt to use as a prompt prefix for all input contexts.
                 Must be a list of token IDs. Defaults to None. The prompt ids can be set post-init via `set_prompt_from_str` or `prompt_ids`.
@@ -231,21 +251,22 @@ class PromptedLLM(Potential):
         Returns:
             (PromptedLLM): An instance of PromptedLLM
         """
+        eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         backend = backend or ("vllm" if torch.cuda.is_available() else "hf")
         model = load_model_by_name(name, backend=backend, **kwargs)
         return cls(
-            model, prompt_ids=prompt_ids, eos_tokens=eos_tokens, temperature=temperature
+            model, prompt_ids=prompt_ids, eos_byte_strings=eos_byte_strings, temperature=temperature
         )
 
     @property
-    def eos_tokens(self):
-        return self.token_maps.eos_tokens
+    def eos_byte_strings(self):
+        return self.token_maps.eos_byte_strings
 
-    @eos_tokens.setter
-    def eos_tokens(self, value):
+    @eos_byte_strings.setter
+    def eos_byte_strings(self, value):
         raise ValueError(
-            "Cannot reset eos_tokens after initialization. "
-            "Use spawn_new_eos(new_eos_tokens) instead."
+            "Cannot reset eos_byte_strings after initialization. "
+            "Use spawn_new_eos(new_eos_byte_strings) instead."
         )
 
     @property
@@ -432,7 +453,7 @@ class PromptedLLM(Potential):
         """Process the log probabilities for the next tokens.
 
         This function rearranges the log probabilities such that the end-of-sequence (EOS) token's log probability
-        is the sum of the log probabilities of `self.eos_tokens`.
+        is the sum of the log probabilities of `self.eos_byte_strings`.
 
         Args:
             logw_next (torch.tensor): The log probabilities for the next tokens.
@@ -540,15 +561,15 @@ class PromptedLLM(Potential):
     def __repr__(self):
         return f"PromptedLLM(prompt={self.prompt!r})"
 
-    def spawn(self, prompt_ids=None, eos_tokens=None, temperature=None):
+    def spawn(self, prompt_ids=None, eos_byte_strings=None, temperature=None, **kwargs):
         """
         Spawn a new PromptedLLM.
 
         Args:
             prompt_ids (optional, list[int]): The prompt to use as a prompt prefix for all input contexts.
                 Defaults to the same prompt_ids as `self`.
-            eos_tokens (optional, list[bytes]): A list of tokens to treat as end-of-sequence tokens.
-                Defaults to the same eos_tokens as `self`.
+            eos_byte_strings (optional, list[bytes]): A list of tokens to treat as end-of-sequence tokens.
+                Defaults to the same eos_byte_strings as `self`.
             temperature (optional, float): The temperature with which to rescale logprobs.
                 Defaults to the same temperature as `self`.
 
@@ -558,10 +579,11 @@ class PromptedLLM(Potential):
         Note:
             This is a shallow copy. The new PromptedLLM will share the underlying AsyncLM instance.
         """
+        eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         prompt_ids = prompt_ids if prompt_ids is not None else self.prompt_ids.copy()
         temperature = temperature if temperature is not None else self.temperature
 
-        if (eos_tokens is None) or (eos_tokens == self.token_maps.eos_tokens):
+        if (eos_byte_strings is None) or (eos_byte_strings == self.token_maps.eos_byte_strings):
             # If the eos tokens don't change, we don't need to recompute the token maps or vocabulary.
             return PromptedLLM(
                 self.model,
@@ -573,22 +595,23 @@ class PromptedLLM(Potential):
         return PromptedLLM(
             self.model,
             prompt_ids=prompt_ids,
-            eos_tokens=eos_tokens,
+            eos_byte_strings=eos_byte_strings,
             temperature=temperature,
         )
 
-    def spawn_new_eos(self, eos_tokens):
+    def spawn_new_eos(self, eos_byte_strings=None, **kwargs):
         """
         Create a new PromptedLLM with a different set of end-of-sequence tokens.
 
         Args:
-            eos_tokens (list[bytes]): A list of tokens to treat as end-of-sequence tokens.
+            eos_byte_strings (list[bytes]): A list of tokens to treat as end-of-sequence tokens.
 
         Returns:
             (PromptedLLM): A new PromptedLLM with the specified end-of-sequence tokens.
                 The new model will have the same prompt_ids as `self`.
         """
-        return self.spawn(eos_tokens=eos_tokens)
+        eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
+        return self.spawn(eos_byte_strings=eos_byte_strings)
 
     def to_autobatched(self):
         raise ValueError("PromptedLLMs are autobatched by default.")
