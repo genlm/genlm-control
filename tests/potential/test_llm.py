@@ -367,3 +367,41 @@ def test_duplicate_eos_byte_string_warning():
 
     with pytest.warns(UserWarning, match="Multiple tokens with EOS byte_string"):
         TokenMappings.create(decode=decode, eos_byte_strings=[b"hello"])
+
+
+def test_eos_tokens_deprecation_from_name(llm):
+    """Test that the deprecated eos_tokens kwarg works with DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        new_llm = PromptedLLM(llm.model, eos_tokens=[b"!"])
+    assert new_llm.eos_byte_strings == [b"!"]
+
+
+def test_eos_tokens_deprecation_spawn(llm):
+    """Test that spawn accepts deprecated eos_tokens kwarg."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        new_llm = llm.spawn(eos_tokens=[b"!"])
+    assert new_llm.eos_byte_strings == [b"!"]
+
+
+def test_eos_tokens_deprecation_spawn_new_eos(llm):
+    """Test that spawn_new_eos accepts deprecated eos_tokens kwarg."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
+    assert new_llm.eos_byte_strings == [b"!"]
+
+
+def test_eos_tokens_deprecation_token_mappings():
+    """Test that TokenMappings.create accepts deprecated eos_tokens kwarg."""
+    decode = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+    ]
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        tm = TokenMappings.create(decode=decode, eos_tokens=[b"hello"])
+    assert tm.eos_byte_strings == [b"hello"]
+
+
+def test_eos_tokens_and_byte_strings_conflict(llm):
+    """Test that specifying both eos_tokens and eos_byte_strings raises."""
+    with pytest.raises(TypeError, match="Cannot specify both"):
+        llm.spawn(eos_byte_strings=[b"!"], eos_tokens=[b"?"])
