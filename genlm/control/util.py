@@ -55,18 +55,23 @@ class LazyWeights:
         if token in self.encode:
             return self.weights[self.encode[token]]
 
-        # Fallback: if token is plain bytes (not Token), search by byte_string content.
+        # Fallback: if token is plain bytes (not Token), look up by byte_string content.
         # This supports old code that indexes by bytes; returns the first match.
         if Token.is_plain_bytes(token):
-            for vocab_token in self.decode:
-                if isinstance(vocab_token, Token) and vocab_token.byte_string == token:
-                    warnings.warn(
-                        "Indexing LazyWeights by bytes is deprecated. "
-                        "Use Token objects instead (e.g. from llm.tokenize()).",
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
-                    return self.weights[self.encode[vocab_token]]
+            if not hasattr(self, "_bytes_fallback"):
+                self._bytes_fallback = {}
+                for vocab_token in self.decode:
+                    if isinstance(vocab_token, Token) and vocab_token.byte_string not in self._bytes_fallback:
+                        self._bytes_fallback[vocab_token.byte_string] = vocab_token
+            match = self._bytes_fallback.get(token)
+            if match is not None:
+                warnings.warn(
+                    "Indexing LazyWeights by bytes is deprecated. "
+                    "Use Token objects instead (e.g. from llm.tokenize()).",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return self.weights[self.encode[match]]
 
         return float("-inf") if self.is_log else 0
 
