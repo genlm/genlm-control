@@ -47,7 +47,7 @@ class _TokenEncodeDict(dict):
         try:
             return super().__getitem__(key)
         except KeyError:
-            if isinstance(key, bytes) and not isinstance(key, Token):
+            if Token.is_plain_bytes(key):
                 self._build_bytes_fallback()
                 if key in self._bytes_fallback:
                     warnings.warn(
@@ -62,7 +62,7 @@ class _TokenEncodeDict(dict):
     def __contains__(self, key):
         if super().__contains__(key):
             return True
-        if isinstance(key, bytes) and not isinstance(key, Token):
+        if Token.is_plain_bytes(key):
             self._build_bytes_fallback()
             return key in self._bytes_fallback
         return False
@@ -138,8 +138,7 @@ class TokenMappings(NamedTuple):
                     )
 
         # Verify all EOS tokens were found
-        missing = eos_byte_strings_set - set(eos_byte_to_token.keys())
-        if missing:
+        if eos_byte_strings_set - set(eos_byte_to_token.keys()):
             raise ValueError("EOS token not in language model vocabulary")
 
         # Build lists in order of eos_byte_strings input

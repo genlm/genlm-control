@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 from genlm.grammar import Float, Log
 from arsenal.maths import logsumexp
@@ -55,9 +57,7 @@ class LazyWeights:
 
         # Fallback: if token is plain bytes (not Token), search by byte_string content.
         # This supports old code that indexes by bytes; returns the first match.
-        if isinstance(token, bytes) and not isinstance(token, Token):
-            import warnings
-
+        if Token.is_plain_bytes(token):
             for vocab_token in self.decode:
                 if isinstance(vocab_token, Token) and vocab_token.byte_string == token:
                     warnings.warn(

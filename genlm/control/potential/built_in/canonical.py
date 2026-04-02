@@ -127,23 +127,14 @@ class FastCanonicalityFilterBPE:
         if context == ():
             mask = np.ones(self.V, dtype=bool)
         else:
-            (_, last_token) = context
-            last_token_bytes = (
-                last_token.byte_string
-                if isinstance(last_token, Token)
-                else last_token
-            )
+            _, last_token = context
+            last_token_bytes = Token.as_bytes(last_token)
 
-            try:
-                left_id = self._encode[last_token_bytes]  # Get the ID of the last token
-            except KeyError as e:
-                raise KeyError(
-                    f"Last token {last_token_bytes!r} not found in encode map."
-                ) from e
+            left_id = self._encode.get(last_token_bytes)
+            if left_id is None:
+                raise KeyError(f"Last token {last_token_bytes!r} not found in encode map.")
 
-            mask = self._vectorized_conflicting_next_tokens(
-                left_id
-            )  # Get base mask from BPE rules
+            mask = self._vectorized_conflicting_next_tokens(left_id)
 
             # Apply overrides: Ensure overridden tokens are allowed (True)
             if left_id in self.overrides:
@@ -414,11 +405,7 @@ class CanonicalTokenization(Potential):
             # print("percent of mask: ", np.sum(mask)*100 / len(mask))
 
             # Find token_id in the canonicality filter's vocabulary
-            current_token_bytes = (
-                current_token.byte_string
-                if isinstance(current_token, Token)
-                else current_token
-            )
+            current_token_bytes = Token.as_bytes(current_token)
 
             token_id = self.canonicality_filter._encode[current_token_bytes]
             if not mask[token_id]:

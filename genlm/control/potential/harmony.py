@@ -10,6 +10,7 @@ from genlm.control.potential import Potential
 from genlm.control.potential.built_in.llm import TokenMappings
 from genlm.control.util import LazyWeights
 from genlm.backend import decode_vocab
+from genlm.backend.tokenization import Token
 
 
 class HarmonyChat:
@@ -199,8 +200,6 @@ class HarmonyChat:
         Raises:
             ValueError: If any token is not in the vocabulary.
         """
-        from genlm.backend.tokenization import Token
-
         result = []
         for item in tokens:
             if isinstance(item, Token):
@@ -249,12 +248,10 @@ class HarmonyChat:
         ):  # Remove the EOS token if present.
             context = context[:-1]  # pragma: no cover
 
-        from genlm.backend.tokenization import Token
-
         if isinstance(context, list) and all(
             isinstance(x, (bytes, Token)) for x in context
         ):
-            byte_parts = [x.byte_string if isinstance(x, Token) else x for x in context]
+            byte_parts = [Token.as_bytes(x) for x in context]
             context_str = b"".join(byte_parts).decode("utf-8", errors="replace")
         elif isinstance(context, str):  # pragma: no cover
             context_str = context  # pragma: no cover
