@@ -1,8 +1,11 @@
+import warnings
+
 import numpy as np
 from genlm.grammar import Float, Log
 from arsenal.maths import logsumexp
 
 from genlm.control.constant import EndOfSequence
+from genlm.backend.tokenization import Token
 
 
 class LazyWeights:
@@ -28,7 +31,7 @@ class LazyWeights:
             log (bool, optional): Indicates if the weights are in log space. Defaults to True.
 
         Raises:
-            AssertionError: If the lengths of weights and decode or encode do not match.
+            AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
         assert len(weights) == len(decode)
         assert len(encode) == len(decode)
@@ -44,13 +47,33 @@ class LazyWeights:
 
         Args:
             token (Any): The token for which to retrieve the weight.
+                Can be a Token object (direct lookup) or bytes (searches by byte_string).
 
         Returns:
             (float): The weight of the token, or -inf/0 if the token is not found.
         """
-        if token not in self.encode:
-            return float("-inf") if self.is_log else 0
-        return self.weights[self.encode[token]]
+        if token in self.encode:
+            return self.weights[self.encode[token]]
+
+        # Fallback: if token is plain bytes (not Token), look up by byte_string content.
+        # This supports old code that indexes by bytes; returns the first match.
+        if Token.is_plain_bytes(token):
+            if not hasattr(self, "_bytes_fallback"):
+                self._bytes_fallback = {}
+                for vocab_token in self.decode:
+                    if isinstance(vocab_token, Token) and vocab_token.byte_string not in self._bytes_fallback:
+                        self._bytes_fallback[vocab_token.byte_string] = vocab_token
+            match = self._bytes_fallback.get(token)
+            if match is not None:
+                warnings.warn(
+                    "Indexing LazyWeights by bytes is deprecated. "
+                    "Use Token objects instead (e.g. from llm.tokenize()).",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return self.weights[self.encode[match]]
+
+        return float("-inf") if self.is_log else 0
 
     def __len__(self):
         return len(self.weights)
@@ -207,7 +230,7 @@ def load_trie(V, backend=None, **kwargs):
     Load a TokenCharacterTrie.
 
     Args:
-        V (list): The vocabulary.
+        V (list[Token] | list[bytes] | list[str]): The vocabulary.
         backend (str, optional): The backend to use for trie construction. Defaults to None.
         **kwargs (dict): Additional arguments for the trie construction.
 
@@ -215,6 +238,23 @@ def load_trie(V, backend=None, **kwargs):
         (TokenCharacterTrie): A trie instance.
     """
     import torch
+    from genlm.backend.tokenization import Token
+
+    # Convert pure bytes/strings vocabularies to Token objects.
+    # Skip if V already contains Token objects (Token subclasses bytes,
+    # so we must check Token first).
+    if (
+        V
+        and not isinstance(V[0], Token)
+        and all(isinstance(item, (bytes, str)) for item in V)
+    ):
+        V = [
+            Token(
+                token_id=i,
+                byte_string=item if isinstance(item, bytes) else item.encode("utf-8"),
+            )
+            for i, item in enumerate(V)
+        ]
 
     if backend is None:
         backend = "parallel" if torch.cuda.is_available() else "sequential"

@@ -10,7 +10,7 @@ First, let's look at basic language model sampling using a [`PromptedLLM`][genlm
 from genlm.control import PromptedLLM, direct_token_sampler
 
 # Load gpt2 (or any other Hugging Face model)
-mtl_llm = PromptedLLM.from_name("gpt2", temperature=0.5, eos_tokens=[b'.'])
+mtl_llm = PromptedLLM.from_name("gpt2", temperature=0.5, eos_byte_strings=[b'.'])
 
 # Set the fixed prompt prefix for the language model
 # All language model predictions will be conditioned on this prompt
@@ -30,7 +30,7 @@ sequences.posterior
 sequences.decoded_posterior
 ```
 
-Note: Sequences are lists of `bytes` objects because each token in the language model's vocabulary is represented as a bytes object.
+Note: Sequences are lists of `Token` objects. Each `Token` carries a `token_id` and a `byte_string`, and subclasses `bytes` for backwards compatibility (so `b"".join(sequence)` still works).
 
 ## Prompt Intersection
 

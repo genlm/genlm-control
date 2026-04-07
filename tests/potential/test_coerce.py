@@ -3,6 +3,7 @@ import numpy as np
 from genlm.control.typing import Atomic
 from genlm.control.constant import EOS
 from genlm.control.potential import Coerced, Potential
+from genlm.backend.tokenization import Token
 
 
 class MockPotential(Potential):
@@ -113,3 +114,31 @@ def test_coerced_no_prune():
     c = Coerced(p, [b"aa", b"bb", b"aab", b"aad"], f=b"".join, prune=False)
     assert len(c.vocab) == 4
     assert set(c.vocab) == {b"aa", b"bb", b"aab", b"aad"}
+
+
+class TokenPotential(Potential):
+    """Mock potential with Token-based vocabulary."""
+
+    def __init__(self, tokens):
+        super().__init__(tokens)
+
+    async def complete(self, context):
+        return len(context)
+
+    async def prefix(self, context):
+        return len(context) / 2
+
+
+def test_coerced_with_token_vocab():
+    """Test Coerced with Token-based potential vocabulary (exercises byte_string extraction)."""
+    tokens = [
+        Token(0, b"a"),
+        Token(1, b"b"),
+        Token(2, b"c"),
+    ]
+    p = TokenPotential(tokens)
+    target = [b"aa", b"bb", b"aab", b"aad"]
+    c = Coerced(p, target, f=b"".join, prune=True)
+
+    assert len(c.vocab) == 3
+    assert set(c.vocab) == {b"aa", b"bb", b"aab"}

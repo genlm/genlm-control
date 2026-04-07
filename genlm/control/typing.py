@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from collections.abc import Sequence as SequenceABC
 
 from genlm.control.constant import EndOfSequence
+from genlm.backend.tokenization import Token
 
 
 @dataclass
@@ -39,6 +40,12 @@ class TokenType:
                 self.type is str
                 and isinstance(element_type, Atomic)
                 and element_type.type is str
+            ):
+                return True
+            if (
+                self.type is Token
+                and isinstance(element_type, Atomic)
+                and element_type.type is int
             ):
                 return True
 

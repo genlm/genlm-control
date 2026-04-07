@@ -13,11 +13,16 @@ def model_name():
 
 
 @pytest.fixture(scope="module")
-def beam_params(model_name):
+def llm(model_name):
+    """Provides the underlying LLM for the test module."""
+    return load_model_by_name(model_name)
+
+
+@pytest.fixture(scope="module")
+def beam_params(llm):
     """Provides BeamParams configured with the model's default EOS token."""
-    llm = load_model_by_name(model_name)
-    model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    return BeamParams(K=5, prune_threshold=0.0, eos_tokens={model_eos_token})
+    eos_byte_string = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
+    return BeamParams(K=5, prune_threshold=0.0, eos_byte_strings=[eos_byte_string])
 
 
 @pytest.fixture
@@ -210,9 +215,9 @@ async def measure_prefix_reach(byte_llm: ByteLLM, context: list) -> int:
 async def test_healing_disabled_fails(model_name):
     """Without healing, K=1 beam fails on text requiring alternative tokenization."""
     llm = load_model_by_name(model_name)
-    beam_params = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False
-    )
+    eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
+    # Explicitly disable healing to test failure mode
+    beam_params = BeamParams(K=1, eos_byte_strings=[eos], heal=False)
     byte_llm = ByteLLM(llm, beam_params)
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
@@ -229,20 +234,17 @@ async def test_healing_disabled_fails(model_name):
 async def test_healing_enabled_succeeds(model_name):
     """With healing enabled, K=1 beam processes more text than without healing."""
     llm = load_model_by_name(model_name)
+    eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
     # Test without healing - find how far we get
-    beam_params_no_heal = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False
-    )
+    beam_params_no_heal = BeamParams(K=1, eos_byte_strings=[eos], heal=False)
     no_heal_len = await measure_prefix_reach(ByteLLM(llm, beam_params_no_heal), context)
 
     # Test with healing - should get further
-    beam_params_heal = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True
-    )
+    beam_params_heal = BeamParams(K=1, eos_byte_strings=[eos], heal=True)
     heal_len = await measure_prefix_reach(ByteLLM(llm, beam_params_heal), context)
 
     assert (
@@ -254,13 +256,14 @@ async def test_healing_enabled_succeeds(model_name):
 async def test_healing_max_backoff(model_name):
     """Limited backoff constrains healing effectiveness."""
     llm = load_model_by_name(model_name)
+    eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
     # Unlimited healing
     beam_params_unlimited = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True
+        K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=None
     )
     unlimited_len = await measure_prefix_reach(
         ByteLLM(llm, beam_params_unlimited), context
@@ -268,10 +271,7 @@ async def test_healing_max_backoff(model_name):
 
     # Limited healing
     beam_params_limited = BeamParams(
-        K=1,
-        eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]},
-        heal=True,
-        heal_max_backoff=2,
+        K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=2
     )
     limited_len = await measure_prefix_reach(ByteLLM(llm, beam_params_limited), context)
 

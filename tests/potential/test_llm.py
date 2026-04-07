@@ -4,7 +4,9 @@ import numpy as np
 from arsenal.maths import logsumexp
 from hypothesis import given, strategies as st, settings, reject
 
+from genlm.backend.tokenization import Token
 from genlm.control.potential.built_in import PromptedLLM
+from genlm.control.potential.built_in.llm import TokenMappings
 
 # pytest.mark.asyncio seems to cause issues with hypothesis
 # and the vllm backend, so we use asyncio.run here.
@@ -62,11 +64,11 @@ async def test_prompt_setting(llm, pre_prompt):
     # Test ids setter
     llm.prompt_ids = pre_prompt_ids
     assert llm.prompt_ids == pre_prompt_ids
-    assert b"".join(llm.prompt).decode() == pre_prompt
+    assert b"".join(t.byte_string for t in llm.prompt).decode() == pre_prompt
 
     # Test str setter
     llm.set_prompt_from_str(pre_prompt)
-    assert b"".join(llm.prompt).decode() == pre_prompt
+    assert b"".join(t.byte_string for t in llm.prompt).decode() == pre_prompt
     assert llm.prompt_ids == pre_prompt_ids
 
 
@@ -109,7 +111,7 @@ async def test_properties(llm, pre_prompt, context, temp):
     await llm.assert_logw_next_consistency(context, top=10, rtol=0.01, atol=1e-3)
     await llm.assert_autoreg_fact(context, rtol=0.01, atol=1e-3)
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!", b"?"])
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!", b"?"])
     await new_llm.assert_logw_next_consistency(context, top=10, rtol=0.01, atol=1e-3)
     await new_llm.assert_autoreg_fact(context, rtol=0.01, atol=1e-3)
 
@@ -148,21 +150,23 @@ def eos_test_params(draw):
 @given(eos_test_params())
 async def test_new_eos_tokens(llm, params):
     with pytest.raises(
-        ValueError, match="Cannot reset eos_tokens after initialization"
+        ValueError, match="Cannot reset eos_byte_strings after initialization"
     ):
-        llm.eos_tokens = []
+        llm.eos_byte_strings = []
 
     eos_token_ids, context_ids, prompt_ids = params
     llm.prompt_ids = prompt_ids
-    eos_tokens = [llm.token_maps.decode[x] for x in eos_token_ids]
-    new_llm = llm.spawn_new_eos(eos_tokens=eos_tokens)
-    assert new_llm.eos_tokens == eos_tokens
+    eos_bs = [llm.token_maps.decode[x].byte_string for x in eos_token_ids]
+    new_llm = llm.spawn_new_eos(eos_byte_strings=eos_bs)
+    assert new_llm.eos_byte_strings == eos_bs
 
     new_llm.temperature = 1.0
 
     assert new_llm.prompt_ids == prompt_ids  # check prompt_ids is not changed
     assert new_llm.token_maps.eos_idxs == eos_token_ids
-    assert set(new_llm.token_maps.decode) - set(eos_tokens) == set(new_llm.vocab)
+    vocab_bytes = {token.byte_string for token in new_llm.vocab}
+    decode_bytes = {token.byte_string for token in new_llm.token_maps.decode}
+    assert decode_bytes - set(eos_bs) == vocab_bytes
 
     context = new_llm.decode_tokens(context_ids)
     have = await new_llm.complete(context)
@@ -174,18 +178,21 @@ def test_invalid_eos_tokens(llm):
     # Test EOS token not in vocabulary
     invalid_eos = [b"THIS_TOKEN_DOES_NOT_EXIST"]
     with pytest.raises(ValueError, match="EOS token not in language model vocabulary"):
-        llm.spawn_new_eos(eos_tokens=invalid_eos)
+        llm.spawn_new_eos(eos_byte_strings=invalid_eos)
 
     # Test duplicate EOS tokens
-    duplicate_eos = [llm.token_maps.decode[0], llm.token_maps.decode[0]]
-    with pytest.raises(ValueError, match="Duplicate eos tokens"):
-        llm.spawn_new_eos(eos_tokens=duplicate_eos)
+    duplicate_eos = [
+        llm.token_maps.decode[0].byte_string,
+        llm.token_maps.decode[0].byte_string,
+    ]
+    with pytest.raises(ValueError, match="Duplicate eos byte strings"):
+        llm.spawn_new_eos(eos_byte_strings=duplicate_eos)
 
-    # Test attempting to modify eos_tokens directly
+    # Test attempting to modify eos_byte_strings directly
     with pytest.raises(
-        ValueError, match="Cannot reset eos_tokens after initialization"
+        ValueError, match="Cannot reset eos_byte_strings after initialization"
     ):
-        llm.eos_tokens = [llm.token_maps.decode[0]]
+        llm.eos_byte_strings = [llm.token_maps.decode[0].byte_string]
 
 
 def test_invalid_token_encoding(llm):
@@ -218,7 +225,7 @@ def test_spawn(llm):
     assert new_llm.token_maps == llm.token_maps
     assert new_llm.vocab == llm.vocab
 
-    new_llm = llm.spawn(eos_tokens=[b"!"], temperature=1.0)
+    new_llm = llm.spawn(eos_byte_strings=[b"!"], temperature=1.0)
     assert new_llm.token_maps.eos_idxs == [0]
     assert new_llm.temperature == 1.0
     assert new_llm.prompt_ids == llm.prompt_ids
@@ -227,12 +234,12 @@ def test_spawn(llm):
 
 def test_providing_eos_tokens_and_token_maps(llm):
     with pytest.raises(
-        ValueError, match="eos_tokens must not be provided when token_maps is provided."
+        ValueError, match="eos_byte_strings must not be provided when token_maps is provided."
     ):
         PromptedLLM(
             llm.model,
             prompt_ids=llm.prompt_ids,
-            eos_tokens=[b"!"],
+            eos_byte_strings=[b"!"],
             token_maps=llm.token_maps,
         )
 
@@ -263,9 +270,9 @@ async def test_vllm_backend():
         [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
     )
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
     assert new_llm.token_maps.eos_idxs == [0]
-    assert new_llm.token_maps.decode[0] == b"!"
+    assert new_llm.token_maps.decode[0].byte_string == b"!"
 
     context = llm.tokenize(" world")
     await new_llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
@@ -282,3 +289,120 @@ def test_llm_repr(llm):
 def test_prompt_warning(llm):
     with pytest.warns(UserWarning):
         llm.set_prompt_from_str("hello ")
+
+
+def test_encode_tokens_with_bytes(llm):
+    """Test that encode_tokens works with bytes (deprecated path) and issues warning."""
+    token = llm.vocab[0]
+    byte_string = token.byte_string
+
+    with pytest.warns(
+        DeprecationWarning, match="Passing bytes to encode_tokens is deprecated"
+    ):
+        result = llm.encode_tokens([byte_string])
+
+    assert result == [token.token_id]
+
+
+def test_encode_tokens_invalid_bytes(llm):
+    """Test that encode_tokens raises error for invalid bytes."""
+    with pytest.raises(ValueError, match="Token .* not in vocabulary"):
+        llm.encode_tokens([b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"])
+
+
+def test_token_encode_dict_getitem_bytes(llm):
+    """Test _TokenEncodeDict.__getitem__ with bytes key (deprecated path)."""
+    token = llm.vocab[0]
+    with pytest.warns(DeprecationWarning, match="Indexing token_maps.encode by bytes is deprecated"):
+        idx = llm.token_maps.encode[token.byte_string]
+    assert idx == llm.token_maps.encode[token]
+
+
+def test_token_encode_dict_getitem_missing(llm):
+    """Test _TokenEncodeDict.__getitem__ raises KeyError for missing key."""
+    with pytest.raises(KeyError):
+        llm.token_maps.encode[b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"]
+
+
+def test_token_encode_dict_contains_token(llm):
+    """Test _TokenEncodeDict.__contains__ with Token key."""
+    token = llm.vocab[0]
+    assert token in llm.token_maps.encode
+
+
+def test_token_encode_dict_contains_bytes(llm):
+    """Test _TokenEncodeDict.__contains__ with bytes key (deprecated fallback)."""
+    token = llm.vocab[0]
+    assert token.byte_string in llm.token_maps.encode
+
+
+def test_token_encode_dict_contains_missing(llm):
+    """Test _TokenEncodeDict.__contains__ returns False for missing key."""
+    assert b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345" not in llm.token_maps.encode
+
+
+def test_find_token_id_for_bytes(llm):
+    """Test _find_token_id_for_bytes returns first match and caches."""
+    token = llm.vocab[0]
+    tid = llm._find_token_id_for_bytes(token.byte_string)
+    assert tid == token.token_id
+    # Second call uses cache
+    tid2 = llm._find_token_id_for_bytes(token.byte_string)
+    assert tid2 == tid
+
+
+def test_find_token_id_for_bytes_missing(llm):
+    """Test _find_token_id_for_bytes returns None for missing bytes."""
+    assert llm._find_token_id_for_bytes(b"THIS_DOES_NOT_EXIST_12345") is None
+
+
+def test_duplicate_eos_byte_string_includes_all():
+    """Test that TokenMappings treats all tokens sharing an EOS byte_string as EOS."""
+    decode = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"hello"),
+        Token(token_id=3, byte_string=b"foo"),
+    ]
+
+    tm = TokenMappings.create(decode=decode, eos_byte_strings=[b"hello"])
+    assert set(tm.eos_idxs) == {0, 2}
+    assert all(t.byte_string != b"hello" for t in tm.potential_vocab)
+
+
+def test_eos_tokens_deprecation_from_name(llm):
+    """Test that the deprecated eos_tokens kwarg works with DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        new_llm = PromptedLLM(llm.model, eos_tokens=[b"!"])
+    assert new_llm.eos_byte_strings == [b"!"]
+
+
+def test_eos_tokens_deprecation_spawn(llm):
+    """Test that spawn accepts deprecated eos_tokens kwarg."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        new_llm = llm.spawn(eos_tokens=[b"!"])
+    assert new_llm.eos_byte_strings == [b"!"]
+
+
+def test_eos_tokens_deprecation_spawn_new_eos(llm):
+    """Test that spawn_new_eos accepts deprecated eos_tokens kwarg."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
+    assert new_llm.eos_byte_strings == [b"!"]
+
+
+def test_eos_tokens_deprecation_token_mappings():
+    """Test that TokenMappings.create accepts deprecated eos_tokens kwarg."""
+    decode = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+    ]
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        tm = TokenMappings.create(decode=decode, eos_tokens=[b"hello"])
+    assert tm.eos_byte_strings == [b"hello"]
+
+
+def test_eos_tokens_and_byte_strings_conflict(llm):
+    """Test that specifying both eos_tokens and eos_byte_strings raises."""
+    with pytest.raises(TypeError, match="Cannot specify both"):
+        llm.spawn(eos_byte_strings=[b"!"], eos_tokens=[b"?"])

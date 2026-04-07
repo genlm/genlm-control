@@ -123,7 +123,7 @@ book_schema = {
 # (You will need to login via the Hugging Face CLI and have access to the model.)
 llm = PromptedLLM.from_name(
     "meta-llama/Llama-3.2-1B-Instruct",
-    eos_tokens=[b"<|eom_id|>", b"<|eot_id|>"],
+    eos_byte_strings=[b"<|eom_id|>", b"<|eot_id|>"],
     temperature=0.8
 )
 

@@ -5,6 +5,7 @@ from arsenal.datastructures import LocatorMaxHeap
 from abc import ABC, abstractmethod
 
 from genlm.control.util import load_async_trie
+from genlm.backend.tokenization import Token
 
 
 class SetSampler(ABC):
@@ -69,6 +70,7 @@ class TrieSetSampler(SetSampler):
             )
         self.iter_potential = iter_potential
         self.item_potential = item_potential
+
         self.f = lambda context: [item for items in context for item in items]
 
         super().__init__(
@@ -80,15 +82,22 @@ class TrieSetSampler(SetSampler):
         )
         self.trie = self.trie_executor.trie
 
+        # Build mappings between trie structure and target vocabulary
         vocab_eos = self.target.vocab_eos
         word2leaf = self.trie.word2leaf
         lookup = self.target.lookup
 
-        common_tokens = set(vocab_eos) & set(word2leaf)
+        # Get word2leaf key for each token
+        def get_word_key(token):
+            if isinstance(token, Token):
+                return (token.byte_string, token.token_id)
+            return token
 
-        self.leaf_to_token_id = dict(
-            (word2leaf[token], lookup[token]) for token in common_tokens
-        )
+        common_tokens = [t for t in vocab_eos if get_word_key(t) in word2leaf]
+
+        self.leaf_to_token_id = {
+            word2leaf[get_word_key(token)]: lookup[token] for token in common_tokens
+        }
 
     async def sample_set(self, context):
         """
@@ -147,14 +156,20 @@ class EagerSetSampler(TrieSetSampler):
         while True:
             children = self.trie.children[curr]
             item_w_curr = item_ws[curr]
-            item_ws1 = Float.chart(
-                {a: item_ws[c] / item_w_curr for a, c in children.items()}
-            )
 
-            if None in item_ws1:
-                leaf = children[None]
-                token = self.trie.leaf2word[leaf]
-                token_id = self.leaf_to_token_id[leaf]
+            # Build item_ws1, handling (None, token_id) leaf markers
+            item_ws1 = Float.chart()
+            leaf_node = None
+            for a, c in children.items():
+                if isinstance(a, tuple) and a[0] is None:
+                    # Leaf marker - record but don't add to item_ws1
+                    leaf_node = c
+                else:
+                    item_ws1[a] = item_ws[c] / item_w_curr
+
+            if leaf_node is not None:
+                token_id = self.leaf_to_token_id[leaf_node]
+                token = self.target.vocab_eos[token_id]
                 logws[token_id] = iter_logws[token] + logw - logp
 
             item_logws2 = await self.item_potential.logw_next(coerced_ctx + subtokens)
@@ -268,7 +283,7 @@ class TopKSetSampler(TrieSetSampler):
         W = Float.chart()
 
         # initial conditions
-        (token, node) = ((), self.trie.root)
+        token, node = ((), self.trie.root)
         agenda[token, node, False] = max_logws[node]
         W[node] = 0
 
@@ -296,7 +311,8 @@ class TopKSetSampler(TrieSetSampler):
 
             logws = None
             for x, y in children[node].items():
-                if x is None:
+                if isinstance(x, tuple) and x[0] is None:
+                    # Leaf marker (None, token_id)
                     W_y = W[node]
                     W[y] = W_y
                     agenda[token, y, True] = W_y + max_logws[y]

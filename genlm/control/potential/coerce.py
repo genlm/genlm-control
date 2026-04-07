@@ -1,4 +1,5 @@
 from genlm.control.potential import Potential
+from genlm.backend.tokenization import Token
 from itertools import chain
 import asyncio
 
@@ -55,10 +56,21 @@ class Coerced(Potential):
         self.f = f
 
         if prune:
+            # When vocab contains Token objects (bytes subclass), the coercion
+            # function f (typically b"".join) produces bytes. set(bytes) yields
+            # int byte values, so we need potential_items to also be int byte
+            # values for the subset check to work.
+            if potential.vocab and isinstance(potential.vocab[0], Token):
+                potential_items = set(
+                    byte_val for tok in potential.vocab for byte_val in tok.byte_string
+                )
+            else:
+                potential_items = set(potential.vocab)
+
             tokens = []
             for target_token in target_vocab:
                 base_token = f([target_token])
-                if set(base_token) <= set(potential.vocab):
+                if set(base_token) <= potential_items:
                     tokens.append(target_token)
         else:
             tokens = target_vocab

@@ -25,20 +25,20 @@ class MockAsyncTransformer:  # Mock the backend LLM object
 
 
 class MockLLM(PromptedLLM):
-    def __init__(self, tokenizer, model_name="mock_model", eos_tokens=None):
+    def __init__(self, tokenizer, model_name="mock_model", eos_byte_strings=None):
         # Create the mock backend object
         mock_backend_llm = MockAsyncTransformer(tokenizer)
 
         # Call the parent PromptedLLM initializer
-        # Use provided eos_tokens if available, otherwise extract from tokenizer
-        if eos_tokens is None:
+        # Use provided eos_byte_strings if available, otherwise extract from tokenizer
+        if eos_byte_strings is None:
             eos_token_bytes = (
                 tokenizer.eos_token.encode("utf-8") if tokenizer.eos_token else None
             )
             eos_token_list = [eos_token_bytes] if eos_token_bytes else []
         else:
-            # Assume provided eos_tokens are already bytes or handle conversion if needed
-            eos_token_list = eos_tokens
+            # Assume provided eos_byte_strings are already bytes or handle conversion if needed
+            eos_token_list = eos_byte_strings
 
         # Need to handle cases where byte_vocab is None for unsupported tokenizers
         if mock_backend_llm.byte_vocab is None:
@@ -52,7 +52,7 @@ class MockLLM(PromptedLLM):
             )
             self.token_maps = None  # Indicate maps aren't properly initialized
         else:
-            super().__init__(llm=mock_backend_llm, eos_tokens=eos_token_list)
+            super().__init__(llm=mock_backend_llm, eos_byte_strings=eos_token_list)
             # The super init should handle setting up self.model and self.token_maps
 
 
@@ -63,7 +63,7 @@ def llm():
 
 @pytest.fixture(scope="module")
 def llm_with_multiple_eos(llm):
-    return llm.spawn_new_eos(eos_tokens=[b".", b" city", b"\n", b" "])
+    return llm.spawn_new_eos(eos_byte_strings=[b".", b" city", b"\n", b" "])
 
 
 @pytest.fixture(scope="module")
@@ -167,9 +167,9 @@ async def test_set_overrides(canonical_potential):
     if any(idx >= len(_decode) or _decode[idx] is None for idx in required_ids):
         pytest.skip("Required token IDs for override test not present in vocabulary.")
 
-    token_198_bytes = _decode[198]
-    token_2637_bytes = _decode[2637]
-    token_82_bytes = _decode[82]  # Corresponds to 's' for gpt2
+    token_198_bytes = _decode[198].byte_string
+    token_2637_bytes = _decode[2637].byte_string
+    token_82_bytes = _decode[82].byte_string  # Corresponds to 's' for gpt2
 
     # Test override (198, 198) -> \n\n
     logw_198 = await canonical_potential.logw_next([token_198_bytes])
@@ -272,13 +272,14 @@ def test_from_llm_extract_merges_fallback():
 
 def test_from_llm_duplicate_byte_error(llm):
     """Test that from_tokenizer raises ValueError if decode_vocab returns duplicates."""
+    from genlm.backend.tokenization import Token
 
     # Define the vocabulary with duplicates we want decode_vocab to return
     duplicate_vocab = [
-        b"a",  # ID 0
-        b"b",  # ID 1
-        b"c",  # ID 2
-        b"a",  # ID 3 - DUPLICATE of ID 0
+        Token(0, b"a"),  # ID 0
+        Token(1, b"b"),  # ID 1
+        Token(2, b"c"),  # ID 2
+        Token(3, b"a"),  # ID 3 - DUPLICATE byte_string of ID 0
     ]
 
     # Patch decode_vocab within the canonical module for this test
@@ -345,9 +346,11 @@ def test_extract_merges_slow_id_mapping_failure():
     # Patch hasattr to return True for bpe_ranks check
     with patch(
         "builtins.hasattr",
-        lambda obj, name: True
-        if obj is mock_tokenizer and name == "bpe_ranks"
-        else hasattr(obj, name),
+        lambda obj, name: (
+            True
+            if obj is mock_tokenizer and name == "bpe_ranks"
+            else hasattr(obj, name)
+        ),
     ):
         # Catch ALL UserWarnings
         with pytest.raises(ValueError):

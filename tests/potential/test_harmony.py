@@ -199,6 +199,29 @@ def test_harmony_potential_validation(tokenizer, wcfg):
         HarmonyPotential(coerced_cfg, tokenizer, constrained_channels=["invalid"])
 
 
+def test_harmony_encode_tokens_bytes_fallback(tokenizer):
+    """Test HarmonyChat.encode_tokens with bytes input (deprecated path)."""
+    harmony_chat = HarmonyChat(tokenizer)
+    # Get a token and its byte_string
+    token = harmony_chat.token_maps.decode[0]
+    byte_string = token.byte_string
+
+    # Bytes path should work and return the same token_id
+    result_bytes = harmony_chat.encode_tokens([byte_string])
+    result_token = harmony_chat.encode_tokens([token])
+    assert result_bytes == result_token
+
+
+def test_harmony_encode_tokens_mixed(tokenizer):
+    """Test HarmonyChat.encode_tokens with mixed Token and bytes input."""
+    harmony_chat = HarmonyChat(tokenizer)
+    t0 = harmony_chat.token_maps.decode[0]
+    t1 = harmony_chat.token_maps.decode[1]
+    # Mix Token objects and raw bytes
+    result = harmony_chat.encode_tokens([t0, t1.byte_string])
+    assert result == [t0.token_id, t1.token_id]
+
+
 def test_harmony_channel_extraction(harmony_examples, tokenizer):
     """Test that HarmonyChat correctly extracts channels from harmony chat examples."""
     samples = harmony_examples["samples"]

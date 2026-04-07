@@ -172,13 +172,19 @@ def test_lazy_weights_items():
 def test_load_trie():
     vocab = ["a", "b", "c"]
     trie = load_trie(vocab, backend="sequential")
-    assert trie.decode == vocab
+    assert [token.byte_string for token in trie.decode] == [
+        v.encode("utf-8") for v in vocab
+    ]
 
     trie = load_trie(vocab, backend="parallel")
-    assert trie.decode == vocab
+    assert [token.byte_string for token in trie.decode] == [
+        v.encode("utf-8") for v in vocab
+    ]
 
     trie = load_trie(vocab)
-    assert trie.decode == vocab
+    assert [token.byte_string for token in trie.decode] == [
+        v.encode("utf-8") for v in vocab
+    ]
 
 
 def test_lazy_weights_repr():
@@ -188,6 +194,22 @@ def test_lazy_weights_repr():
 
     lw = LazyWeights(weights, encode, decode, log=False)
     lw.__repr__()
+
+
+def test_lazy_weights_bytes_fallback():
+    """Test that indexing LazyWeights by plain bytes warns and uses cached lookup."""
+    from genlm.backend.tokenization import Token
+
+    tokens = [Token(0, b"hello"), Token(1, b"world")]
+    encode = {tokens[0]: 0, tokens[1]: 1}
+    weights = np.array([-1.0, -2.0])
+    lw = LazyWeights(weights, encode, tokens, log=True)
+
+    with pytest.warns(DeprecationWarning, match="Indexing LazyWeights by bytes is deprecated"):
+        assert lw[b"hello"] == -1.0
+
+    # Missing bytes should return -inf (log mode)
+    assert lw[b"missing"] == float("-inf")
 
 
 def test_escape():
