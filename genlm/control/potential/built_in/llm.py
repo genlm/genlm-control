@@ -122,8 +122,6 @@ class TokenMappings(NamedTuple):
         if len(set(eos_byte_strings)) != len(eos_byte_strings):
             raise ValueError("Duplicate eos byte strings")
 
-        eos_byte_strings_set = set(eos_byte_strings)
-
         # Collect ALL tokens whose byte_string matches any EOS byte_string.
         # When multiple tokens share the same byte_string (duplicate byte
         # representations), all of them must be treated as EOS — otherwise the
