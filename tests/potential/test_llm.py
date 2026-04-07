@@ -356,8 +356,8 @@ def test_find_token_id_for_bytes_missing(llm):
     assert llm._find_token_id_for_bytes(b"THIS_DOES_NOT_EXIST_12345") is None
 
 
-def test_duplicate_eos_byte_string_warning():
-    """Test that TokenMappings warns when multiple tokens have the same EOS byte_string."""
+def test_duplicate_eos_byte_string_includes_all():
+    """Test that TokenMappings treats all tokens sharing an EOS byte_string as EOS."""
     decode = [
         Token(token_id=0, byte_string=b"hello"),
         Token(token_id=1, byte_string=b"world"),
@@ -365,8 +365,9 @@ def test_duplicate_eos_byte_string_warning():
         Token(token_id=3, byte_string=b"foo"),
     ]
 
-    with pytest.warns(UserWarning, match="Multiple tokens with EOS byte_string"):
-        TokenMappings.create(decode=decode, eos_byte_strings=[b"hello"])
+    tm = TokenMappings.create(decode=decode, eos_byte_strings=[b"hello"])
+    assert set(tm.eos_idxs) == {0, 2}
+    assert all(t.byte_string != b"hello" for t in tm.potential_vocab)
 
 
 def test_eos_tokens_deprecation_from_name(llm):

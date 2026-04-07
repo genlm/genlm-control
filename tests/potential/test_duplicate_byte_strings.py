@@ -347,9 +347,9 @@ def test_encode_tokens_bytes_fallback_returns_first_match(llm):
 # ---------------------------------------------------------------------------
 
 
-def test_eos_duplicate_keeps_non_eos_in_vocab(mock_llm):
+def test_eos_duplicate_excludes_all_matching_tokens(mock_llm):
     """If the EOS byte_string also appears as a non-EOS token (different token_id),
-    only the designated EOS token should be excluded from potential_vocab."""
+    ALL tokens with that byte_string should be excluded from potential_vocab."""
     decode = mock_llm.byte_vocab
     eos_byte = decode[mock_llm.tokenizer.eos_token_id].byte_string
 
@@ -358,38 +358,34 @@ def test_eos_duplicate_keeps_non_eos_in_vocab(mock_llm):
     if len(eos_dupes) < 2:
         pytest.skip("This model's EOS byte_string has no duplicate")
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        tm = TokenMappings.create(decode=decode, eos_byte_strings=[eos_byte])
+    tm = TokenMappings.create(decode=decode, eos_byte_strings=[eos_byte])
 
-    # The non-EOS duplicate must still be in potential_vocab
-    non_eos_dupes = [t for t in eos_dupes if t.token_id not in set(tm.eos_idxs)]
-    for t in non_eos_dupes:
-        assert t in [
-            v for v in tm.potential_vocab if v.token_id == t.token_id
-        ], f"Token({t.token_id}, {t.byte_string!r}) wrongly excluded from potential_vocab"
+    # All duplicate tokens sharing the EOS byte_string must be excluded
+    for t in eos_dupes:
+        assert t.token_id in set(tm.eos_idxs), (
+            f"Token({t.token_id}, {t.byte_string!r}) should be EOS but is not"
+        )
+        assert not any(
+            v.token_id == t.token_id for v in tm.potential_vocab
+        ), f"Token({t.token_id}, {t.byte_string!r}) should be excluded from potential_vocab"
 
 
 def test_spawn_new_eos_with_duplicate_byte_string(llm):
     """spawn_new_eos with a byte_string that has duplicates in the vocab
-    should work and only exclude the designated EOS token."""
+    should exclude ALL tokens with that byte_string."""
     byte_strings = [t.byte_string for t in llm.vocab]
     counts = Counter(byte_strings)
     dup_bs = next(bs for bs, cnt in counts.items() if cnt > 1)
 
     new_llm = llm.spawn_new_eos(eos_byte_strings=[dup_bs])
 
-    # Only ONE token should be excluded (the first match)
-    assert len(new_llm.token_maps.eos_idxs) == 1
-
-    # The other duplicate should still be in vocab
+    # ALL tokens with the duplicate byte_string should be excluded
     dup_tokens = [t for t in llm.vocab if t.byte_string == dup_bs]
-    excluded_id = new_llm.token_maps.eos_idxs[0]
-    remaining = [t for t in dup_tokens if t.token_id != excluded_id]
-    for t in remaining:
-        assert any(
-            v.token_id == t.token_id for v in new_llm.vocab
-        ), f"Token({t.token_id}) wrongly excluded from vocab"
+    assert len(new_llm.token_maps.eos_idxs) >= len(dup_tokens)
+    for t in dup_tokens:
+        assert t.token_id in set(new_llm.token_maps.eos_idxs), (
+            f"Token({t.token_id}, {t.byte_string!r}) should be EOS"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -124,28 +124,36 @@ class TokenMappings(NamedTuple):
 
         eos_byte_strings_set = set(eos_byte_strings)
 
-        # First pass: find the first Token for each EOS byte_string
-        eos_byte_to_token = {}  # byte_string -> Token object (first match)
+        # Collect ALL tokens whose byte_string matches any EOS byte_string.
+        # When multiple tokens share the same byte_string (duplicate byte
+        # representations), all of them must be treated as EOS — otherwise the
+        # model could emit a duplicate token that the sampler wouldn't
+        # recognise as end-of-sequence.
+        #
+        # Order: first the primary matches (one per eos_byte_string, in input
+        # order), then any extra duplicates found in decode order.
+        eos_bs_to_tokens = {bs: [] for bs in eos_byte_strings}
         for token in decode:
-            if token.byte_string in eos_byte_strings_set:
-                if token.byte_string not in eos_byte_to_token:
-                    eos_byte_to_token[token.byte_string] = token
-                else:
-                    warnings.warn(
-                        f"Multiple tokens with EOS byte_string {token.byte_string!r}. "
-                        f"Using first match (token_id={eos_byte_to_token[token.byte_string].token_id}).",
-                        UserWarning,
-                    )
+            if token.byte_string in eos_bs_to_tokens:
+                eos_bs_to_tokens[token.byte_string].append(token)
 
-        # Verify all EOS tokens were found
-        if eos_byte_strings_set - set(eos_byte_to_token.keys()):
+        # Verify all requested EOS byte_strings were found
+        missing = {bs for bs, toks in eos_bs_to_tokens.items() if not toks}
+        if missing:
             raise ValueError("EOS token not in language model vocabulary")
 
-        # Build lists in order of eos_byte_strings input
-        eos_token_objs = [eos_byte_to_token[eos] for eos in eos_byte_strings]
-        eos_idxs = [t.token_id for t in eos_token_objs]
+        # Primary matches first (preserves input order), then duplicates
+        seen = set()
+        eos_token_objs = []
+        eos_idxs = []
+        for bs in eos_byte_strings:
+            for token in eos_bs_to_tokens[bs]:
+                if token.token_id not in seen:
+                    seen.add(token.token_id)
+                    eos_token_objs.append(token)
+                    eos_idxs.append(token.token_id)
 
-        # Second pass: build potential_vocab excluding only the designated EOS Token objects
+        # Build potential_vocab excluding all EOS tokens
         eos_token_ids = set(eos_idxs)
         potential_vocab = [
             token for token in decode if token.token_id not in eos_token_ids
