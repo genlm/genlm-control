@@ -302,3 +302,16 @@ async def test_wfsa_divergent_backward_short_circuit():
         assert await pot.prefix(b"a") == float("inf")
         with pytest.raises(ValueError, match="Context.*divergent weight"):
             await pot.logw_next(b"a")
+
+
+@pytest.mark.asyncio
+async def test_wfsa_prefix_raises_on_nan():
+    """A NaN reaching _prefix indicates an upstream bug; verify it raises
+    loudly instead of being silently coerced to -inf."""
+    m = BaseWFSA(Log)
+    m.add_I(0, Log.one)
+    m.add_arc(0, b"a"[0], 1, Log(float("nan")))
+    m.add_F(1, Log.one)
+    pot = WFSA(m)
+    with pytest.raises(FloatingPointError, match="NaN in WFSA prefix weights"):
+        await pot.prefix(b"a")
