@@ -1,6 +1,5 @@
 import string
 import numpy as np
-from arsenal.maths import logsumexp
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
 from genlm.grammar.lark_interface import interegular_to_wfsa
@@ -133,10 +132,19 @@ class WFSA(Potential):
             return float("-inf"), curr
 
         bkwd = self.wfsa.epsremove.backward
-        log_ctx_w = logsumexp([(curr[i] * bkwd[i]).score for i in curr])
+        # Inlined logsumexp with infinity short-circuits.
+        arr = np.asarray(
+            [(curr[i] * bkwd[i]).score for i in curr], dtype=np.float64
+        )
+        vmax = arr.max()
+        if vmax == np.inf:
+            return float("inf"), curr
+        if vmax == -np.inf:
+            return float("-inf"), curr
+        log_ctx_w = vmax + np.log(np.exp(arr - vmax).sum())
 
         if np.isnan(log_ctx_w):
-            return float("-inf"), curr
+            raise FloatingPointError("NaN in WFSA prefix weights")
 
         return log_ctx_w, curr
 
@@ -172,6 +180,9 @@ class WFSA(Potential):
 
         if log_ctx_w == float("-inf"):
             raise ValueError(f"Context {context!r} has zero weight.")
+        # Conditional log-weights are undefined when context weight diverges
+        if log_ctx_w == float("inf"):
+            raise ValueError(f"Context {context!r} has divergent weight.")
 
         bkwd = self.wfsa.epsremove.backward
 
