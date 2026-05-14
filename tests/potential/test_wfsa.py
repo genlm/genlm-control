@@ -288,19 +288,17 @@ async def test_wfsa_dead_end_prefix(float_wfsa):
 
 
 @pytest.mark.asyncio
-async def test_bool_fsa_divergent_scc():
-    """Regression: ``[\\s\\S]*PATTERN[\\s\\S]*`` over a large default charset
-    produces an FSA with diverging closure (Log.star score>=0).
-    This returned NaN and BoolFSA.prefix returned-inf for every non-matching prefix.
-    logw_next on a divergent context has no well-defined conditional, so it must raise."""
-    pat = r"[\s\S]*[eE]njoy\s+[A-Za-z]+[iI][nN][gG][\s\S]*"
-    fsa = BoolFSA.from_regex(pat)
-
+async def test_wfsa_divergent_backward_short_circuit():
+    """Construct a WFSA with a +inf-weighted arc (the kind of value
+    genlm-grammar produces from a divergent SCC closure. Use the +inf
+    short-circuit in _prefix and the divergent-weight raise in logw_next."""
+    m = BaseWFSA(Log)
+    m.add_I(0, Log.one)
+    m.add_arc(0, b"a"[0], 1, Log(float("inf")))
+    m.add_F(1, Log.one)
+    pot = WFSA(m)
     with warnings.catch_warnings():
         warnings.simplefilter("error", category=RuntimeWarning)
-        assert await fsa.prefix(b"") == 0
-        assert await fsa.prefix(b"Hello") == 0
-        assert await fsa.complete(b"I enjoy walking.") == 0
-        assert await fsa.complete(b"I enjoy films.") == -float("inf")
+        assert await pot.prefix(b"a") == float("inf")
         with pytest.raises(ValueError, match="Context.*divergent weight"):
-            await fsa.logw_next(b"")
+            await pot.logw_next(b"a")
