@@ -19,6 +19,7 @@ from conftest import MockPotential
 @pytest.mark.asyncio
 async def test_multi_token_unit_sampler_basic():
     """Test basic multi-token unit sampling with boundary tokens."""
+    np.random.seed(0) # Seed deterministic sampling
     # Create a simple mock potential
     vocab = [b"hello", b" ", b"world", b"!"]
     logws = np.log([0.4, 0.1, 0.3, 0.1, 0.1])
