@@ -1,4 +1,6 @@
 import re
+import warnings
+
 import pytest
 import graphviz
 import numpy as np
@@ -272,3 +274,33 @@ async def test_zero_weight_context():
     pot = BoolFSA.from_regex(r"a")
     with pytest.raises(ValueError, match="Context.*has zero weight."):
         await pot.logw_next(b"b")
+
+
+@pytest.mark.asyncio
+async def test_wfsa_dead_end_prefix(float_wfsa):
+    """Consuming 'ad' lands the FSA in dead-end state 3 (backward = -inf).
+    Exercises the vmax==-inf short-circuit in _prefix; the previous arsenal
+    logsumexp produced NaN here via -inf - -inf and emitted a RuntimeWarning."""
+    pot = WFSA(float_wfsa)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=RuntimeWarning)
+        assert await pot.prefix(b"ad") == -float("inf")
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_divergent_scc():
+    """Regression: ``[\\s\\S]*PATTERN[\\s\\S]*`` over a large default charset
+    produces an FSA with diverging closure (Log.star score>=0).
+    This returned NaN and BoolFSA.prefix returned-inf for every non-matching prefix.
+    logw_next on a divergent context has no well-defined conditional, so it must raise."""
+    pat = r"[\s\S]*[eE]njoy\s+[A-Za-z]+[iI][nN][gG][\s\S]*"
+    fsa = BoolFSA.from_regex(pat)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=RuntimeWarning)
+        assert await fsa.prefix(b"") == 0
+        assert await fsa.prefix(b"Hello") == 0
+        assert await fsa.complete(b"I enjoy walking.") == 0
+        assert await fsa.complete(b"I enjoy films.") == -float("inf")
+        with pytest.raises(ValueError, match="Context.*divergent weight"):
+            await fsa.logw_next(b"")
