@@ -12,19 +12,23 @@ from .unit import (
 from genlm.control.potential import Potential
 
 
-def direct_token_sampler(potential):
+def direct_token_sampler(potential, proposal=None):
     """Create a `DirectTokenSampler` that samples directly from a potential's vocabulary.
 
-    See `DirectTokenSampler` for more details.
+    See `DirectTokenSampler` for more details, including the `proposal` argument.
 
     Args:
         potential (Potential): The potential function to sample from. Should have an efficient logw_next method.
+        proposal (Potential, optional): Optional importance-sampling proposal;
+            must share `potential.vocab_eos`. Defaults to None.
 
     Returns:
-        (DirectTokenSampler): A sampler that directly samples tokens from the potential's vocabulary.
+        (DirectTokenSampler): A sampler that samples tokens from `potential`
+            (or `proposal`, if supplied) and returns importance weights relative
+            to `potential`.
     """
     assert isinstance(potential, Potential)
-    return DirectTokenSampler(potential)
+    return DirectTokenSampler(potential, proposal=proposal)
 
 
 def eager_token_sampler(iter_potential, item_potential):
