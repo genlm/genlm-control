@@ -11,8 +11,7 @@ def _validate_proposal_vocab(target_potential, proposal):
         )
     if proposal.vocab_eos != target_potential.vocab_eos:
         raise ValueError(
-            "Proposal must share the target potential's `vocab_eos` "
-            "(token-for-token); cross-tokenizer proposals are not yet supported. "
+            "Proposals with different tokenizers are not yet supported. "
             f"Target has {len(target_potential.vocab_eos)} tokens; proposal has "
             f"{len(proposal.vocab_eos)}."
         )

@@ -560,7 +560,7 @@ def test_awrs_proposal_vocab_mismatch():
         [bytes([i]) for i in range(3)],
         np.log([0.5, 0.3, 0.1, 0.1]),
     )
-    with pytest.raises(ValueError, match="vocab_eos"):
+    with pytest.raises(ValueError, match="different tokenizers"):
         AWRS(potential, condition, proposal=different_vocab)
 
 
@@ -575,6 +575,98 @@ def test_awrs_proposal_must_be_potential():
     )
     with pytest.raises(TypeError, match="Potential"):
         AWRS(potential, condition, proposal=object())
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_rejection_returns_neg_inf():
+    """When the condition rejects all tokens, the final weight must be -inf
+    even with a proposal (the log_ratio correction must not rescue it)."""
+    vocab = [bytes([i]) for i in range(4)]
+    potential = MockPotential(vocab, np.log([0.1, 0.2, 0.3, 0.3, 0.1]))
+    proposal = MockPotential(vocab, np.log([0.4, 0.1, 0.1, 0.3, 0.1]))
+    # Condition rejects everything
+    condition = MockPotential(vocab, [float("-inf")] * 5)
+
+    sampler = AWRS(potential, condition, proposal=proposal, seed=0)
+    for _ in range(50):
+        tok, logw, _ = await sampler.sample([])
+        assert logw == float("-inf"), (
+            f"Expected -inf weight when all tokens rejected, got {logw}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_partial_rejection_neg_inf():
+    """When a proposal is used and the sampled token happens to be rejected,
+    the weight is -inf. When accepted, the weight is finite."""
+    vocab = [bytes([i]) for i in range(4)]
+    potential = MockPotential(vocab, np.log([0.1, 0.2, 0.3, 0.3, 0.1]))
+    proposal = MockPotential(vocab, np.log([0.4, 0.1, 0.1, 0.3, 0.1]))
+    # Only first two tokens are valid
+    condition = MockPotential(vocab, [0, 0, float("-inf"), float("-inf"), 0])
+
+    sampler = AWRS(potential, condition, proposal=proposal, seed=42)
+    saw_finite = False
+    for _ in range(200):
+        tok, logw, _ = await sampler.sample([])
+        if logw > float("-inf"):
+            saw_finite = True
+            assert np.isfinite(logw), f"Expected finite weight, got {logw}"
+        else:
+            assert logw == float("-inf")
+    assert saw_finite, "Expected at least one finite-weight sample"
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_with_pruning_is_unbiased():
+    """With prune_logws=True and a proposal, pruning zeros out proposal weights
+    for tokens outside the condition's support, but the IS correction via
+    log_ratio (target/proposal) must still yield an unbiased estimator."""
+    vocab = [bytes([i]) for i in range(5)]
+    potential = MockPotential(
+        vocab, np.log([0.15, 0.25, 0.20, 0.15, 0.15, 0.10])
+    )
+    proposal = MockPotential(
+        vocab, np.log([0.30, 0.10, 0.10, 0.20, 0.20, 0.10])
+    )
+    # Condition accepts tokens 0, 1, 2 and EOS; rejects 3, 4
+    condition = MockPotential(
+        vocab, [0, 0, 0, float("-inf"), float("-inf"), 0]
+    )
+
+    sampler = AWRS(
+        potential, condition, proposal=proposal, prune_logws=True, seed=0
+    )
+
+    want = await sampler.target.logw_next([])
+    have = await monte_carlo(sampler, [], 10000)
+
+    assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_without_pruning_is_unbiased():
+    """Same as above but with prune_logws=False: the _accept function
+    (not pruning) filters invalid tokens, and IS correction still holds."""
+    vocab = [bytes([i]) for i in range(5)]
+    potential = MockPotential(
+        vocab, np.log([0.15, 0.25, 0.20, 0.15, 0.15, 0.10])
+    )
+    proposal = MockPotential(
+        vocab, np.log([0.30, 0.10, 0.10, 0.20, 0.20, 0.10])
+    )
+    condition = MockPotential(
+        vocab, [0, 0, 0, float("-inf"), float("-inf"), 0]
+    )
+
+    sampler = AWRS(
+        potential, condition, proposal=proposal, prune_logws=False, seed=0
+    )
+
+    want = await sampler.target.logw_next([])
+    have = await monte_carlo(sampler, [], 10000)
+
+    assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize(
