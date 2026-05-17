@@ -268,23 +268,32 @@ async def test_direct_token_sampler_proposal_different_distributions_monte_carlo
 
 
 @pytest.mark.asyncio
-async def test_sis_with_proposal_weights_match_manual_computation():
-    """SIS (ess_threshold=0) with a proposal: verify each particle's final
-    log-weight matches the manually computed importance weight.
+@pytest.mark.parametrize(
+    "target_ws, proposal_ws",
+    [
+        # cross-distribution — IS weight differs from logZ_target per step.
+        (np.log([0.3, 0.4, 0.2, 0.1]), np.log([0.1, 0.1, 0.5, 0.3])),
+        # proposal == target — IS correction collapses to logZ_target.
+        (np.log([0.3, 0.4, 0.2, 0.1]), np.log([0.3, 0.4, 0.2, 0.1])),
+        # peaked target, near-uniform proposal.
+        (np.log([0.6, 0.1, 0.1, 0.2]), np.log([0.25, 0.25, 0.25, 0.25])),
+    ],
+)
+async def test_sis_with_proposal_weights_match_manual_computation(
+    target_ws, proposal_ws
+):
+    """SIS (ess_threshold=0) with a proposal: each particle's final log-weight
+    equals start_weight + sum_t (target_logws[tok_t] - proposal_logws[tok_t]
+    + logsumexp(proposal_logws)).
 
-    For DirectTokenSampler with proposal, the per-step log-weight is
-        logw_t = target_logws[tok] - proposal_logws[tok] + logsumexp(proposal_logws)
-    and start_weight = target.prefix([]) = 0 for MockPotential.
-
-    The final particle weight should equal:
-        start_weight + sum_t logw_t
+    `ess_threshold=0` disables resampling so weights propagate intact through
+    SMC, letting us check the IS formula exactly. Parametrized over several
+    (target, proposal) pairs so a silently-dropped proposal or wrong-sign
+    correction is caught regardless of which token happens to be drawn.
     """
     from genlm.control.constant import EOS
 
     vocab = [bytes([i]) for i in range(3)]
-    target_ws = np.log([0.3, 0.4, 0.2, 0.1])
-    proposal_ws = np.log([0.1, 0.1, 0.5, 0.3])
-
     target = MockPotential(vocab, target_ws)
     proposal = MockPotential(vocab, proposal_ws)
 
@@ -296,19 +305,12 @@ async def test_sis_with_proposal_weights_match_manual_computation():
         max_tokens=5,
     )
 
-    # start_weight for MockPotential is prefix([]) = 0
-    start_weight = 0.0
-
     for ctx, actual_logw in zip(seqs.contexts, seqs.log_weights):
-        # Manually compute the expected final weight
-        expected_logw = start_weight
+        # start_weight = target.prefix([]) = 0 for MockPotential.
+        expected_logw = 0.0
         for tok in ctx:
-            if tok is EOS:
-                tid = len(vocab)  # EOS is the last index
-            else:
-                tid = target.lookup[tok]
-            step_logw = target_ws[tid] - proposal_ws[tid] + proposal_logZ
-            expected_logw += step_logw
+            tid = len(vocab) if tok is EOS else target.lookup[tok]
+            expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
 
         np.testing.assert_allclose(
             actual_logw, expected_logw, rtol=1e-10,
@@ -387,13 +389,15 @@ async def test_smc_token_sampler(params):
 @settings(deadline=None)
 @given(mock_vocab_and_logws())
 async def test_smc_token_sampler_with_proposal(params):
-    """SMC end-to-end with a proposal-equipped DirectTokenSampler produces
-    valid sequences and propagates logw/logp correctly through forward()."""
+    """Smoke test: proposal-equipped DirectTokenSampler runs end-to-end
+    through SMC with resampling (ess_threshold=0.5) and with a critic.
+    Weight correctness is verified by `test_sis_with_proposal_weights_match_manual_computation`
+    (which uses ess_threshold=0.0); this test only guards against crashes
+    in the resampling + critic code paths when a proposal is in play."""
     vocab, logws, logws2 = params
     target = MockPotential(vocab, logws)
     proposal = MockPotential(vocab, logws2)
 
-    # Without critic
     sampler = DirectTokenSampler(target, proposal=proposal)
     sequences = await sampler.smc(
         n_particles=10,
@@ -403,7 +407,6 @@ async def test_smc_token_sampler_with_proposal(params):
     assert len(sequences) == 10
     assert all(len(seq) <= 10 for seq in sequences)
 
-    # With critic
     mock_critic = MockPotential(vocab, logws2)
     sampler = DirectTokenSampler(target, proposal=proposal)
     sequences = await sampler.smc(
