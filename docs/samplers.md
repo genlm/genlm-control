@@ -18,6 +18,48 @@ token, logw, logp = await sampler.sample(context)
 
 `DirectTokenSampler` is efficient when the potential's `logw_next` method is efficient (e.g., for language models). However, for potentials with large vocabularies or expensive `logw_next` computations, other sampling strategies may be more appropriate.
 
+## Sampling from arbitrary proposals
+
+Both [`DirectTokenSampler`][genlm.control.sampler.token.DirectTokenSampler] and [`AWRS`][genlm.control.sampler.token.AWRS] accept an optional `proposal` potential. When supplied, the sampler draws candidate tokens from `proposal.logw_next` and applies a per-step importance correction so the returned `(token, weight)` remains properly weighted with respect to the *target*'s `logw_next`. With `proposal=None` (the default), each sampler is its own proposal.
+
+A typical use case is pairing a larger target LM with a smaller proposal LM that shares the same tokenizer. Below we use Llama-3.2-3B as the target and Llama-3.2-1B as the proposal for molecular synthesis. The task (taken from [`genlm-eval`](https://github.com/genlm/genlm-eval)) is to generate a valid SMILES string conditioned on a few example molecules:
+
+```python
+from genlm.control import PromptedLLM, direct_token_sampler
+from genlm.eval.domains.molecular_synthesis import (
+    PartialSMILES, default_prompt_formatter, MolecularSynthesisInstance,
+)
+
+# Llama-3.2-1B and -3B share the same tokenizer, so their vocab_eos matches.
+target = PromptedLLM.from_name("meta-llama/Llama-3.2-3B")
+proposal = PromptedLLM.from_name("meta-llama/Llama-3.2-1B")
+
+instance = MolecularSynthesisInstance(
+    instance_id=0,
+    molecules=["BrC1=C2C3C4C3N(CC4C#C)C2=NC(=O)S1"],
+)
+prompt_ids = default_prompt_formatter(target.model.tokenizer, instance)
+target.prompt_ids = prompt_ids
+proposal.prompt_ids = prompt_ids
+
+# Byte-level SMILES validity, coerced onto the LM's token vocabulary.
+smiles_critic = PartialSMILES().coerce(target, f=b"".join)
+
+sampler = direct_token_sampler(target, proposal=proposal)
+sequences = await sampler.smc(
+    n_particles=10, ess_threshold=0.5, max_tokens=40, critic=smiles_critic,
+)
+```
+
+The same `proposal=` argument is available on `AWRS` when the constraint is boolean:
+
+```python
+sampler = AWRS(target, smiles_critic, proposal=proposal)
+```
+
+Other use cases include the same LM at a different temperature (e.g., a flatter proposal that explores more broadly), or the same LM under a different prompt (e.g., a more permissive instruction as the proposal).
+
+Requirements: The proposal must share the target's `vocab_eos` (same tokenizer). Cross-tokenizer proposals raise `ValueError`.
 
 ## Adaptive Weighted Rejection Sampling
 
