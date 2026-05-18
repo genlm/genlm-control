@@ -26,6 +26,27 @@ class MockPotential(Potential):
         return self.make_lazy_weights(self.next_token_logws)
 
 
+class ContextSensitiveMockPotential(Potential):
+    """A mock potential whose logw_next depends on context length,
+    simulating different prompt/conditioning lengths."""
+
+    def __init__(self, vocab, base_logws, context_scale=0.5):
+        self.base_logws = np.array(base_logws)
+        self.context_scale = context_scale
+        super().__init__(vocab)
+
+    async def prefix(self, context):
+        return sum(self.base_logws[self.lookup[t]] for t in context)
+
+    async def complete(self, context):
+        return await self.prefix(context) + self.base_logws[-1]
+
+    async def logw_next(self, context):
+        # Scale weights by context length to make them context-dependent
+        scale = 1.0 + self.context_scale * len(context)
+        return self.make_lazy_weights(self.base_logws * scale)
+
+
 @st.composite
 def mock_vocab(draw):
     item_strategy = draw(
