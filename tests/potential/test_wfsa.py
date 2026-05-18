@@ -220,22 +220,22 @@ def test_wfsa_init_wrong_semiring():
 
 
 @pytest.mark.asyncio
-async def test_bool_fsa_from_regex_default_is_log():
-    """Default `from_regex` keeps the Log-semiring internal representation."""
+async def test_bool_fsa_from_regex_default_is_boolean():
+    """Default `from_regex` uses the Boolean semiring."""
     fsa = BoolFSA.from_regex("a(b|c)")
-    assert fsa.wfsa.R is Log
+    assert fsa.wfsa.R is Boolean
     assert (await fsa.complete(b"ab")) == 0
     assert (await fsa.prefix(b"a")) == 0
 
 
 @pytest.mark.asyncio
-async def test_bool_fsa_from_regex_boolean_optin():
-    """Regression: leading-wildcard regex over a large charset; default path
-    silently returns ``-inf``, `semiring="boolean"` gives the right answer."""
+async def test_bool_fsa_from_regex_default_fixes_divergent_scc():
+    """Regression: leading-wildcard regex over a large charset previously
+    silently returned ``-inf`` via the Log path; the Boolean default fixes it."""
     import warnings
 
     pat = r"[\s\S]*[eE]njoy\s+[A-Za-z]+[iI][nN][gG][\s\S]*"
-    fsa = BoolFSA.from_regex(pat, semiring="boolean")
+    fsa = BoolFSA.from_regex(pat)
     assert fsa.wfsa.R is Boolean
     with warnings.catch_warnings():
         warnings.simplefilter("error", category=RuntimeWarning)
@@ -248,10 +248,17 @@ async def test_bool_fsa_from_regex_boolean_optin():
         assert (lw.weights > -float("inf")).any()
 
 
+def test_bool_fsa_from_regex_log_is_deprecated():
+    """Explicit `semiring="log"` still works but emits a DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        fsa = BoolFSA.from_regex("a(b|c)", semiring="log")
+    assert fsa.wfsa.R is Log
+
+
 @pytest.mark.asyncio
 async def test_bool_fsa_boolean_consistency():
-    """Math-consistency invariants hold for the Boolean path."""
-    fsa = BoolFSA.from_regex("a(b|c)", semiring="boolean")
+    """Math-consistency invariants hold for the default (Boolean) path."""
+    fsa = BoolFSA.from_regex("a(b|c)")
     assert fsa.wfsa.R is Boolean
     await fsa.assert_logw_next_consistency(b"a")
     await fsa.assert_autoreg_fact(b"a")

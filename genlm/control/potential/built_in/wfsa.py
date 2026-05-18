@@ -1,4 +1,6 @@
 import string
+import warnings
+
 import numpy as np
 from arsenal.maths import logsumexp
 
@@ -223,15 +225,18 @@ class WFSA(Potential):
 class BoolFSA(WFSA):
     """Boolean FSA potential. Returns ``0`` for accepted, ``-inf`` for rejected.
 
-    Defaults to a Log-semiring internal representation. Pass
-    ``semiring="boolean"`` to ``from_regex`` for the Boolean-semiring path,
-    which gives correct boolean answers for regexes the default path
-    silently mishandles (typically leading-wildcard regexes over a large
-    alphabet).
+    ``from_regex`` constructs a Boolean-semiring WFSA by default; the
+    ``semiring="log"`` path is deprecated (the Log-semiring FSA closure is
+    unsound because ``Log.star`` is partial).
     """
 
     def __init__(self, wfsa):
-        # Float/Log go through parent (Float -> Log). Boolean stays Boolean.
+        """Initialize the BoolFSA from a WFSA.
+
+        Args:
+            wfsa (genlm_grammar.WFSA): A Float, Log, or Boolean WFSA.
+                Float is converted to Log; Boolean is kept as-is.
+        """
         if wfsa.R is Boolean:
             self.wfsa = wfsa
             self.cache = {(): self.wfsa.epsremove.start}
@@ -240,19 +245,30 @@ class BoolFSA(WFSA):
             super().__init__(wfsa)
 
     @classmethod
-    def from_regex(cls, pattern, charset=None, to_bytes=True, semiring="log"):
+    def from_regex(cls, pattern, charset=None, to_bytes=True, semiring="boolean"):
         """Create a BoolFSA from a regex pattern.
 
         Args:
             pattern (str): regex pattern.
             charset (set): see ``WFSA.from_regex``.
             to_bytes (bool): see ``WFSA.from_regex``.
-            semiring (str): ``"log"`` (default) or ``"boolean"``. Use
-                ``"boolean"`` for regexes the default path silently mishandles.
+            semiring (str): ``"boolean"`` (default) or ``"log"``. ``"log"``
+                is deprecated; its closure is unsound (``Log.star`` is partial).
+
+        Returns:
+            (BoolFSA): An instance of the BoolFSA class.
         """
         if semiring not in ("log", "boolean"):
             raise ValueError(
                 f"semiring must be 'log' or 'boolean', got {semiring!r}"
+            )
+        if semiring == "log":
+            warnings.warn(
+                "semiring='log' is deprecated: the FSA closure is unsound on "
+                "the Log semiring because Log.star is partial. "
+                "Use semiring='boolean'.",
+                DeprecationWarning,
+                stacklevel=2,
             )
         charset = charset or set(string.printable)
         wfsa = interegular_to_wfsa(pattern, charset=charset)
@@ -275,7 +291,14 @@ class BoolFSA(WFSA):
         return super()._prefix(context)
 
     async def prefix(self, context):
-        """``0`` if ``context`` is an accepted prefix, ``-inf`` otherwise."""
+        """Tests whether `context` is accepted as a prefix.
+
+        Args:
+            context (list): A sequence of tokens in the WFSA's alphabet.
+
+        Returns:
+            (float): ``0`` if accepted as a prefix, ``-inf`` otherwise.
+        """
         if self.wfsa.R is Boolean:
             return self._prefix(context)[0]
         prefix_w = await super().prefix(context)
@@ -284,7 +307,14 @@ class BoolFSA(WFSA):
         return float("-inf")
 
     async def complete(self, context):
-        """``0`` if ``context`` is accepted, ``-inf`` otherwise."""
+        """Tests whether `context` is accepted.
+
+        Args:
+            context (list): A sequence of tokens in the WFSA's alphabet.
+
+        Returns:
+            (float): ``0`` if accepted, ``-inf`` otherwise.
+        """
         if self.wfsa.R is Boolean:
             curr = self._consume(context)
             if not curr:
@@ -300,7 +330,15 @@ class BoolFSA(WFSA):
         return float("-inf")
 
     async def logw_next(self, context):
-        """Per-token admissibility log-weights: ``0`` admissible, ``-inf`` not."""
+        """Per-token admissibility log weights given `context`.
+
+        Args:
+            context (list): A sequence of tokens in the WFSA's alphabet.
+
+        Returns:
+            (LazyWeights): ``0`` for admissible next tokens (incl. EOS),
+                ``-inf`` for rejected.
+        """
         if self.wfsa.R is Boolean:
             curr = self._consume(context)
             if not curr:
@@ -325,7 +363,14 @@ class BoolFSA(WFSA):
         )
 
     async def batch_logw_next(self, contexts):
-        """Per-token admissibility log-weights for each context."""
+        """Per-token admissibility log weights for a batch of contexts.
+
+        Args:
+            contexts (list): The list of contexts.
+
+        Returns:
+            (list): List of ``LazyWeights``, one per context.
+        """
         if self.wfsa.R is Boolean:
             return [await self.logw_next(c) for c in contexts]
         logw_nexts = await super().batch_logw_next(contexts)
