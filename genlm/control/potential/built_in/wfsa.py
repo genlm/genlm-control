@@ -3,9 +3,30 @@ import numpy as np
 from arsenal.maths import logsumexp
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
+from genlm.grammar.semiring import Boolean
 from genlm.grammar.lark_interface import interegular_to_wfsa
 
 from genlm.control.potential.base import Potential
+
+
+def _float_to_boolean(wfsa):
+    """Convert a Float-semiring WFSA to Boolean: non-zero weights become ``Boolean.one``.
+
+    Same accepted language; ``Boolean.star`` is total so closure has no
+    precision issues.
+    """
+    assert wfsa.R is Float
+    new = BaseWFSA(Boolean)
+    for i, w in wfsa.I:
+        if w != 0:
+            new.add_I(i, Boolean.one)
+    for i, w in wfsa.F:
+        if w != 0:
+            new.add_F(i, Boolean.one)
+    for i, a, j, w in wfsa.arcs():
+        if w != 0:
+            new.add_arc(i, a, j, Boolean.one)
+    return new
 
 
 class WFSA(Potential):
@@ -203,48 +224,103 @@ class WFSA(Potential):
 
 
 class BoolFSA(WFSA):
-    """Boolean FSA potential."""
+    """Boolean FSA potential. Returns ``0`` for accepted, ``-inf`` for rejected.
 
-    async def prefix(self, context):
-        """
-        Computes whether the context is accepted as a prefix by the FSA.
+    Defaults to a Log-semiring internal representation. Pass
+    ``semiring="boolean"`` to ``from_regex`` to use the Boolean semiring
+    instead, which avoids ``Log.star``'s precision wall on regexes whose
+    DFA has a near-recurrent SCC (typically leading-wildcard regexes over
+    a large alphabet).
+    """
+
+    def __init__(self, wfsa):
+        # Float/Log go through parent (Float -> Log). Boolean stays Boolean.
+        if wfsa.R is Boolean:
+            self.wfsa = wfsa
+            self.cache = {(): self.wfsa.epsremove.start}
+            Potential.__init__(self, vocabulary=list(self.wfsa.alphabet))
+        else:
+            super().__init__(wfsa)
+
+    @classmethod
+    def from_regex(cls, pattern, charset=None, to_bytes=True, semiring="log"):
+        """Create a BoolFSA from a regex pattern.
 
         Args:
-            context (list): A sequence of tokens in the WFSA's alphabet.
-
-        Returns:
-            (float): `0` if the context is accepted as a prefix, `-inf` otherwise.
+            pattern (str): regex pattern.
+            charset (set): see ``WFSA.from_regex``.
+            to_bytes (bool): see ``WFSA.from_regex``.
+            semiring (str): ``"log"`` (default) or ``"boolean"``. Use
+                ``"boolean"`` when ``Log.star`` would hit its precision wall.
         """
+        if semiring not in ("log", "boolean"):
+            raise ValueError(
+                f"semiring must be 'log' or 'boolean', got {semiring!r}"
+            )
+        charset = charset or set(string.printable)
+        wfsa = interegular_to_wfsa(pattern, charset=charset)
+        if to_bytes:
+            wfsa = wfsa.to_bytes()
+        if semiring == "boolean":
+            wfsa = _float_to_boolean(wfsa)
+        return cls(wfsa)
+
+    def _prefix(self, context):
+        # Boolean path: graph reachability, no Lehmann / Log.star.
+        if self.wfsa.R is Boolean:
+            curr = self._consume(context)
+            if not curr:
+                return float("-inf"), curr
+            bkwd = self.wfsa.epsremove.backward
+            for i in curr:
+                if bkwd[i].score:  # i is co-accessible
+                    return 0.0, curr
+            return float("-inf"), curr
+        return super()._prefix(context)
+
+    async def prefix(self, context):
+        """``0`` if ``context`` is an accepted prefix, ``-inf`` otherwise."""
+        if self.wfsa.R is Boolean:
+            return self._prefix(context)[0]
         prefix_w = await super().prefix(context)
         if prefix_w > float("-inf"):
             return 0
         return float("-inf")
 
     async def complete(self, context):
-        """
-        Computes whether the context is accepted by the FSA.
-
-        Args:
-            context (list): A sequence of tokens in the WFSA's alphabet.
-
-        Returns:
-            (float): `0` if the context is accepted, `-inf` otherwise.
-        """
+        """``0`` if ``context`` is accepted, ``-inf`` otherwise."""
+        if self.wfsa.R is Boolean:
+            curr = self._consume(context)
+            if not curr:
+                return float("-inf")
+            finals = dict(self.wfsa.epsremove.F)
+            for i in curr:
+                if i in finals and finals[i].score:
+                    return 0.0
+            return float("-inf")
         complete_w = await super().complete(context)
         if complete_w > float("-inf"):
             return 0
         return float("-inf")
 
     async def logw_next(self, context):
-        """
-        Returns next token log weights given `context`.
-
-        Args:
-            context (list): A sequence of tokens in the WFSA's alphabet.
-
-        Returns:
-            (LazyWeights): Boolean log-weights for next token.
-        """
+        """Per-token admissibility log-weights: ``0`` admissible, ``-inf`` not."""
+        if self.wfsa.R is Boolean:
+            curr = self._consume(context)
+            if not curr:
+                raise ValueError(f"Context {context!r} has zero weight.")
+            bkwd = self.wfsa.epsremove.backward
+            finals = dict(self.wfsa.epsremove.F)
+            out = self.alloc_logws()
+            for i in curr:
+                for b, j, w in self.wfsa.epsremove.arcs(i=i):
+                    if w.score and bkwd[j].score and b in self.lookup:
+                        out[self.lookup[b]] = 0.0
+            for i in curr:
+                if i in finals and finals[i].score:
+                    out[self.lookup[self.eos]] = 0.0
+                    break
+            return self.make_lazy_weights(out)
         logw_next = await super().logw_next(context)
         return logw_next.spawn(
             new_weights=np.where(
@@ -253,15 +329,9 @@ class BoolFSA(WFSA):
         )
 
     async def batch_logw_next(self, contexts):
-        """
-        Returns next token log weights for a batch of contexts.
-
-        Args:
-            contexts (list): The list of contexts.
-
-        Returns:
-            (list): List of log-weights for next token, one per context.
-        """
+        """Per-token admissibility log-weights for each context."""
+        if self.wfsa.R is Boolean:
+            return [await self.logw_next(c) for c in contexts]
         logw_nexts = await super().batch_logw_next(contexts)
         return [
             logw_next.spawn(
