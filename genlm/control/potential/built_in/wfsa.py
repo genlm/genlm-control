@@ -10,11 +10,8 @@ from genlm.control.potential.base import Potential
 
 
 def _float_to_boolean(wfsa):
-    """Convert a Float-semiring WFSA to Boolean: non-zero weights become ``Boolean.one``.
-
-    Same accepted language; ``Boolean.star`` is total so closure has no
-    precision issues.
-    """
+    """Convert a Float-semiring WFSA to Boolean: every non-zero weight
+    becomes ``Boolean.one``. Same accepted language."""
     assert wfsa.R is Float
     new = BaseWFSA(Boolean)
     for i, w in wfsa.I:
@@ -227,10 +224,10 @@ class BoolFSA(WFSA):
     """Boolean FSA potential. Returns ``0`` for accepted, ``-inf`` for rejected.
 
     Defaults to a Log-semiring internal representation. Pass
-    ``semiring="boolean"`` to ``from_regex`` to use the Boolean semiring
-    instead, which avoids ``Log.star``'s precision wall on regexes whose
-    DFA has a near-recurrent SCC (typically leading-wildcard regexes over
-    a large alphabet).
+    ``semiring="boolean"`` to ``from_regex`` for the Boolean-semiring path,
+    which gives correct boolean answers for regexes the default path
+    silently mishandles (typically leading-wildcard regexes over a large
+    alphabet).
     """
 
     def __init__(self, wfsa):
@@ -251,7 +248,7 @@ class BoolFSA(WFSA):
             charset (set): see ``WFSA.from_regex``.
             to_bytes (bool): see ``WFSA.from_regex``.
             semiring (str): ``"log"`` (default) or ``"boolean"``. Use
-                ``"boolean"`` when ``Log.star`` would hit its precision wall.
+                ``"boolean"`` for regexes the default path silently mishandles.
         """
         if semiring not in ("log", "boolean"):
             raise ValueError(
@@ -266,7 +263,6 @@ class BoolFSA(WFSA):
         return cls(wfsa)
 
     def _prefix(self, context):
-        # Boolean path: graph reachability, no Lehmann / Log.star.
         if self.wfsa.R is Boolean:
             curr = self._consume(context)
             if not curr:
