@@ -230,8 +230,8 @@ async def test_bool_fsa_from_regex_default_is_log():
 
 @pytest.mark.asyncio
 async def test_bool_fsa_from_regex_boolean_optin():
-    """Regression: leading-wildcard regex hits the Log-semiring precision wall;
-    `semiring="boolean"` avoids it."""
+    """Regression: leading-wildcard regex over a large charset; default path
+    silently returns ``-inf``, `semiring="boolean"` gives the right answer."""
     import warnings
 
     pat = r"[\s\S]*[eE]njoy\s+[A-Za-z]+[iI][nN][gG][\s\S]*"
@@ -260,20 +260,45 @@ async def test_bool_fsa_boolean_consistency():
     await fsa.assert_batch_consistency([b"", b"a", b"ab", b"ac"])
 
 
-@pytest.mark.asyncio
-async def test_bool_fsa_constructed_from_boolean_wfsa():
-    """`BoolFSA(boolean_wfsa)` exercises the Boolean `__init__` branch."""
+@pytest.fixture
+def boolean_wfsa():
+    """A tiny Boolean WFSA: accepts only ``ab``."""
     m = BaseWFSA(Boolean)
     m.add_I(0, Boolean.one)
     m.add_arc(0, b"a"[0], 1, Boolean.one)
     m.add_arc(1, b"b"[0], 2, Boolean.one)
     m.add_F(2, Boolean.one)
-    pot = BoolFSA(m)
+    return m
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_constructed_from_boolean_wfsa(boolean_wfsa):
+    """`BoolFSA(boolean_wfsa)` exercises the Boolean `__init__` branch and
+    all four boolean public methods on accept / reject / empty-curr paths."""
+    pot = BoolFSA(boolean_wfsa)
     assert pot.wfsa.R is Boolean
+    # accept paths
     assert (await pot.prefix(b"a")) == 0
     assert (await pot.complete(b"ab")) == 0
+    # reject paths
     assert (await pot.complete(b"a")) == -float("inf")
+    # empty-curr paths (no transition from start on 'c')
     assert (await pot.prefix(b"c")) == -float("inf")
+    assert (await pot.complete(b"c")) == -float("inf")
+    with pytest.raises(ValueError, match="zero weight"):
+        await pot.logw_next(b"c")
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_boolean_batch_logw_next(boolean_wfsa):
+    """``batch_logw_next`` on the Boolean path matches per-context ``logw_next``."""
+    pot = BoolFSA(boolean_wfsa)
+    contexts = [b"", b"a"]
+    single = [(await pot.logw_next(c)).weights for c in contexts]
+    batch = await pot.batch_logw_next(contexts)
+    assert len(batch) == len(contexts)
+    for s, b in zip(single, batch):
+        assert np.array_equal(s, b.weights)
 
 
 def test_bool_fsa_from_regex_bad_semiring_arg():
