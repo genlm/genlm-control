@@ -1,3 +1,4 @@
+import asyncio
 import numpy as np
 from arsenal import colors
 from llamppl import SubModel
@@ -6,6 +7,7 @@ import warnings
 
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
+from genlm.control.sampler.util import _validate_proposal_vocab
 
 
 class TokenSampler(SubModel):
@@ -87,7 +89,13 @@ class DirectTokenSampler(TokenSampler):
     of a potential.
 
     Args:
-        potential (Potential): The potential function to sample from
+        potential (Potential): The potential function to sample from.
+        proposal (Potential, optional): If supplied, tokens are drawn from
+            `proposal.logw_next` and reweighted by `target/proposal` so the result
+            stays properly weighted with respect to `potential.logw_next`. Must
+            share `potential.vocab_eos` (cross-tokenizer not yet supported). When
+            `None` (the default), the target acts as its own proposal. The proposal
+            must place positive mass on every token the target weights positively.
 
     Warning:
         Only use this sampler if the potential's `logw_next` method is efficient. This is the case
@@ -96,9 +104,12 @@ class DirectTokenSampler(TokenSampler):
         sampler will be slow.
     """
 
-    def __init__(self, potential):
+    def __init__(self, potential, proposal=None):
         super().__init__(target=potential)
         self.potential = potential
+        if proposal is not None:
+            _validate_proposal_vocab(potential, proposal)
+        self.proposal = proposal
 
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
@@ -111,19 +122,39 @@ class DirectTokenSampler(TokenSampler):
         \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})
         $$
 
-        The returned weight corresponds to the log normalizing constant of $\\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})$.
+        Without a proposal, the returned weight is the log normalizing constant
+        of $\\textsf{target.logw_next}$. With a proposal $q$, the returned weight
+        is the importance weight
+        $\\textsf{target.logw_next}[x_n] - \\log q_{\\text{norm}}(x_n)$.
 
         Returns:
             (token, weight, logp): A tuple containing the sampled token, weight, and log-probability of the sampled token.
         """
-        logws = await self.potential.logw_next(context)
-        logps = logws.normalize()
+        if self.proposal is None:
+            logws = await self.potential.logw_next(context)
+            logps = logws.normalize()
+            if draw is None:
+                # fast sampling from logps using gumbel-max trick
+                token = fast_sample_lazyweights(logps)
+            else:
+                token = draw(logps.exp().materialize())
+            return token, logws.sum(), logps[token]
+
+        proposal_logws, target_logws = await asyncio.gather(
+            self.proposal.logw_next(context),
+            self.potential.logw_next(context),
+        )
+        proposal_logps = proposal_logws.normalize()
         if draw is None:
-            # fast sampling from logps using gumbel-max trick
-            token = fast_sample_lazyweights(logps)
+            token = fast_sample_lazyweights(proposal_logps)
         else:
-            token = draw(logps.exp().materialize())
-        return token, logws.sum(), logps[token]
+            token = draw(proposal_logps.exp().materialize())
+        logw = (
+            target_logws[token]
+            - proposal_logws[token]
+            + proposal_logws.sum()
+        )
+        return token, logw, proposal_logps[token]
 
     async def cleanup(self):
         pass  # pragma: no cover
@@ -202,6 +233,15 @@ class AWRS(TokenSampler):
         max_accepts (int): The maximum number of tokens to accept - higher values will decrease the variance of the weight estimate.
         max_rejects (int or float('inf')): The maximum number of tokens to reject - lower values will run faster, but at the cost of returning a weight of zero for some samples where there are tokens that would be accepted if tested.
         n_monte_carlo_samples (int): The number of Monte Carlo samples to use to estimate the weight. Higher values will decrease the variance of the weight estimate, but will run slower.
+        proposal (Potential, optional): If supplied, the rejection loop proposes
+            from `proposal.logw_next` instead of `potential.logw_next`, and the
+            returned weight is corrected by `target/proposal` so the sample stays
+            properly weighted with respect to `(potential * condition).logw_next`.
+            Must share `potential.vocab_eos` (cross-tokenizer not supported). With
+            `proper_weights=False`, the proposal still steers sampling but no
+            correction is applied (matching the `proper_weights=False` contract).
+            The proposal must place positive mass on every token the target
+            weights positively.
     """
 
     def __init__(
@@ -214,10 +254,14 @@ class AWRS(TokenSampler):
         max_accepts=2,
         max_rejects=float("inf"),
         n_monte_carlo_samples=None,
+        proposal=None,
     ):
         super().__init__(target=potential * condition)
         self.potential = potential
         self.condition = condition
+        if proposal is not None:
+            _validate_proposal_vocab(potential, proposal)
+        self.proposal = proposal
 
         self.prune_logws = prune_logws
         self.proper_weights = proper_weights
@@ -279,12 +323,23 @@ class AWRS(TokenSampler):
     async def sample(self, context, verbosity=0):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method via adaptive weighted rejection sampling.
 
-        The returned weight corresponds to the log normalizing constant of $\\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})$.
+        With no proposal, the returned weight is the log normalizing constant of
+        $\\textsf{target.logw_next}$. With a proposal $q$, the inner loop proposes
+        from $q$ and the returned weight adds an importance correction
+        $\\textsf{potential.logw_next}[x_n] - q.\\textsf{logw_next}[x_n]$.
 
         Returns:
             (token, weight, np.nan): A tuple containing the sampled token, weight, and a dummy value for the log-probability of the sampled token.
         """
-        logws = await self.potential.logw_next(context)
+        if self.proposal is None:
+            logws = await self.potential.logw_next(context)
+            target_logws = None
+        else:
+            target_logws, logws = await asyncio.gather(
+                self.potential.logw_next(context),
+                self.proposal.logw_next(context),
+            )
+
         if self.prune_logws:
             logws = self._prune_logws(logws)
 
@@ -340,7 +395,6 @@ class AWRS(TokenSampler):
                 max_rejects=self.max_rejects,
                 max_accepts=self.max_accepts,
             )
-            return tok, w + logZ, np.nan
         else:
             tok, w, _ = await recursive_awrs(
                 logps=logps,
@@ -349,7 +403,16 @@ class AWRS(TokenSampler):
                 rng=self.rng,
                 max_rejects=self.max_rejects,
             )
+
+        if target_logws is None:
             return tok, w + logZ, np.nan
+
+        # `tok` was drawn with finite sampling weight, so `_prune_logws` left
+        # `logws.weights[tok_idx]` untouched even when pruning is on. When
+        # `w == -inf` (rejection failure) the result stays -inf.
+        tok_idx = self.potential.lookup[tok]
+        log_ratio = target_logws.weights[tok_idx] - logws.weights[tok_idx]
+        return tok, w + logZ + log_ratio, np.nan
 
 
 # If the top log probability exceeds this value, then it will be

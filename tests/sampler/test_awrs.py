@@ -422,6 +422,253 @@ async def test_awrs_does_not_return_zero_weight_in_default_configuration(
         assert logp == float("-inf")
 
 
+async def assert_monte_carlo_close_with_proposal(
+    params,
+    proposal_ws,
+    N,
+    equality_opts={},
+    sampler_opts={},
+):
+    """`assert_monte_carlo_close` variant that constructs AWRS with an explicit
+    proposal over the same vocab as the potential."""
+    vocab, b_weights, c_weights = params
+    potential = MockPotential(
+        vocab,
+        np.array([np.log(w) if w > 0 else float("-inf") for w in c_weights]),
+    )
+    condition = MockPotential(
+        vocab,
+        np.array([np.log(w) if w > 0 else float("-inf") for w in b_weights]),
+    )
+    proposal = MockPotential(
+        vocab,
+        np.array([np.log(w) if w > 0 else float("-inf") for w in proposal_ws]),
+    )
+    sampler = AWRS(potential, condition, proposal=proposal, **sampler_opts)
+
+    want = await sampler.target.logw_next([])
+    have = await monte_carlo(sampler, [], N)
+
+    assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), **equality_opts)
+
+
+@pytest.mark.asyncio
+@settings(deadline=None, max_examples=15)
+@given(params())
+async def test_awrs_with_uniform_proposal_is_unbiased(params):
+    """AWRS recovers `target.logw_next` from a uniform proposal."""
+    vocab, b_weights, c_weights = params
+    # Skip degenerate target (no valid mass): the existing tests cover that case
+    # and here we want a meaningful Monte-Carlo signal.
+    assume(any(b and c > 0 for b, c in zip(b_weights, c_weights)))
+
+    n = len(vocab) + 1
+    uniform = [1.0 / n] * n
+
+    await assert_monte_carlo_close_with_proposal(
+        params=params,
+        proposal_ws=uniform,
+        N=10000,
+        equality_opts={"rtol": 3e-2, "atol": 3e-2},
+    )
+
+
+@pytest.mark.asyncio
+@settings(deadline=None, max_examples=15)
+@given(params())
+async def test_awrs_with_perturbed_proposal_is_unbiased(params):
+    """AWRS recovers `target.logw_next` from a sqrt-reshaped proposal
+    (same support as the target, different mass)."""
+    vocab, b_weights, c_weights = params
+    assume(any(b and c > 0 for b, c in zip(b_weights, c_weights)))
+
+    perturbed = [float(np.sqrt(w)) for w in c_weights]
+
+    await assert_monte_carlo_close_with_proposal(
+        params=params,
+        proposal_ws=perturbed,
+        N=10000,
+        equality_opts={"rtol": 3e-2, "atol": 3e-2},
+    )
+
+
+@pytest.mark.asyncio
+@settings(deadline=None, max_examples=10)
+@given(params())
+async def test_awrs_with_proposal_and_no_pruning(params):
+    """Proposal + `prune_logws=False`: IS correction still unbiased when
+    `_accept` (not pruning) filters invalid tokens."""
+    vocab, b_weights, c_weights = params
+    assume(any(b and c > 0 for b, c in zip(b_weights, c_weights)))
+
+    perturbed = [float(np.sqrt(w)) for w in c_weights]
+    await assert_monte_carlo_close_with_proposal(
+        params=params,
+        proposal_ws=perturbed,
+        N=10000,
+        equality_opts={"rtol": 3e-2, "atol": 3e-2},
+        sampler_opts={"prune_logws": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_awrs_with_proposal_and_improper_weights_returns_zero_or_minus_inf():
+    """`proper_weights=False` + proposal: no IS correction; weights are 0 on
+    accept and -inf on reject, by design."""
+    vocab = [bytes([i]) for i in range(4)]
+    potential = MockPotential(vocab, np.log([0.10, 0.20, 0.30, 0.30, 0.10]))
+    proposal = MockPotential(vocab, np.log([0.40, 0.10, 0.10, 0.30, 0.10]))
+    condition = MockPotential(vocab, [0, 0, float("-inf"), float("-inf"), 0])
+
+    sampler = AWRS(
+        potential, condition, proposal=proposal, proper_weights=False, seed=0
+    )
+    for _ in range(50):
+        tok, logw, _ = await sampler.sample([])
+        assert logw == 0.0 or logw == float("-inf")
+        assert tok in sampler.target.vocab_eos
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_none_matches_no_proposal_kwarg():
+    """`AWRS(..., proposal=None)` consumes the same RNG draws as `AWRS(...)` —
+    guards against accidental RNG-consumption changes in the new branch."""
+    vocab = [bytes([i]) for i in range(4)]
+    potential = MockPotential(vocab, np.log([0.1, 0.2, 0.3, 0.3, 0.1]))
+    condition = MockPotential(vocab, [0, 0, float("-inf"), float("-inf"), 0])
+
+    N = 5000
+
+    s_default = AWRS(potential, condition, seed=0)
+    s_explicit = AWRS(potential, condition, seed=0, proposal=None)
+
+    h_default = await monte_carlo(s_default, [], N)
+    h_explicit = await monte_carlo(s_explicit, [], N)
+    np.testing.assert_array_equal(h_default.weights, h_explicit.weights)
+
+
+def test_awrs_proposal_vocab_mismatch():
+    potential = MockPotential(
+        [bytes([i]) for i in range(4)],
+        np.log([0.4, 0.3, 0.1, 0.1, 0.1]),
+    )
+    condition = MockPotential(
+        [bytes([i]) for i in range(4)],
+        [0, 0, float("-inf"), float("-inf"), 0],
+    )
+    different_vocab = MockPotential(
+        [bytes([i]) for i in range(3)],
+        np.log([0.5, 0.3, 0.1, 0.1]),
+    )
+    with pytest.raises(ValueError, match="different tokenizers"):
+        AWRS(potential, condition, proposal=different_vocab)
+
+
+def test_awrs_proposal_must_be_potential():
+    potential = MockPotential(
+        [bytes([i]) for i in range(4)],
+        np.log([0.4, 0.3, 0.1, 0.1, 0.1]),
+    )
+    condition = MockPotential(
+        [bytes([i]) for i in range(4)],
+        [0, 0, float("-inf"), float("-inf"), 0],
+    )
+    with pytest.raises(TypeError, match="Potential"):
+        AWRS(potential, condition, proposal=object())
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_rejection_returns_neg_inf():
+    """When the condition rejects all tokens, the final weight must be -inf
+    even with a proposal (the log_ratio correction must not rescue it)."""
+    vocab = [bytes([i]) for i in range(4)]
+    potential = MockPotential(vocab, np.log([0.1, 0.2, 0.3, 0.3, 0.1]))
+    proposal = MockPotential(vocab, np.log([0.4, 0.1, 0.1, 0.3, 0.1]))
+    # Condition rejects everything
+    condition = MockPotential(vocab, [float("-inf")] * 5)
+
+    sampler = AWRS(potential, condition, proposal=proposal, seed=0)
+    for _ in range(50):
+        tok, logw, _ = await sampler.sample([])
+        assert logw == float("-inf"), (
+            f"Expected -inf weight when all tokens rejected, got {logw}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_partial_rejection_neg_inf():
+    """When a proposal is used and the sampled token happens to be rejected,
+    the weight is -inf. When accepted, the weight is finite."""
+    vocab = [bytes([i]) for i in range(4)]
+    potential = MockPotential(vocab, np.log([0.1, 0.2, 0.3, 0.3, 0.1]))
+    proposal = MockPotential(vocab, np.log([0.4, 0.1, 0.1, 0.3, 0.1]))
+    # Only first two tokens are valid
+    condition = MockPotential(vocab, [0, 0, float("-inf"), float("-inf"), 0])
+
+    sampler = AWRS(potential, condition, proposal=proposal, seed=42)
+    saw_finite = False
+    for _ in range(200):
+        tok, logw, _ = await sampler.sample([])
+        if logw > float("-inf"):
+            saw_finite = True
+            assert np.isfinite(logw), f"Expected finite weight, got {logw}"
+        else:
+            assert logw == float("-inf")
+    assert saw_finite, "Expected at least one finite-weight sample"
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_with_pruning_is_unbiased():
+    """With prune_logws=True and a proposal, pruning zeros out proposal weights
+    for tokens outside the condition's support, but the IS correction via
+    log_ratio (target/proposal) must still yield an unbiased estimator."""
+    vocab = [bytes([i]) for i in range(5)]
+    potential = MockPotential(
+        vocab, np.log([0.15, 0.25, 0.20, 0.15, 0.15, 0.10])
+    )
+    proposal = MockPotential(
+        vocab, np.log([0.30, 0.10, 0.10, 0.20, 0.20, 0.10])
+    )
+    # Condition accepts tokens 0, 1, 2 and EOS; rejects 3, 4
+    condition = MockPotential(
+        vocab, [0, 0, 0, float("-inf"), float("-inf"), 0]
+    )
+
+    sampler = AWRS(
+        potential, condition, proposal=proposal, prune_logws=True, seed=0
+    )
+
+    want = await sampler.target.logw_next([])
+    have = await monte_carlo(sampler, [], 10000)
+
+    assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.asyncio
+async def test_awrs_proposal_without_pruning_is_unbiased():
+    """Same as above but with prune_logws=False: the _accept function
+    (not pruning) filters invalid tokens, and IS correction still holds."""
+    vocab = [bytes([i]) for i in range(5)]
+    potential = MockPotential(
+        vocab, np.log([0.15, 0.25, 0.20, 0.15, 0.15, 0.10])
+    )
+    proposal = MockPotential(
+        vocab, np.log([0.30, 0.10, 0.10, 0.20, 0.20, 0.10])
+    )
+    condition = MockPotential(
+        vocab, [0, 0, 0, float("-inf"), float("-inf"), 0]
+    )
+
+    sampler = AWRS(
+        potential, condition, proposal=proposal, prune_logws=False, seed=0
+    )
+
+    want = await sampler.target.logw_next([])
+    have = await monte_carlo(sampler, [], 10000)
+
+    assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), rtol=3e-2, atol=3e-2)
+
+
 @pytest.mark.parametrize(
     "params",
     [
