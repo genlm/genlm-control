@@ -169,6 +169,44 @@ def test_direct_token_sampler_factory_threads_proposal():
     assert s_with_proposal.proposal is proposal
 
 
+class _TrackedPotential(MockPotential):
+    """Records peak in-flight `logw_next` calls in a shared tracker.
+    The `sleep(0)` yields the loop so a sibling coroutine can also enter."""
+
+    def __init__(self, vocab, next_token_logws, tracker):
+        super().__init__(vocab, next_token_logws)
+        self._tracker = tracker
+
+    async def logw_next(self, context):
+        self._tracker["in_flight"] += 1
+        self._tracker["peak"] = max(self._tracker["peak"], self._tracker["in_flight"])
+        await asyncio.sleep(0)
+        self._tracker["in_flight"] -= 1
+        return await super().logw_next(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sampler_cls", ["direct", "awrs"])
+async def test_proposal_logw_next_runs_concurrently(sampler_cls):
+    """Target and proposal `logw_next` must overlap (peak=2). Sequential
+    `await; await` would give peak=1."""
+    from genlm.control.sampler import DirectTokenSampler, AWRS
+
+    vocab = [bytes([i]) for i in range(3)]
+    tracker = {"in_flight": 0, "peak": 0}
+    target = _TrackedPotential(vocab, np.log([0.3, 0.4, 0.2, 0.1]), tracker)
+    proposal = _TrackedPotential(vocab, np.log([0.1, 0.1, 0.5, 0.3]), tracker)
+
+    if sampler_cls == "direct":
+        sampler = DirectTokenSampler(target, proposal=proposal)
+    else:
+        condition = MockPotential(vocab, [0.0, 0.0, 0.0, float("-inf")])
+        sampler = AWRS(target, condition, proposal=proposal, seed=0)
+
+    await sampler.sample([])
+    assert tracker["peak"] == 2
+
+
 @pytest.mark.asyncio
 @settings(deadline=None)
 @given(iter_item_params())

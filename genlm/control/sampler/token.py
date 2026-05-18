@@ -1,3 +1,4 @@
+import asyncio
 import numpy as np
 from arsenal import colors
 from llamppl import SubModel
@@ -139,13 +140,15 @@ class DirectTokenSampler(TokenSampler):
                 token = draw(logps.exp().materialize())
             return token, logws.sum(), logps[token]
 
-        proposal_logws = await self.proposal.logw_next(context)
+        proposal_logws, target_logws = await asyncio.gather(
+            self.proposal.logw_next(context),
+            self.potential.logw_next(context),
+        )
         proposal_logps = proposal_logws.normalize()
         if draw is None:
             token = fast_sample_lazyweights(proposal_logps)
         else:
             token = draw(proposal_logps.exp().materialize())
-        target_logws = await self.potential.logw_next(context)
         logw = (
             target_logws[token]
             - proposal_logws[token]
@@ -332,8 +335,10 @@ class AWRS(TokenSampler):
             logws = await self.potential.logw_next(context)
             target_logws = None
         else:
-            target_logws = await self.potential.logw_next(context)
-            logws = await self.proposal.logw_next(context)
+            target_logws, logws = await asyncio.gather(
+                self.potential.logw_next(context),
+                self.proposal.logw_next(context),
+            )
 
         if self.prune_logws:
             logws = self._prune_logws(logws)
