@@ -406,3 +406,29 @@ def test_eos_tokens_and_byte_strings_conflict(llm):
     """Test that specifying both eos_tokens and eos_byte_strings raises."""
     with pytest.raises(TypeError, match="Cannot specify both"):
         llm.spawn(eos_byte_strings=[b"!"], eos_tokens=[b"?"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_ids_is_per_asyncio_task(llm):
+    """Concurrent asyncio tasks setting distinct ``prompt_ids`` on the
+    same ``PromptedLLM`` instance must each read back their own value.
+
+    Pre-fix, ``prompt_ids`` was a plain mutable instance attribute, so this
+    would fail: every task would read whichever task set the attribute
+    most recently before the read. With ``prompt_ids`` backed by a
+    per-instance ``contextvars.ContextVar``, each task's reads see only
+    its own writes (asyncio Contexts are per-Task).
+    """
+    import asyncio
+
+    async def use_prompt(token_ids):
+        llm.prompt_ids = token_ids
+        # Yield to the event loop so sibling tasks get a chance to clobber
+        # ``llm.prompt_ids`` before we read it back. A shared-mutable-state
+        # implementation would race here; the contextvar isolates tasks.
+        await asyncio.sleep(0)
+        return list(llm.prompt_ids)
+
+    expected = [[1, 2, 3], [10, 20, 30], [100, 200, 300]]
+    results = await asyncio.gather(*[use_prompt(p) for p in expected])
+    assert results == expected

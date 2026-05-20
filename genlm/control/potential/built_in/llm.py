@@ -1,3 +1,4 @@
+import contextvars
 import torch
 import warnings
 from typing import NamedTuple
@@ -207,7 +208,14 @@ class PromptedLLM(Potential):
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         self.model = llm
-        self.prompt_ids = prompt_ids or []
+        # ``prompt_ids`` is backed by a per-instance ``contextvars.ContextVar``
+        # so that concurrent asyncio tasks setting their own prompt on this
+        # instance don't race on shared mutable state. Each task's reads
+        # see its own writes; sibling tasks see the parent context's value
+        # (the default bound here, or whatever the parent task last set).
+        self._prompt_ids_var = contextvars.ContextVar(
+            f"prompt_ids@{id(self)}", default=list(prompt_ids or []),
+        )
         self.temperature = temperature
 
         if token_maps is not None:
@@ -275,6 +283,19 @@ class PromptedLLM(Potential):
         )
 
     @property
+    def prompt_ids(self):
+        """The currently active prompt token ids.
+
+        Backed by a per-instance ``contextvars.ContextVar``: concurrent
+        asyncio tasks each see their own writes (no cross-task races).
+        """
+        return self._prompt_ids_var.get()
+
+    @prompt_ids.setter
+    def prompt_ids(self, value):
+        self._prompt_ids_var.set(list(value))
+
+    @property
     def prompt(self):
         """
         Get the current prompt as Token objects.
@@ -294,7 +315,6 @@ class PromptedLLM(Potential):
         Args:
             prompt_str (str): The prompt to set.
         """
-        # TODO: Handle race condition where prompt_ids reset concurrently.
         if not isinstance(prompt_str, str):
             raise ValueError(
                 f"Prompt must a string got {type(prompt_str)}. "
