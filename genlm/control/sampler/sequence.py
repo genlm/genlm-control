@@ -11,6 +11,7 @@ from llamppl import smc_standard
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
+from genlm.control.sampler.csmc import csmc_standard, RetainedTokenSampler
 from genlm.control.util import escape
 
 
@@ -75,9 +76,16 @@ class SMC:
         max_tokens,
         verbosity=0,
         json_path=None,
+        retained_sequence=None,
         **kwargs,
     ):
         """Generate sequences using sequential Monte Carlo inference.
+
+        When ``retained_sequence`` is supplied, Conditional SMC (Andrieu,
+        Doucet & Holenstein 2010, §4.3) is run instead of standard SMC:
+        slot 0 of the particle population is force-extended along
+        ``retained_sequence`` and exempted from resampling; the other
+        ``n_particles - 1`` slots evolve normally.
 
         Args:
             n_particles (int): Number of particles (candidate sequences) to maintain during
@@ -94,6 +102,11 @@ class SMC:
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
+                Only used in standard-SMC mode.
+            retained_sequence (list, optional): If provided, runs Conditional
+                SMC with this pre-specified token sequence as the retained
+                particle. ``n_particles >= 2`` is recommended for nontrivial
+                mixing.
             **kwargs (dict): Additional keyword arguments to pass to the SMC algorithm.
                 See the `llamppl.inference.smc_standard` documentation for more details.
 
@@ -101,21 +114,33 @@ class SMC:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
+        unit_sampler = (
+            RetainedTokenSampler(self.unit_sampler, retained_sequence)
+            if retained_sequence is not None
+            else self.unit_sampler
+        )
         model = SequenceModel(
-            unit_sampler=self.unit_sampler,
+            unit_sampler=unit_sampler,
             critic=self.critic,
             max_tokens=max_tokens,
             verbosity=verbosity,
             twist_with_critic=ess_threshold > 0,
         )
 
-        particles = await smc_standard(
-            model=model,
-            n_particles=n_particles,
-            ess_threshold=ess_threshold,
-            json_file=json_path,
-            **kwargs,
-        )
+        if retained_sequence is None:
+            particles = await smc_standard(
+                model=model,
+                n_particles=n_particles,
+                ess_threshold=ess_threshold,
+                json_file=json_path,
+                **kwargs,
+            )
+        else:
+            particles = await csmc_standard(
+                model=model,
+                n_particles=n_particles,
+                ess_threshold=ess_threshold,
+            )
 
         return Sequences(*_unpack_particles(particles))
 
