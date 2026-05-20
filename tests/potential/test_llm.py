@@ -120,6 +120,7 @@ async def test_properties(llm, pre_prompt, context, temp):
 @settings(deadline=None, max_examples=50)
 @given(st.lists(st.text(min_size=1), min_size=1, max_size=4))
 async def test_batch_consistency(llm, contexts):
+    llm.prompt_ids = llm.model.tokenizer.encode("test")
     contexts = [llm.tokenize(context) for context in contexts]
     await llm.assert_batch_consistency(contexts, rtol=1e-3, atol=1e-3)
 
