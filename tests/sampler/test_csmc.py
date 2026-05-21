@@ -229,6 +229,46 @@ async def test_retained_sampler_passthrough_after_exhaustion():
 
 
 @pytest.mark.asyncio
+async def test_retained_sampler_sample_delegates_to_base():
+    pot = WeightedSet([["x"]], [1.0])
+    base = DirectTokenSampler(pot)
+    try:
+        wrapper = RetainedTokenSampler(base, retained_sequence=[])
+        token, _w, _p = await wrapper.sample([], draw=lambda _: "x")
+        assert token == "x"
+    finally:
+        await base.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_retained_sampler_start_weight_delegates_to_base():
+    pot = WeightedSet([["x"]], [1.0])
+    base = DirectTokenSampler(pot)
+    try:
+        wrapper = RetainedTokenSampler(base, retained_sequence=[])
+        assert await wrapper.start_weight() == await base.start_weight()
+    finally:
+        await base.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_retained_sampler_cleanup_delegates_to_base():
+    pot = WeightedSet([["x"]], [1.0])
+    base = DirectTokenSampler(pot)
+    calls: list[str] = []
+    orig_cleanup = base.cleanup
+
+    async def tracking_cleanup():
+        calls.append("base")
+        await orig_cleanup()
+
+    base.cleanup = tracking_cleanup
+    wrapper = RetainedTokenSampler(base, retained_sequence=[])
+    await wrapper.cleanup()
+    assert calls == ["base"]
+
+
+@pytest.mark.asyncio
 async def test_retained_sampler_idx_only_advances_when_forcing():
     """``retained_idx`` advances iff the wrapper actually forces a
     token (host is retained AND sequence not exhausted)."""
