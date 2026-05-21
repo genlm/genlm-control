@@ -6,6 +6,11 @@ from genlm.control.potential.base import Potential
 from genlm.backend.tokenization import Token
 
 
+_prompt_ids_overrides: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "genlm_control_prompt_ids_overrides", default={}
+)
+
+
 def _compat_eos_tokens(eos_byte_strings, kwargs):
     """Handle deprecated ``eos_tokens`` kwarg, forwarding to ``eos_byte_strings``."""
     old = kwargs.pop("eos_tokens", None)
@@ -208,14 +213,7 @@ class PromptedLLM(Potential):
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         self.model = llm
-        # ``prompt_ids`` is backed by a per-instance ``contextvars.ContextVar``
-        # so that concurrent asyncio tasks setting their own prompt on this
-        # instance don't race on shared mutable state. Each task's reads
-        # see its own writes; sibling tasks see the parent context's value
-        # (the default bound here, or whatever the parent task last set).
-        self._prompt_ids_var = contextvars.ContextVar(
-            f"prompt_ids@{id(self)}", default=list(prompt_ids or []),
-        )
+        self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
 
         if token_maps is not None:
@@ -286,14 +284,17 @@ class PromptedLLM(Potential):
     def prompt_ids(self):
         """The currently active prompt token ids.
 
-        Backed by a per-instance ``contextvars.ContextVar``: concurrent
-        asyncio tasks each see their own writes (no cross-task races).
+        Backed by a module-level ``contextvars.ContextVar`` holding a
+        per-instance override dict (keyed by ``id(self)``). Concurrent
+        asyncio tasks each see their own writes via copy-on-write; sibling
+        tasks see the parent context's value or the instance default.
         """
-        return self._prompt_ids_var.get()
+        return _prompt_ids_overrides.get().get(id(self), self._default_prompt_ids)
 
     @prompt_ids.setter
     def prompt_ids(self, value):
-        self._prompt_ids_var.set(list(value))
+        current = _prompt_ids_overrides.get()
+        _prompt_ids_overrides.set({**current, id(self): list(value)})
 
     @property
     def prompt(self):

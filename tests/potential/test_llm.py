@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 import torch
 import numpy as np
@@ -420,7 +421,6 @@ async def test_prompt_ids_is_per_asyncio_task(llm):
     per-instance ``contextvars.ContextVar``, each task's reads see only
     its own writes (asyncio Contexts are per-Task).
     """
-    import asyncio
 
     async def use_prompt(token_ids):
         llm.prompt_ids = token_ids
