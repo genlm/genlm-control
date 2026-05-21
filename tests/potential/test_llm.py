@@ -433,3 +433,30 @@ async def test_prompt_ids_is_per_asyncio_task(llm):
     expected = [[1, 2, 3], [10, 20, 30], [100, 200, 300]]
     results = await asyncio.gather(*[use_prompt(p) for p in expected])
     assert results == expected
+
+
+def test_prompt_ids_override_entries_gc_with_instance(llm):
+    """Override-dict entries must be garbage-collected with their
+    PromptedLLM instance. Regression for the id(self)-reuse window
+    Samuel flagged on PR #143: with a plain dict keyed by id(self),
+    entries persist forever and a new instance allocated at the same
+    address would inherit the stale override.
+    """
+    import gc
+    import weakref
+    from genlm.control.potential.built_in.llm import _prompt_ids_overrides
+
+    transient = llm.spawn()
+    transient.prompt_ids = [9, 9, 9]
+    overrides = _prompt_ids_overrides.get()
+    assert overrides is not None and transient in overrides
+    n_before = len(overrides)
+
+    weak = weakref.ref(transient)
+    del transient
+    gc.collect()
+
+    assert weak() is None, "transient PromptedLLM was not collected"
+    assert len(overrides) == n_before - 1, (
+        f"stale override entry remained: before={n_before} after={len(overrides)}"
+    )

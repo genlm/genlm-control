@@ -1,4 +1,5 @@
 import contextvars
+import weakref
 import torch
 import warnings
 from typing import NamedTuple
@@ -6,8 +7,8 @@ from genlm.control.potential.base import Potential
 from genlm.backend.tokenization import Token
 
 
-_prompt_ids_overrides: contextvars.ContextVar[dict] = contextvars.ContextVar(
-    "genlm_control_prompt_ids_overrides", default={}
+_prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_prompt_ids_overrides", default=None
 )
 
 
@@ -285,16 +286,22 @@ class PromptedLLM(Potential):
         """The currently active prompt token ids.
 
         Backed by a module-level ``contextvars.ContextVar`` holding a
-        per-instance override dict (keyed by ``id(self)``). Concurrent
+        ``WeakKeyDictionary`` keyed by the instance itself. Concurrent
         asyncio tasks each see their own writes via copy-on-write; sibling
         tasks see the parent context's value or the instance default.
+        Entries vanish automatically when an instance is garbage-collected.
         """
-        return _prompt_ids_overrides.get().get(id(self), self._default_prompt_ids)
+        overrides = _prompt_ids_overrides.get()
+        if overrides is None:
+            return self._default_prompt_ids
+        return overrides.get(self, self._default_prompt_ids)
 
     @prompt_ids.setter
     def prompt_ids(self, value):
         current = _prompt_ids_overrides.get()
-        _prompt_ids_overrides.set({**current, id(self): list(value)})
+        new = weakref.WeakKeyDictionary() if current is None else weakref.WeakKeyDictionary(current)
+        new[self] = list(value)
+        _prompt_ids_overrides.set(new)
 
     @property
     def prompt(self):
