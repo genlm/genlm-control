@@ -2,8 +2,8 @@ import warnings
 
 import numpy as np
 from genlm.grammar import Float, Log
-from arsenal.maths import logsumexp
 
+from genlm.control._fast import logsumexp
 from genlm.control.constant import EndOfSequence
 from genlm.backend.tokenization import Token
 

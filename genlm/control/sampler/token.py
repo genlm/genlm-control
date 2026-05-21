@@ -2,9 +2,10 @@ import asyncio
 import numpy as np
 from arsenal import colors
 from llamppl import SubModel
-from arsenal.maths import log1mexp, logsumexp
+from arsenal.maths import log1mexp
 import warnings
 
+from genlm.control._fast import logsumexp
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab

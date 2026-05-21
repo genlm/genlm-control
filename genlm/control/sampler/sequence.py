@@ -1,10 +1,10 @@
 import numpy as np
 from genlm.grammar import Float
-from arsenal.maths import logsumexp
 from functools import cached_property
 from dataclasses import dataclass
 from arsenal import colors
 
+from genlm.control._fast import logsumexp
 from llamppl import Model
 from llamppl import smc_standard
 

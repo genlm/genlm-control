@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Cython generated
+genlm/control/_fast.c
+genlm/control/_fast.html

@@ -1,7 +1,7 @@
 import string
 import numpy as np
-from arsenal.maths import logsumexp
 
+from genlm.control._fast import logsumexp
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
 from genlm.grammar.lark_interface import interegular_to_wfsa
 
