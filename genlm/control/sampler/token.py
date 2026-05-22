@@ -5,7 +5,7 @@ from llamppl import SubModel
 from arsenal.maths import log1mexp, logsumexp
 import warnings
 
-from genlm.control.util import fast_sample_lazyweights, fast_sample_logprobs
+from genlm.control.util import fast_sample_logprobs
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 
