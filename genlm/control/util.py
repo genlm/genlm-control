@@ -287,6 +287,9 @@ def load_async_trie(V, backend=None, **kwargs):
     return AsyncTokenCharacterTrie(load_trie(V, backend, **kwargs))
 
 
+_GUMBEL_RNG = np.random.default_rng()
+
+
 def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
     """Sample indices from an array of log probabilities using the Gumbel-max trick.
 
@@ -298,11 +301,22 @@ def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
         (np.ndarray): Array of sampled indices
 
     Note:
-        This is much faster than np.random.choice for large arrays since it avoids
-        normalizing probabilities and uses vectorized operations.
+        Uses one in-place buffer instead of four temporaries, and PCG64 instead
+        of the legacy locked ``np.random.random``. The gumbel-max trick reduces
+        to ``argmin(log(-log U) - logprobs)`` via ``argmax(x) = argmin(-x)``,
+        which lets us skip the final negation that ``-log(-log U) + logprobs``
+        would otherwise require.
+
+        Module-level rng is private state and is NOT reseeded by
+        ``np.random.seed``; pass an explicit ``np.random.default_rng(seed)``
+        via a future ``rng=`` kwarg if seeded sampling is needed.
     """
-    noise = -np.log(-np.log(np.random.random((size, len(logprobs)))))
-    return (logprobs + noise).argmax(axis=1)
+    work = _GUMBEL_RNG.random((size, len(logprobs)))
+    np.log(work, out=work)         # log(U)
+    np.negative(work, out=work)    # -log(U) > 0
+    np.log(work, out=work)         # log(-log(U)) = -gumbel noise
+    work -= logprobs               # log(-log(U)) - logprobs
+    return work.argmin(axis=1)     # == argmax(logprobs + (-log(-log U)))
 
 
 def fast_sample_lazyweights(lazyweights):
