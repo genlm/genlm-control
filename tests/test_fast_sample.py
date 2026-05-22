@@ -5,7 +5,6 @@ from genlm.control.util import fast_sample_logprobs
 
 
 def test_size_one_returns_int_array_of_length_one():
-    rng = np.random.default_rng(0)
     out = fast_sample_logprobs(np.array([0.0, 0.0, 0.0, 0.0]), size=1)
     assert out.shape == (1,)
     assert 0 <= int(out[0]) < 4
@@ -53,6 +52,15 @@ def test_argmax_dominates_when_one_logprob_is_huge(v):
     logprobs[v // 2] = 100.0
     samples = fast_sample_logprobs(logprobs, size=500)
     assert (samples == v // 2).all()
+
+
+def test_rng_kwarg_gives_deterministic_samples():
+    logprobs = np.linspace(-3.0, 3.0, 256)
+    a = fast_sample_logprobs(logprobs, size=1000, rng=np.random.default_rng(42))
+    b = fast_sample_logprobs(logprobs, size=1000, rng=np.random.default_rng(42))
+    assert np.array_equal(a, b)
+    c = fast_sample_logprobs(logprobs, size=1000, rng=np.random.default_rng(43))
+    assert not np.array_equal(a, c)
 
 
 def _legacy_fast_sample_logprobs(logprobs, size=1):

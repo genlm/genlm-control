@@ -290,12 +290,18 @@ def load_async_trie(V, backend=None, **kwargs):
 _GUMBEL_RNG = np.random.default_rng()
 
 
-def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
+def fast_sample_logprobs(
+    logprobs: np.ndarray, size: int = 1, rng: np.random.Generator | None = None
+) -> np.ndarray:
     """Sample indices from an array of log probabilities using the Gumbel-max trick.
 
     Args:
         logprobs: Array of log probabilities
         size (int): Number of samples to draw
+        rng: Optional ``np.random.Generator`` for seeded sampling. Defaults
+            to a module-level ``np.random.default_rng()`` instance, which is
+            NOT reseeded by ``np.random.seed`` — pass an explicit
+            ``np.random.default_rng(seed)`` if you need reproducibility.
 
     Returns:
         (np.ndarray): Array of sampled indices
@@ -306,12 +312,10 @@ def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
         to ``argmin(log(-log U) - logprobs)`` via ``argmax(x) = argmin(-x)``,
         which lets us skip the final negation that ``-log(-log U) + logprobs``
         would otherwise require.
-
-        Module-level rng is private state and is NOT reseeded by
-        ``np.random.seed``; pass an explicit ``np.random.default_rng(seed)``
-        via a future ``rng=`` kwarg if seeded sampling is needed.
     """
-    work = _GUMBEL_RNG.random((size, len(logprobs)))
+    if rng is None:
+        rng = _GUMBEL_RNG
+    work = rng.random((size, len(logprobs)))
     np.log(work, out=work)         # log(U)
     np.negative(work, out=work)    # -log(U) > 0
     np.log(work, out=work)         # log(-log(U)) = -gumbel noise
