@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 import torch
 import numpy as np
@@ -120,6 +121,7 @@ async def test_properties(llm, pre_prompt, context, temp):
 @settings(deadline=None, max_examples=50)
 @given(st.lists(st.text(min_size=1), min_size=1, max_size=4))
 async def test_batch_consistency(llm, contexts):
+    llm.prompt_ids = llm.model.tokenizer.encode("test")
     contexts = [llm.tokenize(context) for context in contexts]
     await llm.assert_batch_consistency(contexts, rtol=1e-3, atol=1e-3)
 
@@ -406,3 +408,55 @@ def test_eos_tokens_and_byte_strings_conflict(llm):
     """Test that specifying both eos_tokens and eos_byte_strings raises."""
     with pytest.raises(TypeError, match="Cannot specify both"):
         llm.spawn(eos_byte_strings=[b"!"], eos_tokens=[b"?"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_ids_is_per_asyncio_task(llm):
+    """Concurrent asyncio tasks setting distinct ``prompt_ids`` on the
+    same ``PromptedLLM`` instance must each read back their own value.
+
+    Pre-fix, ``prompt_ids`` was a plain mutable instance attribute, so this
+    would fail: every task would read whichever task set the attribute
+    most recently before the read. With ``prompt_ids`` backed by a
+    per-instance ``contextvars.ContextVar``, each task's reads see only
+    its own writes (asyncio Contexts are per-Task).
+    """
+
+    async def use_prompt(token_ids):
+        llm.prompt_ids = token_ids
+        # Yield to the event loop so sibling tasks get a chance to clobber
+        # ``llm.prompt_ids`` before we read it back. A shared-mutable-state
+        # implementation would race here; the contextvar isolates tasks.
+        await asyncio.sleep(0)
+        return list(llm.prompt_ids)
+
+    expected = [[1, 2, 3], [10, 20, 30], [100, 200, 300]]
+    results = await asyncio.gather(*[use_prompt(p) for p in expected])
+    assert results == expected
+
+
+def test_prompt_ids_override_entries_gc_with_instance(llm):
+    """Override-dict entries must be garbage-collected with their
+    PromptedLLM instance. Regression for the id(self)-reuse window
+    Samuel flagged on PR #143: with a plain dict keyed by id(self),
+    entries persist forever and a new instance allocated at the same
+    address would inherit the stale override.
+    """
+    import gc
+    import weakref
+    from genlm.control.potential.built_in.llm import _prompt_ids_overrides
+
+    transient = llm.spawn()
+    transient.prompt_ids = [9, 9, 9]
+    overrides = _prompt_ids_overrides.get()
+    assert overrides is not None and transient in overrides
+    n_before = len(overrides)
+
+    weak = weakref.ref(transient)
+    del transient
+    gc.collect()
+
+    assert weak() is None, "transient PromptedLLM was not collected"
+    assert len(overrides) == n_before - 1, (
+        f"stale override entry remained: before={n_before} after={len(overrides)}"
+    )
