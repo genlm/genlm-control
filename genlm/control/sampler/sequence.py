@@ -29,9 +29,14 @@ class SMC:
        particles are resampled according to their weights. This helps focus computation
        on more promising sequences.
 
-    4. Termination: The process continues until either:\n
-        - All sequences reach an end-of-sequence (EOS) token\n
-        - The maximum token length is reached
+    4. Termination: Each sequence terminates either by naturally sampling an
+       end-of-sequence (EOS) token, or by hitting the ``max_tokens`` boundary.
+       In the latter case, EOS is deterministically appended to the sequence
+       and the particle's importance weight is corrected by
+       ``unit_sampler.target.logw_next(context)[EOS]`` (see
+       :meth:`TokenSampler.logw_eos`). This makes the resulting particles
+       properly weighted with respect to the target distribution conditioned
+       on ``|y| <= max_tokens``; every returned sequence ends with EOS.
 
     If a critic is provided, the resulting sequences are properly weighted with respect to the product of the unit sampler's
     target potential and the critic potential (`unit_sampler.target * critic`). If a critic is not provided,
@@ -88,8 +93,10 @@ class SMC:
                 this value, particles are resampled according to their weights. Should be between 0 and 1.
                 Higher values lead to more frequent resampling. Note that when ess_threshold = 0,
                 the critic is only applied at the end of the generation (if it is provided).
-            max_tokens (int): Maximum number of tokens to generate per sequence. Generation
-                may terminate earlier if all sequences reach an EOS token.
+            max_tokens (int): Maximum sequence length (including the terminal EOS token).
+                Sequences that haven't naturally sampled EOS by the boundary have EOS
+                deterministically appended, with an importance-weight correction so the
+                particles target the length-conditioned distribution.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
@@ -289,14 +296,30 @@ class SequenceModel(Model):
         self.score(start_w)
 
     async def step(self):
-        unit = await self.call(self.unit_sampler)
-        self.token_ctx.append(unit)
+        if self.verbosity > 0:
+            print(self.__repr__())
 
-        inf_weight = self.weight == float("-inf")
-        if inf_weight:
+        # Advance the context: either sample, or force EOS at the max_tokens
+        # boundary. Forcing EOS is equivalent to swapping the proposal for a
+        # point mass at EOS for that step; its IS correction is therefore the
+        # target's unnormalized log-weight on EOS (see TokenSampler.logw_eos).
+        if self.max_tokens == 1:
+            self.score(await self.unit_sampler.logw_eos(self.token_ctx))
+            self.token_ctx.append(EOS)
+        else:
+            unit = await self.call(self.unit_sampler)
+            self.token_ctx.append(unit)
+
+        if self.weight == float("-inf"):
             if self.critic:
                 assert self.twist_amount != float("-inf")
             self.finish()
+            return
+
+        if self.token_ctx[-1] is EOS:
+            self.finish()
+            if self.critic:
+                self.score(await self.critic.score(self.token_ctx))
             return
 
         if self.critic and self.twist_with_critic:
@@ -308,17 +331,7 @@ class SequenceModel(Model):
                 self.finish()
                 return
 
-        if self.verbosity > 0:
-            print(self.__repr__())
-
         self.max_tokens -= 1
-        if self.max_tokens == 0 or self.token_ctx[-1] is EOS:
-            self.finish()
-            if self.critic:
-                if not self.twist_with_critic:
-                    twist_amt = await self.critic.score(self.token_ctx)
-                self.score(twist_amt)
-            return
 
     def __repr__(self):
         return (
