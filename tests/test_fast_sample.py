@@ -53,3 +53,26 @@ def test_argmax_dominates_when_one_logprob_is_huge(v):
     logprobs[v // 2] = 100.0
     samples = fast_sample_logprobs(logprobs, size=500)
     assert (samples == v // 2).all()
+
+
+def _legacy_fast_sample_logprobs(logprobs, size=1):
+    noise = -np.log(-np.log(np.random.random((size, len(logprobs)))))
+    return (logprobs + noise).argmax(axis=1)
+
+
+@pytest.mark.parametrize(
+    "logprobs,n",
+    [
+        (np.array([0.0, 1.0, 2.0, -1.0, 0.5]), 200_000),
+        (np.linspace(-3.0, 3.0, 50), 200_000),
+        (np.random.default_rng(0).standard_normal(1024), 50_000),
+    ],
+)
+def test_matches_legacy_implementation_distributionally(logprobs, n):
+    new = np.bincount(fast_sample_logprobs(logprobs, size=n),
+                      minlength=len(logprobs)) / n
+    legacy = np.bincount(_legacy_fast_sample_logprobs(logprobs, size=n),
+                         minlength=len(logprobs)) / n
+    assert np.allclose(new, legacy, atol=5e-3), (
+        f"V={len(logprobs)}  max diff={np.abs(new - legacy).max():.4f}"
+    )
