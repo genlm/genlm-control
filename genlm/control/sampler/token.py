@@ -1,7 +1,6 @@
 import asyncio
 import numpy as np
 from arsenal import colors
-from llamppl import SubModel
 from arsenal.maths import log1mexp, logsumexp
 import warnings
 
@@ -10,7 +9,7 @@ from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 
 
-class TokenSampler(SubModel):
+class TokenSampler:
     """Base class for sampling a token from a potential's vocabulary.
 
     `TokenSampler`s generate properly weighted samples with respect to a `target` potential.
@@ -23,12 +22,16 @@ class TokenSampler(SubModel):
     \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})
     $$
 
+    A `TokenSampler` collapses to a single per-step transition that the SMC hub
+    calls: :meth:`transition` maps a particle context to
+    ``(to_append, logw, logp)``. The hub owns the population, ESS test,
+    resampling and log marginal likelihood; samplers never reimplement the loop.
+
     Args:
         target (Potential): The potential that samples are properly weighted with respect to.
     """
 
     def __init__(self, target):
-        super().__init__()
         self.target = target
         self.token_type = self.target.token_type
 
@@ -36,12 +39,24 @@ class TokenSampler(SubModel):
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
 
-    async def forward(self):
-        parent = self.parent  # For some reason, need to hold onto this reference.
-        token, logw, logp = await self.sample(parent.token_ctx)
-        parent.score(logw)
-        parent.logp += logp
-        return token
+    async def transition(self, context):
+        """The hub-facing per-step transition.
+
+        Draws a single token, returning the list of items to append to the
+        particle context together with the importance-weight increment and the
+        log-probability of the random choices.
+
+        Args:
+            context (list): The particle's current token context.
+
+        Returns:
+            (to_append, logw, logp): ``to_append`` is ``[token]`` (subclasses
+                that produce multi-token units may return more than one item),
+                ``logw`` is the importance-weight increment, ``logp`` the
+                log-probability of the sampler's random choices.
+        """
+        token, logw, logp = await self.sample(context)
+        return [token], logw, logp
 
     async def sample(self, context, draw):
         """Sample a token and weight from the `target`potential's vocabulary.
@@ -149,11 +164,7 @@ class DirectTokenSampler(TokenSampler):
             token = fast_sample_lazyweights(proposal_logps)
         else:
             token = draw(proposal_logps.exp().materialize())
-        logw = (
-            target_logws[token]
-            - proposal_logws[token]
-            + proposal_logws.sum()
-        )
+        logw = target_logws[token] - proposal_logws[token] + proposal_logws.sum()
         return token, logw, proposal_logps[token]
 
     async def cleanup(self):

@@ -91,35 +91,41 @@ class MultiTokenUnitSampler(TokenSampler):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
         return await self.subunit_sampler.start_weight()
 
-    async def forward(self):
-        """Called by LLaMPPL Model.call() to sample one multi-token unit.
+    async def transition(self, context):
+        """The hub-facing per-step transition for multi-token units.
 
-        Called by SequenceModel.step() when it calls self.call(unit_sampler).
+        Samples one multi-token unit and returns the list of items to append to
+        the particle context, the importance-weight increment, and the
+        log-probability of the random choices.
+
+        The context passed by the hub is the structured (possibly nested) unit
+        context; it is flattened before sampling so the subunit sampler always
+        sees a flat token list. The trailing-EOS split logic mirrors the old
+        LLaMPPL ``forward``: when the sampled unit ends with EOS, the content
+        before EOS (if any) is appended as one unit and EOS is appended
+        separately so the hub's terminal check (``context[-1] is EOS``) fires.
+
+        Args:
+            context (list): The particle's structured unit context.
+
+        Returns:
+            (to_append, logw, logp): items to extend the context with, the
+                weight increment, and the log-probability of random choices.
         """
-        parent = self.parent
+        flat_context = flatten_units(context)
 
-        # Flatten parent.token_ctx before passing to sample
-        # This ensures sample() always works with a flat list
-        flat_context = flatten_units(parent.token_ctx)
-
-        # Sample multi-token unit, passing both flat context and structured unit context
         unit, logw, logp = await self.sample(
-            flat_context, unit_context=parent.token_ctx, draw=None
+            flat_context, unit_context=context, draw=None
         )
 
-        # Update parent's weight and logp
-        parent.score(logw)
-        parent.logp += logp
-
-        # If the unit ends with EOS, return EOS directly so SequenceModel can detect completion
-        # SequenceModel.step() checks `token_ctx[-1] is EOS` to finish generation
         if unit and unit[-1] is EOS:
-            # Keep the unit content before EOS in token_ctx, then return EOS separately
+            to_append = []
             if len(unit) > 1:
-                parent.token_ctx.append(unit[:-1])  # Add unit without EOS
-            return EOS  # Return EOS directly for SequenceModel to detect
+                to_append.append(unit[:-1])  # unit content without EOS
+            to_append.append(EOS)
+            return to_append, logw, logp
 
-        return unit
+        return [unit], logw, logp
 
     async def sample(self, flat_token_context, unit_context=None, draw=None):
         """Sample a multi-token unit by running sequence sampling for $\\varphi_{\\bm{x}}$.

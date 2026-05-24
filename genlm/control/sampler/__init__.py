@@ -1,6 +1,6 @@
 from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
-from .sequence import SMC, SequenceModel
+from .sequence import SMC
 from .unit import (
     MultiTokenUnitSampler,
     BoundaryPredicate,
@@ -77,7 +77,6 @@ __all__ = [
     "TokenSampler",
     "Importance",
     "SMC",
-    "SequenceModel",
     "MultiTokenUnitSampler",
     "BoundaryPredicate",
     "TokenSetBoundary",

@@ -3,15 +3,11 @@ from genlm.grammar import Float
 from arsenal.maths import logsumexp
 from functools import cached_property
 from dataclasses import dataclass
-from arsenal import colors
-
-from llamppl import Model
-from llamppl import smc_standard
 
 from genlm.control.potential import Potential
-from genlm.control.constant import EOS, EndOfSequence
+from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.util import escape
+from genlm.control.sampler.hub import Hub, SlowDriver
 
 
 class SMC:
@@ -94,28 +90,30 @@ class SMC:
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
-            **kwargs (dict): Additional keyword arguments to pass to the SMC algorithm.
-                See the `llamppl.inference.smc_standard` documentation for more details.
+            **kwargs (dict): Additional keyword arguments to pass to the SMC hub.
+                Currently ``resampling_method`` (one of 'multinomial', 'stratified',
+                'systematic', 'residual'; defaults to 'multinomial').
 
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
-        model = SequenceModel(
+        hub = Hub(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
-            max_tokens=max_tokens,
-            verbosity=verbosity,
-            twist_with_critic=ess_threshold > 0,
-        )
-
-        particles = await smc_standard(
-            model=model,
             n_particles=n_particles,
             ess_threshold=ess_threshold,
-            json_file=json_path,
+            max_tokens=max_tokens,
+            twist_with_critic=ess_threshold > 0,
+            record=json_path is not None,
+            verbosity=verbosity,
             **kwargs,
         )
+
+        particles = await SlowDriver(hub).run()
+
+        if json_path is not None:
+            hub.save_record(json_path)
 
         return Sequences(*_unpack_particles(particles))
 
@@ -259,88 +257,12 @@ class Sequences:
             print(p)
 
 
-class SequenceModel(Model):
-    def __init__(
-        self,
-        unit_sampler,
-        critic=None,
-        max_tokens=float("inf"),
-        verbosity=0,
-        twist_with_critic=True,
-    ):
-        assert max_tokens > 0
-
-        super().__init__()
-        self.token_ctx = []
-        self.unit_sampler = unit_sampler
-        self.max_tokens = max_tokens
-        self.critic = critic
-        self.logp = 0
-        self.verbosity = verbosity
-        self.twist_with_critic = twist_with_critic
-
-    async def start(self):
-        start_w = await self.unit_sampler.start_weight()
-        if start_w == float("-inf"):
-            raise ValueError(
-                "Start weight is -inf (log(0)). This is likely because a potential assigns zero weight to "
-                "the empty sequence under `prefix`, which violates the potential contract."
-            )
-        self.score(start_w)
-
-    async def step(self):
-        unit = await self.call(self.unit_sampler)
-        self.token_ctx.append(unit)
-
-        inf_weight = self.weight == float("-inf")
-        if inf_weight:
-            if self.critic:
-                assert self.twist_amount != float("-inf")
-            self.finish()
-            return
-
-        if self.critic and self.twist_with_critic:
-            twist_amt = await self.critic.score(self.token_ctx)
-            if twist_amt != float("-inf"):
-                self.twist(twist_amt)
-            else:
-                self.score(twist_amt)
-                self.finish()
-                return
-
-        if self.verbosity > 0:
-            print(self.__repr__())
-
-        self.max_tokens -= 1
-        if self.max_tokens == 0 or self.token_ctx[-1] is EOS:
-            self.finish()
-            if self.critic:
-                if not self.twist_with_critic:
-                    twist_amt = await self.critic.score(self.token_ctx)
-                self.score(twist_amt)
-            return
-
-    def __repr__(self):
-        return (
-            f"{self.weight:.2f}:\t"
-            + colors.magenta % "["
-            + (colors.magenta % "|").join(escape(y) for y in self.token_ctx)
-            + colors.magenta % "]"
-        )
-
-    def string_for_serialization(self):
-        return "|".join(escape(y) for y in self.token_ctx)
-
-    def immutable_properties(self):
-        return set(["unit_sampler", "critic"])
-
-
 def _unpack_particles(particles):
     contexts, logws = map(
         list,
         zip(
             *[
-                (p.token_ctx, float("-inf") if np.isnan(p.weight) else p.weight)
+                (p.context, float("-inf") if np.isnan(p.logw) else p.logw)
                 for p in particles
             ]
         ),

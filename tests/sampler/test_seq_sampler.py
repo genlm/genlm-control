@@ -3,7 +3,9 @@ import numpy as np
 
 
 from genlm.control.potential import Potential
-from genlm.control.sampler.sequence import SMC, SequenceModel
+from genlm.control.sampler.sequence import SMC
+from genlm.control.sampler.hub import Hub
+from genlm.control.sampler.smc_record import string_for_serialization
 from genlm.control.sampler.token import DirectTokenSampler
 
 from hypothesis import strategies as st, settings, given
@@ -140,7 +142,7 @@ async def test_smc_weights(params):
 
 
 @pytest.mark.asyncio
-async def test_sequence_model_invalid_start_weight():
+async def test_hub_invalid_start_weight():
     class MockPotential(Potential):
         async def prefix(self, context):
             if not context:
@@ -151,10 +153,17 @@ async def test_sequence_model_invalid_start_weight():
             return 0
 
     unit_sampler = DirectTokenSampler(MockPotential([0]))
-    seq_model = SequenceModel(unit_sampler)
+    hub = Hub(
+        unit_sampler=unit_sampler,
+        critic=None,
+        n_particles=1,
+        ess_threshold=0.5,
+        max_tokens=10,
+        twist_with_critic=True,
+    )
     with pytest.raises(ValueError, match="Start weight.*"):
-        await seq_model.start()
+        await hub.start()
 
 
-def test_sequence_model_str_for_serialization(default_unit_sampler):
-    SequenceModel(default_unit_sampler).string_for_serialization()
+def test_string_for_serialization(default_unit_sampler):
+    string_for_serialization([b"a", b"b"])
