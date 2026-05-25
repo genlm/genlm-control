@@ -54,12 +54,15 @@ def test_argmax_dominates_when_one_logprob_is_huge(v):
     assert (samples == v // 2).all()
 
 
-def test_rng_kwarg_gives_deterministic_samples():
+def test_np_random_seed_gives_deterministic_samples():
     logprobs = np.linspace(-3.0, 3.0, 256)
-    a = fast_sample_logprobs(logprobs, size=1000, rng=np.random.default_rng(42))
-    b = fast_sample_logprobs(logprobs, size=1000, rng=np.random.default_rng(42))
+    np.random.seed(42)
+    a = fast_sample_logprobs(logprobs, size=1000)
+    np.random.seed(42)
+    b = fast_sample_logprobs(logprobs, size=1000)
     assert np.array_equal(a, b)
-    c = fast_sample_logprobs(logprobs, size=1000, rng=np.random.default_rng(43))
+    np.random.seed(43)
+    c = fast_sample_logprobs(logprobs, size=1000)
     assert not np.array_equal(a, c)
 
 
