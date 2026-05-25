@@ -4,7 +4,7 @@ import numpy as np
 
 from genlm.control.potential import Potential
 from genlm.control.sampler.sequence import SMC
-from genlm.control.sampler.hub import Controller
+from genlm.control.sampler.controller import Controller
 from genlm.control.sampler.smc_record import string_for_serialization
 from genlm.control.sampler.token import DirectTokenSampler
 
@@ -142,7 +142,7 @@ async def test_smc_weights(params):
 
 
 @pytest.mark.asyncio
-async def test_hub_invalid_start_weight():
+async def test_controller_invalid_start_weight():
     class MockPotential(Potential):
         async def prefix(self, context):
             if not context:
@@ -153,7 +153,7 @@ async def test_hub_invalid_start_weight():
             return 0
 
     unit_sampler = DirectTokenSampler(MockPotential([0]))
-    hub = Controller(
+    controller = Controller(
         unit_sampler=unit_sampler,
         critic=None,
         n_particles=1,
@@ -162,7 +162,7 @@ async def test_hub_invalid_start_weight():
         twist_with_critic=True,
     )
     with pytest.raises(ValueError, match="Start weight.*"):
-        await hub.start()
+        await controller.start()
 
 
 def test_string_for_serialization(default_unit_sampler):

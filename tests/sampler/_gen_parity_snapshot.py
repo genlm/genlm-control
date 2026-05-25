@@ -6,9 +6,9 @@ the original ``smc_standard`` path:
     python tests/sampler/_gen_parity_snapshot.py
 
 This writes ``tests/sampler/parity_snapshot.json``, which ``test_per_token_parity.py``
-loads and compares the new hub-driven ``SMC`` path against. Snapshotting the
+loads and compares the new controller-driven ``SMC`` path against. Snapshotting the
 reference path (rather than running llamppl live in the test) lets the parity
-gate keep guarding the hub after the llamppl dependency is removed.
+gate keep guarding the controller after the llamppl dependency is removed.
 
 The reference ``_RefSequenceModel`` is a verbatim transcription of the deleted
 ``SequenceModel.step`` semantics; it calls ``unit_sampler.sample(context)``

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.hub import Controller, StepLoop, BurstLoop, can_burst
+from genlm.control.sampler.controller import Controller, StepLoop, BurstLoop, can_burst
 
 
 class SMC:
@@ -91,7 +91,7 @@ class SMC:
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
-            **kwargs (dict): Additional keyword arguments to pass to the SMC hub.
+            **kwargs (dict): Additional keyword arguments to pass to the SMC controller.
                 Currently ``resampling_method`` (one of 'multinomial', 'stratified',
                 'systematic', 'residual'; defaults to 'multinomial').
 
@@ -99,7 +99,7 @@ class SMC:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
-        hub = Controller(
+        controller = Controller(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
             n_particles=n_particles,
@@ -111,13 +111,13 @@ class SMC:
             **kwargs,
         )
 
-        if backend is not None and can_burst(hub):
-            particles = await BurstLoop(hub).run()
+        if backend is not None and can_burst(controller):
+            particles = await BurstLoop(controller).run()
         else:
-            particles = await StepLoop(hub).run()
+            particles = await StepLoop(controller).run()
 
         if json_path is not None:
-            hub.save_record(json_path)
+            controller.save_record(json_path)
 
         return Sequences(*_unpack_particles(particles))
 

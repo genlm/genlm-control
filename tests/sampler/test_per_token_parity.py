@@ -1,6 +1,6 @@
-"""Ground-truth per-token parity gate for the SMC hub.
+"""Ground-truth per-token parity gate for the SMC controller.
 
-This compares the new hub-driven slow path (``genlm.control.sampler.SMC``)
+This compares the new controller-driven slow path (``genlm.control.sampler.SMC``)
 against a stored snapshot of the original llamppl ``smc_standard`` path
 (``parity_snapshot.json``, produced by ``_gen_parity_snapshot.py`` while
 llamppl was still installed). Under a fixed numpy+torch seed the per-particle
@@ -111,7 +111,7 @@ def _canonical_record(record_text):
 @pytest.mark.parametrize("use_critic", [False, True])
 @pytest.mark.parametrize("ess_threshold", MATRIX)
 def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
-    # Synchronous test driving the hub with a fresh ``asyncio.run`` per case,
+    # Synchronous test driving the controller with a fresh ``asyncio.run`` per case,
     # matching the snapshot generator.
     #
     # Byte-exact token parity requires a deterministic vocabulary order: the
@@ -119,11 +119,11 @@ def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
     # position, so a vocab whose order varies run-to-run would map the same RNG
     # stream onto different tokens. The conftest ``WeightedSet`` fixture
     # previously built its vocab via ``set(...)``, whose string iteration order
-    # is randomized per process (PYTHONHASHSEED); this made BOTH the hub and the
+    # is randomized per process (PYTHONHASHSEED); this made BOTH the controller and the
     # original llamppl ``smc_standard`` path draw different tokens across fresh
     # processes (root-caused on the GPU box). The fixture now dedupes by
     # first-seen order, so the vocab -- and hence the whole population -- is
-    # bit-stable run-to-run under the default randomized hash seed, and the hub
+    # bit-stable run-to-run under the default randomized hash seed, and the controller
     # reproduces the original path bit-for-bit.
     import asyncio
 

@@ -1,6 +1,6 @@
 """Gate-2 parity: the engine-accelerated BurstLoop vs the ground-truth StepLoop.
 
-Both loops run the identical hub SMC algorithm; the ONLY intended difference is
+Both loops run the identical controller SMC algorithm; the ONLY intended difference is
 the source of next-token logits:
 
 * StepLoop re-prefills the full context every step (``PromptedLLM.logw_next`` ->
@@ -47,8 +47,8 @@ if not torch.cuda.is_available():  # pragma: no cover
 from genlm.control.constant import EndOfSequence  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.potential.built_in.wfsa import BoolFSA  # noqa: E402
-from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
-from genlm.control.sampler.hub import (  # noqa: E402
+from genlm.control.sampler.token import DirectTokenSampler, AWRS  # noqa: E402
+from genlm.control.sampler.controller import (  # noqa: E402
     Controller,
     StepLoop,
     BurstLoop,
@@ -89,9 +89,12 @@ def _ctx_ids(ctx):
     return out
 
 
-def _hub(target, n_particles, ess_threshold, max_tokens):
+def _controller(make_sampler, n_particles, ess_threshold, max_tokens):
+    # `make_sampler` is a factory so the slow and window runs each get a fresh
+    # sampler (an AWRS carries its own RNG; a fresh one per run keeps the two
+    # comparable, seeded by `_seed`).
     return Controller(
-        unit_sampler=DirectTokenSampler(target),
+        unit_sampler=make_sampler(),
         critic=None,
         n_particles=n_particles,
         ess_threshold=ess_threshold,
@@ -104,14 +107,14 @@ def _key(label, n_particles, ess_threshold, max_tokens, seed):
     return f"{label}|N={n_particles}|ess={ess_threshold}|mt={max_tokens}|seed={seed}"
 
 
-def _run_slow(target, n_particles, ess_threshold, max_tokens, seed):
+def _run_slow(make_sampler, n_particles, ess_threshold, max_tokens, seed):
     """The ground-truth StepLoop reference (the expensive, cached half)."""
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     _seed(seed)
-    hub = _hub(target, n_particles, ess_threshold, max_tokens)
+    controller = _controller(make_sampler, n_particles, ess_threshold, max_tokens)
     t0 = time.perf_counter()
-    parts = asyncio.run(StepLoop(hub).run())
+    parts = asyncio.run(StepLoop(controller).run())
     dt = time.perf_counter() - t0
     seq = Sequences(*_unpack_particles(parts))
     return {
@@ -122,25 +125,25 @@ def _run_slow(target, n_particles, ess_threshold, max_tokens, seed):
     }
 
 
-def _slow_cached(label, target, n_particles, ess_threshold, max_tokens, seed):
+def _slow_cached(label, make_sampler, n_particles, ess_threshold, max_tokens, seed):
     """Return the cached slow reference; (re)compute + persist it under REGEN or
     when the key is absent (first run with no snapshot)."""
     key = _key(label, n_particles, ess_threshold, max_tokens, seed)
     if _REGEN or key not in _SNAPSHOT:
         _SNAPSHOT[key] = _run_slow(
-            target, n_particles, ess_threshold, max_tokens, seed
+            make_sampler, n_particles, ess_threshold, max_tokens, seed
         )
         if _REGEN:
             _save_snapshot()
     return _SNAPSHOT[key]
 
 
-def _run_window(target, n_particles, ess_threshold, max_tokens, seed):
+def _run_window(make_sampler, n_particles, ess_threshold, max_tokens, seed):
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     _seed(seed)
-    hub = _hub(target, n_particles, ess_threshold, max_tokens)
-    driver = BurstLoop(hub)
+    controller = _controller(make_sampler, n_particles, ess_threshold, max_tokens)
+    driver = BurstLoop(controller)
     t0 = time.perf_counter()
     parts = asyncio.run(driver.run())
     dt = time.perf_counter() - t0
@@ -230,9 +233,13 @@ def _boolfsa_target(llm, regex):
 @pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
 def test_unconstrained_window_vs_slow(llm, ess_threshold):
     llm.set_prompt_from_str("The")
-    assert can_burst(_hub(llm, 8, ess_threshold, 12))
-    slow = _slow_cached("unconstrained", llm, 8, ess_threshold, 12, SEED)
-    win = _run_window(llm, 8, ess_threshold, 12, SEED)
+
+    def make():
+        return DirectTokenSampler(llm)
+
+    assert can_burst(_controller(make, 8, ess_threshold, 12))
+    slow = _slow_cached("unconstrained", make, 8, ess_threshold, 12, SEED)
+    win = _run_window(make, 8, ess_threshold, 12, SEED)
     _compare("unconstrained", ess_threshold, 8, slow, win)
 
 
@@ -243,9 +250,13 @@ def test_unconstrained_window_vs_slow(llm, ess_threshold):
 def test_constrained_boolfsa_window_vs_slow(llm, ess_threshold):
     llm.set_prompt_from_str("The")
     target = _boolfsa_target(llm, r"[a-z ]+")
-    assert can_burst(_hub(target, 16, ess_threshold, 12))
-    slow = _slow_cached("boolfsa[a-z ]+", target, 16, ess_threshold, 12, SEED)
-    win = _run_window(target, 16, ess_threshold, 12, SEED)
+
+    def make():
+        return DirectTokenSampler(target)
+
+    assert can_burst(_controller(make, 16, ess_threshold, 12))
+    slow = _slow_cached("boolfsa[a-z ]+", make, 16, ess_threshold, 12, SEED)
+    win = _run_window(make, 16, ess_threshold, 12, SEED)
     stats = _compare("boolfsa[a-z ]+", ess_threshold, 16, slow, win)
     # Low-variance constrained case (broad allowed set, full-length sequences):
     # the warm-KV residual is small and unbiased, so a single-seed log_ml diff
@@ -278,12 +289,15 @@ def test_constrained_forces_resample_window_vs_slow(llm):
     llm.set_prompt_from_str("The")
     target = _boolfsa_target(llm, r"[aeiou ]+")
 
+    def make():
+        return DirectTokenSampler(target)
+
     seeds = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
     diffs, len_gaps = [], []
     any_resample = False
     for seed in seeds:
-        slow = _slow_cached("boolfsa[aeiou ]+", target, 16, 0.5, 10, seed)
-        win = _run_window(target, 16, 0.5, 10, seed)
+        slow = _slow_cached("boolfsa[aeiou ]+", make, 16, 0.5, 10, seed)
+        win = _run_window(make, 16, 0.5, 10, seed)
         s = _compare("boolfsa[aeiou ]+", 0.5, 16, slow, win)
         diffs.append(s["log_ml_diff"])
         len_gaps.append(s["mean_len_win"] - s["mean_len_slow"])
@@ -307,4 +321,52 @@ def test_constrained_forces_resample_window_vs_slow(llm):
     )
     assert abs(len_gaps.mean()) <= 1.5, (
         f"window length is systematically biased: mean gap {len_gaps.mean():+.3f}"
+    )
+
+
+# ----- gate 2c: AWRS (rejection over engine logits + stateful condition) ------
+
+
+def test_awrs_window_vs_slow(llm):
+    """AWRS over an engine LM + a boolean condition, in the window: the rejection
+    runs over the engine LM logits with the condition checked from its carried
+    state (no per-step gather over the vocab). AWRS's weight is a Monte-Carlo
+    estimate, so -- like the resample test -- check the window-vs-slow log_ml is
+    UNBIASED across seeds (mean near 0); a persistent same-sign gap would be a bug.
+    """
+    llm.set_prompt_from_str("The")
+    condition = BoolFSA.from_regex(r"[a-z ]+").coerce(llm, f=b"".join)
+
+    def make_seed(s):
+        # A fresh AWRS seeded per run so slow and window share the rejection RNG,
+        # and the seed varies the draws across the loop (AWRS uses its own RNG).
+        def make():
+            return AWRS(llm, condition, seed=s)
+
+        return make
+
+    assert can_burst(_controller(make_seed(SEED), 16, 0.0, 12))
+
+    seeds = (1234, 7, 99, 2024, 555, 31)
+    diffs, len_gaps = [], []
+    for seed in seeds:
+        make = make_seed(seed)
+        slow = _slow_cached("awrs[a-z ]+", make, 16, 0.0, 12, seed)
+        win = _run_window(make, 16, 0.0, 12, seed)
+        s = _compare("awrs[a-z ]+", 0.0, 16, slow, win)
+        diffs.append(s["log_ml_diff"])
+        len_gaps.append(s["mean_len_win"] - s["mean_len_slow"])
+    diffs = np.array(diffs)
+    len_gaps = np.array(len_gaps)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nAWRS [a-z ]+ over {len(seeds)} seeds: "
+        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f} "
+        f"len gap mean={len_gaps.mean():+.3f}"
+    )
+    assert abs(diffs.mean()) <= max(0.3, 2.0 * sem), (
+        f"AWRS window log_ml biased: mean diff {diffs.mean():+.4f} (sem {sem:.4f})"
+    )
+    assert abs(len_gaps.mean()) <= 1.5, (
+        f"AWRS window length biased: mean gap {len_gaps.mean():+.3f}"
     )

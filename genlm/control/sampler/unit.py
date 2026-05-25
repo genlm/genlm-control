@@ -92,18 +92,18 @@ class MultiTokenUnitSampler(TokenSampler):
         return await self.subunit_sampler.start_weight()
 
     async def transition(self, context):
-        """The hub-facing per-step transition for multi-token units.
+        """The controller-facing per-step transition for multi-token units.
 
         Samples one multi-token unit and returns the list of items to append to
         the particle context, the importance-weight increment, and the
         log-probability of the random choices.
 
-        The context passed by the hub is the structured (possibly nested) unit
+        The context passed by the controller is the structured (possibly nested) unit
         context; it is flattened before sampling so the subunit sampler always
         sees a flat token list. The trailing-EOS split logic mirrors the old
         LLaMPPL ``forward``: when the sampled unit ends with EOS, the content
         before EOS (if any) is appended as one unit and EOS is appended
-        separately so the hub's terminal check (``context[-1] is EOS``) fires.
+        separately so the controller's terminal check (``context[-1] is EOS``) fires.
 
         Args:
             context (list): The particle's structured unit context.

@@ -22,9 +22,9 @@ class TokenSampler:
     \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})
     $$
 
-    A `TokenSampler` collapses to a single per-step transition that the SMC hub
+    A `TokenSampler` collapses to a single per-step transition that the SMC controller
     calls: :meth:`transition` maps a particle context to
-    ``(to_append, logw, logp)``. The hub owns the population, ESS test,
+    ``(to_append, logw, logp)``. The controller owns the population, ESS test,
     resampling and log marginal likelihood; samplers never reimplement the loop.
 
     Args:
@@ -35,25 +35,36 @@ class TokenSampler:
         self.target = target
         self.token_type = self.target.token_type
 
-    def supports_engine_native(self) -> bool:
-        """Whether this sampler can be driven by native backend generation.
+    def supports_window(self) -> bool:
+        """Whether this sampler can be driven inside the engine window -- i.e. it
+        implements :meth:`window_draw`. Default ``False`` (stays on ``StepLoop``).
 
-        Returns ``True`` only if drawing tokens directly from the backend LM's
-        own normalized ``logw_next`` is equivalent to this sampler's per-step
-        ``sample``. This holds for an unbiased direct sampler over a plain
-        ``PromptedLLM``, but not for samplers that run a rejection loop
-        (``AWRS``), walk a trie (set samplers), or reweight against a separate
-        proposal. Used by the window driver to decide whether the per-token
-        Python loop can be bypassed. Default is ``False``.
+        The control loop (``Controller``/``BurstLoop``) is uniform; each
+        window-capable sampler plugs its own per-row draw in via ``window_draw``,
+        the same way every sampler plugs its slow per-step draw in via
+        ``transition`` -- no sampler-type dispatch in the loop.
         """
         return False
+
+    def window_draw(self, lm_logws, factor_state, ctx):
+        """Engine-window per-row draw (the window analog of ``sample``).
+
+        Given the engine LM's next-token weights ``lm_logws``, the particle's
+        carried factor state, and the Controller's window context ``ctx`` (which
+        exposes the factor, the product index maps, ``eval_factor`` =
+        ``logw_next_from_state``, and ``run_async``), return
+        ``(token, logw, logp, new_factor_state)``. The Controller banks the
+        weight, appends the token, sets the state, and runs termination -- the
+        sampler only computes the draw. Window-capable samplers override.
+        """
+        raise NotImplementedError
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
 
     async def transition(self, context):
-        """The hub-facing per-step transition.
+        """The controller-facing per-step transition.
 
         Draws a single token, returning the list of items to append to the
         particle context together with the importance-weight increment and the
@@ -139,12 +150,38 @@ class DirectTokenSampler(TokenSampler):
             _validate_proposal_vocab(potential, proposal)
         self.proposal = proposal
 
-    def supports_engine_native(self) -> bool:
+    def supports_window(self) -> bool:
         # An unbiased direct sampler (no separate proposal) draws exactly from
-        # the target's normalized ``logw_next``, which is what native backend
-        # sampling reproduces. With a proposal, the per-step importance weight is
-        # non-trivial, so the loop cannot be bypassed.
+        # the target's normalized ``logw_next``, which the engine reproduces. With
+        # a proposal the per-step importance weight is non-trivial, so it stays
+        # on the slow loop.
         return self.proposal is None
+
+    def window_draw(self, lm_logws, factor_state, ctx):
+        """Shape the product proposal from the carried factor state, sample once,
+        bank ``logsumexp`` + the drawn lp (the window analog of ``sample``)."""
+        from genlm.control.constant import EndOfSequence
+        from genlm.control.util import fast_sample_lazyweights
+
+        factor = ctx["factor"]
+        new_state = factor_state
+        if factor is None:
+            logws = lm_logws
+        else:
+            # Reconstruct Product(llm, factor).logw_next over the product vocab,
+            # reading the factor from the carried state, gathered through
+            # Product's index maps (the engine LM weights substitute the
+            # reprefilled ones).
+            factor_logws = ctx["eval_factor"](factor, factor_state)
+            logws = ctx["target"].make_lazy_weights(
+                lm_logws.weights[ctx["llm_idxs"]]
+                + factor_logws.weights[ctx["factor_idxs"]]
+            )
+        logps = logws.normalize()
+        token = fast_sample_lazyweights(logps)
+        if factor is not None and not isinstance(token, EndOfSequence):
+            new_state = factor.advance(factor_state, token)
+        return token, logws.sum(), logps[token], new_state
 
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
@@ -319,6 +356,32 @@ class AWRS(TokenSampler):
         self.vocab_eos_set = set(self.target.vocab_eos)
         self.V = len(self.potential.vocab_eos)
         self.rng = np.random.default_rng(seed=seed)
+
+    def supports_window(self) -> bool:
+        # No separate proposal, and the boolean condition is sync-stateful
+        # (exposes prefix_logw/complete_logw), so the rejection can run over the
+        # engine LM logits with the condition checked from its carried state.
+        return self.proposal is None and hasattr(self.condition, "prefix_logw")
+
+    def window_draw(self, lm_logws, factor_state, ctx):
+        """AWRS rejection over the engine LM logits with the boolean condition
+        checked from the carried state -- reuses the shared ``_run_rejection`` so
+        the rejection algorithm + returned weight match the slow path. ``logp`` is
+        ``nan`` (as in ``sample``)."""
+        from genlm.control.constant import EndOfSequence
+
+        condition = ctx["factor"]
+
+        async def accept(tok):
+            if isinstance(tok, EndOfSequence):
+                return condition.complete_logw(factor_state) == 0
+            return condition.prefix_logw(condition.advance(factor_state, tok)) == 0
+
+        token, logw, _ = ctx["run_async"](self._run_rejection(lm_logws, accept))
+        new_state = factor_state
+        if not isinstance(token, EndOfSequence):
+            new_state = condition.advance(factor_state, token)
+        return token, logw, float("nan"), new_state
 
     def _prune_logws(self, logws):
         # Prune the logws to only include the tokens in the

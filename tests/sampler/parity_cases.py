@@ -1,7 +1,7 @@
 """Shared sampler/critic definitions and the parity matrix.
 
 Imported by both the snapshot generator (``_gen_parity_snapshot.py``) and the
-parity gate (``test_per_token_parity.py``) so the reference and the hub run on
+parity gate (``test_per_token_parity.py``) so the reference and the controller run on
 identical inputs.
 """
 

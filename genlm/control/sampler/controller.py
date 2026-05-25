@@ -1,12 +1,12 @@
-"""The SMC hub: a single, engine-independent owner of the entire SMC algorithm.
+"""The SMC controller: a single, engine-independent owner of the entire SMC algorithm.
 
 This module replaces the previous llamppl ``smc_standard`` + ``SequenceModel``
-coupling. The hub owns the particle population, the per-step transition, the
+coupling. The controller owns the particle population, the per-step transition, the
 ESS test, resampling/forking and the log marginal likelihood accumulation --
 *always*. It is exact per token: there is no segment-graining and no
 hard/soft constraint fork. ``logw_next`` is one operation.
 
-The hub is designed so that the per-step work splits into two phases that can
+The controller is designed so that the per-step work splits into two phases that can
 be invoked either by the slow Python loop (this file's ``StepLoop``) or,
 later, row-wise by in-engine arms keyed on a ``request_id -> particle`` map:
 
@@ -15,7 +15,7 @@ later, row-wise by in-engine arms keyed on a ``request_id -> particle`` map:
 2. **draw + weight + advance**: sample a token, compute the importance-weight
    increment, advance the sampler/critic transition state.
 
-Resample / fork / ESS / log_ml are hub-owned and are NEVER delegated.
+Resample / fork / ESS / log_ml are controller-owned and are NEVER delegated.
 
 See :class:`EngineControl` for the protocol the future window driver / engine
 arms will call back into.
@@ -113,7 +113,7 @@ class Particle:
         """Shallow clone for resampling/forking.
 
         The context list is shallow-copied (its token elements are immutable),
-        and all scalar bookkeeping is copied. This is the hub analogue of the
+        and all scalar bookkeeping is copied. This is the controller analogue of the
         ``copy.deepcopy`` llamppl performed per resampled particle, but without
         deep-copying immutable tokens.
         """
@@ -144,10 +144,10 @@ class EngineControl(Protocol):
     inside the sampler's ``sample`` coroutine). It exists so that the window
     driver can hand consecutive steps to the engine, which will then invoke
     these two methods row-wise on raw logits, keyed by ``request_ids`` mapping
-    engine rows to hub particles.
+    engine rows to controller particles.
 
     Implementations mutate logits in place (``shape``) and return a sampled
-    token id per row (``draw``); ``draw`` may force EOS for pop-out. The hub's
+    token id per row (``draw``); ``draw`` may force EOS for pop-out. The controller's
     resample / fork / ESS / log_ml machinery is never delegated through this
     protocol.
     """
@@ -173,7 +173,7 @@ class Controller:
     """Owns the SMC algorithm: population, transition, ESS, resample, log_ml.
 
     A "sampler" collapses to a single per-step transition
-    ``state -> (token, logw[, logp])`` that this hub calls. The hub is owned
+    ``state -> (token, logw[, logp])`` that this controller calls. The controller is owned
     once; no sampler reimplements the loop.
 
     Args:
@@ -305,7 +305,7 @@ class Controller:
             + colors.magenta % "]"
         )
 
-    # -- the hub-owned loop --------------------------------------------------
+    # -- the controller-owned loop --------------------------------------------------
 
     async def start(self):
         """Initialize particles from the sampler's start weight.
@@ -495,7 +495,7 @@ class Controller:
 
         w = self._window
         eos_id = w["eos_id"]
-        draw_row = w["draw_row"]  # per-sampler strategy bound by the BurstLoop
+        sampler = self.unit_sampler
         out = []
 
         for i, rid in enumerate(request_ids):
@@ -510,7 +510,18 @@ class Controller:
             row = logits[i]
             if row.dtype != torch.float32:
                 row = row.float()
-            token = draw_row(p, row)
+            # The sampler computes its own draw from the engine LM weights + the
+            # carried factor state (its window_draw, the analog of transition);
+            # the Controller banks the weight, appends the token, sets the state,
+            # and runs termination -- no sampler-type dispatch here.
+            token, logw, logp, new_state = sampler.window_draw(
+                self._lm_logws(row), p.factor_state, w
+            )
+            p.score(logw)
+            p.logp += logp
+            p.context.append(token)
+            p.factor_state = new_state
+            self._terminate_after_draw(p)
 
             out.append(eos_id if isinstance(token, EndOfSequence) else token.token_id)
 
@@ -536,34 +547,6 @@ class Controller:
         else:
             self._terminate_if_done(p)
 
-    def _draw_direct(self, p, row):
-        """DirectTokenSampler window draw: shape the product proposal from the
-        carried factor state, sample once, bank ``logsumexp`` + the drawn lp."""
-        from genlm.control.util import fast_sample_lazyweights
-
-        w = self._window
-        factor = w["factor"]
-        lm_logws = self._lm_logws(row)
-        if factor is None:
-            logws = lm_logws
-        else:
-            # Reconstruct Product(llm, factor).logw_next over the product vocab,
-            # reading the factor from the particle's CARRIED state (not the
-            # context), gathered through Product's own index maps.
-            factor_logws = w["eval_factor"](factor, p.factor_state)
-            logws = w["target"].make_lazy_weights(
-                lm_logws.weights[w["llm_idxs"]] + factor_logws.weights[w["factor_idxs"]]
-            )
-        logps = logws.normalize()
-        token = fast_sample_lazyweights(logps)
-        p.score(logws.sum())
-        p.logp += logps[token]
-        p.context.append(token)
-        if factor is not None and not isinstance(token, EndOfSequence):
-            p.factor_state = factor.advance(p.factor_state, token)
-        self._terminate_after_draw(p)
-        return token
-
 
 # ---------------------------------------------------------------------------
 # Drivers
@@ -579,12 +562,12 @@ class StepLoop:
     are recomputed from the full context every step.
     """
 
-    def __init__(self, hub):
-        self.hub = hub
+    def __init__(self, controller):
+        self.controller = controller
 
     async def run(self):
-        await self.hub.start()
-        return await self.hub.run()
+        await self.controller.start()
+        return await self.controller.run()
 
 
 def _is_engine_llm(potential):
@@ -628,60 +611,59 @@ def split_engine_target(potential):
     return llm, factor, potential
 
 
-def can_burst(hub):
-    """Whether the ``BurstLoop`` can drive this hub's configuration.
+def can_burst(controller):
+    """Whether the ``BurstLoop`` can drive this configuration.
 
     The window fast path requires:
 
-    * the unit sampler is engine-native (``supports_engine_native()``) -- i.e. an
-      unbiased ``DirectTokenSampler`` with no separate proposal, so drawing from
-      the backend LM's normalized ``logw_next`` equals its per-step ``sample``;
-    * the sampler target decomposes (:func:`split_engine_target`) into a
-      single engine LM, optionally times one additive same-vocab factor (e.g. a
-      coerced ``BoolFSA``);
+    * the unit sampler is **window-capable** -- it implements ``window_draw``,
+      declared via ``supports_window()`` (DirectTokenSampler with no separate
+      proposal, or AWRS over a sync-stateful boolean condition). The Controller
+      asks the sampler; it does not branch on the sampler's type.
+    * the sampler target decomposes (:func:`split_engine_target`) into a single
+      engine LM, optionally times one additive same-vocab factor (e.g. a coerced
+      ``BoolFSA``);
     * no critic. A non-trivial critic twists per step / reweights at termination
       and is not yet handled by the window's synchronous draw, so it stays on the
       slow path.
 
     Anything else falls back to :class:`StepLoop`.
     """
-    sampler = hub.unit_sampler
-    if not getattr(sampler, "supports_engine_native", lambda: False)():
+    sampler = controller.unit_sampler
+    if controller.critic is not None:
         return False
-
-    potential = getattr(sampler, "potential", None)
-    if potential is None or split_engine_target(potential) is None:
+    if not getattr(sampler, "supports_window", lambda: False)():
         return False
-
-    if hub.critic is not None:
-        return False
-
-    return True
+    return split_engine_target(sampler.target) is not None
 
 
 class BurstLoop:
     """Drives consecutive SMC steps inside a vLLM engine via EngineControl.
 
     Opens a *window* = one ``AsyncVirtualLM.run_burst`` call over the live
-    particles' token contexts. The hub's :meth:`Controller.shape` /
+    particles' token contexts. The controller's :meth:`Controller.shape` /
     :meth:`Controller.draw` run per engine
     decode step, advancing each particle exactly as the slow path's transition
-    would. The window itself NEVER resamples: when the hub's end-of-step ESS test
+    would. The window itself NEVER resamples: when the controller's end-of-step ESS test
     crosses the threshold it arms pop-out, the next step forces EOS for every live
     row (a control signal, never banked), and ``run_burst`` returns. The driver
-    then runs the hub-owned ESS test + resample/fork and relaunches the next
+    then runs the controller-owned ESS test + resample/fork and relaunches the next
     window from each surviving particle's token prefix. ESS / resample / log_ml
-    stay entirely hub-owned -- the engine only produces logits.
+    stay entirely controller-owned -- the engine only produces logits.
 
     Only valid when :func:`can_burst` is True (checked by the caller).
     """
 
-    def __init__(self, hub):
-        self.hub = hub
+    def __init__(self, controller):
+        self.controller = controller
         # Number of engine windows opened (>1 iff a resample popped a window out
         # mid-generation). Useful for verifying the pop-out/relaunch path ran.
         self.n_windows = 0
-        decomposed = split_engine_target(hub.unit_sampler.potential)
+        self.sampler = controller.unit_sampler
+        # `target` decomposes uniformly: DirectTokenSampler.target == its
+        # potential; AWRS.target == potential * condition (so factor == the
+        # condition). split_engine_target peels the engine LM off either.
+        decomposed = split_engine_target(self.sampler.target)
         if decomposed is None:  # pragma: no cover - guarded by can_burst
             raise ValueError("target is not window-expressible")
         self.llm, self.factor, self.target = decomposed
@@ -716,14 +698,14 @@ class BurstLoop:
         return ids
 
     async def run(self):
-        hub = self.hub
-        await hub.start()
+        controller = self.controller
+        await controller.start()
 
         # Seed each particle's carried factor state (empty context == state0).
         # Across windows the state is carried (cloned on resample), never
         # re-derived, so only freshly-started particles need seeding.
         if self.factor is not None:
-            for p in hub.particles:
+            for p in controller.particles:
                 if p.factor_state is None:
                     p.factor_state = self.factor.state0()
 
@@ -731,7 +713,7 @@ class BurstLoop:
         eos_id = eos_idxs[0]
         loop = asyncio.get_running_loop()
 
-        # The factor is evaluated from its CARRIED state (advanced one token at a
+        # A factor is evaluated from its CARRIED state (advanced one token at a
         # time), not by replaying the context: `logw_next_from_state` has a sync
         # body (no `asyncio.gather` over the vocabulary -- the dominant per-step
         # cost), and `draw` runs in the worker thread below, so it schedules this
@@ -742,16 +724,24 @@ class BurstLoop:
             )
             return fut.result()
 
-        while any(not p.done for p in hub.particles):
+        def run_async(coro):
+            # Run a sampler's async helper (e.g. AWRS's rejection) from the
+            # worker-thread draw and block for the result -- one event-loop hop,
+            # no inner gather.
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+        while any(not p.done for p in controller.particles):
             self.n_windows += 1
-            live = [p for p in hub.particles if not p.done]
+            live = [p for p in controller.particles if not p.done]
             prompts = [self._context_ids(p) for p in live]
             # Each particle keeps its own budget; the engine window just needs to
             # be long enough to reach the longest particle's budget (plus one
             # step to let a budget-exhausted row pop out via forced EOS).
             max_steps = max(p.max_tokens_left for p in live) + 1
 
-            hub._window = {
+            # The window context handed to each sampler's `window_draw` (and read
+            # by `Controller.draw`). The sampler picks what it needs.
+            controller._window = {
                 "particles": live,
                 "llm": self.llm,
                 "factor": self.factor,
@@ -759,12 +749,9 @@ class BurstLoop:
                 "llm_idxs": self.llm_idxs,
                 "factor_idxs": self.factor_idxs,
                 "eval_factor": eval_factor,
+                "run_async": run_async,
                 "eos_id": eos_id,
                 "pop_out": False,
-                # Per-sampler draw strategy (the "samplers share one control"
-                # seam). DirectTokenSampler shapes the product and samples once;
-                # other samplers (AWRS, ...) bind their own row-draw here.
-                "draw_row": hub._draw_direct,
             }
             try:
                 # Run the engine step loop in a worker thread so this event loop
@@ -773,16 +760,18 @@ class BurstLoop:
                     None,
                     lambda: self.llm.model.run_burst(
                         prompts=prompts,
-                        control=hub,
+                        control=controller,
                         max_steps=max_steps,
                         eos_token_ids=eos_idxs,
                         temperature=self.llm.temperature,
                     ),
                 )
             finally:
-                hub._window = None
+                controller._window = None
 
             # Controller-owned ESS test + resample/fork over the FULL population.
-            hub._maybe_resample(sort_ancestors=hub.record is not None)
+            controller._maybe_resample(
+                sort_ancestors=controller.record is not None
+            )
 
-        return hub.particles
+        return controller.particles
