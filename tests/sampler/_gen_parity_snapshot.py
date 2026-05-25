@@ -33,7 +33,15 @@ from genlm.control.util import escape  # noqa: E402
 
 from llamppl import Model, smc_standard  # noqa: E402
 
-from parity_cases import SAMPLER_BUILDERS, MATRIX, N_PARTICLES, MAX_TOKENS, SEED  # noqa: E402
+from parity_cases import (  # noqa: E402
+    SAMPLER_BUILDERS,
+    MATRIX,
+    N_PARTICLES,
+    MAX_TOKENS,
+    SEED,
+    _ctx_repr,
+    _num,
+)
 
 
 class _RefSequenceModel(Model):
@@ -116,21 +124,6 @@ class _RefSequenceModel(Model):
         return set(["unit_sampler", "critic"])
 
 
-def _ctx_repr(ctx):
-    """A JSON-serializable, comparison-stable representation of a context."""
-
-    def one(t):
-        if t is EOS or (hasattr(t, "type_")):
-            return f"<EOS:{getattr(t, 'type_', 'EOS')}>"
-        if isinstance(t, list):
-            return [one(x) for x in t]
-        if isinstance(t, bytes):
-            return "b:" + t.hex()
-        return repr(t)
-
-    return [one(t) for t in ctx]
-
-
 async def _run_reference(unit_sampler, critic, ess_threshold, json_path):
     model = _RefSequenceModel(
         unit_sampler=unit_sampler,
@@ -155,16 +148,6 @@ async def _run_reference(unit_sampler, critic, ess_threshold, json_path):
     )
     seqs = Sequences(contexts, logws)
     return seqs
-
-
-def _num(x):
-    if np.isnan(x):
-        return "nan"
-    if np.isneginf(x):
-        return "-inf"
-    if np.isposinf(x):
-        return "inf"
-    return float(x)
 
 
 def _gen_case(sampler_name, use_critic, ess):

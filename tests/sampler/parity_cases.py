@@ -27,6 +27,37 @@ SEED = 1234
 MATRIX = [0.0, 0.5, 1.0]
 
 
+# -- serialization shared by the generator and the gate. These MUST be one
+#    definition: if the gate's context/number formatting drifts from the
+#    generator's, the parity comparison silently passes against a mis-encoded
+#    reference. --
+
+
+def _ctx_repr(ctx):
+    """A JSON-serializable, comparison-stable representation of a context."""
+
+    def one(t):
+        if t is EOS or hasattr(t, "type_"):
+            return f"<EOS:{getattr(t, 'type_', 'EOS')}>"
+        if isinstance(t, list):
+            return [one(x) for x in t]
+        if isinstance(t, bytes):
+            return "b:" + t.hex()
+        return repr(t)
+
+    return [one(t) for t in ctx]
+
+
+def _num(x):
+    if np.isnan(x):
+        return "nan"
+    if np.isneginf(x):
+        return "-inf"
+    if np.isposinf(x):
+        return "inf"
+    return float(x)
+
+
 class _FlatteningMockPotential(MockPotential):
     """A MockPotential critic that flattens nested unit contexts before scoring,
     as a real multi-token critic would via `flatten_units` coercion."""

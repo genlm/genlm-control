@@ -23,10 +23,17 @@ import os
 import numpy as np
 import pytest
 
-from genlm.control.constant import EOS
 from genlm.control.sampler.sequence import SMC
 
-from parity_cases import SAMPLER_BUILDERS, MATRIX, N_PARTICLES, MAX_TOKENS, SEED
+from parity_cases import (
+    SAMPLER_BUILDERS,
+    MATRIX,
+    N_PARTICLES,
+    MAX_TOKENS,
+    SEED,
+    _ctx_repr,
+    _num,
+)
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "parity_snapshot.json")
 
@@ -47,29 +54,8 @@ def _seed(s=SEED):
     torch.manual_seed(s)
 
 
-def _ctx_repr(ctx):
-    """Mirror the generator's context serialization for exact comparison."""
-
-    def one(t):
-        if t is EOS or hasattr(t, "type_"):
-            return f"<EOS:{getattr(t, 'type_', 'EOS')}>"
-        if isinstance(t, list):
-            return [one(x) for x in t]
-        if isinstance(t, bytes):
-            return "b:" + t.hex()
-        return repr(t)
-
-    return [one(t) for t in ctx]
-
-
-def _num(x):
-    if np.isnan(x):
-        return "nan"
-    if np.isneginf(x):
-        return "-inf"
-    if np.isposinf(x):
-        return "inf"
-    return float(x)
+# _ctx_repr / _num are imported from parity_cases so the gate and the snapshot
+# generator share one serialization -- drift here would be a silent false-green.
 
 
 def _canonical_record(record_text):
