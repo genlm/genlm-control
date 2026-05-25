@@ -233,6 +233,26 @@ class WFSA(Potential):
 
         return self.make_lazy_weights(log_ws)
 
+    def prefix_logw(self, state):
+        """Log prefix weight from a carried chart `state` (sync; `-inf` if dead).
+
+        Sync stateful analog of `prefix` -- no `_consume`, no async. Lets a
+        coercion evaluate many candidate extensions from a carried chart without
+        an `asyncio.gather` over the vocabulary (the dominant per-step cost)."""
+        if not state:
+            return float("-inf")
+        bkwd = self.wfsa.epsremove.backward
+        log_ctx_w = logsumexp([(state[i] * bkwd[i]).score for i in state])
+        return float("-inf") if np.isnan(log_ctx_w) else float(log_ctx_w)
+
+    def complete_logw(self, state):
+        """Log complete weight from a carried chart `state` (sync). Sync stateful
+        analog of `complete` (the EOS column)."""
+        acc = self.wfsa.R.zero
+        for j, w in self.wfsa.epsremove.F:
+            acc += state[j] * w
+        return float(acc.score)
+
     def _repr_svg_(self):
         return self.wfsa._repr_svg_()
 
@@ -306,6 +326,14 @@ class BoolFSA(WFSA):
                 logw_next.weights > float("-inf"), 0, logw_next.weights
             )
         )
+
+    def prefix_logw(self, state):
+        """Boolean prefix weight from a carried chart (0 if alive, else -inf)."""
+        return 0.0 if super().prefix_logw(state) > float("-inf") else float("-inf")
+
+    def complete_logw(self, state):
+        """Boolean complete weight from a carried chart (0 if accepting, else -inf)."""
+        return 0.0 if super().complete_logw(state) > float("-inf") else float("-inf")
 
     async def batch_logw_next(self, contexts):
         """

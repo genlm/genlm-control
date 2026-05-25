@@ -49,3 +49,29 @@ def test_wfsa_stateful_matches_logw_next_branching():
     # a regex with branching / multiple live states
     _check(WFSA.from_regex(r"(ab|ac|b)+"))
     _check(BoolFSA.from_regex(r"(ab|ac|b)+"))
+
+
+def _coerced(regex, charset):
+    """Coerce a BoolFSA onto a synthetic byte-token target vocab."""
+    import itertools
+
+    from genlm.control.potential.coerce import Coerced
+    from genlm.backend.tokenization import Token
+
+    toks, i = [], 0
+    for L in (1, 2):
+        for combo in itertools.product(charset, repeat=L):
+            toks.append(Token(i, bytes(combo)))
+            i += 1
+    return Coerced(BoolFSA.from_regex(regex), toks, f=b"".join)
+
+
+def test_coerced_stateful_matches_logw_next():
+    # permissive constraint: all coerced tokens stay live (exercises the live path)
+    _check(_coerced(r"[a-z ]+", (ord("a"), ord("b"), ord("z"), ord(" "))))
+
+
+def test_coerced_stateful_matches_logw_next_with_dead_states():
+    # branching constraint: after 'a' only b/c continue, so e.g. token "aa" walks
+    # to a dead state mid-sequence -> a real -inf the stateful path must match.
+    _check(_coerced(r"(ab|ac|b)+", (ord("a"), ord("b"), ord("c"))))

@@ -98,6 +98,37 @@ class Coerced(Potential):
         Ws[:-1] = await self.potential.batch_prefix(exts) - ctx_w
         return self.make_lazy_weights(Ws)
 
+    # -- stateful interface: thread the wrapped potential's state through the
+    #    coerced byte-stream (carry it instead of replaying the context) --
+
+    def state0(self):
+        return self.potential.state0()
+
+    def advance(self, state, token):
+        # f([token]) is the wrapped-vocab symbol sequence for one target token
+        # (for f=b"".join, the token's bytes -> int byte-values); advance the
+        # wrapped potential's state through them one symbol at a time.
+        for sym in self.f([token]):
+            state = self.potential.advance(state, sym)
+        return state
+
+    async def logw_next_from_state(self, state):
+        """Stateful `logw_next`: score each candidate from the carried wrapped
+        state with a SYNC walk, avoiding the `asyncio.gather`-over-the-vocabulary
+        that dominates `logw_next` (~94% of its cost). Requires the wrapped
+        potential to be sync-stateful (`prefix_logw`); else falls back to the
+        recompute default. Bit-identical to `logw_next` for the matching state.
+        """
+        p = self.potential
+        if not hasattr(p, "prefix_logw"):
+            return await super().logw_next_from_state(state)
+        Ws = self.alloc_logws()
+        ctx_w = p.prefix_logw(state)
+        Ws[-1] = p.complete_logw(state) - ctx_w
+        for i, x in enumerate(self.vocab):
+            Ws[i] = p.prefix_logw(self.advance(state, x)) - ctx_w
+        return self.make_lazy_weights(Ws)
+
     async def batch_complete(self, contexts):
         return await self.potential.batch_complete(contexts=self._batch_f(contexts))
 
