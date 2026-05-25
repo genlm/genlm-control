@@ -111,15 +111,20 @@ def _canonical_record(record_text):
 @pytest.mark.parametrize("use_critic", [False, True])
 @pytest.mark.parametrize("ess_threshold", MATRIX)
 def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
-    # NOTE: this is intentionally a synchronous test that drives the hub with a
-    # fresh ``asyncio.run`` event loop, matching the snapshot generator. For
-    # potentials whose ``logw_next`` awaits (e.g. WeightedSet's base
-    # implementation does an inner ``asyncio.gather``), the cross-particle
-    # RNG-consumption order depends on event-loop task scheduling -- a property
-    # the original llamppl path shares. pytest-asyncio's shared per-session loop
-    # machinery can be perturbed by a preceding ``@given`` async test, shifting
-    # that scheduling; a fresh ``asyncio.run`` per case removes the dependence
-    # and keeps the gate order-independent.
+    # Synchronous test driving the hub with a fresh ``asyncio.run`` per case,
+    # matching the snapshot generator.
+    #
+    # Byte-exact token parity requires a deterministic vocabulary order: the
+    # Gumbel-max draw (``fast_sample_lazyweights``) is indexed by vocab
+    # position, so a vocab whose order varies run-to-run would map the same RNG
+    # stream onto different tokens. The conftest ``WeightedSet`` fixture
+    # previously built its vocab via ``set(...)``, whose string iteration order
+    # is randomized per process (PYTHONHASHSEED); this made BOTH the hub and the
+    # original llamppl ``smc_standard`` path draw different tokens across fresh
+    # processes (root-caused on the GPU box). The fixture now dedupes by
+    # first-seen order, so the vocab -- and hence the whole population -- is
+    # bit-stable run-to-run under the default randomized hash seed, and the hub
+    # reproduces the original path bit-for-bit.
     import asyncio
 
     key = f"{sampler_name}|critic={use_critic}|ess={ess_threshold}"

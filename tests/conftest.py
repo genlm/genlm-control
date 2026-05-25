@@ -147,7 +147,13 @@ class WeightedSet(Potential):
             np.log(total_weight) if total_weight != 0 else float("-inf"),
         )
 
-        super().__init__(list(set(t for seq in sequences for t in seq)))
+        # Deterministic vocabulary order: dedupe by first-seen order rather than
+        # via `set(...)`, whose string iteration order is randomized per process
+        # (PYTHONHASHSEED). A hash-dependent vocab permutes the index that the
+        # Gumbel-max draw maps onto, so the same RNG stream would pick different
+        # tokens run-to-run -- breaking any byte-exact token-identity assertion.
+        vocab = list(dict.fromkeys(t for seq in sequences for t in seq))
+        super().__init__(vocab)
 
     async def complete(self, context):
         return self.complete_logws.get(tuple(context), float("-inf"))
