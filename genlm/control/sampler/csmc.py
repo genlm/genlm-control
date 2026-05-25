@@ -142,18 +142,45 @@ class RetainedTokenSampler(TokenSampler):
 
     async def forward(self):
         parent = self.parent
-        draw = None
         if (
             getattr(parent, "is_retained", False)
             and self.retained_idx < len(self.retained_sequence)
         ):
             forced = self.retained_sequence[self.retained_idx]
-            draw = lambda _probs, _forced=forced: _forced  # noqa: E731
             self.retained_idx += 1
-        token, logw, logp = await self.base.sample(parent.token_ctx, draw=draw)
+            token, logw, logp = await self._forced_sample(parent.token_ctx, forced)
+            parent.score(logw)
+            parent.logp += logp
+            return token
+        # Free-particle (or post-exhaustion retained) path: unchanged delegate.
+        token, logw, logp = await self.base.sample(parent.token_ctx)
         parent.score(logw)
         parent.logp += logp
         return token
+
+    async def _forced_sample(self, context, forced):
+        """Compute the (token, logw, logp) tuple that ``self.base.sample`` would
+        return for the forced token, but without the ``.exp().materialize()``
+        full-vocab chart build that ``DirectTokenSampler.sample``'s draw-callback
+        path goes through. Mathematically identical to passing
+        ``draw=lambda _: forced`` to the base sampler; ~30k materialize calls/step
+        cheaper on a 7B with ~150k vocab."""
+        base = self.base
+        if base.proposal is None:
+            logws = await base.potential.logw_next(context)
+            log_z = logsumexp(logws.weights)
+            forced_id = logws.encode[forced]
+            logp = float(logws.weights[forced_id] - log_z)
+            return forced, float(log_z), logp
+        proposal_logws, target_logws = await asyncio.gather(
+            base.proposal.logw_next(context),
+            base.potential.logw_next(context),
+        )
+        proposal_log_z = logsumexp(proposal_logws.weights)
+        forced_id = proposal_logws.encode[forced]
+        proposal_logp = float(proposal_logws.weights[forced_id] - proposal_log_z)
+        logw = float(target_logws[forced] - proposal_logws[forced] + proposal_log_z)
+        return forced, logw, proposal_logp
 
     async def sample(self, context, draw=None):
         return await self.base.sample(context, draw=draw)
