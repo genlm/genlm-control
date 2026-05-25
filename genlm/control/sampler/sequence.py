@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.hub import Hub, SlowDriver, WindowDriver, window_eligible
+from genlm.control.sampler.hub import Controller, StepLoop, BurstLoop, can_burst
 
 
 class SMC:
@@ -99,7 +99,7 @@ class SMC:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
-        hub = Hub(
+        hub = Controller(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
             n_particles=n_particles,
@@ -111,10 +111,10 @@ class SMC:
             **kwargs,
         )
 
-        if backend is not None and window_eligible(hub):
-            particles = await WindowDriver(hub, backend).run()
+        if backend is not None and can_burst(hub):
+            particles = await BurstLoop(hub).run()
         else:
-            particles = await SlowDriver(hub).run()
+            particles = await StepLoop(hub).run()
 
         if json_path is not None:
             hub.save_record(json_path)

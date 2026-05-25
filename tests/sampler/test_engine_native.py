@@ -1,11 +1,11 @@
-"""Gate-2 parity: the engine-accelerated WindowDriver vs the ground-truth SlowDriver.
+"""Gate-2 parity: the engine-accelerated BurstLoop vs the ground-truth StepLoop.
 
-Both drivers run the identical hub SMC algorithm; the ONLY intended difference is
+Both loops run the identical hub SMC algorithm; the ONLY intended difference is
 the source of next-token logits:
 
-* SlowDriver re-prefills the full context every step (``PromptedLLM.logw_next`` ->
+* StepLoop re-prefills the full context every step (``PromptedLLM.logw_next`` ->
   ``AsyncVirtualLM.next_token_logprobs``);
-* WindowDriver reads warm-KV decode logits inside the vLLM engine.
+* BurstLoop reads warm-KV decode logits inside the vLLM engine.
 
 So the two should agree up to the warm-KV-vs-reprefill numerical residual
 (~1e-2/logit), which may occasionally flip a single Gumbel-max draw but is small
@@ -35,10 +35,10 @@ from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.potential.built_in.wfsa import BoolFSA  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
 from genlm.control.sampler.hub import (  # noqa: E402
-    Hub,
-    SlowDriver,
-    WindowDriver,
-    window_eligible,
+    Controller,
+    StepLoop,
+    BurstLoop,
+    can_burst,
 )
 
 MODEL = "gpt2"
@@ -62,7 +62,7 @@ def _ctx_ids(ctx):
 
 
 def _hub(target, n_particles, ess_threshold, max_tokens):
-    return Hub(
+    return Controller(
         unit_sampler=DirectTokenSampler(target),
         critic=None,
         n_particles=n_particles,
@@ -87,18 +87,18 @@ def llm():
     return PromptedLLM(model, eos_byte_strings=[b"\n"])
 
 
-def _compare(label, target, n_particles, ess_threshold, max_tokens, backend, seed=SEED):
-    assert window_eligible(_hub(target, n_particles, ess_threshold, max_tokens))
+def _compare(label, target, n_particles, ess_threshold, max_tokens, seed=SEED):
+    assert can_burst(_hub(target, n_particles, ess_threshold, max_tokens))
 
     _seed(seed)
     slow_hub = _hub(target, n_particles, ess_threshold, max_tokens)
     t0 = time.perf_counter()
-    slow = asyncio.run(SlowDriver(slow_hub).run())
+    slow = asyncio.run(StepLoop(slow_hub).run())
     slow_t = time.perf_counter() - t0
 
     _seed(seed)
     win_hub = _hub(target, n_particles, ess_threshold, max_tokens)
-    driver = WindowDriver(win_hub, backend)
+    driver = BurstLoop(win_hub)
     t0 = time.perf_counter()
     win = asyncio.run(driver.run())
     win_t = time.perf_counter() - t0
@@ -166,10 +166,8 @@ def _compare(label, target, n_particles, ess_threshold, max_tokens, backend, see
 
 @pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
 def test_unconstrained_window_vs_slow(llm, ess_threshold):
-    import genlm.backend.llm.vllm as backend
-
     llm.set_prompt_from_str("The")
-    _compare("unconstrained", llm, 8, ess_threshold, 12, backend)
+    _compare("unconstrained", llm, 8, ess_threshold, 12)
 
 
 # ----- gate 2b: constrained (additive factor folded into target) -----------
@@ -177,15 +175,13 @@ def test_unconstrained_window_vs_slow(llm, ess_threshold):
 
 @pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
 def test_constrained_boolfsa_window_vs_slow(llm, ess_threshold):
-    import genlm.backend.llm.vllm as backend
-
     llm.set_prompt_from_str("The")
     # lowercase letters + space; coerced onto the gpt2 token vocab (prunes to
     # tokens whose bytes are all in [a-z ]).
     fsa = BoolFSA.from_regex(r"[a-z ]+")
     coerced = fsa.coerce(llm, f=b"".join)
     target = llm * coerced
-    stats = _compare("boolfsa[a-z ]+", target, 16, ess_threshold, 12, backend)
+    stats = _compare("boolfsa[a-z ]+", target, 16, ess_threshold, 12)
     # This is the low-variance constrained case (broad allowed set, full-length
     # sequences): the warm-KV residual is small and unbiased, so a single-seed
     # log_ml diff and the mean length stay tight.
@@ -215,8 +211,6 @@ def test_constrained_forces_resample_window_vs_slow(llm):
     even though any single seed is noisy. A persistent same-sign gap would be a
     real bias bug; Monte Carlo noise cancels.
     """
-    import genlm.backend.llm.vllm as backend
-
     llm.set_prompt_from_str("The")
     fsa = BoolFSA.from_regex(r"[aeiou ]+")
     coerced = fsa.coerce(llm, f=b"".join)
@@ -226,7 +220,7 @@ def test_constrained_forces_resample_window_vs_slow(llm):
     diffs, len_gaps = [], []
     any_resample = False
     for seed in seeds:
-        s = _compare("boolfsa[aeiou ]+", target, 16, 0.5, 10, backend, seed=seed)
+        s = _compare("boolfsa[aeiou ]+", target, 16, 0.5, 10, seed=seed)
         diffs.append(s["log_ml_diff"])
         len_gaps.append(s["mean_len_win"] - s["mean_len_slow"])
         any_resample = any_resample or s["n_windows"] > 1

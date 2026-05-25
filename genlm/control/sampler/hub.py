@@ -7,7 +7,7 @@ ESS test, resampling/forking and the log marginal likelihood accumulation --
 hard/soft constraint fork. ``logw_next`` is one operation.
 
 The hub is designed so that the per-step work splits into two phases that can
-be invoked either by the slow Python loop (this file's ``SlowDriver``) or,
+be invoked either by the slow Python loop (this file's ``StepLoop``) or,
 later, row-wise by in-engine arms keyed on a ``request_id -> particle`` map:
 
 1. **shape the proposal**: turn a particle's state into the proposal
@@ -159,7 +159,7 @@ class EngineControl(Protocol):
 # ---------------------------------------------------------------------------
 
 
-class Hub:
+class Controller:
     """Owns the SMC algorithm: population, transition, ESS, resample, log_ml.
 
     A "sampler" collapses to a single per-step transition
@@ -204,7 +204,7 @@ class Hub:
         self.particles = [Particle(max_tokens) for _ in range(n_particles)]
         self.record = SMCRecord(n_particles) if record else None
 
-        # Set by the WindowDriver for the duration of a single engine window;
+        # Set by the BurstLoop for the duration of a single engine window;
         # read by the EngineControl ``shape`` / ``draw`` callbacks. ``None``
         # outside a window.
         self._window = None
@@ -374,7 +374,7 @@ class Hub:
         """Run the ESS test on the current population and resample if it crosses.
 
         This is the *only* implementation of the ESS/resample math; both the slow
-        ``run`` loop and the ``WindowDriver`` call it so the two paths are
+        ``run`` loop and the ``BurstLoop`` call it so the two paths are
         bit-identical here. Mutates ``self.particles`` on a resample.
 
         Returns ``(did_resample, ancestor_indices)``.
@@ -411,7 +411,7 @@ class Hub:
             f.write(self.record.to_json())
         print(f"Saved record to {json_path}")
 
-    # -- EngineControl phases (used only by the WindowDriver) ----------------
+    # -- EngineControl phases (used only by the BurstLoop) ----------------
     #
     # These reproduce, row-wise on raw engine logits, exactly what
     # ``_draw_and_score`` does for an UNCONSTRAINED ``DirectTokenSampler`` (and,
@@ -421,7 +421,7 @@ class Hub:
     # over the same control-side V+1 vocabulary so the same RNG stream selects
     # the same token (up to the warm-KV-vs-reprefill logit residual).
     #
-    # A live window is described by ``self._window`` (set by the WindowDriver):
+    # A live window is described by ``self._window`` (set by the BurstLoop):
     #   particles   -- list of live particles, indexed by external request id
     #   llm         -- the engine PromptedLLM (the LM the engine evaluates;
     #                  supplies ``_process_logw_next`` / ``_maybe_temper``)
@@ -437,7 +437,7 @@ class Hub:
 
     def _window_particle(self, request_id):
         """Map a vLLM internal request id (``"{external}-{8 chars}"``) to its
-        particle via the external index the WindowDriver assigned."""
+        particle via the external index the BurstLoop assigned."""
         external = request_id.rsplit("-", 1)[0]
         return self._window["particles"][int(external)]
 
@@ -478,7 +478,7 @@ class Hub:
         ``logws.sum()`` and ``logps[token]``, advance the particle, and run the
         no-critic termination bookkeeping. The factor's ``logw_next`` is the
         slow path's exact (async) call, evaluated synchronously via the driver's
-        ``eval_factor`` hook on the WindowDriver's event loop. When popping out,
+        ``eval_factor`` hook on the BurstLoop's event loop. When popping out,
         force EOS for every row WITHOUT banking it.
         """
         import torch
@@ -544,7 +544,7 @@ class Hub:
 
         # End-of-step ESS test (same predicate the slow path applies after every
         # token). If it crosses, arm pop-out: the next engine step forces EOS for
-        # all live rows so the window ends and the WindowDriver resamples. Skip
+        # all live rows so the window ends and the BurstLoop resamples. Skip
         # while already popping out (no real step happened).
         if not w["pop_out"] and self._ess_crosses():
             w["pop_out"] = True
@@ -557,7 +557,7 @@ class Hub:
 # ---------------------------------------------------------------------------
 
 
-class SlowDriver:
+class StepLoop:
     """Per-token round-trip driver (the ground-truth path).
 
     Each step batches ``unit_sampler.sample(context)`` over the live particles
@@ -580,7 +580,7 @@ def _is_engine_llm(potential):
     return model is not None and hasattr(model, "llm_engine")
 
 
-def decompose_engine_target(potential):
+def split_engine_target(potential):
     """Split a sampler target into ``(llm, factor, target)`` for the window.
 
     Recognizes two shapes:
@@ -615,29 +615,29 @@ def decompose_engine_target(potential):
     return llm, factor, potential
 
 
-def window_eligible(hub):
-    """Whether the ``WindowDriver`` can drive this hub's configuration.
+def can_burst(hub):
+    """Whether the ``BurstLoop`` can drive this hub's configuration.
 
     The window fast path requires:
 
     * the unit sampler is engine-native (``supports_engine_native()``) -- i.e. an
       unbiased ``DirectTokenSampler`` with no separate proposal, so drawing from
       the backend LM's normalized ``logw_next`` equals its per-step ``sample``;
-    * the sampler target decomposes (:func:`decompose_engine_target`) into a
+    * the sampler target decomposes (:func:`split_engine_target`) into a
       single engine LM, optionally times one additive same-vocab factor (e.g. a
       coerced ``BoolFSA``);
     * no critic. A non-trivial critic twists per step / reweights at termination
       and is not yet handled by the window's synchronous draw, so it stays on the
       slow path.
 
-    Anything else falls back to :class:`SlowDriver`.
+    Anything else falls back to :class:`StepLoop`.
     """
     sampler = hub.unit_sampler
     if not getattr(sampler, "supports_engine_native", lambda: False)():
         return False
 
     potential = getattr(sampler, "potential", None)
-    if potential is None or decompose_engine_target(potential) is None:
+    if potential is None or split_engine_target(potential) is None:
         return False
 
     if hub.critic is not None:
@@ -646,30 +646,30 @@ def window_eligible(hub):
     return True
 
 
-class WindowDriver:
+class BurstLoop:
     """Drives consecutive SMC steps inside a vLLM engine via EngineControl.
 
-    Opens a *window* = one ``backend.run_window`` call over the live particles'
-    token contexts. The hub's :meth:`Hub.shape` / :meth:`Hub.draw` run per engine
+    Opens a *window* = one ``AsyncVirtualLM.run_burst`` call over the live
+    particles' token contexts. The hub's :meth:`Controller.shape` /
+    :meth:`Controller.draw` run per engine
     decode step, advancing each particle exactly as the slow path's transition
     would. The window itself NEVER resamples: when the hub's end-of-step ESS test
     crosses the threshold it arms pop-out, the next step forces EOS for every live
-    row (a control signal, never banked), and ``run_window`` returns. The driver
+    row (a control signal, never banked), and ``run_burst`` returns. The driver
     then runs the hub-owned ESS test + resample/fork and relaunches the next
     window from each surviving particle's token prefix. ESS / resample / log_ml
     stay entirely hub-owned -- the engine only produces logits.
 
-    Only valid when :func:`window_eligible` is True (checked by the caller).
+    Only valid when :func:`can_burst` is True (checked by the caller).
     """
 
-    def __init__(self, hub, backend):
+    def __init__(self, hub):
         self.hub = hub
-        self.backend = backend
         # Number of engine windows opened (>1 iff a resample popped a window out
         # mid-generation). Useful for verifying the pop-out/relaunch path ran.
         self.n_windows = 0
-        decomposed = decompose_engine_target(hub.unit_sampler.potential)
-        if decomposed is None:  # pragma: no cover - guarded by window_eligible
+        decomposed = split_engine_target(hub.unit_sampler.potential)
+        if decomposed is None:  # pragma: no cover - guarded by can_burst
             raise ValueError("target is not window-expressible")
         self.llm, self.factor, self.target = decomposed
 
@@ -686,9 +686,6 @@ class WindowDriver:
             self.factor_idxs = np.array(
                 [self.factor.lookup[t] for t in self.target.vocab_eos]
             )
-
-    def _engine(self):
-        return self.llm.model.llm_engine
 
     def _eos_idxs(self):
         return list(self.llm.token_maps.eos_idxs)
@@ -747,8 +744,7 @@ class WindowDriver:
                 # stays free to service the factor's run_coroutine_threadsafe.
                 await loop.run_in_executor(
                     None,
-                    lambda: self.backend.run_window(
-                        self._engine(),
+                    lambda: self.llm.model.run_burst(
                         prompts=prompts,
                         control=hub,
                         max_steps=max_steps,
@@ -759,7 +755,7 @@ class WindowDriver:
             finally:
                 hub._window = None
 
-            # Hub-owned ESS test + resample/fork over the FULL population.
+            # Controller-owned ESS test + resample/fork over the FULL population.
             hub._maybe_resample(sort_ancestors=hub.record is not None)
 
         return hub.particles

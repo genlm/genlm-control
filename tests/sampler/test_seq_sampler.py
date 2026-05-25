@@ -4,7 +4,7 @@ import numpy as np
 
 from genlm.control.potential import Potential
 from genlm.control.sampler.sequence import SMC
-from genlm.control.sampler.hub import Hub
+from genlm.control.sampler.hub import Controller
 from genlm.control.sampler.smc_record import string_for_serialization
 from genlm.control.sampler.token import DirectTokenSampler
 
@@ -153,7 +153,7 @@ async def test_hub_invalid_start_weight():
             return 0
 
     unit_sampler = DirectTokenSampler(MockPotential([0]))
-    hub = Hub(
+    hub = Controller(
         unit_sampler=unit_sampler,
         critic=None,
         n_particles=1,
