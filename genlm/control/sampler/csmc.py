@@ -79,6 +79,9 @@ async def csmc_standard(model, n_particles, ess_threshold=0.5):
         )
 
         W = np.array([p.weight for p in particles])
+        if np.all(W == -np.inf):
+            # All particles dead — skip resampling to avoid NaNs.
+            continue
         w_sum = logsumexp(W)
         normalized_log_weights = W - w_sum
 

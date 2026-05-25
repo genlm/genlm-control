@@ -137,6 +137,20 @@ async def test_csmc_standard_n_particles_zero_raises():
         await csmc_standard(_MockModel(), n_particles=0)
 
 
+@pytest.mark.asyncio
+async def test_csmc_standard_skips_resample_when_all_particles_dead():
+    """If every particle's weight is -inf, the resample block must skip
+    rather than feed NaN into ``np.random.choice``. Mirrors the same
+    guard in llamppl's ``smc_standard``."""
+    model = _MockModel(
+        n_steps=2, score_retained=float("-inf"), score_free=float("-inf")
+    )
+    particles = await csmc_standard(model, n_particles=4, ess_threshold=1.0)
+    assert len(particles) == 4
+    for p in particles:
+        assert p.done_stepping()
+
+
 # ---------------------------------------------------------------------------
 # RetainedTokenSampler
 # ---------------------------------------------------------------------------
