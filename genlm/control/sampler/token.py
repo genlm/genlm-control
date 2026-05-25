@@ -35,6 +35,19 @@ class TokenSampler:
         self.target = target
         self.token_type = self.target.token_type
 
+    def supports_engine_native(self) -> bool:
+        """Whether this sampler can be driven by native backend generation.
+
+        Returns ``True`` only if drawing tokens directly from the backend LM's
+        own normalized ``logw_next`` is equivalent to this sampler's per-step
+        ``sample``. This holds for an unbiased direct sampler over a plain
+        ``PromptedLLM``, but not for samplers that run a rejection loop
+        (``AWRS``), walk a trie (set samplers), or reweight against a separate
+        proposal. Used by the window driver to decide whether the per-token
+        Python loop can be bypassed. Default is ``False``.
+        """
+        return False
+
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
@@ -125,6 +138,13 @@ class DirectTokenSampler(TokenSampler):
         if proposal is not None:
             _validate_proposal_vocab(potential, proposal)
         self.proposal = proposal
+
+    def supports_engine_native(self) -> bool:
+        # An unbiased direct sampler (no separate proposal) draws exactly from
+        # the target's normalized ``logw_next``, which is what native backend
+        # sampling reproduces. With a proposal, the per-step importance weight is
+        # non-trivial, so the loop cannot be bypassed.
+        return self.proposal is None
 
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.

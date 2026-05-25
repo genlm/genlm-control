@@ -120,6 +120,23 @@ class Potential(ABC, PotentialOps, PotentialTests):
         else:
             return await self.prefix(context)
 
+    def is_terminal_only(self) -> bool:
+        """Whether this potential contributes weight only at sequence termination.
+
+        A terminal-only potential has ``prefix(context) == 0`` for every proper
+        prefix, so it never reweights mid-generation; all of its weight comes from
+        ``complete`` (equivalently, ``score`` at EOS). Indicator critics like
+        ``1[f(z) == y]`` are the canonical example.
+
+        Returning ``True`` lets the SMC window driver skip per-step twisting for
+        this potential and, when the rest of the configuration allows it, draw
+        whole windows from the backend natively and reweight only at termination.
+        The default is ``False``: a potential is assumed to reweight per step
+        unless it explicitly opts in. Override in subclasses that satisfy the
+        ``prefix == 0`` invariant.
+        """
+        return False
+
     async def logw_next(self, context):
         """Compute the next-token weights of each token in `self.vocab_eos` given `context`.
 

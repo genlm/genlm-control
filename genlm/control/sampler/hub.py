@@ -26,7 +26,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from genlm.control.constant import EOS
+from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
 
@@ -204,6 +204,11 @@ class Hub:
         self.particles = [Particle(max_tokens) for _ in range(n_particles)]
         self.record = SMCRecord(n_particles) if record else None
 
+        # Set by the WindowDriver for the duration of a single engine window;
+        # read by the EngineControl ``shape`` / ``draw`` callbacks. ``None``
+        # outside a window.
+        self._window = None
+
     # -- phase 1: shape + draw + weight + advance for ONE particle -----------
     #
     # In the slow path these two phases are fused inside the sampler's
@@ -236,6 +241,10 @@ class Hub:
             p.finish()
             return
 
+        if not self.critic:
+            self._terminate_if_done(p)
+            return
+
         if self.critic and self.twist_with_critic:
             twist_amt = await self.critic.score(p.context)
             if twist_amt != float("-inf"):
@@ -256,6 +265,21 @@ class Hub:
                     twist_amt = await self.critic.score(p.context)
                 p.score(twist_amt)
             return
+
+    def _terminate_if_done(self, p):
+        """Synchronous post-draw termination for the NO-CRITIC path.
+
+        Exactly the tail of ``_draw_and_score`` when ``self.critic`` is None:
+        verbosity print, budget decrement, and finish on budget exhaustion or a
+        terminal EOS. Shared with the window driver's synchronous ``draw`` so the
+        two paths terminate particles identically.
+        """
+        assert not self.critic
+        if self.verbosity > 0:
+            print(self._repr_particle(p))
+        p.max_tokens_left -= 1
+        if p.max_tokens_left == 0 or self._is_terminal(p):
+            p.finish()
 
     def _is_terminal(self, p):
         return bool(p.context) and p.context[-1] is EOS
@@ -315,33 +339,61 @@ class Hub:
                 else:
                     self.record.add_smc_step(self.particles)
 
-            W = np.array([p.logw for p in self.particles])
-            if np.all(W == -np.inf):
-                did_resample = False
-                continue
-
-            w_sum = logsumexp(W)
-            normalized_weights = W - w_sum
-
-            if -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(
-                n
-            ):
-                probs = np.exp(normalized_weights)
-                ancestor_indices = self.resample_fn(probs).tolist()
-
-                if self.record is not None:
-                    ancestor_indices.sort()
-
-                self.particles = [self.particles[i].clone() for i in ancestor_indices]
-                avg_weight = w_sum - np.log(n)
-                for p in self.particles:
-                    p.logw = avg_weight
-
-                did_resample = True
-            else:
-                did_resample = False
+            did_resample, ancestor_indices = self._maybe_resample(
+                sort_ancestors=self.record is not None
+            )
 
         return self.particles
+
+    def _ess_crosses(self):
+        """Whether the ESS test triggers a resample on the current population.
+
+        Test only -- does not mutate. Uses the identical predicate as
+        ``_maybe_resample`` so the window's pop-out decision matches the slow
+        path's resample decision exactly. Returns ``False`` when all weights are
+        ``-inf`` (matching the slow path's ``continue``).
+        """
+        n = self.n_particles
+        W = np.array([p.logw for p in self.particles])
+        if np.all(W == -np.inf):
+            return False
+        normalized_weights = W - logsumexp(W)
+        return -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(
+            n
+        )
+
+    def _maybe_resample(self, sort_ancestors=False):
+        """Run the ESS test on the current population and resample if it crosses.
+
+        This is the *only* implementation of the ESS/resample math; both the slow
+        ``run`` loop and the ``WindowDriver`` call it so the two paths are
+        bit-identical here. Mutates ``self.particles`` on a resample.
+
+        Returns ``(did_resample, ancestor_indices)``.
+        """
+        n = self.n_particles
+        W = np.array([p.logw for p in self.particles])
+        if np.all(W == -np.inf):
+            return False, list(range(n))
+
+        w_sum = logsumexp(W)
+        normalized_weights = W - w_sum
+
+        if -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(n):
+            probs = np.exp(normalized_weights)
+            ancestor_indices = self.resample_fn(probs).tolist()
+
+            if sort_ancestors:
+                ancestor_indices.sort()
+
+            self.particles = [self.particles[i].clone() for i in ancestor_indices]
+            avg_weight = w_sum - np.log(n)
+            for p in self.particles:
+                p.logw = avg_weight
+
+            return True, ancestor_indices
+
+        return False, list(range(n))
 
     def save_record(self, json_path):
         """Write the SMC record JSON, matching the old smc_standard json_file path."""
@@ -350,6 +402,124 @@ class Hub:
         with open(json_path, "w") as f:
             f.write(self.record.to_json())
         print(f"Saved record to {json_path}")
+
+    # -- EngineControl phases (used only by the WindowDriver) ----------------
+    #
+    # These reproduce, row-wise on raw engine logits, exactly what
+    # ``_draw_and_score`` does for an UNCONSTRAINED ``DirectTokenSampler`` (and,
+    # with an additive control-side factor, for the constrained extension). The
+    # engine IS the language model, so ``shape`` adds only the non-LM factor's
+    # per-token log-weights; the draw reuses the slow path's ``fast_sample_*``
+    # over the same control-side V+1 vocabulary so the same RNG stream selects
+    # the same token (up to the warm-KV-vs-reprefill logit residual).
+    #
+    # A live window is described by ``self._window`` (set by the WindowDriver):
+    #   particles  -- list of live particles, indexed by external request id
+    #   potential  -- the engine PromptedLLM (the LM the engine evaluates)
+    #   factor     -- an additive control-side factor with ``logw_next`` over the
+    #                 engine vocab, or None for the unconstrained case (stage a).
+    #                 The constrained extension (stage b) lives in ``shape`` and
+    #                 is gated off by ``window_eligible`` until verified.
+    #   eos_id     -- an engine token id to return when forcing/observing EOS
+    #   pop_out    -- once True, every subsequent draw forces EOS (control
+    #                 signal; never banked) so the window ends for resampling
+
+    def _window_particle(self, request_id):
+        """Map a vLLM internal request id (``"{external}-{8 chars}"``) to its
+        particle via the external index the WindowDriver assigned."""
+        external = request_id.rsplit("-", 1)[0]
+        return self._window["particles"][int(external)]
+
+    def shape(self, logits, request_ids) -> None:
+        """Shape each row's raw engine logits into its proposal in place.
+
+        For the unconstrained ``DirectTokenSampler`` (the only configuration
+        ``window_eligible`` currently admits) there is no control-side factor, so
+        shaping is the identity and the per-step weight increment is zero.
+
+        The constrained extension (stage b) belongs here: add the additive
+        factor's per-token log-weights -- mapped into engine-token-id order as the
+        exact inverse of ``PromptedLLM._process_logw_next`` -- and bank
+        ``logsumexp(shaped) - logsumexp(raw)`` on the particle so the draw matches
+        ``DirectTokenSampler(Product(llm, factor))``. It is intentionally not
+        wired yet (see ``window_eligible``); doing so requires advancing the
+        factor's per-token state synchronously inside this callback, which must be
+        verified against the slow path before being enabled.
+        """
+        w = self._window
+        if w["pop_out"]:
+            # We are forcing EOS this step; do not touch logits or weights.
+            return
+
+        if w["factor"] is not None:  # pragma: no cover - stage b, not yet enabled
+            raise NotImplementedError(
+                "constrained engine-native shaping (stage b) is not wired; "
+                "window_eligible should have routed this to SlowDriver"
+            )
+        # Unconstrained: identity shape, zero weight increment.
+
+    def draw(self, logits, request_ids, sampling_metadata):
+        """Draw one token per row using the SLOW PATH's draw function.
+
+        Reproduces ``DirectTokenSampler.sample``: build the control-side V+1
+        ``LazyWeights`` from the (already shaped) engine logits exactly as
+        ``PromptedLLM._process_logw_next`` does, normalize, and draw with
+        ``fast_sample_lazyweights`` (the same Gumbel-max consuming the same numpy
+        RNG as the slow path). Advance the particle (append token, accumulate
+        ``logp`` and the start/normalizer weight), and return the engine token id
+        per row. When popping out, force EOS for every row WITHOUT banking it.
+        """
+        import torch
+
+        from genlm.control.util import fast_sample_lazyweights
+
+        w = self._window
+        potential = w["potential"]
+        eos_id = w["eos_id"]
+        out = []
+
+        for i, rid in enumerate(request_ids):
+            p = self._window_particle(rid)
+
+            if w["pop_out"] or p.done:
+                # Forced pop-out (control signal) or an already-finished row:
+                # return EOS, advance nothing, bank nothing.
+                out.append(eos_id)
+                continue
+
+            # Reproduce DirectTokenSampler.sample over the V+1 control vocab,
+            # exactly as PromptedLLM.logw_next: temper, then _process_logw_next.
+            row = logits[i]
+            if row.dtype != torch.float32:
+                row = row.float()
+            logws = potential._process_logw_next(potential._maybe_temper(row))
+            logps = logws.normalize()
+            token = fast_sample_lazyweights(logps)
+
+            # Bank exactly what the slow path's transition banks, then run the
+            # identical synchronous (no-critic) termination bookkeeping.
+            p.score(logws.sum())
+            p.logp += logps[token]
+            p.context.append(token)
+
+            if p.logw == float("-inf"):
+                p.finish()
+            else:
+                self._terminate_if_done(p)
+
+            if isinstance(token, EndOfSequence):
+                out.append(eos_id)
+            else:
+                out.append(token.token_id)
+
+        # End-of-step ESS test (same predicate the slow path applies after every
+        # token). If it crosses, arm pop-out: the next engine step forces EOS for
+        # all live rows so the window ends and the WindowDriver resamples. Skip
+        # while already popping out (no real step happened).
+        if not w["pop_out"] and self._ess_crosses():
+            w["pop_out"] = True
+
+        return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
 
 # ---------------------------------------------------------------------------
@@ -374,35 +544,121 @@ class SlowDriver:
         return await self.hub.run()
 
 
-class WindowDriver:
-    """Delegates consecutive steps to the engine via the EngineControl contract.
+def window_eligible(hub):
+    """Whether the ``WindowDriver`` can drive this hub's configuration.
 
-    NOT IMPLEMENTED here -- the engine arms are built by a separate effort. The
-    hub already exposes everything this driver needs: it implements the
-    EngineControl shape/draw phases over a ``request_id -> particle`` map, and
-    keeps resample/fork/ESS/log_ml hub-owned (those are never delegated).
+    The window fast path requires:
+
+    * the unit sampler is engine-native (``supports_engine_native()``) -- i.e. an
+      unbiased ``DirectTokenSampler`` with no separate proposal, so drawing from
+      the backend LM's normalized ``logw_next`` equals its per-step ``sample``;
+    * the target potential is a single engine LM exposing a vLLM engine
+      (``potential.model.llm_engine``);
+    * no critic (stage a). A terminal-only critic (``is_terminal_only()``) is a
+      natural future extension -- it never twists mid-generation, so only the
+      end-of-window terminal reweight differs -- but the window's synchronous
+      ``draw`` does not yet perform that terminal critic ``score``, so it stays
+      excluded until wired and verified.
+
+    Anything else falls back to :class:`SlowDriver`. This is intentionally
+    conservative; it grows as more factors become additively expressible over the
+    engine vocab.
+    """
+    sampler = hub.unit_sampler
+    if not getattr(sampler, "supports_engine_native", lambda: False)():
+        return False
+
+    potential = getattr(sampler, "potential", None)
+    model = getattr(potential, "model", None)
+    if model is None or not hasattr(model, "llm_engine"):
+        return False
+
+    if hub.critic is not None:
+        return False
+
+    return True
+
+
+class WindowDriver:
+    """Drives consecutive SMC steps inside a vLLM engine via EngineControl.
+
+    Opens a *window* = one ``backend.run_window`` call over the live particles'
+    token contexts. The hub's :meth:`Hub.shape` / :meth:`Hub.draw` run per engine
+    decode step, advancing each particle exactly as the slow path's transition
+    would. The window itself NEVER resamples: when the hub's end-of-step ESS test
+    crosses the threshold it arms pop-out, the next step forces EOS for every live
+    row (a control signal, never banked), and ``run_window`` returns. The driver
+    then runs the hub-owned ESS test + resample/fork and relaunches the next
+    window from each surviving particle's token prefix. ESS / resample / log_ml
+    stay entirely hub-owned -- the engine only produces logits.
+
+    Only valid when :func:`window_eligible` is True (checked by the caller).
     """
 
     def __init__(self, hub, backend):
         self.hub = hub
         self.backend = backend
 
-    async def run(self):  # pragma: no cover - engine arms not built yet
-        await self.hub.start()
-        # TODO(engine-native): drive the engine over windows of consecutive
-        # steps, e.g.
-        #
-        #   prompts = [p.context for p in self.hub.particles]
-        #   await self.backend.run_window(
-        #       prompts, control=self.hub, max_steps=...
-        #   )
-        #
-        # The backend calls back into the hub via EngineControl.shape /
-        # EngineControl.draw, keyed on a request_id -> particle map, to shape
-        # the proposal and draw+weight+advance each row. After each engine
-        # window returns, the hub performs the ESS test, resampling/forking and
-        # log_ml accumulation (never delegated to the engine).
-        raise NotImplementedError(
-            "WindowDriver requires the in-engine arms (backend.run_window); "
-            "use SlowDriver until those land."
-        )
+    def _potential(self):
+        return self.hub.unit_sampler.potential
+
+    def _engine(self):
+        return self._potential().model.llm_engine
+
+    def _prompt_ids(self):
+        return list(self._potential().prompt_ids)
+
+    def _eos_idxs(self):
+        return list(self._potential().token_maps.eos_idxs)
+
+    def _context_ids(self, p):
+        """Engine prompt for a particle: prompt prefix + its drawn token ids.
+
+        Drops a trailing control EOS sentinel (a finished particle is never
+        relaunched, but a context may carry EOS as its last element)."""
+        ids = self._prompt_ids()
+        for tok in p.context:
+            if isinstance(tok, EndOfSequence):
+                continue
+            ids.append(tok.token_id)
+        return ids
+
+    async def run(self):
+        hub = self.hub
+        await hub.start()
+
+        potential = self._potential()
+        eos_idxs = self._eos_idxs()
+        eos_id = eos_idxs[0]
+
+        while any(not p.done for p in hub.particles):
+            live = [p for p in hub.particles if not p.done]
+            prompts = [self._context_ids(p) for p in live]
+            # Each particle keeps its own budget; the engine window just needs to
+            # be long enough to reach the longest particle's budget (plus one
+            # step to let a budget-exhausted row pop out via forced EOS).
+            max_steps = max(p.max_tokens_left for p in live) + 1
+
+            hub._window = {
+                "particles": live,
+                "potential": potential,
+                "factor": None,
+                "eos_id": eos_id,
+                "pop_out": False,
+            }
+            try:
+                self.backend.run_window(
+                    self._engine(),
+                    prompts=prompts,
+                    control=hub,
+                    max_steps=max_steps,
+                    eos_token_ids=eos_idxs,
+                    temperature=potential.temperature,
+                )
+            finally:
+                hub._window = None
+
+            # Hub-owned ESS test + resample/fork over the FULL population.
+            hub._maybe_resample(sort_ancestors=hub.record is not None)
+
+        return hub.particles

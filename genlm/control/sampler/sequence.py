@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.hub import Hub, SlowDriver
+from genlm.control.sampler.hub import Hub, SlowDriver, WindowDriver, window_eligible
 
 
 class SMC:
@@ -71,6 +71,7 @@ class SMC:
         max_tokens,
         verbosity=0,
         json_path=None,
+        backend=None,
         **kwargs,
     ):
         """Generate sequences using sequential Monte Carlo inference.
@@ -110,7 +111,10 @@ class SMC:
             **kwargs,
         )
 
-        particles = await SlowDriver(hub).run()
+        if backend is not None and window_eligible(hub):
+            particles = await WindowDriver(hub, backend).run()
+        else:
+            particles = await SlowDriver(hub).run()
 
         if json_path is not None:
             hub.save_record(json_path)
