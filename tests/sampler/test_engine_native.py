@@ -157,54 +157,54 @@ def _run_burst(make_sampler, n_particles, ess_threshold, max_tokens, seed):
     }
 
 
-def _compare(label, ess_threshold, n_particles, slow, win):
-    """Burst-vs-(cached)-slow stats + report. ``slow``/``win`` are the dicts
+def _compare(label, ess_threshold, n_particles, slow, burst):
+    """Burst-vs-(cached)-slow stats + report. ``slow``/``burst`` are the dicts
     from ``_slow_cached`` / ``_run_burst``."""
-    slow_ctx, win_ctx = slow["contexts"], win["contexts"]
+    slow_ctx, burst_ctx = slow["contexts"], burst["contexts"]
     slow_w = np.array(slow["logw"])
-    win_w = np.array(win["logw"])
+    burst_w = np.array(burst["logw"])
 
-    n_match = sum(a == b for a, b in zip(slow_ctx, win_ctx))
+    n_match = sum(a == b for a, b in zip(slow_ctx, burst_ctx))
     slow_lens = [len(c) for c in slow_ctx]
-    win_lens = [len(c) for c in win_ctx]
+    burst_lens = [len(c) for c in burst_ctx]
     # First-divergence step per particle: isolates single-flip-then-cascade
     # (the warm-KV signature) from a step-1 wiring bug.
     first_div = []
-    for a, b in zip(slow_ctx, win_ctx):
+    for a, b in zip(slow_ctx, burst_ctx):
         k = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), None)
         first_div.append(k if k is not None else min(len(a), len(b)))
 
     matched = [
-        abs(slow_w[i] - win_w[i])
+        abs(slow_w[i] - burst_w[i])
         for i in range(n_particles)
-        if slow_ctx[i] == win_ctx[i]
+        if slow_ctx[i] == burst_ctx[i]
     ]
-    signed = win_w - slow_w
+    signed = burst_w - slow_w
     finite = signed[np.isfinite(signed)]
 
     lines = [
         f"=== {label}  ess={ess_threshold}  N={n_particles} (slow cached) ===",
         f"contexts match: {n_match}/{n_particles}",
         f"first-divergence step per particle: {first_div}",
-        f"mean len slow={np.mean(slow_lens):.3f} win={np.mean(win_lens):.3f}",
+        f"mean len slow={np.mean(slow_lens):.3f} burst={np.mean(burst_lens):.3f}",
         f"max |logw diff| over matched contexts: "
         f"{max(matched) if matched else float('nan'):.4e}",
-        f"signed logw diff (win-slow): mean={np.mean(finite):+.4e} "
+        f"signed logw diff (burst-slow): mean={np.mean(finite):+.4e} "
         f"std={np.std(finite):.4e} n={len(finite)}",
-        f"slow log_ml={slow['log_ml']:.6f}  win log_ml={win['log_ml']:.6f}  "
-        f"diff={win['log_ml'] - slow['log_ml']:+.6f}",
-        f"burst wall={win['wall']:.2f}s  bursts opened={win['n_bursts']}",
+        f"slow log_ml={slow['log_ml']:.6f}  burst log_ml={burst['log_ml']:.6f}  "
+        f"diff={burst['log_ml'] - slow['log_ml']:+.6f}",
+        f"burst wall={burst['wall']:.2f}s  bursts opened={burst['n_bursts']}",
     ]
     print("\n" + "\n".join(lines))
 
     return {
-        "n_bursts": win["n_bursts"],
+        "n_bursts": burst["n_bursts"],
         "n_match": n_match,
-        "log_ml_diff": float(win["log_ml"] - slow["log_ml"]),
+        "log_ml_diff": float(burst["log_ml"] - slow["log_ml"]),
         "slow_log_ml": float(slow["log_ml"]),
-        "win_log_ml": float(win["log_ml"]),
+        "burst_log_ml": float(burst["log_ml"]),
         "mean_len_slow": float(np.mean(slow_lens)),
-        "mean_len_win": float(np.mean(win_lens)),
+        "mean_len_burst": float(np.mean(burst_lens)),
     }
 
 
@@ -239,8 +239,18 @@ def test_unconstrained_burst_vs_slow(llm, ess_threshold):
 
     assert can_burst(_controller(make, 8, ess_threshold, 12))
     slow = _slow_cached("unconstrained", make, 8, ess_threshold, 12, SEED)
-    win = _run_burst(make, 8, ess_threshold, 12, SEED)
-    _compare("unconstrained", ess_threshold, 8, slow, win)
+    burst = _run_burst(make, 8, ess_threshold, 12, SEED)
+    stats = _compare("unconstrained", ess_threshold, 8, slow, burst)
+    # Pure warm-KV residual (no factor): the burst draws from the same normalized
+    # LM logw_next as the slow path, so length and log_ml track tightly.
+    assert abs(stats["mean_len_burst"] - stats["mean_len_slow"]) <= 2.0, (
+        f"length diverged (slow {stats['mean_len_slow']:.2f} vs "
+        f"burst {stats['mean_len_burst']:.2f})"
+    )
+    assert abs(stats["log_ml_diff"]) <= 0.2, (
+        f"log_ml diverged (slow {stats['slow_log_ml']:.4f} vs "
+        f"burst {stats['burst_log_ml']:.4f})"
+    )
 
 
 # ----- gate 2b: constrained (additive factor folded into target) -----------
@@ -256,18 +266,18 @@ def test_constrained_boolfsa_burst_vs_slow(llm, ess_threshold):
 
     assert can_burst(_controller(make, 16, ess_threshold, 12))
     slow = _slow_cached("boolfsa[a-z ]+", make, 16, ess_threshold, 12, SEED)
-    win = _run_burst(make, 16, ess_threshold, 12, SEED)
-    stats = _compare("boolfsa[a-z ]+", ess_threshold, 16, slow, win)
+    burst = _run_burst(make, 16, ess_threshold, 12, SEED)
+    stats = _compare("boolfsa[a-z ]+", ess_threshold, 16, slow, burst)
     # Low-variance constrained case (broad allowed set, full-length sequences):
     # the warm-KV residual is small and unbiased, so a single-seed log_ml diff
     # and the mean length stay tight.
-    assert abs(stats["mean_len_win"] - stats["mean_len_slow"]) <= 2.0, (
+    assert abs(stats["mean_len_burst"] - stats["mean_len_slow"]) <= 2.0, (
         f"length diverged (slow {stats['mean_len_slow']:.2f} vs "
-        f"win {stats['mean_len_win']:.2f})"
+        f"burst {stats['mean_len_burst']:.2f})"
     )
     assert abs(stats["log_ml_diff"]) <= 0.2, (
         f"log_ml diverged (slow {stats['slow_log_ml']:.4f} vs "
-        f"win {stats['win_log_ml']:.4f})"
+        f"burst {stats['burst_log_ml']:.4f})"
     )
 
 
@@ -297,10 +307,10 @@ def test_constrained_forces_resample_burst_vs_slow(llm):
     any_resample = False
     for seed in seeds:
         slow = _slow_cached("boolfsa[aeiou ]+", make, 16, 0.5, 10, seed)
-        win = _run_burst(make, 16, 0.5, 10, seed)
-        s = _compare("boolfsa[aeiou ]+", 0.5, 16, slow, win)
+        burst = _run_burst(make, 16, 0.5, 10, seed)
+        s = _compare("boolfsa[aeiou ]+", 0.5, 16, slow, burst)
         diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_win"] - s["mean_len_slow"])
+        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
         any_resample = any_resample or s["n_bursts"] > 1
     diffs = np.array(diffs)
     len_gaps = np.array(len_gaps)
@@ -352,10 +362,10 @@ def test_awrs_burst_vs_slow(llm):
     for seed in seeds:
         make = make_seed(seed)
         slow = _slow_cached("awrs[a-z ]+", make, 16, 0.0, 12, seed)
-        win = _run_burst(make, 16, 0.0, 12, seed)
-        s = _compare("awrs[a-z ]+", 0.0, 16, slow, win)
+        burst = _run_burst(make, 16, 0.0, 12, seed)
+        s = _compare("awrs[a-z ]+", 0.0, 16, slow, burst)
         diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_win"] - s["mean_len_slow"])
+        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
     diffs = np.array(diffs)
     len_gaps = np.array(len_gaps)
     sem = diffs.std() / np.sqrt(len(diffs))
