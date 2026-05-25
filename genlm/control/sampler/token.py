@@ -371,6 +371,22 @@ class AWRS(TokenSampler):
                 self.proposal.logw_next(context),
             )
 
+        async def accept(tok):
+            return await self._accept(context, tok, verbosity)
+
+        return await self._run_rejection(logws, accept, target_logws)
+
+    async def _run_rejection(self, logws, accept, target_logws=None):
+        """Shared AWRS rejection over next-token ``logws`` with a boolean
+        ``accept(tok)`` coroutine (and an optional ``target_logws`` proposal
+        correction).
+
+        ``sample`` (slow path: context-based ``accept``, ``logws`` from
+        ``potential.logw_next``) and the engine window (stateful-condition
+        ``accept``, ``logws`` from the engine LM logits) both call this, so the
+        rejection algorithm and the returned weight stay identical -- only the
+        source of ``logws`` and the form of ``accept`` differ.
+        """
         if self.prune_logws:
             logws = self._prune_logws(logws)
 
@@ -378,16 +394,15 @@ class AWRS(TokenSampler):
         logps = logws.weights - logZ
         toks = logws.decode
 
-        # We cache successful calls, as algorithms may want to see the
-        # same successful token more than once (currently just geometric_awrs)
+        # Cache successful calls (geometric_awrs may revisit a token).
         cache = {}
 
-        async def accept(tok):
+        async def cached_accept(tok):
             try:
                 return cache[tok]
             except KeyError:
                 pass
-            result = await self._accept(context, tok, verbosity)
+            result = await accept(tok)
             if result:
                 cache[tok] = result
             return result
@@ -396,32 +411,17 @@ class AWRS(TokenSampler):
             return await improper_sample(
                 logps=logps,
                 toks=toks,
-                accept=accept,
+                accept=cached_accept,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
             )
-        # We pick which algorithm to use based on parameters and the
-        # shape of the distribution, as this lets us pick the most
-        # effective option.
-        elif (
-            # If max_accepts is large then recursive_awrs (which
-            # does not currently support this parameter) isn't very
-            # useful, because the recursive step means that you never
-            # revisit the same value, so will often throw away most
-            # of the accepted mass if you were to continue. Also
-            # this parameter is only really relevant if you want to
-            # lower the variance, and geometric_awrs is lower variance.
-            self.max_accepts > 2
-            or
-            # If the distribution is strongly peaked around a single value
-            # then geometric_awrs will be more efficient. See below
-            # for specific derivation.
-            logps.max() >= GEOMETRIC_THRESHOLD
-        ):
+        # geometric_awrs when max_accepts>2 (recursive_awrs ignores it) or when
+        # the distribution is peaked (then geometric is more efficient).
+        elif self.max_accepts > 2 or logps.max() >= GEOMETRIC_THRESHOLD:
             tok, w, _ = await geometric_awrs(
                 logps=logps,
                 toks=toks,
-                accept=accept,
+                accept=cached_accept,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
                 max_accepts=self.max_accepts,
@@ -430,7 +430,7 @@ class AWRS(TokenSampler):
             tok, w, _ = await recursive_awrs(
                 logps=logps,
                 toks=toks,
-                accept=accept,
+                accept=cached_accept,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
             )

@@ -493,14 +493,9 @@ class Controller:
         """
         import torch
 
-        from genlm.control.util import fast_sample_lazyweights
-
         w = self._window
-        llm = w["llm"]
-        factor = w["factor"]
-        target = w["target"]
-        eval_factor = w["eval_factor"]
         eos_id = w["eos_id"]
+        draw_row = w["draw_row"]  # per-sampler strategy bound by the BurstLoop
         out = []
 
         for i, rid in enumerate(request_ids):
@@ -512,50 +507,12 @@ class Controller:
                 out.append(eos_id)
                 continue
 
-            # LM half: temper, then _process_logw_next -- == llm.logw_next(ctx)
-            # (modulo the warm-KV-vs-reprefill residual).
             row = logits[i]
             if row.dtype != torch.float32:
                 row = row.float()
-            lm_logws = llm._process_logw_next(llm._maybe_temper(row))
+            token = draw_row(p, row)
 
-            if factor is None:
-                logws = lm_logws
-            else:
-                # Factor half: read from the particle's CARRIED factor state
-                # (advanced one token at a time), not by replaying the context.
-                # Reconstruct Product.logw_next over the product vocab by gathering
-                # the LM and factor weight vectors onto the product's vocab_eos
-                # (the same gather Product.logw_next performs), with the
-                # engine-derived LM weights substituted for the reprefilled ones.
-                factor_logws = eval_factor(factor, p.factor_state)
-                logws = target.make_lazy_weights(
-                    lm_logws.weights[w["llm_idxs"]]
-                    + factor_logws.weights[w["factor_idxs"]]
-                )
-
-            logps = logws.normalize()
-            token = fast_sample_lazyweights(logps)
-
-            # Bank exactly what the slow path's transition banks, then run the
-            # identical synchronous (no-critic) termination bookkeeping.
-            p.score(logws.sum())
-            p.logp += logps[token]
-            p.context.append(token)
-            # Advance the carried factor state by the drawn token (EOS has no
-            # symbols and ends the particle, so nothing to advance).
-            if factor is not None and not isinstance(token, EndOfSequence):
-                p.factor_state = factor.advance(p.factor_state, token)
-
-            if p.logw == float("-inf"):
-                p.finish()
-            else:
-                self._terminate_if_done(p)
-
-            if isinstance(token, EndOfSequence):
-                out.append(eos_id)
-            else:
-                out.append(token.token_id)
+            out.append(eos_id if isinstance(token, EndOfSequence) else token.token_id)
 
         # End-of-step ESS test (same predicate the slow path applies after every
         # token). If it crosses, arm pop-out: the next engine step forces EOS for
@@ -565,6 +522,47 @@ class Controller:
             w["pop_out"] = True
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
+
+    def _lm_logws(self, row):
+        """The LM half: the engine row as V+1 LazyWeights, exactly as
+        ``PromptedLLM._process_logw_next`` (modulo the warm-KV residual)."""
+        llm = self._window["llm"]
+        return llm._process_logw_next(llm._maybe_temper(row))
+
+    def _terminate_after_draw(self, p):
+        """The no-critic termination bookkeeping shared by every window draw."""
+        if p.logw == float("-inf"):
+            p.finish()
+        else:
+            self._terminate_if_done(p)
+
+    def _draw_direct(self, p, row):
+        """DirectTokenSampler window draw: shape the product proposal from the
+        carried factor state, sample once, bank ``logsumexp`` + the drawn lp."""
+        from genlm.control.util import fast_sample_lazyweights
+
+        w = self._window
+        factor = w["factor"]
+        lm_logws = self._lm_logws(row)
+        if factor is None:
+            logws = lm_logws
+        else:
+            # Reconstruct Product(llm, factor).logw_next over the product vocab,
+            # reading the factor from the particle's CARRIED state (not the
+            # context), gathered through Product's own index maps.
+            factor_logws = w["eval_factor"](factor, p.factor_state)
+            logws = w["target"].make_lazy_weights(
+                lm_logws.weights[w["llm_idxs"]] + factor_logws.weights[w["factor_idxs"]]
+            )
+        logps = logws.normalize()
+        token = fast_sample_lazyweights(logps)
+        p.score(logws.sum())
+        p.logp += logps[token]
+        p.context.append(token)
+        if factor is not None and not isinstance(token, EndOfSequence):
+            p.factor_state = factor.advance(p.factor_state, token)
+        self._terminate_after_draw(p)
+        return token
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +761,10 @@ class BurstLoop:
                 "eval_factor": eval_factor,
                 "eos_id": eos_id,
                 "pop_out": False,
+                # Per-sampler draw strategy (the "samplers share one control"
+                # seam). DirectTokenSampler shapes the product and samples once;
+                # other samplers (AWRS, ...) bind their own row-draw here.
+                "draw_row": hub._draw_direct,
             }
             try:
                 # Run the engine step loop in a worker thread so this event loop

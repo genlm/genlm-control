@@ -129,6 +129,15 @@ class Coerced(Potential):
             Ws[i] = p.prefix_logw(self.advance(state, x)) - ctx_w
         return self.make_lazy_weights(Ws)
 
+    def prefix_logw(self, state):
+        """Sync stateful prefix weight -- delegates to the wrapped potential
+        (the coerced state IS the wrapped potential's state)."""
+        return self.potential.prefix_logw(state)
+
+    def complete_logw(self, state):
+        """Sync stateful complete weight -- delegates to the wrapped potential."""
+        return self.potential.complete_logw(state)
+
     async def batch_complete(self, contexts):
         return await self.potential.batch_complete(contexts=self._batch_f(contexts))
 
