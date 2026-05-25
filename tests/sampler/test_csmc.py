@@ -15,7 +15,6 @@ import pytest
 from genlm.control.sampler.csmc import (
     csmc_standard,
     RetainedTokenSampler,
-    _tag_slots,
 )
 from genlm.control.sampler.sequence import SMC
 from genlm.control.sampler.token import DirectTokenSampler
@@ -78,33 +77,6 @@ class _MockParent:
 
 
 # ---------------------------------------------------------------------------
-# _tag_slots
-# ---------------------------------------------------------------------------
-
-
-def test_tag_slots_sets_only_slot_zero_retained():
-    particles = [_MockModel() for _ in range(4)]
-    _tag_slots(particles)
-    assert particles[0].is_retained is True
-    for p in particles[1:]:
-        assert p.is_retained is False
-
-
-def test_tag_slots_clears_inherited_retained_flag():
-    """If a free slot inherits ``is_retained=True`` via deepcopy from a
-    retained slot, :func:`_tag_slots` clears it. This is the invariant
-    that makes retainedness a *slot* property rather than a particle
-    property."""
-    particles = [_MockModel() for _ in range(3)]
-    for p in particles:
-        p.is_retained = True  # simulate post-deepcopy inheritance
-    _tag_slots(particles)
-    assert particles[0].is_retained is True
-    assert particles[1].is_retained is False
-    assert particles[2].is_retained is False
-
-
-# ---------------------------------------------------------------------------
 # csmc_standard
 # ---------------------------------------------------------------------------
 
@@ -136,10 +108,11 @@ async def test_csmc_standard_other_slots_free_at_termination():
     Note: we do *not* assert anything about ``slot_history`` of non-zero
     slots, because the loop's post-last-step resample (after the final
     step but before the while-check exits) may overwrite their
-    ``slot_history`` with deepcopied content from slot 0. The
-    invariant that survives that final inheritance is on the
-    ``is_retained`` tag itself, which :func:`_tag_slots` re-establishes
-    immediately after every resample.
+    ``slot_history`` with deepcopied content from slot 0. The invariant
+    that survives that final inheritance is on the ``is_retained`` tag
+    itself, which the resample block re-establishes (slot 0 stays
+    retained, slots 1..N-1 are explicitly marked free) immediately
+    after every resample.
     """
     model = _MockModel(n_steps=4)
     particles = await csmc_standard(model, n_particles=8, ess_threshold=1.0)

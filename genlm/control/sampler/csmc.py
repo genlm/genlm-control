@@ -63,8 +63,13 @@ async def csmc_standard(model, n_particles, ess_threshold=0.5):
     if n_particles < 1:
         raise ValueError(f"n_particles must be >= 1, got {n_particles}")
 
+    # Retainedness is a slot property, not a particle property: slot 0 is
+    # always the retained slot, regardless of which trajectory any slot
+    # inherits via resampling.
     particles = [copy.deepcopy(model) for _ in range(n_particles)]
-    _tag_slots(particles)
+    particles[0].is_retained = True
+    for p in particles[1:]:
+        p.is_retained = False
 
     while any(not p.done_stepping() for p in particles):
         for p in particles:
@@ -80,34 +85,22 @@ async def csmc_standard(model, n_particles, ess_threshold=0.5):
         ess_log = -logsumexp(2 * normalized_log_weights)
         if ess_log < np.log(ess_threshold) + np.log(n_particles):
             probs = np.exp(normalized_log_weights)
-            # Slot 0 survives unchanged; the remaining N-1 are drawn from
-            # the multinomial over all N normalized weights.
+            avg_weight = w_sum - np.log(n_particles)
+            # Slot 0 survives unchanged and stays retained; slots 1..N-1
+            # are drawn multinomially from all N weights and marked free.
+            # Build + reweight + re-tag in one pass over the new slots.
+            particles[0].weight = avg_weight
+            particles[0].is_retained = True
             new_particles = [particles[0]]
             for _ in range(n_particles - 1):
                 idx = np.random.choice(n_particles, p=probs)
-                new_particles.append(copy.deepcopy(particles[idx]))
+                p = copy.deepcopy(particles[idx])
+                p.weight = avg_weight
+                p.is_retained = False
+                new_particles.append(p)
             particles = new_particles
 
-            avg_weight = w_sum - np.log(n_particles)
-            for p in particles:
-                p.weight = avg_weight
-
-            _tag_slots(particles)
-
     return particles
-
-
-def _tag_slots(particles):
-    """Set ``is_retained``: ``True`` on slot 0, ``False`` on slots 1..N-1.
-
-    Called once at startup and after every resample, so that retainedness
-    stays a slot property: a free slot that just inherited its trajectory
-    from slot 0 via multinomial resampling is correctly marked as free
-    going forward, and will sample (not force) at its next step.
-    """
-    particles[0].is_retained = True
-    for p in particles[1:]:
-        p.is_retained = False
 
 
 class RetainedTokenSampler(TokenSampler):
