@@ -287,35 +287,30 @@ def load_async_trie(V, backend=None, **kwargs):
     return AsyncTokenCharacterTrie(load_trie(V, backend, **kwargs))
 
 
-_GUMBEL_RNG = np.random.default_rng()
-
-
-def fast_sample_logprobs(
-    logprobs: np.ndarray, size: int = 1, rng: np.random.Generator | None = None
-) -> np.ndarray:
+def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
     """Sample indices from an array of log probabilities using the Gumbel-max trick.
 
     Args:
         logprobs: Array of log probabilities
         size (int): Number of samples to draw
-        rng: Optional ``np.random.Generator`` for seeded sampling. Defaults
-            to a module-level ``np.random.default_rng()`` instance, which is
-            NOT reseeded by ``np.random.seed`` — pass an explicit
-            ``np.random.default_rng(seed)`` if you need reproducibility.
 
     Returns:
         (np.ndarray): Array of sampled indices
 
     Note:
-        Uses one in-place buffer instead of four temporaries, and PCG64 instead
-        of the legacy locked ``np.random.random``. The gumbel-max trick reduces
-        to ``argmin(log(-log U) - logprobs)`` via ``argmax(x) = argmin(-x)``,
-        which lets us skip the final negation that ``-log(-log U) + logprobs``
-        would otherwise require.
+        Uses one in-place buffer instead of four temporaries. The gumbel-max
+        trick reduces to ``argmin(log(-log U) - logprobs)`` via
+        ``argmax(x) = argmin(-x)``, which lets us skip the final negation that
+        ``-log(-log U) + logprobs`` would otherwise require.
+
+        Randomness comes from numpy's global RNG (``np.random.random``) so
+        ``np.random.seed`` controls reproducibility. ``np.random.random``
+        draws from ``[0, 1)``; a draw of exactly ``0`` would make one
+        ``(sample, token)`` entry of ``work`` non-finite and exclude that
+        single cell from ``argmin``. Probability ≈ 2⁻⁵³, negligible in
+        practice.
     """
-    if rng is None:
-        rng = _GUMBEL_RNG
-    work = rng.random((size, len(logprobs)))
+    work = np.random.random((size, len(logprobs)))
     np.log(work, out=work)         # log(U)
     np.negative(work, out=work)    # -log(U) > 0
     np.log(work, out=work)         # log(-log(U)) = -gumbel noise
