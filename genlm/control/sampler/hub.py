@@ -67,6 +67,7 @@ class Particle:
         "twist_amount",
         "done",
         "max_tokens_left",
+        "factor_state",
     )
 
     def __init__(self, max_tokens):
@@ -76,6 +77,11 @@ class Particle:
         self.twist_amount = 0.0
         self.done = False
         self.max_tokens_left = max_tokens
+        # Carried stateful-potential state for the window's factor (the chart of
+        # the in-engine product's control-side factor), advanced one token at a
+        # time instead of replaying the context. None on the slow path / when
+        # there is no factor. Kept in lockstep with `context` (cloned together).
+        self.factor_state = None
 
     # -- weight bookkeeping, mirroring llamppl.modeling.Model exactly --
 
@@ -118,6 +124,10 @@ class Particle:
         cpy.twist_amount = self.twist_amount
         cpy.done = self.done
         cpy.max_tokens_left = self.max_tokens_left
+        # The factor state is immutable per step (advance returns a fresh chart),
+        # so it can be shared by reference across the clone -- it stays in lockstep
+        # with the (copied) context.
+        cpy.factor_state = self.factor_state
         return cpy
 
 
@@ -512,12 +522,13 @@ class Controller:
             if factor is None:
                 logws = lm_logws
             else:
-                # Factor half: the slow path's exact async logw_next(context).
-                # Reconstruct Product.logw_next over the product vocab by
-                # gathering the LM and factor weight vectors onto the product's
-                # vocab_eos (the same gather Product.logw_next performs), with the
+                # Factor half: read from the particle's CARRIED factor state
+                # (advanced one token at a time), not by replaying the context.
+                # Reconstruct Product.logw_next over the product vocab by gathering
+                # the LM and factor weight vectors onto the product's vocab_eos
+                # (the same gather Product.logw_next performs), with the
                 # engine-derived LM weights substituted for the reprefilled ones.
-                factor_logws = eval_factor(factor, list(p.context))
+                factor_logws = eval_factor(factor, p.factor_state)
                 logws = target.make_lazy_weights(
                     lm_logws.weights[w["llm_idxs"]]
                     + factor_logws.weights[w["factor_idxs"]]
@@ -531,6 +542,10 @@ class Controller:
             p.score(logws.sum())
             p.logp += logps[token]
             p.context.append(token)
+            # Advance the carried factor state by the drawn token (EOS has no
+            # symbols and ends the particle, so nothing to advance).
+            if factor is not None and not isinstance(token, EndOfSequence):
+                p.factor_state = factor.advance(p.factor_state, token)
 
             if p.logw == float("-inf"):
                 p.finish()
@@ -706,17 +721,27 @@ class BurstLoop:
         hub = self.hub
         await hub.start()
 
+        # Seed each particle's carried factor state (empty context == state0).
+        # Across windows the state is carried (cloned on resample), never
+        # re-derived, so only freshly-started particles need seeding.
+        if self.factor is not None:
+            for p in hub.particles:
+                if p.factor_state is None:
+                    p.factor_state = self.factor.state0()
+
         eos_idxs = self._eos_idxs()
         eos_id = eos_idxs[0]
         loop = asyncio.get_running_loop()
 
-        # The factor's logw_next is the slow path's exact (async) call. ``draw``
-        # runs synchronously inside the engine step loop (which itself runs in a
-        # thread, below), so it schedules the coroutine back onto this event loop
-        # and blocks the worker thread for the result. This reuses the slow
-        # path's computation verbatim -- no separate factor-state machine.
-        def eval_factor(factor, context):
-            fut = asyncio.run_coroutine_threadsafe(factor.logw_next(context), loop)
+        # The factor is evaluated from its CARRIED state (advanced one token at a
+        # time), not by replaying the context: `logw_next_from_state` has a sync
+        # body (no `asyncio.gather` over the vocabulary -- the dominant per-step
+        # cost), and `draw` runs in the worker thread below, so it schedules this
+        # one coroutine back onto the event loop and blocks for the result.
+        def eval_factor(factor, state):
+            fut = asyncio.run_coroutine_threadsafe(
+                factor.logw_next_from_state(state), loop
+            )
             return fut.result()
 
         while any(not p.done for p in hub.particles):
