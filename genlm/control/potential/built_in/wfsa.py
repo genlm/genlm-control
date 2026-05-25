@@ -126,19 +126,38 @@ class WFSA(Potential):
         # TODO: optimize to use _consume cache
         return self.wfsa(context).score
 
+    def _chart_prefix_logw(self, chart):
+        """Prefix log weight of a carried `chart`: the logsumexp over its
+        backward-weighted live states, collapsed to `-inf` for a dead (empty) or
+        `nan` chart. The single source of the prefix normalizer shared by
+        `_prefix`, `prefix_logw`, and `logw_next_from_state` -- so the dead-state
+        boundary is decided in exactly one place."""
+        if not chart:
+            return float("-inf")
+        bkwd = self.wfsa.epsremove.backward
+        log_ctx_w = logsumexp([(chart[i] * bkwd[i]).score for i in chart])
+        return float("-inf") if np.isnan(log_ctx_w) else log_ctx_w
+
+    def _logw_next_from_chart(self, chart, log_ctx_w):
+        """Next-token + EOS log weights from a carried `chart` and its prefix log
+        weight `log_ctx_w`. The shared chart->weights tail of both `logw_next`
+        (chart from `_consume`) and `logw_next_from_state` (carried chart)."""
+        bkwd = self.wfsa.epsremove.backward
+        ws = self.wfsa.R.chart()
+        for i in chart:
+            for b, j, w in self.wfsa.epsremove.arcs(i=i):
+                ws[b] += chart[i] * w * bkwd[j]
+
+        ws[self.eos] = self.wfsa.R.zero
+        for j, w in self.wfsa.epsremove.F:
+            ws[self.eos] += chart[j] * w
+
+        log_ws = np.array([ws[b].score for b in self.vocab_eos]) - log_ctx_w
+        return self.make_lazy_weights(log_ws)
+
     def _prefix(self, context):
         curr = self._consume(context)
-
-        if not curr:
-            return float("-inf"), curr
-
-        bkwd = self.wfsa.epsremove.backward
-        log_ctx_w = logsumexp([(curr[i] * bkwd[i]).score for i in curr])
-
-        if np.isnan(log_ctx_w):
-            return float("-inf"), curr
-
-        return log_ctx_w, curr
+        return self._chart_prefix_logw(curr), curr
 
     async def prefix(self, context):
         """
@@ -169,24 +188,9 @@ class WFSA(Potential):
             (LazyWeights): Log-weights for next token and EOS.
         """
         log_ctx_w, curr = self._prefix(context)
-
         if log_ctx_w == float("-inf"):
             raise ValueError(f"Context {context!r} has zero weight.")
-
-        bkwd = self.wfsa.epsremove.backward
-
-        ws = self.wfsa.R.chart()
-        for i in curr:
-            for b, j, w in self.wfsa.epsremove.arcs(i=i):
-                ws[b] += curr[i] * w * bkwd[j]
-
-        ws[self.eos] = self.wfsa.R.zero
-        for j, w in self.wfsa.epsremove.F:
-            ws[self.eos] += curr[j] * w
-
-        log_ws = np.array([ws[b].score for b in self.vocab_eos]) - log_ctx_w
-
-        return self.make_lazy_weights(log_ws)
+        return self._logw_next_from_chart(curr, log_ctx_w)
 
     # -- stateful interface (the WFSA's state is its chart, what `_consume`
     #    already maintains): carry + advance it instead of replaying `context` --
@@ -212,31 +216,16 @@ class WFSA(Potential):
     async def logw_next_from_state(self, state):
         """Next-token log weights from a carried chart `state`.
 
-        Mirrors `logw_next` but reads the chart from `state` instead of
-        `_consume`-ing the whole context. Bit-identical to `logw_next(context)`
-        for the state reached by advancing `state0()` through `context` -- the
-        parity contract. (Body intentionally duplicates `logw_next`; DRY-ing the
-        shared chart->weights step is a housekeeping task, gated by that parity.)
+        Reads the chart from `state` instead of `_consume`-ing the whole context,
+        then shares `logw_next`'s exact chart->weights tail
+        (`_logw_next_from_chart`). Bit-identical to `logw_next(context)` for the
+        state reached by advancing `state0()` through `context` -- the parity
+        contract.
         """
-        if not state:
+        log_ctx_w = self._chart_prefix_logw(state)
+        if log_ctx_w == float("-inf"):
             raise ValueError("Context has zero weight (dead state).")
-        bkwd = self.wfsa.epsremove.backward
-        log_ctx_w = logsumexp([(state[i] * bkwd[i]).score for i in state])
-        if np.isnan(log_ctx_w) or log_ctx_w == float("-inf"):
-            raise ValueError("Context has zero weight.")
-
-        ws = self.wfsa.R.chart()
-        for i in state:
-            for b, j, w in self.wfsa.epsremove.arcs(i=i):
-                ws[b] += state[i] * w * bkwd[j]
-
-        ws[self.eos] = self.wfsa.R.zero
-        for j, w in self.wfsa.epsremove.F:
-            ws[self.eos] += state[j] * w
-
-        log_ws = np.array([ws[b].score for b in self.vocab_eos]) - log_ctx_w
-
-        return self.make_lazy_weights(log_ws)
+        return self._logw_next_from_chart(state, log_ctx_w)
 
     def prefix_logw(self, state):
         """Log prefix weight from a carried chart `state` (sync; `-inf` if dead).
@@ -244,11 +233,7 @@ class WFSA(Potential):
         Sync stateful analog of `prefix` -- no `_consume`, no async. Lets a
         coercion evaluate many candidate extensions from a carried chart without
         an `asyncio.gather` over the vocabulary (the dominant per-step cost)."""
-        if not state:
-            return float("-inf")
-        bkwd = self.wfsa.epsremove.backward
-        log_ctx_w = logsumexp([(state[i] * bkwd[i]).score for i in state])
-        return float("-inf") if np.isnan(log_ctx_w) else float(log_ctx_w)
+        return float(self._chart_prefix_logw(state))
 
     def complete_logw(self, state):
         """Log complete weight from a carried chart `state` (sync). Sync stateful
