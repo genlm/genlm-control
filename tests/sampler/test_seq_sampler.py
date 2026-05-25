@@ -165,5 +165,6 @@ async def test_controller_invalid_start_weight():
         await controller.start()
 
 
-def test_string_for_serialization(default_unit_sampler):
-    string_for_serialization([b"a", b"b"])
+def test_string_for_serialization():
+    out = string_for_serialization([b"a", b"b"])
+    assert isinstance(out, str) and "|" in out

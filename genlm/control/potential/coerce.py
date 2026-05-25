@@ -34,6 +34,12 @@ class Coerced(Potential):
         The coerced potential's vocabulary will by default be pruned to only include tokens that can be mapped to the original potential's vocabulary
         via the coercion function (i.e. `set(f([x])) <= set(potential.vocab)`). If no such tokens are found, a `ValueError` is raised.
         This behavior can be overridden by setting `prune=False`, in which case the coerced potential's vocabulary will include all tokens from the target vocabulary.
+
+        The stateful path (`state0`/`advance`/`logw_next_from_state`) additionally
+        assumes `f` is a per-token homomorphism --
+        `f(context) == concat(f([t]) for t in context)` -- so that `advance` can
+        thread one target token at a time (true for the usual `f=b"".join`). The
+        stateless methods make no such assumption.
     """
 
     def __init__(self, potential, target_vocab, f, prune=True):

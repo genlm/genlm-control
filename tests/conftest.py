@@ -105,10 +105,10 @@ def iter_item_params(draw, max_iter_w=1e3, max_item_w=1e3):
     context = [
         item.encode("utf-8") if isinstance(item, str) else item for item in context
     ]
-    item_vocab = set()
-    for items in iter_vocab:
-        item_vocab.update(items)
-    item_vocab = list(item_vocab)
+    # dict.fromkeys, not set(): a set of string tokens has PYTHONHASHSEED-dependent
+    # iteration order, which permutes the vocab and makes draws nondeterministic
+    # across processes. dict.fromkeys keeps deterministic first-seen order.
+    item_vocab = list(dict.fromkeys(item for items in iter_vocab for item in items))
 
     # Sample weights over item vocabulary and EOS.
     item_next_token_ws = draw(

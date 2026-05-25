@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import asyncio
+import warnings
 
 from genlm.bytes import BeamParams
 from genlm.backend import load_model_by_name
@@ -32,8 +33,10 @@ def llm(model_name):
     if cleanup is not None:
         try:
             asyncio.run(cleanup())
-        except Exception:
-            pass
+        except Exception as e:
+            # Surface (don't swallow) a failing teardown: a silently-failing
+            # cleanup is exactly how a later module hits an unexplained OOM.
+            warnings.warn(f"engine cleanup failed during teardown: {e}")
 
 
 @pytest.fixture(scope="module")

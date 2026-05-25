@@ -6,23 +6,15 @@ ESS test, resampling/forking and the log marginal likelihood accumulation --
 *always*. It is exact per token: there is no segment-graining and no
 hard/soft constraint fork. ``logw_next`` is one operation.
 
-The controller is designed so that the per-step work splits into two phases that can
-be invoked either by the slow Python loop (this file's ``StepLoop``) or,
-later, row-wise by in-engine arms keyed on a ``request_id -> particle`` map:
-
-1. **shape the proposal**: turn a particle's state into the proposal
-   log-distribution it will sample its next token from.
-2. **draw + weight + advance**: sample a token, compute the importance-weight
-   increment, advance the sampler/critic transition state.
-
-Resample / fork / ESS / log_ml are controller-owned and are NEVER delegated.
-
-See :class:`EngineControl` for the protocol the future burst driver / engine
-arms will call back into.
+Two drivers turn the population: the slow per-token Python loop (this file's
+``StepLoop``) fuses shaping + drawing inside the sampler's ``transition``; the
+engine-accelerated ``BurstLoop`` instead calls :meth:`Controller.draw` row-wise
+on raw engine logits (``shape`` is currently an identity pre-pass). Either way,
+resample / fork / ESS / log_ml are controller-owned and NEVER delegated to the
+engine.
 """
 
 import asyncio
-from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -129,39 +121,6 @@ class Particle:
         # with the (copied) context.
         cpy.factor_state = self.factor_state
         return cpy
-
-
-# ---------------------------------------------------------------------------
-# The engine-control contract (shape so the future burst driver plugs in)
-# ---------------------------------------------------------------------------
-
-
-@runtime_checkable
-class EngineControl(Protocol):
-    """Protocol the future in-engine burst driver / engine arms call back into.
-
-    The slow driver does NOT use this protocol (it fuses shaping + drawing
-    inside the sampler's ``sample`` coroutine). It exists so that the burst
-    driver can hand consecutive steps to the engine, which will then invoke
-    these two methods row-wise on raw logits, keyed by ``request_ids`` mapping
-    engine rows to controller particles.
-
-    Implementations mutate logits in place (``shape``) and return a sampled
-    token id per row (``draw``); ``draw`` may force EOS for pop-out. The controller's
-    resample / fork / ESS / log_ml machinery is never delegated through this
-    protocol.
-    """
-
-    def shape(self, logits, request_ids) -> None:  # pragma: no cover - contract
-        """Mutate ``logits[i]`` in place into the proposal log-distribution for
-        the particle mapped to ``request_ids[i]``."""
-        ...
-
-    def draw(self, logits, request_ids, sampling_metadata):  # pragma: no cover
-        """Return a sampled token id per row for ``request_ids``; may force EOS
-        for pop-out. Weight/advance bookkeeping is applied to the mapped
-        particles as a side effect."""
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -298,17 +257,17 @@ class Controller:
         self.record = SMCRecord(n_particles) if record else None
 
         # The :class:`_Burst` runtime set by the BurstLoop for the duration of a
-        # single engine burst; read by the EngineControl ``shape`` / ``draw``
-        # callbacks. ``None`` outside a burst.
+        # single engine burst; read by the ``shape`` / ``draw`` callbacks the
+        # engine invokes row-wise. ``None`` outside a burst.
         self._burst = None
 
-    # -- phase 1: shape + draw + weight + advance for ONE particle -----------
+    # -- the per-step transition for ONE particle ----------------------------
     #
-    # In the slow path these two phases are fused inside the sampler's
-    # ``sample`` coroutine (which computes logw_next, draws, and returns the
-    # importance weight). The burst driver will instead call EngineControl
-    # .shape / .draw row-wise; both paths converge on ``_advance_particle``
-    # below, which applies the identical SMC math to the population.
+    # In the slow path shaping + drawing are fused inside the sampler's
+    # ``transition`` coroutine (which computes logw_next, draws, and returns the
+    # importance weight). The burst path instead calls ``shape`` / ``draw``
+    # row-wise; both paths apply the identical SMC weight/termination math via
+    # the ``_terminate_*`` helpers below.
 
     async def _draw_and_score(self, p):
         """The shared per-step transition for one particle.
@@ -504,7 +463,7 @@ class Controller:
             f.write(self.record.to_json())
         print(f"Saved record to {json_path}")
 
-    # -- EngineControl phases (used only by the BurstLoop) ----------------
+    # -- the engine callbacks shape / draw (used only by the BurstLoop) ------
     #
     # These reproduce, row-wise on raw engine logits, exactly what
     # ``_draw_and_score`` does for an UNCONSTRAINED ``DirectTokenSampler`` (and,
@@ -546,7 +505,6 @@ class Controller:
         """
         # Identity for both the unconstrained and additive-factor cases; the
         # full proposal (LM + factor) and its normalizer are formed in ``draw``.
-        return
 
     def draw(self, logits, request_ids, sampling_metadata):
         """Draw one token per row using the SLOW PATH's draw function.
@@ -715,7 +673,7 @@ def can_burst(controller):
 
 
 class BurstLoop:
-    """Drives consecutive SMC steps inside a vLLM engine via EngineControl.
+    """Drives consecutive SMC steps inside a vLLM engine via the engine callbacks.
 
     Opens a *burst* = one ``AsyncVirtualLM.run_burst`` call over the live
     particles' token contexts. The controller's :meth:`Controller.shape` /
@@ -759,9 +717,6 @@ class BurstLoop:
                 [self.factor.lookup[t] for t in self.target.vocab_eos]
             )
 
-    def _eos_idxs(self):
-        return list(self.llm.token_maps.eos_idxs)
-
     def _context_ids(self, p):
         """Engine prompt for a particle: prompt prefix + its drawn token ids.
 
@@ -786,7 +741,7 @@ class BurstLoop:
                 if p.factor_state is None:
                     p.factor_state = self.factor.state0()
 
-        eos_idxs = self._eos_idxs()
+        eos_idxs = list(self.llm.token_maps.eos_idxs)
         eos_id = eos_idxs[0]
         loop = asyncio.get_running_loop()
 

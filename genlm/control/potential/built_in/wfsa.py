@@ -192,7 +192,12 @@ class WFSA(Potential):
     #    already maintains): carry + advance it instead of replaying `context` --
 
     def state0(self):
-        """Carried state for the empty context: the epsilon-removed start chart."""
+        """Carried state for the empty context: the epsilon-removed start chart.
+
+        This is a shared chart object (also cached by `_consume(())`); `advance`
+        and the readers only *read* it and allocate a fresh chart, so callers
+        must likewise treat a carried state as immutable.
+        """
         return self.wfsa.epsremove.start
 
     def advance(self, state, token):
@@ -300,6 +305,22 @@ class BoolFSA(WFSA):
             return 0
         return float("-inf")
 
+    @staticmethod
+    def _booleanize(logw_next):
+        """Map a weighted `LazyWeights` to its boolean indicator (0 where alive,
+        -inf elsewhere). The single definition shared by every BoolFSA next-token
+        method so they cannot drift."""
+        return logw_next.spawn(
+            new_weights=np.where(
+                logw_next.weights > float("-inf"), 0, logw_next.weights
+            )
+        )
+
+    @staticmethod
+    def _bool(w):
+        """Scalar analogue of `_booleanize`: 0 if alive, -inf otherwise."""
+        return 0.0 if w > float("-inf") else float("-inf")
+
     async def logw_next(self, context):
         """
         Returns next token log weights given `context`.
@@ -310,30 +331,20 @@ class BoolFSA(WFSA):
         Returns:
             (LazyWeights): Boolean log-weights for next token.
         """
-        logw_next = await super().logw_next(context)
-        return logw_next.spawn(
-            new_weights=np.where(
-                logw_next.weights > float("-inf"), 0, logw_next.weights
-            )
-        )
+        return self._booleanize(await super().logw_next(context))
 
     async def logw_next_from_state(self, state):
         """Boolean next-token log weights from a carried chart `state` (mirrors
         `logw_next` over the stateful path)."""
-        logw_next = await super().logw_next_from_state(state)
-        return logw_next.spawn(
-            new_weights=np.where(
-                logw_next.weights > float("-inf"), 0, logw_next.weights
-            )
-        )
+        return self._booleanize(await super().logw_next_from_state(state))
 
     def prefix_logw(self, state):
         """Boolean prefix weight from a carried chart (0 if alive, else -inf)."""
-        return 0.0 if super().prefix_logw(state) > float("-inf") else float("-inf")
+        return self._bool(super().prefix_logw(state))
 
     def complete_logw(self, state):
         """Boolean complete weight from a carried chart (0 if accepting, else -inf)."""
-        return 0.0 if super().complete_logw(state) > float("-inf") else float("-inf")
+        return self._bool(super().complete_logw(state))
 
     async def batch_logw_next(self, contexts):
         """
@@ -345,15 +356,7 @@ class BoolFSA(WFSA):
         Returns:
             (list): List of log-weights for next token, one per context.
         """
-        logw_nexts = await super().batch_logw_next(contexts)
-        return [
-            logw_next.spawn(
-                new_weights=np.where(
-                    logw_next.weights > float("-inf"), 0, logw_next.weights
-                )
-            )
-            for logw_next in logw_nexts
-        ]
+        return [self._booleanize(lw) for lw in await super().batch_logw_next(contexts)]
 
     def __repr__(self):
         return f"BoolFSA(wfsa={self.wfsa!r})"

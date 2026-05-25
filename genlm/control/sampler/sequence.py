@@ -91,6 +91,10 @@ class SMC:
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
+            backend (optional): Opt into the engine-accelerated path. When non-None and the
+                configuration is burst-capable (`can_burst`), runs the in-engine `BurstLoop`;
+                otherwise (the default) the per-token `StepLoop`. Both produce identical SMC
+                output -- the burst path is pure acceleration.
             **kwargs (dict): Additional keyword arguments to pass to the SMC controller.
                 Currently ``resampling_method`` (one of 'multinomial', 'stratified',
                 'systematic', 'residual'; defaults to 'multinomial').
@@ -128,7 +132,7 @@ class SMC:
 
         Example:
             ```python
-            sampler = SequenceSampler(unit_sampler, critic)
+            sampler = SMC(unit_sampler, critic)
             try:
                 sequences = await sampler(n_particles=10, ess_threshold=0.5, max_tokens=20)
             finally:

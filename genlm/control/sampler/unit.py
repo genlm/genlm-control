@@ -137,7 +137,7 @@ class MultiTokenUnitSampler(TokenSampler):
 
         Args:
             flat_token_context (list): Flat sequence of all previously sampled tokens.
-                This is pre-flattened by forward() to ensure compatibility with potentials.
+                This is pre-flattened by transition() to ensure compatibility with potentials.
             unit_context (list, optional): Structured sequence of previously sampled units.
                 Used by boundary predicates that need context. Defaults to [].
             draw (callable, optional): Sampling function passed to subunit_sampler

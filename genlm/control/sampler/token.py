@@ -4,6 +4,7 @@ from arsenal import colors
 from arsenal.maths import log1mexp, logsumexp
 import warnings
 
+from genlm.control.constant import EndOfSequence
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
@@ -83,12 +84,11 @@ class TokenSampler:
         token, logw, logp = await self.sample(context)
         return [token], logw, logp
 
-    async def sample(self, context, draw):
+    async def sample(self, context, *args, **kwargs):
         """Sample a token and weight from the `target`potential's vocabulary.
 
         Args:
             context (list[int]): A sequence of tokens in the `target` potential's vocabulary.
-            draw (callable): A callable that draws a sample from a distribution.
 
         Returns:
             (token, weight, logp): A tuple containing the sampled token, weight, and log-probability of the sampled token.
@@ -161,9 +161,6 @@ class DirectTokenSampler(TokenSampler):
     def burst_draw(self, lm_logws, factor_state, ctx):
         """Shape the product proposal from the carried factor state, sample once,
         bank ``logsumexp`` + the drawn lp (the burst analog of ``sample``)."""
-        from genlm.control.constant import EndOfSequence
-        from genlm.control.util import fast_sample_lazyweights
-
         factor = ctx.factor
         new_state = factor_state
         if factor is None:
@@ -364,8 +361,6 @@ class AWRS(TokenSampler):
         checked from the carried state -- reuses the shared ``_run_rejection`` so
         the rejection algorithm + returned weight match the slow path. ``logp`` is
         ``nan`` (as in ``sample``)."""
-        from genlm.control.constant import EndOfSequence
-
         condition = ctx.factor
 
         async def accept(tok):
