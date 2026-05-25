@@ -414,15 +414,18 @@ class Hub:
     # the same token (up to the warm-KV-vs-reprefill logit residual).
     #
     # A live window is described by ``self._window`` (set by the WindowDriver):
-    #   particles  -- list of live particles, indexed by external request id
-    #   potential  -- the engine PromptedLLM (the LM the engine evaluates)
-    #   factor     -- an additive control-side factor with ``logw_next`` over the
-    #                 engine vocab, or None for the unconstrained case (stage a).
-    #                 The constrained extension (stage b) lives in ``shape`` and
-    #                 is gated off by ``window_eligible`` until verified.
-    #   eos_id     -- an engine token id to return when forcing/observing EOS
-    #   pop_out    -- once True, every subsequent draw forces EOS (control
-    #                 signal; never banked) so the window ends for resampling
+    #   particles   -- list of live particles, indexed by external request id
+    #   llm         -- the engine PromptedLLM (the LM the engine evaluates;
+    #                  supplies ``_process_logw_next`` / ``_maybe_temper``)
+    #   factor      -- an additive control-side Potential sharing the LLM's V+1
+    #                  vocab (e.g. a coerced BoolFSA), or None for the
+    #                  unconstrained case
+    #   eval_factor -- callable ``(factor, context) -> LazyWeights`` that runs the
+    #                  factor's async ``logw_next`` synchronously on the driver's
+    #                  event loop (the slow path's exact call)
+    #   eos_id      -- an engine token id to return when forcing/observing EOS
+    #   pop_out     -- once True, every subsequent draw forces EOS (control
+    #                  signal; never banked) so the window ends for resampling
 
     def _window_particle(self, request_id):
         """Map a vLLM internal request id (``"{external}-{8 chars}"``) to its
@@ -433,48 +436,52 @@ class Hub:
     def shape(self, logits, request_ids) -> None:
         """Shape each row's raw engine logits into its proposal in place.
 
-        For the unconstrained ``DirectTokenSampler`` (the only configuration
-        ``window_eligible`` currently admits) there is no control-side factor, so
-        shaping is the identity and the per-step weight increment is zero.
+        For the unconstrained ``DirectTokenSampler`` there is no control-side
+        factor, so shaping is the identity and the per-step weight increment is
+        zero.
 
-        The constrained extension (stage b) belongs here: add the additive
-        factor's per-token log-weights -- mapped into engine-token-id order as the
-        exact inverse of ``PromptedLLM._process_logw_next`` -- and bank
-        ``logsumexp(shaped) - logsumexp(raw)`` on the particle so the draw matches
-        ``DirectTokenSampler(Product(llm, factor))``. It is intentionally not
-        wired yet (see ``window_eligible``); doing so requires advancing the
-        factor's per-token state synchronously inside this callback, which must be
-        verified against the slow path before being enabled.
+        For a ``DirectTokenSampler(Product(llm, factor))`` with an additive
+        factor sharing the LLM's vocabulary, the proposal is the product
+        ``llm.logw_next + factor.logw_next``. That sum is computed in the
+        control-side V+1 space inside :meth:`draw` (the unambiguous reference --
+        it *is* ``Product.logw_next``), so ``shape`` is also a no-op here: there
+        is no engine-token-id-order inverse mapping to get wrong, and no
+        double-counting. The per-step weight (``logsumexp`` of the product) is
+        banked once in :meth:`draw`.
         """
-        w = self._window
-        if w["pop_out"]:
-            # We are forcing EOS this step; do not touch logits or weights.
-            return
-
-        if w["factor"] is not None:  # pragma: no cover - stage b, not yet enabled
-            raise NotImplementedError(
-                "constrained engine-native shaping (stage b) is not wired; "
-                "window_eligible should have routed this to SlowDriver"
-            )
-        # Unconstrained: identity shape, zero weight increment.
+        # Identity for both the unconstrained and additive-factor cases; the
+        # full proposal (LM + factor) and its normalizer are formed in ``draw``.
+        return
 
     def draw(self, logits, request_ids, sampling_metadata):
         """Draw one token per row using the SLOW PATH's draw function.
 
-        Reproduces ``DirectTokenSampler.sample``: build the control-side V+1
-        ``LazyWeights`` from the (already shaped) engine logits exactly as
-        ``PromptedLLM._process_logw_next`` does, normalize, and draw with
-        ``fast_sample_lazyweights`` (the same Gumbel-max consuming the same numpy
-        RNG as the slow path). Advance the particle (append token, accumulate
-        ``logp`` and the start/normalizer weight), and return the engine token id
-        per row. When popping out, force EOS for every row WITHOUT banking it.
+        Reproduces ``DirectTokenSampler.sample``:
+
+        * unconstrained -- build the control-side V+1 ``LazyWeights`` from the
+          engine logits exactly as ``PromptedLLM._process_logw_next`` does;
+        * additive factor -- reconstruct ``Product(llm, factor).logw_next`` over
+          the product's vocabulary, substituting the engine-derived LM weights
+          for the reprefilled ones and gathering through ``Product``'s own
+          ``v1_idxs``/``v2_idxs`` index maps (so vocab narrowing matches slow).
+
+        Then normalize and draw with ``fast_sample_lazyweights`` (the same
+        Gumbel-max consuming the same numpy RNG as the slow path), bank
+        ``logws.sum()`` and ``logps[token]``, advance the particle, and run the
+        no-critic termination bookkeeping. The factor's ``logw_next`` is the
+        slow path's exact (async) call, evaluated synchronously via the driver's
+        ``eval_factor`` hook on the WindowDriver's event loop. When popping out,
+        force EOS for every row WITHOUT banking it.
         """
         import torch
 
         from genlm.control.util import fast_sample_lazyweights
 
         w = self._window
-        potential = w["potential"]
+        llm = w["llm"]
+        factor = w["factor"]
+        target = w["target"]
+        eval_factor = w["eval_factor"]
         eos_id = w["eos_id"]
         out = []
 
@@ -487,12 +494,27 @@ class Hub:
                 out.append(eos_id)
                 continue
 
-            # Reproduce DirectTokenSampler.sample over the V+1 control vocab,
-            # exactly as PromptedLLM.logw_next: temper, then _process_logw_next.
+            # LM half: temper, then _process_logw_next -- == llm.logw_next(ctx)
+            # (modulo the warm-KV-vs-reprefill residual).
             row = logits[i]
             if row.dtype != torch.float32:
                 row = row.float()
-            logws = potential._process_logw_next(potential._maybe_temper(row))
+            lm_logws = llm._process_logw_next(llm._maybe_temper(row))
+
+            if factor is None:
+                logws = lm_logws
+            else:
+                # Factor half: the slow path's exact async logw_next(context).
+                # Reconstruct Product.logw_next over the product vocab by
+                # gathering the LM and factor weight vectors onto the product's
+                # vocab_eos (the same gather Product.logw_next performs), with the
+                # engine-derived LM weights substituted for the reprefilled ones.
+                factor_logws = eval_factor(factor, list(p.context))
+                logws = target.make_lazy_weights(
+                    lm_logws.weights[w["llm_idxs"]]
+                    + factor_logws.weights[w["factor_idxs"]]
+                )
+
             logps = logws.normalize()
             token = fast_sample_lazyweights(logps)
 
@@ -544,6 +566,47 @@ class SlowDriver:
         return await self.hub.run()
 
 
+def _is_engine_llm(potential):
+    """Whether ``potential`` is a single LM backed by a vLLM engine."""
+    model = getattr(potential, "model", None)
+    return model is not None and hasattr(model, "llm_engine")
+
+
+def decompose_engine_target(potential):
+    """Split a sampler target into ``(llm, factor, target)`` for the window.
+
+    Recognizes two shapes:
+
+    * a bare engine LM -> ``(llm, None, llm)`` (unconstrained);
+    * ``Product(llm, factor)`` / ``Product(factor, llm)`` where exactly one side
+      is an engine LM and the other is an additive control-side ``factor`` with
+      the same token type -> ``(llm, factor, product)``.
+
+    For the product case, ``draw`` reconstructs ``Product.logw_next`` over the
+    product's (possibly narrowed) vocabulary by gathering the engine-derived LM
+    weights and the factor's ``logw_next`` through ``Product``'s own
+    ``v1_idxs``/``v2_idxs`` -- i.e. the exact slow-path index maps -- so vocab
+    narrowing (a coerced ``BoolFSA`` prunes to its accepted bytes) is handled the
+    same way the slow path handles it. Returns ``None`` if not expressible.
+    """
+    if _is_engine_llm(potential):
+        return potential, None, potential
+
+    p1 = getattr(potential, "p1", None)
+    p2 = getattr(potential, "p2", None)
+    if p1 is None or p2 is None:
+        return None
+
+    if _is_engine_llm(p1) and not _is_engine_llm(p2):
+        llm, factor = p1, p2
+    elif _is_engine_llm(p2) and not _is_engine_llm(p1):
+        llm, factor = p2, p1
+    else:
+        return None
+
+    return llm, factor, potential
+
+
 def window_eligible(hub):
     """Whether the ``WindowDriver`` can drive this hub's configuration.
 
@@ -552,25 +615,21 @@ def window_eligible(hub):
     * the unit sampler is engine-native (``supports_engine_native()``) -- i.e. an
       unbiased ``DirectTokenSampler`` with no separate proposal, so drawing from
       the backend LM's normalized ``logw_next`` equals its per-step ``sample``;
-    * the target potential is a single engine LM exposing a vLLM engine
-      (``potential.model.llm_engine``);
-    * no critic (stage a). A terminal-only critic (``is_terminal_only()``) is a
-      natural future extension -- it never twists mid-generation, so only the
-      end-of-window terminal reweight differs -- but the window's synchronous
-      ``draw`` does not yet perform that terminal critic ``score``, so it stays
-      excluded until wired and verified.
+    * the sampler target decomposes (:func:`decompose_engine_target`) into a
+      single engine LM, optionally times one additive same-vocab factor (e.g. a
+      coerced ``BoolFSA``);
+    * no critic. A non-trivial critic twists per step / reweights at termination
+      and is not yet handled by the window's synchronous draw, so it stays on the
+      slow path.
 
-    Anything else falls back to :class:`SlowDriver`. This is intentionally
-    conservative; it grows as more factors become additively expressible over the
-    engine vocab.
+    Anything else falls back to :class:`SlowDriver`.
     """
     sampler = hub.unit_sampler
     if not getattr(sampler, "supports_engine_native", lambda: False)():
         return False
 
     potential = getattr(sampler, "potential", None)
-    model = getattr(potential, "model", None)
-    if model is None or not hasattr(model, "llm_engine"):
+    if potential is None or decompose_engine_target(potential) is None:
         return False
 
     if hub.critic is not None:
@@ -598,25 +657,42 @@ class WindowDriver:
     def __init__(self, hub, backend):
         self.hub = hub
         self.backend = backend
+        # Number of engine windows opened (>1 iff a resample popped a window out
+        # mid-generation). Useful for verifying the pop-out/relaunch path ran.
+        self.n_windows = 0
+        decomposed = decompose_engine_target(hub.unit_sampler.potential)
+        if decomposed is None:  # pragma: no cover - guarded by window_eligible
+            raise ValueError("target is not window-expressible")
+        self.llm, self.factor, self.target = decomposed
 
-    def _potential(self):
-        return self.hub.unit_sampler.potential
+        # Gather maps onto the product's vocab_eos (the same maps Product.logw_next
+        # uses, but resolved explicitly against llm/factor so p1/p2 order is
+        # irrelevant). None in the unconstrained case.
+        if self.factor is None:
+            self.llm_idxs = None
+            self.factor_idxs = None
+        else:
+            import numpy as _np
+
+            self.llm_idxs = _np.array(
+                [self.llm.lookup[t] for t in self.target.vocab_eos]
+            )
+            self.factor_idxs = _np.array(
+                [self.factor.lookup[t] for t in self.target.vocab_eos]
+            )
 
     def _engine(self):
-        return self._potential().model.llm_engine
-
-    def _prompt_ids(self):
-        return list(self._potential().prompt_ids)
+        return self.llm.model.llm_engine
 
     def _eos_idxs(self):
-        return list(self._potential().token_maps.eos_idxs)
+        return list(self.llm.token_maps.eos_idxs)
 
     def _context_ids(self, p):
         """Engine prompt for a particle: prompt prefix + its drawn token ids.
 
         Drops a trailing control EOS sentinel (a finished particle is never
         relaunched, but a context may carry EOS as its last element)."""
-        ids = self._prompt_ids()
+        ids = list(self.llm.prompt_ids)
         for tok in p.context:
             if isinstance(tok, EndOfSequence):
                 continue
@@ -624,14 +700,26 @@ class WindowDriver:
         return ids
 
     async def run(self):
+        import asyncio as _asyncio
+
         hub = self.hub
         await hub.start()
 
-        potential = self._potential()
         eos_idxs = self._eos_idxs()
         eos_id = eos_idxs[0]
+        loop = _asyncio.get_running_loop()
+
+        # The factor's logw_next is the slow path's exact (async) call. ``draw``
+        # runs synchronously inside the engine step loop (which itself runs in a
+        # thread, below), so it schedules the coroutine back onto this event loop
+        # and blocks the worker thread for the result. This reuses the slow
+        # path's computation verbatim -- no separate factor-state machine.
+        def eval_factor(factor, context):
+            fut = _asyncio.run_coroutine_threadsafe(factor.logw_next(context), loop)
+            return fut.result()
 
         while any(not p.done for p in hub.particles):
+            self.n_windows += 1
             live = [p for p in hub.particles if not p.done]
             prompts = [self._context_ids(p) for p in live]
             # Each particle keeps its own budget; the engine window just needs to
@@ -641,19 +729,28 @@ class WindowDriver:
 
             hub._window = {
                 "particles": live,
-                "potential": potential,
-                "factor": None,
+                "llm": self.llm,
+                "factor": self.factor,
+                "target": self.target,
+                "llm_idxs": self.llm_idxs,
+                "factor_idxs": self.factor_idxs,
+                "eval_factor": eval_factor,
                 "eos_id": eos_id,
                 "pop_out": False,
             }
             try:
-                self.backend.run_window(
-                    self._engine(),
-                    prompts=prompts,
-                    control=hub,
-                    max_steps=max_steps,
-                    eos_token_ids=eos_idxs,
-                    temperature=potential.temperature,
+                # Run the engine step loop in a worker thread so this event loop
+                # stays free to service the factor's run_coroutine_threadsafe.
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.backend.run_window(
+                        self._engine(),
+                        prompts=prompts,
+                        control=hub,
+                        max_steps=max_steps,
+                        eos_token_ids=eos_idxs,
+                        temperature=self.llm.temperature,
+                    ),
                 )
             finally:
                 hub._window = None
