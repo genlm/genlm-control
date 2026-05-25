@@ -57,6 +57,13 @@ from genlm.control.sampler.controller import (  # noqa: E402
 
 MODEL = "gpt2"
 SEED = 1234
+# Result-affecting global config shared by every gate-2 case (the constraint
+# that DOES vary per case is encoded in each `label`). Recorded in the snapshot
+# so a load against a mismatched reference fails loudly instead of silently
+# comparing the burst against a stale slow run.
+_EOS_BYTES = [b"\n"]
+_PROMPT = "The"
+_CONFIG = {"model": MODEL, "prompt": _PROMPT, "eos_hex": [b.hex() for b in _EOS_BYTES]}
 
 # Slow-reference snapshot (see module docstring). REGEN recomputes + rewrites it.
 _SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "gate2_snapshot.json")
@@ -67,8 +74,18 @@ try:
 except FileNotFoundError:  # pragma: no cover
     _SNAPSHOT = {}
 
+# `__config__` is metadata, not a slow-reference entry -- pop it so it never
+# collides with a data key lookup; `_save_snapshot` re-stamps it.
+_snap_config = _SNAPSHOT.pop("__config__", None)
+if not _REGEN and _snap_config is not None and _snap_config != _CONFIG:  # pragma: no cover
+    raise RuntimeError(
+        f"gate2_snapshot.json was generated under {_snap_config} but the tests "
+        f"now run under {_CONFIG}; regenerate with GATE2_REGEN=1."
+    )
+
 
 def _save_snapshot():  # pragma: no cover - only in REGEN
+    _SNAPSHOT["__config__"] = _CONFIG
     with open(_SNAPSHOT_PATH, "w") as f:
         json.dump(_SNAPSHOT, f, indent=1, sort_keys=True)
 
@@ -126,15 +143,19 @@ def _run_slow(make_sampler, n_particles, ess_threshold, max_tokens, seed):
 
 
 def _slow_cached(label, make_sampler, n_particles, ess_threshold, max_tokens, seed):
-    """Return the cached slow reference; (re)compute + persist it under REGEN or
-    when the key is absent (first run with no snapshot)."""
+    """Return the cached slow reference. Under REGEN, (re)compute + persist it;
+    otherwise a missing key is a hard error (run GATE2_REGEN=1) rather than a
+    silent self-comparison against a freshly-computed reference."""
     key = _key(label, n_particles, ess_threshold, max_tokens, seed)
-    if _REGEN or key not in _SNAPSHOT:
+    if key not in _SNAPSHOT and not _REGEN:  # pragma: no cover
+        raise RuntimeError(
+            f"no cached slow reference for {key!r}; regenerate with GATE2_REGEN=1"
+        )
+    if _REGEN:
         _SNAPSHOT[key] = _run_slow(
             make_sampler, n_particles, ess_threshold, max_tokens, seed
         )
-        if _REGEN:
-            _save_snapshot()
+        _save_snapshot()
     return _SNAPSHOT[key]
 
 
@@ -220,7 +241,7 @@ def llm():
             "enable_prefix_caching": True,
         },
     )
-    return PromptedLLM(model, eos_byte_strings=[b"\n"])
+    return PromptedLLM(model, eos_byte_strings=_EOS_BYTES)
 
 
 def _boolfsa_target(llm, regex):
@@ -232,7 +253,7 @@ def _boolfsa_target(llm, regex):
 
 @pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
 def test_unconstrained_burst_vs_slow(llm, ess_threshold):
-    llm.set_prompt_from_str("The")
+    llm.set_prompt_from_str(_PROMPT)
 
     def make():
         return DirectTokenSampler(llm)
@@ -258,7 +279,7 @@ def test_unconstrained_burst_vs_slow(llm, ess_threshold):
 
 @pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
 def test_constrained_boolfsa_burst_vs_slow(llm, ess_threshold):
-    llm.set_prompt_from_str("The")
+    llm.set_prompt_from_str(_PROMPT)
     target = _boolfsa_target(llm, r"[a-z ]+")
 
     def make():
@@ -296,7 +317,7 @@ def test_constrained_forces_resample_burst_vs_slow(llm):
     slow log_ml difference across several seeds -- the mean should sit near 0
     even though any single seed is noisy.
     """
-    llm.set_prompt_from_str("The")
+    llm.set_prompt_from_str(_PROMPT)
     target = _boolfsa_target(llm, r"[aeiou ]+")
 
     def make():
@@ -344,7 +365,7 @@ def test_awrs_burst_vs_slow(llm):
     estimate, so -- like the resample test -- check the burst-vs-slow log_ml is
     UNBIASED across seeds (mean near 0); a persistent same-sign gap would be a bug.
     """
-    llm.set_prompt_from_str("The")
+    llm.set_prompt_from_str(_PROMPT)
     condition = BoolFSA.from_regex(r"[a-z ]+").coerce(llm, f=b"".join)
 
     def make_seed(s):

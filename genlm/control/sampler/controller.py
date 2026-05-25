@@ -558,7 +558,17 @@ class Controller:
             p.factor_state = new_state
             self._terminate_after_draw(p)
 
-            out.append(eos_id if isinstance(token, EndOfSequence) else token.token_id)
+            if isinstance(token, EndOfSequence):
+                # Emitting EOS to the engine ends this request, so the particle
+                # must have terminated in lockstep. The slow path terminates on
+                # `context[-1] is EOS` (singleton identity); this assert turns a
+                # non-singleton-EOS slow/burst divergence -- which would end the
+                # request without finishing the particle -- into a loud failure
+                # instead of a silent length/log_ml gap.
+                assert p.done, "burst emitted EOS for a particle that did not terminate"
+                out.append(eos_id)
+            else:
+                out.append(token.token_id)
 
         # End-of-step ESS test (same predicate the slow path applies after every
         # token). If it crosses, arm pop-out: the next engine step forces EOS for
