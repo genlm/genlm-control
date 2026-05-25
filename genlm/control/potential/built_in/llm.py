@@ -1,8 +1,15 @@
+import contextvars
+import weakref
 import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.potential.base import Potential
 from genlm.backend.tokenization import Token
+
+
+_prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_prompt_ids_overrides", default=None
+)
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):
@@ -207,7 +214,7 @@ class PromptedLLM(Potential):
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         self.model = llm
-        self.prompt_ids = prompt_ids or []
+        self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
 
         if token_maps is not None:
@@ -275,6 +282,28 @@ class PromptedLLM(Potential):
         )
 
     @property
+    def prompt_ids(self):
+        """The currently active prompt token ids.
+
+        Backed by a module-level ``contextvars.ContextVar`` holding a
+        ``WeakKeyDictionary`` keyed by the instance itself. Concurrent
+        asyncio tasks each see their own writes via copy-on-write; sibling
+        tasks see the parent context's value or the instance default.
+        Entries vanish automatically when an instance is garbage-collected.
+        """
+        overrides = _prompt_ids_overrides.get()
+        if overrides is None:
+            return self._default_prompt_ids
+        return overrides.get(self, self._default_prompt_ids)
+
+    @prompt_ids.setter
+    def prompt_ids(self, value):
+        current = _prompt_ids_overrides.get()
+        new = weakref.WeakKeyDictionary() if current is None else weakref.WeakKeyDictionary(current)
+        new[self] = list(value)
+        _prompt_ids_overrides.set(new)
+
+    @property
     def prompt(self):
         """
         Get the current prompt as Token objects.
@@ -294,7 +323,6 @@ class PromptedLLM(Potential):
         Args:
             prompt_str (str): The prompt to set.
         """
-        # TODO: Handle race condition where prompt_ids reset concurrently.
         if not isinstance(prompt_str, str):
             raise ValueError(
                 f"Prompt must a string got {type(prompt_str)}. "
