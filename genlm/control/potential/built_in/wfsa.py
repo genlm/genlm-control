@@ -188,6 +188,51 @@ class WFSA(Potential):
 
         return self.make_lazy_weights(log_ws)
 
+    # -- stateful interface (the WFSA's state is its chart, what `_consume`
+    #    already maintains): carry + advance it instead of replaying `context` --
+
+    def state0(self):
+        """Carried state for the empty context: the epsilon-removed start chart."""
+        return self.wfsa.epsremove.start
+
+    def advance(self, state, token):
+        """Advance the chart by one WFSA-alphabet symbol (one `_consume` step)."""
+        wfsa = self.wfsa.epsremove
+        curr = wfsa.R.chart()
+        for i in state:
+            for j, w in wfsa.arcs(i, token):
+                curr[j] += state[i] * w
+        return curr
+
+    async def logw_next_from_state(self, state):
+        """Next-token log weights from a carried chart `state`.
+
+        Mirrors `logw_next` but reads the chart from `state` instead of
+        `_consume`-ing the whole context. Bit-identical to `logw_next(context)`
+        for the state reached by advancing `state0()` through `context` -- the
+        parity contract. (Body intentionally duplicates `logw_next`; DRY-ing the
+        shared chart->weights step is a housekeeping task, gated by that parity.)
+        """
+        if not state:
+            raise ValueError("Context has zero weight (dead state).")
+        bkwd = self.wfsa.epsremove.backward
+        log_ctx_w = logsumexp([(state[i] * bkwd[i]).score for i in state])
+        if np.isnan(log_ctx_w) or log_ctx_w == float("-inf"):
+            raise ValueError("Context has zero weight.")
+
+        ws = self.wfsa.R.chart()
+        for i in state:
+            for b, j, w in self.wfsa.epsremove.arcs(i=i):
+                ws[b] += state[i] * w * bkwd[j]
+
+        ws[self.eos] = self.wfsa.R.zero
+        for j, w in self.wfsa.epsremove.F:
+            ws[self.eos] += state[j] * w
+
+        log_ws = np.array([ws[b].score for b in self.vocab_eos]) - log_ctx_w
+
+        return self.make_lazy_weights(log_ws)
+
     def _repr_svg_(self):
         return self.wfsa._repr_svg_()
 
@@ -246,6 +291,16 @@ class BoolFSA(WFSA):
             (LazyWeights): Boolean log-weights for next token.
         """
         logw_next = await super().logw_next(context)
+        return logw_next.spawn(
+            new_weights=np.where(
+                logw_next.weights > float("-inf"), 0, logw_next.weights
+            )
+        )
+
+    async def logw_next_from_state(self, state):
+        """Boolean next-token log weights from a carried chart `state` (mirrors
+        `logw_next` over the stateful path)."""
+        logw_next = await super().logw_next_from_state(state)
         return logw_next.spawn(
             new_weights=np.where(
                 logw_next.weights > float("-inf"), 0, logw_next.weights

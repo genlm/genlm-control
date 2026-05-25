@@ -156,6 +156,33 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
         return self.make_lazy_weights(logws)
 
+    #######################
+    # Stateful interface  #
+    #######################
+    # Potentials are stateful: rather than replay the whole `context` every step
+    # (what `logw_next`/`prefix` do), a consumer carries an opaque state and
+    # advances it one token at a time -- the same way the LLM carries its KV
+    # cache. The trivial default carries the context itself, so every potential
+    # is stateful and byte-identical to the stateless path; potentials with real
+    # internal state (e.g. WFSA's chart) override these three for the speedup.
+
+    def state0(self):
+        """The carried state for the empty context."""
+        return ()
+
+    def advance(self, state, token):
+        """Advance the carried state by one token, returning the new state."""
+        return (*state, token)
+
+    async def logw_next_from_state(self, state):
+        """Next-token log weights from a carried `state`.
+
+        Contract: for the `state` reached by advancing `state0()` through a
+        `context`, this must equal `logw_next(context)` bit-for-bit. That
+        identity is what stateful overrides are validated against.
+        """
+        return await self.logw_next(list(state))
+
     ###################
     # Batched methods #
     ###################
