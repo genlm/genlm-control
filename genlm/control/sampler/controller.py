@@ -17,7 +17,7 @@ later, row-wise by in-engine arms keyed on a ``request_id -> particle`` map:
 
 Resample / fork / ESS / log_ml are controller-owned and are NEVER delegated.
 
-See :class:`EngineControl` for the protocol the future window driver / engine
+See :class:`EngineControl` for the protocol the future burst driver / engine
 arms will call back into.
 """
 
@@ -77,7 +77,7 @@ class Particle:
         self.twist_amount = 0.0
         self.done = False
         self.max_tokens_left = max_tokens
-        # Carried stateful-potential state for the window's factor (the chart of
+        # Carried stateful-potential state for the burst's factor (the chart of
         # the in-engine product's control-side factor), advanced one token at a
         # time instead of replaying the context. None on the slow path / when
         # there is no factor. Kept in lockstep with `context` (cloned together).
@@ -132,16 +132,16 @@ class Particle:
 
 
 # ---------------------------------------------------------------------------
-# The engine-control contract (shape so the future window driver plugs in)
+# The engine-control contract (shape so the future burst driver plugs in)
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class EngineControl(Protocol):
-    """Protocol the future in-engine window driver / engine arms call back into.
+    """Protocol the future in-engine burst driver / engine arms call back into.
 
     The slow driver does NOT use this protocol (it fuses shaping + drawing
-    inside the sampler's ``sample`` coroutine). It exists so that the window
+    inside the sampler's ``sample`` coroutine). It exists so that the burst
     driver can hand consecutive steps to the engine, which will then invoke
     these two methods row-wise on raw logits, keyed by ``request_ids`` mapping
     engine rows to controller particles.
@@ -162,6 +162,89 @@ class EngineControl(Protocol):
         for pop-out. Weight/advance bookkeeping is applied to the mapped
         particles as a side effect."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# The burst context (the only thing a sampler's burst_draw sees)
+# ---------------------------------------------------------------------------
+
+
+class BurstContext:
+    """The per-burst context handed to a burst-capable sampler's ``burst_draw``.
+
+    This is the burst analog of the slow path handing a sampler a ``context``
+    and letting it call its potentials' async methods. In the burst, the engine
+    supplies the LM half (``lm_logws``, passed per row) and the particle carries
+    the factor's state (``factor_state``, passed per row); this object exposes the
+    two substitutions that stand in for the slow path's async potential calls:
+
+    * :meth:`product_logws` -- reconstruct ``Product(llm, factor).logw_next`` over
+      the target vocab from the engine LM weights + carried factor state (the
+      DirectTokenSampler proposal);
+    * :meth:`run_sync` -- run a sampler's own async helper (e.g. AWRS's rejection)
+      to completion on the driver's event loop.
+
+    ``factor`` (the additive control-side factor / AWRS boolean condition, or
+    ``None``) is exposed directly so the sampler can advance it. The Controller's
+    row-map / pop-out / engine-LM runtime is deliberately NOT on this object --
+    a sampler only ever sees this narrow, named interface, never the Controller's
+    private burst state.
+    """
+
+    __slots__ = ("factor", "_target", "_llm_idxs", "_factor_idxs", "_eval_factor", "_run_async")
+
+    def __init__(self, factor, target, llm_idxs, factor_idxs, eval_factor, run_async):
+        self.factor = factor
+        self._target = target
+        self._llm_idxs = llm_idxs
+        self._factor_idxs = factor_idxs
+        self._eval_factor = eval_factor
+        self._run_async = run_async
+
+    def factor_logws(self, state):
+        """The factor's stateful ``logw_next``, evaluated synchronously from the
+        carried ``state`` -- the burst stand-in for the slow path's
+        ``factor.logw_next(context)``."""
+        return self._eval_factor(self.factor, state)
+
+    def product_logws(self, lm_logws, state):
+        """Reconstruct ``Product(llm, factor).logw_next`` over the target vocab
+        from the engine LM weights and the carried factor ``state``.
+
+        Gathers through ``Product``'s own ``v1_idxs``/``v2_idxs`` (resolved here
+        as ``llm_idxs``/``factor_idxs``) -- the exact slow-path index maps -- with
+        the engine LM half substituting the reprefilled one, so vocab narrowing
+        matches the slow path.
+        """
+        factor_logws = self.factor_logws(state)
+        return self._target.make_lazy_weights(
+            lm_logws.weights[self._llm_idxs] + factor_logws.weights[self._factor_idxs]
+        )
+
+    def run_sync(self, coro):
+        """Run a sampler's async helper to completion on the driver's event loop
+        and block for the result -- one event-loop hop, no inner gather."""
+        return self._run_async(coro)
+
+
+class _Burst:
+    """The Controller's private per-engine-burst runtime (set by the BurstLoop
+    for the duration of one ``run_burst``; ``None`` outside a burst).
+
+    Holds what the Controller's ``draw`` needs row-wise -- the live particle
+    row-map, the engine LM (to build each row's ``lm_logws``), the EOS id, and the
+    mutable pop-out flag -- plus the sampler-facing :class:`BurstContext`
+    (``ctx``). Samplers never see this object; only ``ctx``.
+    """
+
+    __slots__ = ("particles", "llm", "eos_id", "pop_out", "ctx")
+
+    def __init__(self, particles, llm, eos_id, ctx):
+        self.particles = particles
+        self.llm = llm
+        self.eos_id = eos_id
+        self.pop_out = False
+        self.ctx = ctx
 
 
 # ---------------------------------------------------------------------------
@@ -214,16 +297,16 @@ class Controller:
         self.particles = [Particle(max_tokens) for _ in range(n_particles)]
         self.record = SMCRecord(n_particles) if record else None
 
-        # Set by the BurstLoop for the duration of a single engine window;
-        # read by the EngineControl ``shape`` / ``draw`` callbacks. ``None``
-        # outside a window.
-        self._window = None
+        # The :class:`_Burst` runtime set by the BurstLoop for the duration of a
+        # single engine burst; read by the EngineControl ``shape`` / ``draw``
+        # callbacks. ``None`` outside a burst.
+        self._burst = None
 
     # -- phase 1: shape + draw + weight + advance for ONE particle -----------
     #
     # In the slow path these two phases are fused inside the sampler's
     # ``sample`` coroutine (which computes logw_next, draws, and returns the
-    # importance weight). The window driver will instead call EngineControl
+    # importance weight). The burst driver will instead call EngineControl
     # .shape / .draw row-wise; both paths converge on ``_advance_particle``
     # below, which applies the identical SMC math to the population.
 
@@ -281,7 +364,7 @@ class Controller:
 
         Exactly the tail of ``_draw_and_score`` when ``self.critic`` is None:
         verbosity print, budget decrement, and finish on budget exhaustion or a
-        terminal EOS. Shared with the window driver's synchronous ``draw`` so the
+        terminal EOS. Shared with the burst driver's synchronous ``draw`` so the
         two paths terminate particles identically.
         """
         assert not self.critic
@@ -370,7 +453,7 @@ class Controller:
         """Whether the ESS test triggers a resample on the current population.
 
         Test only -- does not mutate. Uses the identical predicate as
-        ``_maybe_resample`` so the window's pop-out decision matches the slow
+        ``_maybe_resample`` so the burst's pop-out decision matches the slow
         path's resample decision exactly. Returns ``False`` when all weights are
         ``-inf`` (matching the slow path's ``continue``).
         """
@@ -431,25 +514,19 @@ class Controller:
     # over the same control-side V+1 vocabulary so the same RNG stream selects
     # the same token (up to the warm-KV-vs-reprefill logit residual).
     #
-    # A live window is described by ``self._window`` (set by the BurstLoop):
-    #   particles   -- list of live particles, indexed by external request id
-    #   llm         -- the engine PromptedLLM (the LM the engine evaluates;
-    #                  supplies ``_process_logw_next`` / ``_maybe_temper``)
-    #   factor      -- an additive control-side Potential sharing the LLM's V+1
-    #                  vocab (e.g. a coerced BoolFSA), or None for the
-    #                  unconstrained case
-    #   eval_factor -- callable ``(factor, context) -> LazyWeights`` that runs the
-    #                  factor's async ``logw_next`` synchronously on the driver's
-    #                  event loop (the slow path's exact call)
-    #   eos_id      -- an engine token id to return when forcing/observing EOS
-    #   pop_out     -- once True, every subsequent draw forces EOS (control
-    #                  signal; never banked) so the window ends for resampling
+    # A live burst is described by ``self._burst`` (a :class:`_Burst` set by
+    # the BurstLoop): ``particles`` (the live row-map), ``llm`` (the engine
+    # PromptedLLM, supplying ``_process_logw_next`` / ``_maybe_temper``),
+    # ``eos_id`` (the engine token id to force/observe EOS), the mutable
+    # ``pop_out`` flag (once True, every subsequent draw forces EOS -- a control
+    # signal, never banked -- so the burst ends for resampling), and ``ctx``
+    # (the sampler-facing :class:`BurstContext`).
 
-    def _window_particle(self, request_id):
+    def _burst_particle(self, request_id):
         """Map a vLLM internal request id (``"{external}-{8 chars}"``) to its
         particle via the external index the BurstLoop assigned."""
         external = request_id.rsplit("-", 1)[0]
-        return self._window["particles"][int(external)]
+        return self._burst.particles[int(external)]
 
     def shape(self, logits, request_ids) -> None:
         """Shape each row's raw engine logits into its proposal in place.
@@ -493,15 +570,15 @@ class Controller:
         """
         import torch
 
-        w = self._window
-        eos_id = w["eos_id"]
+        w = self._burst
+        eos_id = w.eos_id
         sampler = self.unit_sampler
         out = []
 
         for i, rid in enumerate(request_ids):
-            p = self._window_particle(rid)
+            p = self._burst_particle(rid)
 
-            if w["pop_out"] or p.done:
+            if w.pop_out or p.done:
                 # Forced pop-out (control signal) or an already-finished row:
                 # return EOS, advance nothing, bank nothing.
                 out.append(eos_id)
@@ -511,11 +588,11 @@ class Controller:
             if row.dtype != torch.float32:
                 row = row.float()
             # The sampler computes its own draw from the engine LM weights + the
-            # carried factor state (its window_draw, the analog of transition);
+            # carried factor state (its burst_draw, the analog of transition);
             # the Controller banks the weight, appends the token, sets the state,
             # and runs termination -- no sampler-type dispatch here.
-            token, logw, logp, new_state = sampler.window_draw(
-                self._lm_logws(row), p.factor_state, w
+            token, logw, logp, new_state = sampler.burst_draw(
+                self._lm_logws(row), p.factor_state, w.ctx
             )
             p.score(logw)
             p.logp += logp
@@ -527,21 +604,21 @@ class Controller:
 
         # End-of-step ESS test (same predicate the slow path applies after every
         # token). If it crosses, arm pop-out: the next engine step forces EOS for
-        # all live rows so the window ends and the BurstLoop resamples. Skip
+        # all live rows so the burst ends and the BurstLoop resamples. Skip
         # while already popping out (no real step happened).
-        if not w["pop_out"] and self._ess_crosses():
-            w["pop_out"] = True
+        if not w.pop_out and self._ess_crosses():
+            w.pop_out = True
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
     def _lm_logws(self, row):
         """The LM half: the engine row as V+1 LazyWeights, exactly as
         ``PromptedLLM._process_logw_next`` (modulo the warm-KV residual)."""
-        llm = self._window["llm"]
+        llm = self._burst.llm
         return llm._process_logw_next(llm._maybe_temper(row))
 
     def _terminate_after_draw(self, p):
-        """The no-critic termination bookkeeping shared by every window draw."""
+        """The no-critic termination bookkeeping shared by every burst draw."""
         if p.logw == float("-inf"):
             p.finish()
         else:
@@ -577,7 +654,7 @@ def _is_engine_llm(potential):
 
 
 def split_engine_target(potential):
-    """Split a sampler target into ``(llm, factor, target)`` for the window.
+    """Split a sampler target into ``(llm, factor, target)`` for the burst.
 
     Recognizes two shapes:
 
@@ -614,17 +691,17 @@ def split_engine_target(potential):
 def can_burst(controller):
     """Whether the ``BurstLoop`` can drive this configuration.
 
-    The window fast path requires:
+    The burst fast path requires:
 
-    * the unit sampler is **window-capable** -- it implements ``window_draw``,
-      declared via ``supports_window()`` (DirectTokenSampler with no separate
+    * the unit sampler is **burst-capable** -- it implements ``burst_draw``,
+      declared via ``supports_burst()`` (DirectTokenSampler with no separate
       proposal, or AWRS over a sync-stateful boolean condition). The Controller
       asks the sampler; it does not branch on the sampler's type.
     * the sampler target decomposes (:func:`split_engine_target`) into a single
       engine LM, optionally times one additive same-vocab factor (e.g. a coerced
       ``BoolFSA``);
     * no critic. A non-trivial critic twists per step / reweights at termination
-      and is not yet handled by the window's synchronous draw, so it stays on the
+      and is not yet handled by the burst's synchronous draw, so it stays on the
       slow path.
 
     Anything else falls back to :class:`StepLoop`.
@@ -632,7 +709,7 @@ def can_burst(controller):
     sampler = controller.unit_sampler
     if controller.critic is not None:
         return False
-    if not getattr(sampler, "supports_window", lambda: False)():
+    if not getattr(sampler, "supports_burst", lambda: False)():
         return False
     return split_engine_target(sampler.target) is not None
 
@@ -640,15 +717,15 @@ def can_burst(controller):
 class BurstLoop:
     """Drives consecutive SMC steps inside a vLLM engine via EngineControl.
 
-    Opens a *window* = one ``AsyncVirtualLM.run_burst`` call over the live
+    Opens a *burst* = one ``AsyncVirtualLM.run_burst`` call over the live
     particles' token contexts. The controller's :meth:`Controller.shape` /
     :meth:`Controller.draw` run per engine
     decode step, advancing each particle exactly as the slow path's transition
-    would. The window itself NEVER resamples: when the controller's end-of-step ESS test
+    would. The burst itself NEVER resamples: when the controller's end-of-step ESS test
     crosses the threshold it arms pop-out, the next step forces EOS for every live
     row (a control signal, never banked), and ``run_burst`` returns. The driver
     then runs the controller-owned ESS test + resample/fork and relaunches the next
-    window from each surviving particle's token prefix. ESS / resample / log_ml
+    burst from each surviving particle's token prefix. ESS / resample / log_ml
     stay entirely controller-owned -- the engine only produces logits.
 
     Only valid when :func:`can_burst` is True (checked by the caller).
@@ -656,16 +733,16 @@ class BurstLoop:
 
     def __init__(self, controller):
         self.controller = controller
-        # Number of engine windows opened (>1 iff a resample popped a window out
+        # Number of engine bursts opened (>1 iff a resample popped a burst out
         # mid-generation). Useful for verifying the pop-out/relaunch path ran.
-        self.n_windows = 0
+        self.n_bursts = 0
         self.sampler = controller.unit_sampler
         # `target` decomposes uniformly: DirectTokenSampler.target == its
         # potential; AWRS.target == potential * condition (so factor == the
         # condition). split_engine_target peels the engine LM off either.
         decomposed = split_engine_target(self.sampler.target)
         if decomposed is None:  # pragma: no cover - guarded by can_burst
-            raise ValueError("target is not window-expressible")
+            raise ValueError("target is not burst-expressible")
         self.llm, self.factor, self.target = decomposed
 
         # Gather maps onto the product's vocab_eos (the same maps Product.logw_next
@@ -702,7 +779,7 @@ class BurstLoop:
         await controller.start()
 
         # Seed each particle's carried factor state (empty context == state0).
-        # Across windows the state is carried (cloned on resample), never
+        # Across bursts the state is carried (cloned on resample), never
         # re-derived, so only freshly-started particles need seeding.
         if self.factor is not None:
             for p in controller.particles:
@@ -731,28 +808,28 @@ class BurstLoop:
             return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
         while any(not p.done for p in controller.particles):
-            self.n_windows += 1
+            self.n_bursts += 1
             live = [p for p in controller.particles if not p.done]
             prompts = [self._context_ids(p) for p in live]
-            # Each particle keeps its own budget; the engine window just needs to
+            # Each particle keeps its own budget; the engine burst just needs to
             # be long enough to reach the longest particle's budget (plus one
             # step to let a budget-exhausted row pop out via forced EOS).
             max_steps = max(p.max_tokens_left for p in live) + 1
 
-            # The window context handed to each sampler's `window_draw` (and read
-            # by `Controller.draw`). The sampler picks what it needs.
-            controller._window = {
-                "particles": live,
-                "llm": self.llm,
-                "factor": self.factor,
-                "target": self.target,
-                "llm_idxs": self.llm_idxs,
-                "factor_idxs": self.factor_idxs,
-                "eval_factor": eval_factor,
-                "run_async": run_async,
-                "eos_id": eos_id,
-                "pop_out": False,
-            }
+            # The sampler-facing context (named methods, no Controller runtime)
+            # wrapped in the Controller's private per-burst runtime. The
+            # Controller reads `_Burst`; the sampler only ever sees `.ctx`.
+            ctx = BurstContext(
+                factor=self.factor,
+                target=self.target,
+                llm_idxs=self.llm_idxs,
+                factor_idxs=self.factor_idxs,
+                eval_factor=eval_factor,
+                run_async=run_async,
+            )
+            controller._burst = _Burst(
+                particles=live, llm=self.llm, eos_id=eos_id, ctx=ctx
+            )
             try:
                 # Run the engine step loop in a worker thread so this event loop
                 # stays free to service the factor's run_coroutine_threadsafe.
@@ -767,7 +844,7 @@ class BurstLoop:
                     ),
                 )
             finally:
-                controller._window = None
+                controller._burst = None
 
             # Controller-owned ESS test + resample/fork over the FULL population.
             controller._maybe_resample(

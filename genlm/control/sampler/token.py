@@ -35,27 +35,28 @@ class TokenSampler:
         self.target = target
         self.token_type = self.target.token_type
 
-    def supports_window(self) -> bool:
-        """Whether this sampler can be driven inside the engine window -- i.e. it
-        implements :meth:`window_draw`. Default ``False`` (stays on ``StepLoop``).
+    def supports_burst(self) -> bool:
+        """Whether this sampler can be driven inside the engine burst -- i.e. it
+        implements :meth:`burst_draw`. Default ``False`` (stays on ``StepLoop``).
 
         The control loop (``Controller``/``BurstLoop``) is uniform; each
-        window-capable sampler plugs its own per-row draw in via ``window_draw``,
+        burst-capable sampler plugs its own per-row draw in via ``burst_draw``,
         the same way every sampler plugs its slow per-step draw in via
         ``transition`` -- no sampler-type dispatch in the loop.
         """
         return False
 
-    def window_draw(self, lm_logws, factor_state, ctx):
-        """Engine-window per-row draw (the window analog of ``sample``).
+    def burst_draw(self, lm_logws, factor_state, ctx):
+        """Engine-burst per-row draw (the burst analog of ``sample``).
 
         Given the engine LM's next-token weights ``lm_logws``, the particle's
-        carried factor state, and the Controller's window context ``ctx`` (which
-        exposes the factor, the product index maps, ``eval_factor`` =
-        ``logw_next_from_state``, and ``run_async``), return
+        carried ``factor_state``, and the sampler-facing
+        :class:`~genlm.control.sampler.controller.BurstContext` ``ctx`` (which
+        exposes ``ctx.factor``, ``ctx.product_logws(lm_logws, state)``,
+        ``ctx.factor_logws(state)`` and ``ctx.run_sync(coro)``), return
         ``(token, logw, logp, new_factor_state)``. The Controller banks the
         weight, appends the token, sets the state, and runs termination -- the
-        sampler only computes the draw. Window-capable samplers override.
+        sampler only computes the draw. Burst-capable samplers override.
         """
         raise NotImplementedError
 
@@ -150,33 +151,28 @@ class DirectTokenSampler(TokenSampler):
             _validate_proposal_vocab(potential, proposal)
         self.proposal = proposal
 
-    def supports_window(self) -> bool:
+    def supports_burst(self) -> bool:
         # An unbiased direct sampler (no separate proposal) draws exactly from
         # the target's normalized ``logw_next``, which the engine reproduces. With
         # a proposal the per-step importance weight is non-trivial, so it stays
         # on the slow loop.
         return self.proposal is None
 
-    def window_draw(self, lm_logws, factor_state, ctx):
+    def burst_draw(self, lm_logws, factor_state, ctx):
         """Shape the product proposal from the carried factor state, sample once,
-        bank ``logsumexp`` + the drawn lp (the window analog of ``sample``)."""
+        bank ``logsumexp`` + the drawn lp (the burst analog of ``sample``)."""
         from genlm.control.constant import EndOfSequence
         from genlm.control.util import fast_sample_lazyweights
 
-        factor = ctx["factor"]
+        factor = ctx.factor
         new_state = factor_state
         if factor is None:
             logws = lm_logws
         else:
             # Reconstruct Product(llm, factor).logw_next over the product vocab,
-            # reading the factor from the carried state, gathered through
-            # Product's index maps (the engine LM weights substitute the
-            # reprefilled ones).
-            factor_logws = ctx["eval_factor"](factor, factor_state)
-            logws = ctx["target"].make_lazy_weights(
-                lm_logws.weights[ctx["llm_idxs"]]
-                + factor_logws.weights[ctx["factor_idxs"]]
-            )
+            # reading the factor from the carried state (the engine LM weights
+            # substitute the reprefilled ones) -- ctx owns the index maps.
+            logws = ctx.product_logws(lm_logws, factor_state)
         logps = logws.normalize()
         token = fast_sample_lazyweights(logps)
         if factor is not None and not isinstance(token, EndOfSequence):
@@ -357,27 +353,27 @@ class AWRS(TokenSampler):
         self.V = len(self.potential.vocab_eos)
         self.rng = np.random.default_rng(seed=seed)
 
-    def supports_window(self) -> bool:
+    def supports_burst(self) -> bool:
         # No separate proposal, and the boolean condition is sync-stateful
         # (exposes prefix_logw/complete_logw), so the rejection can run over the
         # engine LM logits with the condition checked from its carried state.
         return self.proposal is None and hasattr(self.condition, "prefix_logw")
 
-    def window_draw(self, lm_logws, factor_state, ctx):
+    def burst_draw(self, lm_logws, factor_state, ctx):
         """AWRS rejection over the engine LM logits with the boolean condition
         checked from the carried state -- reuses the shared ``_run_rejection`` so
         the rejection algorithm + returned weight match the slow path. ``logp`` is
         ``nan`` (as in ``sample``)."""
         from genlm.control.constant import EndOfSequence
 
-        condition = ctx["factor"]
+        condition = ctx.factor
 
         async def accept(tok):
             if isinstance(tok, EndOfSequence):
                 return condition.complete_logw(factor_state) == 0
             return condition.prefix_logw(condition.advance(factor_state, tok)) == 0
 
-        token, logw, _ = ctx["run_async"](self._run_rejection(lm_logws, accept))
+        token, logw, _ = ctx.run_sync(self._run_rejection(lm_logws, accept))
         new_state = factor_state
         if not isinstance(token, EndOfSequence):
             new_state = condition.advance(factor_state, token)
@@ -445,7 +441,7 @@ class AWRS(TokenSampler):
         correction).
 
         ``sample`` (slow path: context-based ``accept``, ``logws`` from
-        ``potential.logw_next``) and the engine window (stateful-condition
+        ``potential.logw_next``) and the engine burst (stateful-condition
         ``accept``, ``logws`` from the engine LM logits) both call this, so the
         rejection algorithm and the returned weight stay identical -- only the
         source of ``logws`` and the form of ``accept`` differ.
