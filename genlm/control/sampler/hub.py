@@ -245,7 +245,8 @@ class Hub:
             self._terminate_if_done(p)
             return
 
-        if self.critic and self.twist_with_critic:
+        # From here on the critic is non-None (the no-critic case returned above).
+        if self.twist_with_critic:
             twist_amt = await self.critic.score(p.context)
             if twist_amt != float("-inf"):
                 p.twist(twist_amt)
@@ -260,10 +261,9 @@ class Hub:
         p.max_tokens_left -= 1
         if p.max_tokens_left == 0 or self._is_terminal(p):
             p.finish()
-            if self.critic:
-                if not self.twist_with_critic:
-                    twist_amt = await self.critic.score(p.context)
-                p.score(twist_amt)
+            if not self.twist_with_critic:
+                twist_amt = await self.critic.score(p.context)
+            p.score(twist_amt)
             return
 
     def _terminate_if_done(self, p):
@@ -345,6 +345,17 @@ class Hub:
 
         return self.particles
 
+    def _ess_below_threshold(self, normalized_weights):
+        """The ESS resample predicate, shared by the test-only ``_ess_crosses``
+        and the mutating ``_maybe_resample`` so both decide identically.
+
+        Given the (log) normalized weights, returns whether the effective sample
+        size has fallen below ``ess_threshold * n_particles``.
+        """
+        return -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(
+            self.n_particles
+        )
+
     def _ess_crosses(self):
         """Whether the ESS test triggers a resample on the current population.
 
@@ -353,14 +364,11 @@ class Hub:
         path's resample decision exactly. Returns ``False`` when all weights are
         ``-inf`` (matching the slow path's ``continue``).
         """
-        n = self.n_particles
         W = np.array([p.logw for p in self.particles])
         if np.all(W == -np.inf):
             return False
         normalized_weights = W - logsumexp(W)
-        return -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(
-            n
-        )
+        return self._ess_below_threshold(normalized_weights)
 
     def _maybe_resample(self, sort_ancestors=False):
         """Run the ESS test on the current population and resample if it crosses.
@@ -379,7 +387,7 @@ class Hub:
         w_sum = logsumexp(W)
         normalized_weights = W - w_sum
 
-        if -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(n):
+        if self._ess_below_threshold(normalized_weights):
             probs = np.exp(normalized_weights)
             ancestor_indices = self.resample_fn(probs).tolist()
 
@@ -672,12 +680,10 @@ class WindowDriver:
             self.llm_idxs = None
             self.factor_idxs = None
         else:
-            import numpy as _np
-
-            self.llm_idxs = _np.array(
+            self.llm_idxs = np.array(
                 [self.llm.lookup[t] for t in self.target.vocab_eos]
             )
-            self.factor_idxs = _np.array(
+            self.factor_idxs = np.array(
                 [self.factor.lookup[t] for t in self.target.vocab_eos]
             )
 
@@ -700,14 +706,12 @@ class WindowDriver:
         return ids
 
     async def run(self):
-        import asyncio as _asyncio
-
         hub = self.hub
         await hub.start()
 
         eos_idxs = self._eos_idxs()
         eos_id = eos_idxs[0]
-        loop = _asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
 
         # The factor's logw_next is the slow path's exact (async) call. ``draw``
         # runs synchronously inside the engine step loop (which itself runs in a
@@ -715,7 +719,7 @@ class WindowDriver:
         # and blocks the worker thread for the result. This reuses the slow
         # path's computation verbatim -- no separate factor-state machine.
         def eval_factor(factor, context):
-            fut = _asyncio.run_coroutine_threadsafe(factor.logw_next(context), loop)
+            fut = asyncio.run_coroutine_threadsafe(factor.logw_next(context), loop)
             return fut.result()
 
         while any(not p.done for p in hub.particles):
