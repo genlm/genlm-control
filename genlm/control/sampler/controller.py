@@ -17,6 +17,7 @@ engine.
 import asyncio
 
 import numpy as np
+import torch
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.resampling import get_resampling_fn
@@ -37,105 +38,199 @@ def logsumexp(nums):
 # ---------------------------------------------------------------------------
 
 
-class Particle:
-    """One SMC particle: an engine-independent record of a partial sequence.
+class Population:
+    """The SMC particle population, stored columnar.
 
-    Attributes:
-        context (list): The tokens (or units) sampled so far. Token objects are
-            immutable, so resampling can shallow-copy the list.
-        logw (float): The particle's current (twisted) log importance weight.
-        logp (float): Accumulated log-probability of the sampler's random choices.
-        twist_amount (float): The amount currently *added* to ``logw`` by twisting
-            with the critic; subtracted back out (``untwist``) before each step and
-            on termination, exactly as in the llamppl ``Model.twist``/``untwist``.
-        done (bool): Whether this particle has finished stepping.
-        max_tokens_left (int): Remaining token budget for this particle.
+    The per-particle scalars that the algorithm reads in bulk (ESS, resample,
+    log_ml) live as parallel numpy arrays -- the *single source of truth* -- so
+    those tests are array ops, not a fresh ``np.array([p.logw for p in ...])``
+    rebuilt every step. The ragged per-particle state (token ``contexts`` and the
+    carried factor ``states``) stays as Python lists.
+
+    A :class:`Particle` is a thin *view* onto row ``i`` (see below); there is no
+    second copy of ``logw`` to keep in sync. ``Population`` is iterable / indexable
+    / ``len``-able and yields views, so the rest of the controller (and the
+    vendored ``SMCRecord``, which reads ``p.weight`` / ``p.string_for_serialization``
+    at call time) is unchanged.
+
+    Attributes (arrays are length ``n``):
+        logw: current (twisted) log importance weights.
+        logp: accumulated log-probabilities of the sampler's random choices.
+        twist_amount: amount currently added to ``logw`` by the critic twist;
+            subtracted back out (``untwist``) before each step and on termination,
+            exactly as llamppl's ``Model.twist``/``untwist``.
+        done: whether each particle has finished stepping.
+        max_tokens_left: remaining per-particle token budget.
+        contexts: list of token lists sampled so far.
+        states: carried stateful-potential state for the burst's factor (the
+            chart of the in-engine product's control-side factor), advanced one
+            token at a time instead of replaying the context; ``None`` on the slow
+            path / when there is no factor. Kept in lockstep with ``contexts``.
     """
 
     __slots__ = (
-        "context",
+        "n",
         "logw",
         "logp",
         "twist_amount",
         "done",
         "max_tokens_left",
-        "factor_state",
+        "contexts",
+        "states",
     )
 
-    def __init__(self, max_tokens):
-        self.context = []
-        self.logw = 0.0
-        self.logp = 0.0
-        self.twist_amount = 0.0
-        self.done = False
-        self.max_tokens_left = max_tokens
-        # Carried stateful-potential state for the burst's factor (the chart of
-        # the in-engine product's control-side factor), advanced one token at a
-        # time instead of replaying the context. None on the slow path / when
-        # there is no factor. Kept in lockstep with `context` (cloned together).
-        self.factor_state = None
+    def __init__(self, n, max_tokens):
+        self.n = n
+        self.logw = np.zeros(n)
+        self.logp = np.zeros(n)
+        self.twist_amount = np.zeros(n)
+        self.done = np.zeros(n, dtype=bool)
+        self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
+        self.contexts = [[] for _ in range(n)]
+        self.states = [None] * n
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        return Particle(self, i)
+
+    def __iter__(self):
+        return (Particle(self, i) for i in range(self.n))
+
+    def untwist_all(self):
+        """Vectorized per-step untwist over the whole population (the slow loop's
+        ``for p: p.untwist()``). Done particles carry ``twist_amount == 0`` (their
+        ``finish`` already untwisted), so this is a no-op for them -- identical to
+        looping."""
+        self.logw -= self.twist_amount
+        self.twist_amount[:] = 0.0
+
+    def untwist_subset(self, idx):
+        """Vectorized untwist of the rows ``idx`` (the burst's live, not-popped
+        particles); ``idx`` are distinct so the in-place scatter is well-defined.
+        The burst untwists only live rows (done/popped rows already finished),
+        matching the old per-row ``for i in live: parts[i].untwist()``."""
+        self.logw[idx] -= self.twist_amount[idx]
+        self.twist_amount[idx] = 0.0
+
+    def reindex(self, ancestor_indices):
+        """Resample/fork: reindex every column by ``ancestor_indices`` (the
+        columnar form of the old per-particle ``clone()``). Contexts are
+        shallow-copied (their token elements are immutable); factor states are
+        immutable per step so they can be shared by reference -- both matching the
+        old ``clone``."""
+        idx = ancestor_indices
+        self.logw = self.logw[idx]
+        self.logp = self.logp[idx]
+        self.twist_amount = self.twist_amount[idx]
+        self.done = self.done[idx]
+        self.max_tokens_left = self.max_tokens_left[idx]
+        self.contexts = [list(self.contexts[i]) for i in idx]
+        self.states = [self.states[i] for i in idx]
+
+
+class Particle:
+    """A thin view onto one row of a :class:`Population`.
+
+    All scalar reads/writes go through to the population's arrays (single source
+    of truth, no sync), so the existing per-particle bookkeeping
+    (``score``/``twist``/``untwist``/``finish`` -- mirroring ``llamppl.modeling.Model``)
+    reads exactly as before. The vectorized paths (ESS, resample, untwist) operate
+    on the arrays directly and never go through a view.
+    """
+
+    __slots__ = ("_pop", "_i")
+
+    def __init__(self, pop, i):
+        self._pop = pop
+        self._i = i
+
+    @property
+    def logw(self):
+        return self._pop.logw[self._i]
+
+    @logw.setter
+    def logw(self, v):
+        self._pop.logw[self._i] = v
+
+    @property
+    def logp(self):
+        return self._pop.logp[self._i]
+
+    @logp.setter
+    def logp(self, v):
+        self._pop.logp[self._i] = v
+
+    @property
+    def twist_amount(self):
+        return self._pop.twist_amount[self._i]
+
+    @property
+    def done(self):
+        return self._pop.done[self._i]
+
+    @property
+    def max_tokens_left(self):
+        return self._pop.max_tokens_left[self._i]
+
+    @max_tokens_left.setter
+    def max_tokens_left(self, v):
+        self._pop.max_tokens_left[self._i] = v
+
+    @property
+    def context(self):
+        return self._pop.contexts[self._i]
+
+    @property
+    def factor_state(self):
+        return self._pop.states[self._i]
+
+    @factor_state.setter
+    def factor_state(self, v):
+        self._pop.states[self._i] = v
 
     # -- weight bookkeeping, mirroring llamppl.modeling.Model exactly --
 
     def score(self, amt):
-        self.logw += amt
+        self._pop.logw[self._i] += amt
 
     def twist(self, amt):
-        self.twist_amount += amt
-        self.score(amt)
+        self._pop.twist_amount[self._i] += amt
+        self._pop.logw[self._i] += amt
 
     def untwist(self):
-        self.score(-self.twist_amount)
-        self.twist_amount = 0.0
+        self._pop.logw[self._i] -= self._pop.twist_amount[self._i]
+        self._pop.twist_amount[self._i] = 0.0
 
     def finish(self):
         self.untwist()
-        self.done = True
+        self._pop.done[self._i] = True
 
     # -- viz adapter (the record reads .weight + .string_for_serialization()) --
 
     @property
     def weight(self):
-        return self.logw
+        return self._pop.logw[self._i]
 
     def string_for_serialization(self):
-        return string_for_serialization(self.context)
-
-    def clone(self):
-        """Shallow clone for resampling/forking.
-
-        The context list is shallow-copied (its token elements are immutable),
-        and all scalar bookkeeping is copied. This is the controller analogue of the
-        ``copy.deepcopy`` llamppl performed per resampled particle, but without
-        deep-copying immutable tokens.
-        """
-        cpy = Particle.__new__(Particle)
-        cpy.context = list(self.context)
-        cpy.logw = self.logw
-        cpy.logp = self.logp
-        cpy.twist_amount = self.twist_amount
-        cpy.done = self.done
-        cpy.max_tokens_left = self.max_tokens_left
-        # The factor state is immutable per step (advance returns a fresh chart),
-        # so it can be shared by reference across the clone -- it stays in lockstep
-        # with the (copied) context.
-        cpy.factor_state = self.factor_state
-        return cpy
+        return string_for_serialization(self._pop.contexts[self._i])
 
 
 # ---------------------------------------------------------------------------
-# The burst context (the only thing a sampler's burst_draw sees)
+# The burst context (the only thing a sampler's burst_draw_batch sees)
 # ---------------------------------------------------------------------------
 
 
 class BurstContext:
-    """The per-burst context handed to a burst-capable sampler's ``burst_draw``.
+    """The per-burst context handed to a burst-capable sampler's ``burst_draw_batch``.
 
     This is the burst analog of the slow path handing a sampler a ``context``
     and letting it call its potentials' async methods. In the burst, the engine
-    supplies the LM half (``lm_logws``, passed per row) and the particle carries
-    the factor's state (``factor_state``, passed per row); this object exposes the
-    two substitutions that stand in for the slow path's async potential calls:
+    supplies the LM half (the batched ``lm_batch``) and each particle carries the
+    factor's state (``factor_state``), both passed to ``burst_draw_batch``; this
+    object exposes the two substitutions that stand in for the slow path's async
+    potential calls:
 
     * :meth:`product_logws` -- reconstruct ``Product(llm, factor).logw_next`` over
       the target vocab from the engine LM weights + carried factor state (the
@@ -166,9 +261,11 @@ class BurstContext:
         ``factor.logw_next(context)``."""
         return self._eval_factor(self.factor, state)
 
-    def product_logws(self, lm_logws, state):
+    def product_logws(self, lm_weights, state):
         """Reconstruct ``Product(llm, factor).logw_next`` over the target vocab
-        from the engine LM weights and the carried factor ``state``.
+        from the engine LM weights (``lm_weights``, a length-``V+1`` array in the
+        LM's vocab-eos order -- one row of the batched ``_process_logw_next_batch``)
+        and the carried factor ``state``.
 
         Gathers through ``Product``'s own ``v1_idxs``/``v2_idxs`` (resolved here
         as ``llm_idxs``/``factor_idxs``) -- the exact slow-path index maps -- with
@@ -177,7 +274,7 @@ class BurstContext:
         """
         factor_logws = self.factor_logws(state)
         return self._target.make_lazy_weights(
-            lm_logws.weights[self._llm_idxs] + factor_logws.weights[self._factor_idxs]
+            lm_weights[self._llm_idxs] + factor_logws.weights[self._factor_idxs]
         )
 
     def run_sync(self, coro):
@@ -190,20 +287,28 @@ class _Burst:
     """The Controller's private per-engine-burst runtime (set by the BurstLoop
     for the duration of one ``run_burst``; ``None`` outside a burst).
 
-    Holds what the Controller's ``draw`` needs row-wise -- the live particle
-    row-map, the engine LM (to build each row's ``lm_logws``), the EOS id, and the
-    mutable pop-out flag -- plus the sampler-facing :class:`BurstContext`
-    (``ctx``). Samplers never see this object; only ``ctx``.
+    Holds what the Controller's ``draw`` needs -- the live particle row-map, the
+    engine LM (to batch the rows' ``lm_batch``), the EOS id, and the mutable
+    pop-out flag -- plus the sampler-facing :class:`BurstContext` (``ctx``).
+    Samplers never see this object; only ``ctx``.
     """
 
-    __slots__ = ("particles", "llm", "eos_id", "pop_out", "ctx")
+    __slots__ = ("particles", "llm", "eos_id", "pop_out", "ctx", "_run_async")
 
-    def __init__(self, particles, llm, eos_id, ctx):
+    def __init__(self, particles, llm, eos_id, ctx, run_async):
         self.particles = particles
         self.llm = llm
         self.eos_id = eos_id
         self.pop_out = False
         self.ctx = ctx
+        self._run_async = run_async
+
+    def run_sync(self, coro):
+        """Drive a coroutine to completion on the driver's event loop and block
+        for the result (one event-loop hop). The Controller uses this to evaluate
+        the async critic from the synchronous engine-thread ``draw``, the same hop
+        ``BurstContext.run_sync`` gives samplers."""
+        return self._run_async(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +358,14 @@ class Controller:
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
 
-        self.particles = [Particle(max_tokens) for _ in range(n_particles)]
+        self.particles = Population(n_particles, max_tokens)
         self.record = SMCRecord(n_particles) if record else None
+
+        # Constant RHS of the ESS resample predicate (``log(ess_threshold * n)``),
+        # compared against ``log(ESS)`` every step -- precomputed once here instead
+        # of recomputing two ``np.log`` calls on the burst hot path.
+        with np.errstate(divide="ignore"):
+            self._ess_log_threshold = np.log(ess_threshold) + np.log(n_particles)
 
         # The :class:`_Burst` runtime set by the BurstLoop for the duration of a
         # single engine burst; read by the ``shape`` / ``draw`` callbacks the
@@ -270,12 +381,10 @@ class Controller:
     # the ``_terminate_*`` helpers below.
 
     async def _draw_and_score(self, p):
-        """The shared per-step transition for one particle.
+        """The slow per-step transition for one particle.
 
-        Calls the sampler's transition to draw a token + weight increment,
-        scores the particle, advances the critic twist, and handles
-        termination. This is the SMC math, identical regardless of where the
-        next-token logprobs come from.
+        Draws a token + weight increment from the sampler, then applies the
+        shared SMC scoring/twist/termination math (:meth:`_score_advance_terminate`).
 
         ``unit_sampler.transition`` returns ``(to_append, logw, logp)`` where
         ``to_append`` is the list of items to extend the particle context with
@@ -283,18 +392,46 @@ class Controller:
         trailing EOS -- for the multi-token unit sampler).
         """
         to_append, logw, logp = await self.unit_sampler.transition(p.context)
+        await self._score_advance_terminate(p, to_append, logw, logp)
+
+    def _advance_no_critic(self, p, to_append, logw, logp):
+        """Sync score + advance + terminate for the NO-CRITIC path. Shared by the
+        slow :meth:`_score_advance_terminate` (its no-critic branch) and the burst
+        bookkeeping (:meth:`_bank_burst_draw`) -- the burst calls it directly so a
+        no-critic step needs NO event-loop hop, which would otherwise be the new
+        per-particle bottleneck once the LM draw is batched."""
+        p.score(logw)
+        p.logp += logp
+        p.context.extend(to_append)
+        if p.logw == float("-inf"):
+            p.finish()
+        else:
+            self._terminate_if_done(p)
+
+    async def _score_advance_terminate(self, p, to_append, logw, logp):
+        """The post-draw SMC math: score, advance the context, apply the critic
+        twist (per-step when ``twist_with_critic``) and reweight at termination,
+        and terminate. This is the ONE implementation of the per-step math; both
+        the slow loop (:meth:`_draw_and_score`, ``await``) and the engine burst
+        (:meth:`draw`, via ``run_sync``) call it after obtaining their draw, so
+        the critic is handled identically regardless of where the logits came
+        from -- no per-driver critic logic, no critic-category dispatch.
+
+        The caller is responsible for untwisting ``p`` before the draw (the slow
+        ``run`` loop and the burst ``draw`` both untwist each live particle at the
+        start of the step, mirroring llamppl's ``smc_standard``).
+        """
+        if not self.critic:
+            self._advance_no_critic(p, to_append, logw, logp)
+            return
+
         p.score(logw)
         p.logp += logp
         p.context.extend(to_append)
 
         if p.logw == float("-inf"):
-            if self.critic:
-                assert p.twist_amount != float("-inf")
+            assert p.twist_amount != float("-inf")
             p.finish()
-            return
-
-        if not self.critic:
-            self._terminate_if_done(p)
             return
 
         # From here on the critic is non-None (the no-critic case returned above).
@@ -376,8 +513,7 @@ class Controller:
         did_resample = False
 
         while any(not p.done for p in self.particles):
-            for p in self.particles:
-                p.untwist()
+            self.particles.untwist_all()
 
             await asyncio.gather(
                 *[self._draw_and_score(p) for p in self.particles if not p.done]
@@ -402,11 +538,11 @@ class Controller:
         and the mutating ``_maybe_resample`` so both decide identically.
 
         Given the (log) normalized weights, returns whether the effective sample
-        size has fallen below ``ess_threshold * n_particles``.
+        size has fallen below ``ess_threshold * n_particles``. ``-logsumexp(2w)``
+        is ``log(ESS)``; the RHS ``log(ess_threshold * n)`` is the constant
+        precomputed in ``__init__``.
         """
-        return -logsumexp(normalized_weights * 2) < np.log(self.ess_threshold) + np.log(
-            self.n_particles
-        )
+        return -logsumexp(normalized_weights * 2) < self._ess_log_threshold
 
     def _ess_crosses(self):
         """Whether the ESS test triggers a resample on the current population.
@@ -416,7 +552,7 @@ class Controller:
         path's resample decision exactly. Returns ``False`` when all weights are
         ``-inf`` (matching the slow path's ``continue``).
         """
-        W = np.array([p.logw for p in self.particles])
+        W = self.particles.logw
         if np.all(W == -np.inf):
             return False
         normalized_weights = W - logsumexp(W)
@@ -432,7 +568,7 @@ class Controller:
         Returns ``(did_resample, ancestor_indices)``.
         """
         n = self.n_particles
-        W = np.array([p.logw for p in self.particles])
+        W = self.particles.logw
         if np.all(W == -np.inf):
             return False, list(range(n))
 
@@ -446,10 +582,8 @@ class Controller:
             if sort_ancestors:
                 ancestor_indices.sort()
 
-            self.particles = [self.particles[i].clone() for i in ancestor_indices]
-            avg_weight = w_sum - np.log(n)
-            for p in self.particles:
-                p.logw = avg_weight
+            self.particles.reindex(ancestor_indices)
+            self.particles.logw[:] = w_sum - np.log(n)
 
             return True, ancestor_indices
 
@@ -465,17 +599,18 @@ class Controller:
 
     # -- the engine callbacks shape / draw (used only by the BurstLoop) ------
     #
-    # These reproduce, row-wise on raw engine logits, exactly what
-    # ``_draw_and_score`` does for an UNCONSTRAINED ``DirectTokenSampler`` (and,
-    # with an additive control-side factor, for the constrained extension). The
-    # engine IS the language model, so ``shape`` adds only the non-LM factor's
-    # per-token log-weights; the draw reuses the slow path's ``fast_sample_*``
-    # over the same control-side V+1 vocabulary so the same RNG stream selects
-    # the same token (up to the warm-KV-vs-reprefill logit residual).
+    # These reproduce, on raw engine logits, exactly what ``_draw_and_score``
+    # does for a burst-capable sampler over an engine LM (and, with an additive
+    # control-side factor, the constrained extension). The engine IS the language
+    # model, so ``shape`` adds only the non-LM factor's per-token log-weights; the
+    # draw works in the same control-side V+1 vocabulary as the slow path. Each
+    # sampler's ``burst_draw_batch`` decides whether it reuses the slow path's
+    # numpy RNG (tight warm-KV-only parity) or a batched torch draw (no-bias) --
+    # see the per-sampler docstrings in ``token.py``.
     #
     # A live burst is described by ``self._burst`` (a :class:`_Burst` set by
     # the BurstLoop): ``particles`` (the live row-map), ``llm`` (the engine
-    # PromptedLLM, supplying ``_process_logw_next`` / ``_maybe_temper``),
+    # PromptedLLM, supplying ``_process_logw_next_batch`` / ``_maybe_temper``),
     # ``eos_id`` (the engine token id to force/observe EOS), the mutable
     # ``pop_out`` flag (once True, every subsequent draw forces EOS -- a control
     # signal, never banked -- so the burst ends for resampling), and ``ctx``
@@ -506,91 +641,89 @@ class Controller:
         # Identity for both the unconstrained and additive-factor cases; the
         # full proposal (LM + factor) and its normalizer are formed in ``draw``.
 
-    def draw(self, logits, request_ids, sampling_metadata):
-        """Draw one token per row using the SLOW PATH's draw function.
+    def draw(self, logits, request_ids):
+        """Draw one token per live row, reproducing the slow path's per-step draw.
 
-        Reproduces ``DirectTokenSampler.sample``:
+        The expensive 50k-vocab LM processing runs ONCE for the whole batch
+        on-device (``_process_logw_next_batch``); the sampler's
+        :meth:`~TokenSampler.burst_draw_batch` then turns that batched proposal
+        into one ``(token, logw, logp, new_factor_state)`` per live row -- the
+        burst analog of ``sample`` (see the per-sampler docstrings in
+        ``token.py`` for how each reconstructs ``Product(llm, factor).logw_next``
+        from the carried factor state and which RNG stream it draws with). The
+        Controller then banks the weight, advances, and terminates each particle
+        (:meth:`_bank_burst_draw`). When popping out, force EOS for every row
+        WITHOUT banking it.
 
-        * unconstrained -- build the control-side V+1 ``LazyWeights`` from the
-          engine logits exactly as ``PromptedLLM._process_logw_next`` does;
-        * additive factor -- reconstruct ``Product(llm, factor).logw_next`` over
-          the product's vocabulary, substituting the engine-derived LM weights
-          for the reprefilled ones and gathering through ``Product``'s own
-          ``v1_idxs``/``v2_idxs`` index maps (so vocab narrowing matches slow).
-
-        Then normalize and draw with ``fast_sample_lazyweights`` (the same
-        Gumbel-max consuming the same numpy RNG as the slow path), bank
-        ``logws.sum()`` and ``logps[token]``, advance the particle, and run the
-        no-critic termination bookkeeping. The factor's ``logw_next`` is the
-        slow path's exact (async) call, evaluated synchronously via the driver's
-        ``eval_factor`` hook on the BurstLoop's event loop. When popping out,
-        force EOS for every row WITHOUT banking it.
+        The engine's ``SamplingMetadata`` is intentionally not taken: this draw
+        works entirely in the control-side V+1 vocab (temperature via
+        ``_maybe_temper``, no top-k/p), so the engine's per-row sampling params
+        play no role.
         """
-        import torch
-
         w = self._burst
-        eos_id = w.eos_id
         sampler = self.unit_sampler
-        out = []
+        parts = [self._burst_particle(rid) for rid in request_ids]
+        # Rows still being driven (not popped-out for resample, not finished).
+        # Popped-out / done rows are forced to EOS (control signal, never banked).
+        out = [w.eos_id] * len(parts)
+        live = [i for i, p in enumerate(parts) if not (w.pop_out or p.done)]
 
-        for i, rid in enumerate(request_ids):
-            p = self._burst_particle(rid)
+        if live:
+            # Untwist last step's provisional critic twist before this step's score
+            # (mirrors the slow loop's per-step untwist; no-op without a critic).
+            # Vectorized over the live population rows -- no per-particle loop.
+            self.particles.untwist_subset([parts[i]._i for i in live])
 
-            if w.pop_out or p.done:
-                # Forced pop-out (control signal) or an already-finished row:
-                # return EOS, advance nothing, bank nothing.
-                out.append(eos_id)
-                continue
-
-            row = logits[i]
-            if row.dtype != torch.float32:
-                row = row.float()
-            # The sampler computes its own draw from the engine LM weights + the
-            # carried factor state (its burst_draw, the analog of transition);
-            # the Controller banks the weight, appends the token, sets the state,
-            # and runs termination -- no sampler-type dispatch here.
-            token, logw, logp, new_state = sampler.burst_draw(
-                self._lm_logws(row), p.factor_state, w.ctx
+            # The expensive 50k-vocab LM processing happens ONCE for the whole
+            # batch, on-device -- never per row (the per-row Python loop was
+            # ~5-19x the engine's native decode cost). The sampler then draws all
+            # rows from this batched proposal (Direct vectorizes; AWRS/Set loop
+            # their cheap per-particle control over the [V+1] rows).
+            llm = w.llm
+            lm_batch = llm._process_logw_next_batch(llm._maybe_temper(logits[live].float()))
+            tokens, logws, logps, new_states = sampler.burst_draw_batch(
+                lm_batch,
+                [parts[i].factor_state for i in live],
+                [parts[i].context for i in live],
+                w.ctx,
             )
-            p.score(logw)
-            p.logp += logp
-            p.context.append(token)
-            p.factor_state = new_state
-            self._terminate_after_draw(p)
-
-            if isinstance(token, EndOfSequence):
-                # Emitting EOS to the engine ends this request, so the particle
-                # must have terminated in lockstep. The slow path terminates on
-                # `context[-1] is EOS` (singleton identity); this assert turns a
-                # non-singleton-EOS slow/burst divergence -- which would end the
-                # request without finishing the particle -- into a loud failure
-                # instead of a silent length/log_ml gap.
-                assert p.done, "burst emitted EOS for a particle that did not terminate"
-                out.append(eos_id)
-            else:
-                out.append(token.token_id)
+            for k, i in enumerate(live):
+                out[i] = self._bank_burst_draw(
+                    parts[i], tokens[k], logws[k], logps[k], new_states[k]
+                )
 
         # End-of-step ESS test (same predicate the slow path applies after every
         # token). If it crosses, arm pop-out: the next engine step forces EOS for
-        # all live rows so the burst ends and the BurstLoop resamples. Skip
-        # while already popping out (no real step happened).
+        # all live rows so the burst ends and the BurstLoop resamples. Skip while
+        # already popping out (no real step happened).
         if not w.pop_out and self._ess_crosses():
             w.pop_out = True
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
-    def _lm_logws(self, row):
-        """The LM half: the engine row as V+1 LazyWeights, exactly as
-        ``PromptedLLM._process_logw_next`` (modulo the warm-KV residual)."""
-        llm = self._burst.llm
-        return llm._process_logw_next(llm._maybe_temper(row))
-
-    def _terminate_after_draw(self, p):
-        """The no-critic termination bookkeeping shared by every burst draw."""
-        if p.logw == float("-inf"):
-            p.finish()
+    def _bank_burst_draw(self, p, token, logw, logp, new_state):
+        """Per-particle SMC bookkeeping after a burst draw (batched or per-row);
+        returns the engine token id to emit for this row. No-critic uses the sync
+        :meth:`_advance_no_critic` (no event-loop hop); the critic path drives the
+        shared async :meth:`_score_advance_terminate` via the burst's hop."""
+        p.factor_state = new_state
+        if self.critic is None:
+            self._advance_no_critic(p, [token], logw, logp)
         else:
-            self._terminate_if_done(p)
+            self._burst.run_sync(self._score_advance_terminate(p, [token], logw, logp))
+
+        if isinstance(token, EndOfSequence):
+            # Emitting EOS ends the engine request, so the particle must have
+            # terminated in lockstep -- turns a non-singleton-EOS slow/burst
+            # divergence into a loud failure rather than a silent length/log_ml gap.
+            assert p.done, "burst emitted EOS for a particle that did not terminate"
+            return self._burst.eos_id
+        if p.done:
+            # Critic/budget terminated on a non-EOS token: pop the row out now (the
+            # drawn token is already in the context -- bit-identical to the slow
+            # path simply ceasing to step a finished particle).
+            return self._burst.eos_id
+        return token.token_id
 
 
 # ---------------------------------------------------------------------------
@@ -661,22 +794,24 @@ def can_burst(controller):
 
     The burst fast path requires:
 
-    * the unit sampler is **burst-capable** -- it implements ``burst_draw``,
+    * the unit sampler is **burst-capable** -- it implements ``burst_draw_batch``,
       declared via ``supports_burst()`` (DirectTokenSampler with no separate
       proposal, or AWRS over a sync-stateful boolean condition). The Controller
       asks the sampler; it does not branch on the sampler's type.
     * the sampler target decomposes (:func:`split_engine_target`) into a single
       engine LM, optionally times one additive same-vocab factor (e.g. a coerced
-      ``BoolFSA``);
-    * no critic. A non-trivial critic twists per step / reweights at termination
-      and is not yet handled by the burst's synchronous draw, so it stays on the
-      slow path.
+      ``BoolFSA``).
 
-    Anything else falls back to :class:`StepLoop`.
+    A critic does NOT disqualify the burst: it is scored/twisted/terminated by the
+    same :meth:`Controller._score_advance_terminate` the slow loop uses (driven
+    via ``run_sync`` from the engine-thread draw), so a per-step twist
+    (``ess_threshold > 0``) or a terminal reweight (``ess_threshold == 0``) is
+    handled identically to the slow path -- no critic-category gate.
+
+    Anything else (e.g. a two-LM proposal the engine can't express) falls back to
+    :class:`StepLoop`.
     """
     sampler = controller.unit_sampler
-    if controller.critic is not None:
-        return False
     if not getattr(sampler, "supports_burst", lambda: False)():
         return False
     return split_engine_target(sampler.target) is not None
@@ -793,7 +928,8 @@ class BurstLoop:
                 run_async=run_async,
             )
             controller._burst = _Burst(
-                particles=live, llm=self.llm, eos_id=eos_id, ctx=ctx
+                particles=live, llm=self.llm, eos_id=eos_id, ctx=ctx,
+                run_async=run_async,
             )
             try:
                 # Run the engine step loop in a worker thread so this event loop
