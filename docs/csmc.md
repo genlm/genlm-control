@@ -2,7 +2,7 @@
 
 Conditional Sequential Monte Carlo (C-SMC) is a variant of SMC in which one slot in the particle population is *retained* across resampling rounds. This page covers the math, the API, and how to use it.
 
-The C-SMC inference loop lives upstream in [`llamppl.csmc_standard`][llamppl.csmc_standard]; the retained-particle adapter that plugs it into genlm-control's token-sampler layer lives in [`genlm.control.sampler.csmc_memory`][genlm.control.sampler.csmc_memory]. The whole thing is surfaced through `SMC.__call__(retained_sequence=...)`.
+The C-SMC inference loop lives upstream in `llamppl.csmc_standard`; the retained-particle adapter that plugs it into genlm-control's token-sampler layer lives in [`genlm.control.sampler.csmc_memory`][genlm.control.sampler.csmc_memory]. The whole thing is surfaced through `SMC.__call__(retained_sequence=...)`.
 
 ## The target
 
