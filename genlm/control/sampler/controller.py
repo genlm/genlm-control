@@ -300,18 +300,24 @@ class _Burst:
     for the duration of one ``run_burst``; ``None`` outside a burst).
 
     Holds what the Controller's ``draw`` needs -- the live particle row-map, the
-    engine LM (to batch the rows' ``lm_batch``), the EOS id, and the mutable
-    pop-out flag -- plus the sampler-facing :class:`BurstContext` (``ctx``).
-    Samplers never see this object; only ``ctx``.
+    engine LM (to batch the rows' ``lm_batch``), the EOS id, and ``abort_rows``
+    (external row indices the draw has flagged to drop from the burst) -- plus the
+    sampler-facing :class:`BurstContext` (``ctx``). Samplers never see this object;
+    only ``ctx``.
+
+    Pop-out is out-of-band: ``draw`` adds a row's external index to ``abort_rows``
+    (one row when it terminates; every live row when ESS crosses), and ``run_burst``
+    drains them via :meth:`Controller.drain_aborts` and calls ``abort_request`` --
+    no forced-EOS, no discard forward.
     """
 
-    __slots__ = ("particles", "llm", "eos_id", "pop_out", "ctx", "_run_async")
+    __slots__ = ("particles", "llm", "eos_id", "abort_rows", "ctx", "_run_async")
 
     def __init__(self, particles, llm, eos_id, ctx, run_async):
         self.particles = particles
         self.llm = llm
         self.eos_id = eos_id
-        self.pop_out = False
+        self.abort_rows = set()
         self.ctx = ctx
         self._run_async = run_async
 
@@ -623,16 +629,30 @@ class Controller:
     # A live burst is described by ``self._burst`` (a :class:`_Burst` set by
     # the BurstLoop): ``particles`` (the live row-map), ``llm`` (the engine
     # PromptedLLM, supplying ``_process_logw_next_batch`` / ``_maybe_temper``),
-    # ``eos_id`` (the engine token id to force/observe EOS), the mutable
-    # ``pop_out`` flag (once True, every subsequent draw forces EOS -- a control
-    # signal, never banked -- so the burst ends for resampling), and ``ctx``
-    # (the sampler-facing :class:`BurstContext`).
+    # ``eos_id`` (the engine token id used as the committed placeholder for an
+    # aborted row), ``abort_rows`` (external indices ``draw`` flags to drop), and
+    # ``ctx`` (the sampler-facing :class:`BurstContext`). Pop-out is the explicit
+    # ``abort_request`` ``run_burst`` issues from :meth:`drain_aborts` -- no
+    # forced-EOS, no discard forward.
+
+    def _burst_external(self, request_id):
+        """The external particle index for a vLLM internal request id
+        (``"{external}-{8 chars}"``); the BurstLoop assigned ``str(index)``."""
+        return int(request_id.rsplit("-", 1)[0])
 
     def _burst_particle(self, request_id):
-        """Map a vLLM internal request id (``"{external}-{8 chars}"``) to its
-        particle via the external index the BurstLoop assigned."""
-        external = request_id.rsplit("-", 1)[0]
-        return self._burst.particles[int(external)]
+        """Map a vLLM internal request id to its particle via the external index."""
+        return self._burst.particles[self._burst_external(request_id)]
+
+    def drain_aborts(self):
+        """External row indices ``draw`` has flagged to abort since the last call
+        (consumed). ``run_burst`` calls this after each engine step and issues
+        ``abort_request`` for them -- the out-of-band pop-out that replaces the old
+        forced-EOS. A row is flagged when its particle terminates (staggered) or
+        when the ESS test crosses (all live rows, ending the burst for resample)."""
+        rows = self._burst.abort_rows
+        self._burst.abort_rows = set()
+        return list(rows)
 
     def shape(self, logits, request_ids) -> None:
         """Shape each row's raw engine logits into its proposal in place.
@@ -664,8 +684,10 @@ class Controller:
         ``token.py`` for how each reconstructs ``Product(llm, factor).logw_next``
         from the carried factor state and which RNG stream it draws with). The
         Controller then banks the weight, advances, and terminates each particle
-        (:meth:`_bank_burst_draw`). When popping out, force EOS for every row
-        WITHOUT banking it.
+        (:meth:`_bank_burst_draw`). Pop-out is out-of-band: a row whose particle
+        terminates, and every row when the ESS test crosses, is added to
+        ``abort_rows`` for ``run_burst`` to ``abort_request`` (:meth:`drain_aborts`)
+        -- no forced EOS, no discard forward.
 
         The engine's ``SamplingMetadata`` is intentionally not taken: this draw
         works entirely in the control-side V+1 vocab (temperature via
@@ -674,42 +696,39 @@ class Controller:
         """
         w = self._burst
         sampler = self.unit_sampler
+        # Every row in request_ids is live: an aborted/terminated row was dropped
+        # from the engine, so it never reappears here.
         parts = [self._burst_particle(rid) for rid in request_ids]
-        # Rows still being driven (not popped-out for resample, not finished).
-        # Popped-out / done rows are forced to EOS (control signal, never banked).
-        out = [w.eos_id] * len(parts)
-        live = [i for i, p in enumerate(parts) if not (w.pop_out or p.done)]
+        externals = [self._burst_external(rid) for rid in request_ids]
 
-        if live:
-            # Untwist last step's provisional critic twist before this step's score
-            # (mirrors the slow loop's per-step untwist; no-op without a critic).
-            # Vectorized over the live population rows -- no per-particle loop.
-            self.particles.untwist_subset([parts[i]._i for i in live])
+        # Untwist last step's provisional critic twist before this step's score
+        # (mirrors the slow loop's per-step untwist; no-op without a critic).
+        self.particles.untwist_subset([p._i for p in parts])
 
-            # The expensive 50k-vocab LM processing happens ONCE for the whole
-            # batch, on-device -- never per row (the per-row Python loop was
-            # ~5-19x the engine's native decode cost). The sampler then draws all
-            # rows from this batched proposal (Direct vectorizes; AWRS/Set loop
-            # their cheap per-particle control over the [V+1] rows).
-            llm = w.llm
-            lm_batch = llm._process_logw_next_batch(llm._maybe_temper(logits[live].float()))
-            tokens, logws, logps, new_states = sampler.burst_draw_batch(
-                lm_batch,
-                [parts[i].factor_state for i in live],
-                [parts[i].context for i in live],
-                w.ctx,
-            )
-            for k, i in enumerate(live):
-                out[i] = self._bank_burst_draw(
-                    parts[i], tokens[k], logws[k], logps[k], new_states[k]
-                )
+        # The expensive 50k-vocab LM processing happens ONCE for the whole batch,
+        # on-device -- never per row. The sampler then draws all rows from this
+        # batched proposal (Direct vectorizes; AWRS/Set loop their cheap
+        # per-particle control over the [V+1] rows).
+        llm = w.llm
+        lm_batch = llm._process_logw_next_batch(llm._maybe_temper(logits.float()))
+        tokens, logws, logps, new_states = sampler.burst_draw_batch(
+            lm_batch,
+            [p.factor_state for p in parts],
+            [p.context for p in parts],
+            w.ctx,
+        )
+        out = [0] * len(parts)
+        for k, p in enumerate(parts):
+            out[k] = self._bank_burst_draw(p, tokens[k], logws[k], logps[k], new_states[k])
+            if p.done:
+                # Staggered pop-out: this particle terminated -> drop its request.
+                w.abort_rows.add(externals[k])
 
-        # End-of-step ESS test (same predicate the slow path applies after every
-        # token). If it crosses, arm pop-out: the next engine step forces EOS for
-        # all live rows so the burst ends and the BurstLoop resamples. Skip while
-        # already popping out (no real step happened).
-        if not w.pop_out and self._ess_crosses():
-            w.pop_out = True
+        # End-of-step ESS test (the predicate the slow path applies after every
+        # token). If it crosses, abort every live row so the burst ends and the
+        # BurstLoop resamples -- the synchronized pop-out.
+        if self._ess_crosses():
+            w.abort_rows.update(externals)
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
@@ -725,15 +744,10 @@ class Controller:
             self._burst.run_sync(self._score_advance_terminate(p, [token], logw, logp))
 
         if isinstance(token, EndOfSequence):
-            # Emitting EOS ends the engine request, so the particle must have
-            # terminated in lockstep -- turns a non-singleton-EOS slow/burst
-            # divergence into a loud failure rather than a silent length/log_ml gap.
-            assert p.done, "burst emitted EOS for a particle that did not terminate"
-            return self._burst.eos_id
-        if p.done:
-            # Critic/budget terminated on a non-EOS token: pop the row out now (the
-            # drawn token is already in the context -- bit-identical to the slow
-            # path simply ceasing to step a finished particle).
+            # Drawn EOS terminates the particle; the caller aborts the row. EOS has
+            # no token_id, so commit the engine eos id as the (unused) placeholder
+            # -- the assert keeps a non-singleton-EOS slow/burst divergence loud.
+            assert p.done, "burst drew EOS for a particle that did not terminate"
             return self._burst.eos_id
         return token.token_id
 
@@ -1005,8 +1019,9 @@ class BurstLoop:
             live = [p for p in controller.particles if not p.done]
             prompts = [self._context_ids(p) for p in live]
             # Each particle keeps its own budget; the engine burst just needs to
-            # be long enough to reach the longest particle's budget (plus one
-            # step to let a budget-exhausted row pop out via forced EOS).
+            # be long enough to reach the longest particle's budget (+1 so a
+            # budget-exhausted row is dropped by the control's abort, not
+            # length-capped by the engine first).
             max_steps = max(p.max_tokens_left for p in live) + 1
 
             # The sampler-facing context (named methods, no Controller runtime)
@@ -1033,7 +1048,6 @@ class BurstLoop:
                         prompts=prompts,
                         control=controller,
                         max_steps=max_steps,
-                        eos_token_ids=eos_idxs,
                         temperature=self.llm.temperature,
                     ),
                 )
