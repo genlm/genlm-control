@@ -5,7 +5,7 @@ from llamppl import SubModel
 from arsenal.maths import log1mexp, logsumexp
 import warnings
 
-from genlm.control.util import fast_sample_lazyweights
+from genlm.control.util import fast_sample_logprobs
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 
@@ -132,29 +132,32 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            logps = logws.normalize()
+            log_z = logsumexp(logws.weights)
             if draw is None:
-                # fast sampling from logps using gumbel-max trick
-                token = fast_sample_lazyweights(logps)
+                token_id = int(fast_sample_logprobs(logws.weights, size=1)[0])
+                token = logws.decode[token_id]
+                logp = logws.weights[token_id] - log_z
             else:
+                logps = logws.spawn(logws.weights - log_z)
                 token = draw(logps.exp().materialize())
-            return token, logws.sum(), logps[token]
+                logp = logps[token]
+            return token, log_z, logp
 
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context),
             self.potential.logw_next(context),
         )
-        proposal_logps = proposal_logws.normalize()
+        proposal_log_z = logsumexp(proposal_logws.weights)
         if draw is None:
-            token = fast_sample_lazyweights(proposal_logps)
+            token_id = int(fast_sample_logprobs(proposal_logws.weights, size=1)[0])
+            token = proposal_logws.decode[token_id]
+            proposal_logp = proposal_logws.weights[token_id] - proposal_log_z
         else:
+            proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_log_z)
             token = draw(proposal_logps.exp().materialize())
-        logw = (
-            target_logws[token]
-            - proposal_logws[token]
-            + proposal_logws.sum()
-        )
-        return token, logw, proposal_logps[token]
+            proposal_logp = proposal_logps[token]
+        logw = target_logws[token] - proposal_logws[token] + proposal_log_z
+        return token, logw, proposal_logp
 
     async def cleanup(self):
         pass  # pragma: no cover
@@ -201,12 +204,16 @@ class SetTokenSampler(TokenSampler):
             `SetSampler` for more details.
         """
         logws, logp = await self.set_sampler.sample_set(context, draw=draw)
-        logps = logws.normalize()
+        log_z = logsumexp(logws.weights)
         if draw is None:
-            token = fast_sample_lazyweights(logps)
+            token_id = int(fast_sample_logprobs(logws.weights, size=1)[0])
+            token = logws.decode[token_id]
+            selected_logp = logws.weights[token_id] - log_z
         else:
+            logps = logws.spawn(logws.weights - log_z)
             token = draw(logps.exp().materialize())
-        return token, logws.sum(), logp + logps[token]
+            selected_logp = logps[token]
+        return token, log_z, logp + selected_logp
 
     async def cleanup(self):
         """Clean up the sampler.

@@ -298,11 +298,24 @@ def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
         (np.ndarray): Array of sampled indices
 
     Note:
-        This is much faster than np.random.choice for large arrays since it avoids
-        normalizing probabilities and uses vectorized operations.
+        Uses one in-place buffer instead of four temporaries. The gumbel-max
+        trick reduces to ``argmin(log(-log U) - logprobs)`` via
+        ``argmax(x) = argmin(-x)``, which lets us skip the final negation that
+        ``-log(-log U) + logprobs`` would otherwise require.
+
+        Randomness comes from numpy's global RNG (``np.random.random``) so
+        ``np.random.seed`` controls reproducibility. ``np.random.random``
+        draws from ``[0, 1)``; a draw of exactly ``0`` would make one
+        ``(sample, token)`` entry of ``work`` non-finite and exclude that
+        single cell from ``argmin``. Probability ≈ 2⁻⁵³, negligible in
+        practice.
     """
-    noise = -np.log(-np.log(np.random.random((size, len(logprobs)))))
-    return (logprobs + noise).argmax(axis=1)
+    work = np.random.random((size, len(logprobs)))
+    np.log(work, out=work)         # log(U)
+    np.negative(work, out=work)    # -log(U) > 0
+    np.log(work, out=work)         # log(-log(U)) = -gumbel noise
+    work -= logprobs               # log(-log(U)) - logprobs
+    return work.argmin(axis=1)     # == argmax(logprobs + (-log(-log U)))
 
 
 def fast_sample_lazyweights(lazyweights):
