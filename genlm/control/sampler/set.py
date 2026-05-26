@@ -156,6 +156,15 @@ class EagerSetSampler(TrieSetSampler):
         logws = self.target.alloc_logws()
         curr = self.trie.root
         coerced_ctx = self.f(context)
+        # Carry the item_potential's state through the (no-backtracking) trie
+        # descent instead of replaying ``coerced_ctx + subtokens`` from scratch at
+        # every level. Seed it through coerced_ctx once; advance one subtoken per
+        # level. Generic interface: WFSA/BoolFSA advance their chart (fast); other
+        # potentials fall back to context-replay (logw_next_from_state(state) ==
+        # logw_next(coerced_ctx + subtokens)), byte-identical and no slower.
+        item_state = self.item_potential.state0()
+        for sym in coerced_ctx:
+            item_state = self.item_potential.advance(item_state, sym)
         subtokens = []
         logp, logw = 0, 0
 
@@ -178,7 +187,7 @@ class EagerSetSampler(TrieSetSampler):
                 token = self.target.vocab_eos[token_id]
                 logws[token_id] = iter_logws[token] + logw - logp
 
-            item_logws2 = await self.item_potential.logw_next(coerced_ctx + subtokens)
+            item_logws2 = await self.item_potential.logw_next_from_state(item_state)
             item_ws2 = item_logws2.exp().materialize()
             w_next = (item_ws1 * item_ws2).trim()
 
@@ -197,6 +206,9 @@ class EagerSetSampler(TrieSetSampler):
 
             subtokens.append(b)
             curr = children[b]
+            # b is a real item token here (the iter-EOS branch broke above), so
+            # advancing the item_potential state by it is well-defined.
+            item_state = self.item_potential.advance(item_state, b)
 
         return self.target.make_lazy_weights(logws), logp
 
