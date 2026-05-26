@@ -4,14 +4,6 @@ Conditional Sequential Monte Carlo (C-SMC) is a variant of SMC in which one slot
 
 The C-SMC inference loop lives upstream in [`llamppl.csmc_standard`][llamppl.csmc_standard]; the retained-particle adapter that plugs it into genlm-control's token-sampler layer lives in [`genlm.control.sampler.csmc_memory`][genlm.control.sampler.csmc_memory]. The whole thing is surfaced through `SMC.__call__(retained_sequence=...)`.
 
-## Why
-
-Standard SMC produces a fresh set of independently-drawn particles each time you call it. That's fine for one-shot inference, but if you want a **transition kernel** that updates a single trajectory $z$ — for example, as the inner step of an MCMC or Particle Gibbs sampler over sequences — standard SMC doesn't fit: it has no notion of "previous state."
-
-C-SMC closes that gap. Given a current trajectory $z^{\ast}$ (the *retained particle*), it runs an SMC sweep that pins $z^{\ast}$ into one slot and exempts it from resampling, while the other $M - 1$ particles explore freely under the same proposal $r$ and shaping function $\psi$ that standard SMC would use. At termination, sampling an index $R$ from the normalized terminal weights gives the next state $z^{(R)}$.
-
-The resulting kernel $z^{\ast} \mapsto z^{(R)}$ is $\pi$-invariant for any $M \geq 1$, so iterating it produces a valid MCMC chain on sequence space whose stationary distribution is exactly the SMC target. Unlike Independence-MH, C-SMC uses the informative shaping function during proposal, so it inherits SMC's variance-reduction benefits.
-
 ## The target
 
 For a `PromptedLLM` proposal $r = p_\theta$, a critic $\kappa$, and observation $y$, the target posterior over latent token sequences $z \in \Sigma^{*}$ is
@@ -67,7 +59,7 @@ sequences = await sampler.smc(
     retained_sequence=retained,                 # <- triggers C-SMC
 )
 
-# To get the next memory in an EM loop, sample R ~ Categorical(w̃)
+# To get the next memory e.g. in Gibbs sampling (Andrieu et al., 2010), sample R ~ Categorical(w̃)
 # over particles with positive weight:
 import numpy as np
 weights = sequences.normalized_weights
