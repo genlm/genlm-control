@@ -15,6 +15,7 @@ engine.
 """
 
 import asyncio
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -22,6 +23,17 @@ import torch
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
+
+
+class NotAcceleratable(Exception):
+    """Raised when engine acceleration was *required* but the configuration can't
+    be driven by the engine burst.
+
+    The message is the same human-readable ``reason`` that
+    :func:`burst_capability` reports and that an ``accelerate="auto"`` fallback
+    logs, so the explanation a user sees on an explicit failure matches the one
+    they get from introspection (:meth:`SMC.acceleration_report`).
+    """
 
 
 def logsumexp(nums):
@@ -789,8 +801,26 @@ def split_engine_target(potential):
     return llm, factor, potential
 
 
-def can_burst(controller):
-    """Whether the ``BurstLoop`` can drive this configuration.
+@dataclass
+class BurstCapability:
+    """Whether a configuration can be engine-accelerated, and (if not) why.
+
+    Args:
+        ok (bool): True iff the :class:`BurstLoop` can drive this configuration.
+        reason (str | None): Human-readable blocker, naming the exact reason the
+            burst is unavailable. ``None`` when ``ok`` is True.
+
+    This single result backs both the runtime fallback/raise text and the
+    user-facing :meth:`SMC.acceleration_report`, so the message a user sees on
+    fallback is the same one introspection reports.
+    """
+
+    ok: bool
+    reason: str | None = None
+
+
+def burst_capability(controller):
+    """Whether the ``BurstLoop`` can drive this configuration, and why not.
 
     The burst fast path requires:
 
@@ -809,12 +839,75 @@ def can_burst(controller):
     handled identically to the slow path -- no critic-category gate.
 
     Anything else (e.g. a two-LM proposal the engine can't express) falls back to
-    :class:`StepLoop`.
+    :class:`StepLoop`, with the ``reason`` naming the blocker.
+
+    Returns:
+        (BurstCapability): ``ok`` plus a human-readable ``reason`` on failure.
     """
     sampler = controller.unit_sampler
+
     if not getattr(sampler, "supports_burst", lambda: False)():
-        return False
-    return split_engine_target(sampler.target) is not None
+        return BurstCapability(False, _sampler_burst_blocker(sampler))
+
+    if split_engine_target(sampler.target) is None:
+        return BurstCapability(False, _target_burst_blocker(sampler.target))
+
+    return BurstCapability(True)
+
+
+def _sampler_burst_blocker(sampler):
+    """Human-readable reason the unit sampler is not burst-capable.
+
+    Mirrors the per-sampler ``supports_burst()`` conditions (which the
+    Controller does not otherwise branch on) so the blocker text is precise."""
+    # Decision 2: the Set sampler's in-engine path is marginal/at-best and can
+    # regress, so it is reported as not accelerated until the trie is vectorized.
+    if type(sampler).__name__ == "SetTokenSampler":
+        return "SetTokenSampler is not engine-accelerated"
+    # A separate importance-sampling proposal makes the per-step weight
+    # non-engine-expressible (DirectTokenSampler / AWRS with `proposal=`).
+    if getattr(sampler, "proposal", None) is not None:
+        return (
+            "sampler uses a separate proposal; the importance weight isn't "
+            "engine-expressible"
+        )
+    # AWRS needs a sync-stateful boolean condition (exposes prefix_logw) for the
+    # rejection to run over the engine logits from the carried state.
+    if type(sampler).__name__ == "AWRS" and not hasattr(
+        getattr(sampler, "condition", None), "prefix_logw"
+    ):
+        return (
+            "AWRS condition is not sync-stateful (no prefix_logw); the rejection "
+            "can't be checked from a carried state in the engine"
+        )
+    return "this sampler is not engine-accelerated (no burst draw)"
+
+
+def _target_burst_blocker(target):
+    """Human-readable reason the sampler target does not decompose for the burst."""
+    p1 = getattr(target, "p1", None)
+    p2 = getattr(target, "p2", None)
+    if p1 is not None and p2 is not None:
+        if _is_engine_llm(p1) and _is_engine_llm(p2):
+            return "two-LM product can't be expressed in one decode stream"
+        if not _is_engine_llm(p1) and not _is_engine_llm(p2):
+            return (
+                "neither side of the product is a vLLM-engine LM — acceleration "
+                "is vLLM-only"
+            )
+    return (
+        f"target is not a single vLLM-engine LM (got {type(target).__name__}) — "
+        "acceleration is vLLM-only"
+    )
+
+
+def can_burst(controller):
+    """Whether the ``BurstLoop`` can drive this configuration (back-compat).
+
+    Thin boolean wrapper over :func:`burst_capability`; see there for the gate
+    and the failure reasons.
+    """
+    return burst_capability(controller).ok
 
 
 class BurstLoop:

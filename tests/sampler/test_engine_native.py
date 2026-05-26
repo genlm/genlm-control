@@ -54,6 +54,7 @@ from genlm.control.sampler.controller import (  # noqa: E402
     StepLoop,
     BurstLoop,
     can_burst,
+    burst_capability,
 )
 
 MODEL = "gpt2"
@@ -581,7 +582,13 @@ def test_set_sampler_burst_vs_slow(llm):
         return SetTokenSampler(set_sampler)
 
     try:
-        assert can_burst(_controller(make, 8, 0.0, 8))
+        # Decision 2 (UX): the Set sampler's in-engine path exists and is correct
+        # (the burst-vs-slow parity below proves it) but is reported as NOT
+        # accelerated -- the capability gate routes it to StepLoop. The numerical
+        # parity check still drives BurstLoop directly via `_run_burst`.
+        assert not can_burst(_controller(make, 8, 0.0, 8))
+        cap = burst_capability(_controller(make, 8, 0.0, 8))
+        assert cap.reason == "SetTokenSampler is not engine-accelerated"
         seeds = (1234, 7, 99, 2024, 555, 31)
         diffs = []
         for seed in seeds:

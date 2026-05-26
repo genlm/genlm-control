@@ -132,7 +132,16 @@ class TokenSampler:
     async def cleanup(self):
         pass  # pragma: no cover
 
-    async def smc(self, n_particles, ess_threshold, max_tokens, critic=None, **kwargs):
+    async def smc(
+        self,
+        n_particles,
+        ess_threshold,
+        max_tokens,
+        critic=None,
+        *,
+        accelerate="auto",
+        **kwargs,
+    ):
         """Generate sequences using sequential Monte Carlo (SMC) inference with this token sampler and an optional critic.
 
         This method is a convenience wrapper around [`SMC`][genlm.control.sampler.sequence.SMC].
@@ -144,6 +153,12 @@ class TokenSampler:
             max_tokens (int): The maximum number of tokens to generate.
             critic (Potential, optional): A potential function that guides the generation process
                 by scoring candidate sequences. Must have the same token type as the token sampler.
+            accelerate (str | bool, optional): Engine-acceleration knob, forwarded to
+                `SMC.__call__`. One of ``"auto"`` (default; engine path when
+                burst-capable, else the exact per-token path), ``"off"`` (force the
+                exact per-token path), or ``"require"`` (engine path or raise
+                `NotAcceleratable`). ``True``/``False`` alias ``"auto"``/``"off"``.
+                See `SMC.__call__` for the full contract.
             **kwargs (dict): Additional keyword arguments to pass to `SMC`'s `__call__` method.
         """
         from genlm.control.sampler.sequence import SMC
@@ -152,6 +167,7 @@ class TokenSampler:
             n_particles=n_particles,
             ess_threshold=ess_threshold,
             max_tokens=max_tokens,
+            accelerate=accelerate,
             **kwargs,
         )
 
@@ -299,14 +315,14 @@ class SetTokenSampler(TokenSampler):
         self.set_sampler = set_sampler
 
     def supports_burst(self) -> bool:
-        # The only engine-dependent call in the set construction is
-        # iter_potential.logw_next; the burst supplies it from the warm-KV decode
-        # logits (sample_set's iter_logws). The trie + item_potential replay from
-        # context control-side -- exactly as the slow path -- so only the
-        # expensive LLM half is accelerated and the set-sampling weights/RNG are
-        # the slow path's, unchanged. can_burst still gates on split_engine_target
-        # recognizing the iterable potential as an engine LM.
-        return True
+        # Decision 2 (UX): reported as NOT engine-accelerated for now. The burst
+        # machinery for the set draw exists and is correct (see ``burst_draw_batch``
+        # below and the gate-2 set parity test), but in-engine it is marginal/at-best
+        # and can regress versus the per-token path until the trie is vectorized, so
+        # the capability gate routes Set to ``StepLoop`` rather than silently
+        # delivering a possible slowdown. ``burst_capability`` reports the reason
+        # "SetTokenSampler is not engine-accelerated".
+        return False
 
     def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
         """Set construction over the engine's warm-KV iterable weights. The LM half

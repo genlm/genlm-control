@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 from genlm.grammar import Float
 from arsenal.maths import logsumexp
@@ -7,7 +8,34 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.controller import Controller, StepLoop, BurstLoop, can_burst
+from genlm.control.sampler.controller import (
+    Controller,
+    StepLoop,
+    BurstLoop,
+    burst_capability,
+    NotAcceleratable,
+)
+
+logger = logging.getLogger("genlm.control")
+
+
+def _normalize_accelerate(accelerate):
+    """Map the ``accelerate`` argument onto the canonical "auto"/"off"/"require".
+
+    Accepts the bare booleans as friendly aliases: ``True`` -> "auto" (so the
+    common ``accelerate=True`` never silently *requires* and errors) and
+    ``False`` -> "off".
+    """
+    if accelerate is True:
+        return "auto"
+    if accelerate is False:
+        return "off"
+    if accelerate in ("auto", "off", "require"):
+        return accelerate
+    raise ValueError(
+        f"`accelerate` must be one of 'auto', 'off', 'require' (or True/False); "
+        f"got {accelerate!r}"
+    )
 
 
 class SMC:
@@ -69,9 +97,10 @@ class SMC:
         n_particles,
         ess_threshold,
         max_tokens,
+        *,
+        accelerate="auto",
         verbosity=0,
         json_path=None,
-        backend=None,
         **kwargs,
     ):
         """Generate sequences using sequential Monte Carlo inference.
@@ -87,14 +116,26 @@ class SMC:
                 the critic is only applied at the end of the generation (if it is provided).
             max_tokens (int): Maximum number of tokens to generate per sequence. Generation
                 may terminate earlier if all sequences reach an EOS token.
+            accelerate (str | bool, optional): The single engine-acceleration knob,
+                keyword-only. One of:\n
+                - ``"auto"`` (default, also ``True``): run the engine-accelerated
+                  `BurstLoop` when the configuration is burst-capable, else the
+                  exact per-token `StepLoop`. Logs (INFO) which path ran, and on
+                  fallback the reason it was not accelerated.\n
+                - ``"off"`` (also ``False``): always run the exact per-token
+                  `StepLoop` -- byte-reproducible given a seed (the ground truth).\n
+                - ``"require"``: run the engine path, or raise
+                  `NotAcceleratable` with the reason if not burst-capable
+                  (guarantees the fast path; use for benchmarks / production E-steps).\n
+                Acceleration is vLLM-only for now. The engine is derived from the
+                sampler's `PromptedLLM` -- you do not pass it. The burst is
+                statistically identical to `"off"` (same target, unbiased weights)
+                but not byte-identical (warm-KV residual + batched-draw RNG); use
+                `"off"` for exact reproducibility.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
-            backend (optional): Opt into the engine-accelerated path. When non-None and the
-                configuration is burst-capable (`can_burst`), runs the in-engine `BurstLoop`;
-                otherwise (the default) the per-token `StepLoop`. Both produce identical SMC
-                output -- the burst path is pure acceleration.
             **kwargs (dict): Additional keyword arguments to pass to the SMC controller.
                 Currently ``resampling_method`` (one of 'multinomial', 'stratified',
                 'systematic', 'residual'; defaults to 'multinomial').
@@ -102,7 +143,13 @@ class SMC:
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
+
+        Raises:
+            NotAcceleratable: If ``accelerate="require"`` but the configuration is
+                not burst-capable.
         """
+        mode = _normalize_accelerate(accelerate)
+
         controller = Controller(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
@@ -115,7 +162,25 @@ class SMC:
             **kwargs,
         )
 
-        if backend is not None and can_burst(controller):
+        if mode == "off":
+            use_burst = False
+        else:
+            cap = burst_capability(controller)
+            if mode == "require" and not cap.ok:
+                raise NotAcceleratable(cap.reason)
+            use_burst = cap.ok
+            if mode == "auto":
+                if cap.ok:
+                    logger.info("running the engine-accelerated burst path.")
+                else:
+                    logger.info(
+                        "running the exact per-token path -- acceleration "
+                        "unavailable: %s. Pass accelerate=\"off\" to silence, or "
+                        "accelerate=\"require\" to make this an error.",
+                        cap.reason,
+                    )
+
+        if use_burst:
             particles = await BurstLoop(controller).run()
         else:
             particles = await StepLoop(controller).run()
@@ -124,6 +189,38 @@ class SMC:
             controller.save_record(json_path)
 
         return Sequences(*_unpack_particles(particles))
+
+    def acceleration_report(self):
+        """One-line human summary of whether this config engine-accelerates, and why.
+
+        Backed by :func:`~genlm.control.sampler.controller.burst_capability` -- the
+        same source of truth as the runtime fallback/raise text -- so a user can
+        ask the object what it will do before committing a long run, without an
+        engine.
+
+        Returns:
+            (str): e.g. "Engine-accelerated (vLLM): runs the in-engine burst." or
+                "Not accelerated: <reason> -> exact per-token path."
+        """
+        controller = Controller(
+            unit_sampler=self.unit_sampler,
+            critic=self.critic,
+            n_particles=1,
+            ess_threshold=0.0,
+            max_tokens=1,
+            twist_with_critic=False,
+            record=False,
+            verbosity=0,
+        )
+        cap = burst_capability(controller)
+        sampler_name = type(self.unit_sampler).__name__
+        if cap.ok:
+            critic_note = " + terminal critic" if self.critic is not None else ""
+            return (
+                f"Engine-accelerated (vLLM · {sampler_name}{critic_note}): "
+                "runs the in-engine burst, near the raw-decode ceiling."
+            )
+        return f"Not accelerated: {cap.reason} → exact per-token path."
 
     async def cleanup(self):
         """Clean up resources used by the inference engine.
