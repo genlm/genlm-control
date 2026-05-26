@@ -45,6 +45,7 @@ if not torch.cuda.is_available():  # pragma: no cover
     pytest.skip("engine-native parity needs CUDA + vLLM", allow_module_level=True)
 
 from genlm.control.constant import EndOfSequence  # noqa: E402
+from genlm.control.potential import Potential  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.potential.built_in.wfsa import BoolFSA  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler, AWRS  # noqa: E402
@@ -106,17 +107,18 @@ def _ctx_ids(ctx):
     return out
 
 
-def _controller(make_sampler, n_particles, ess_threshold, max_tokens):
-    # `make_sampler` is a factory so the slow and burst runs each get a fresh
-    # sampler (an AWRS carries its own RNG; a fresh one per run keeps the two
-    # comparable, seeded by `_seed`).
+def _controller(make_sampler, n_particles, ess_threshold, max_tokens, make_critic=None):
+    # `make_sampler`/`make_critic` are factories so the slow and burst runs each
+    # get a fresh sampler/critic (an AWRS carries its own RNG; a fresh one per run
+    # keeps the two comparable, seeded by `_seed`). `twist_with_critic` mirrors
+    # SMC.__call__ exactly (per-step twist iff ess_threshold > 0).
     return Controller(
         unit_sampler=make_sampler(),
-        critic=None,
+        critic=make_critic() if make_critic is not None else None,
         n_particles=n_particles,
         ess_threshold=ess_threshold,
         max_tokens=max_tokens,
-        twist_with_critic=False,
+        twist_with_critic=ess_threshold > 0,
     )
 
 
@@ -124,12 +126,14 @@ def _key(label, n_particles, ess_threshold, max_tokens, seed):
     return f"{label}|N={n_particles}|ess={ess_threshold}|mt={max_tokens}|seed={seed}"
 
 
-def _run_slow(make_sampler, n_particles, ess_threshold, max_tokens, seed):
+def _run_slow(make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None):
     """The ground-truth StepLoop reference (the expensive, cached half)."""
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     _seed(seed)
-    controller = _controller(make_sampler, n_particles, ess_threshold, max_tokens)
+    controller = _controller(
+        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
+    )
     t0 = time.perf_counter()
     parts = asyncio.run(StepLoop(controller).run())
     dt = time.perf_counter() - t0
@@ -142,7 +146,9 @@ def _run_slow(make_sampler, n_particles, ess_threshold, max_tokens, seed):
     }
 
 
-def _slow_cached(label, make_sampler, n_particles, ess_threshold, max_tokens, seed):
+def _slow_cached(
+    label, make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
+):
     """Return the cached slow reference. Under REGEN, (re)compute + persist it;
     otherwise a missing key is a hard error (run GATE2_REGEN=1) rather than a
     silent self-comparison against a freshly-computed reference."""
@@ -153,17 +159,19 @@ def _slow_cached(label, make_sampler, n_particles, ess_threshold, max_tokens, se
         )
     if _REGEN:
         _SNAPSHOT[key] = _run_slow(
-            make_sampler, n_particles, ess_threshold, max_tokens, seed
+            make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic
         )
         _save_snapshot()
     return _SNAPSHOT[key]
 
 
-def _run_burst(make_sampler, n_particles, ess_threshold, max_tokens, seed):
+def _run_burst(make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None):
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     _seed(seed)
-    controller = _controller(make_sampler, n_particles, ess_threshold, max_tokens)
+    controller = _controller(
+        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
+    )
     driver = BurstLoop(controller)
     t0 = time.perf_counter()
     parts = asyncio.run(driver.run())
@@ -401,3 +409,194 @@ def test_awrs_burst_vs_slow(llm):
     assert abs(len_gaps.mean()) <= 1.5, (
         f"AWRS burst length biased: mean gap {len_gaps.mean():+.3f}"
     )
+
+
+# ----- gate 2d: critic (terminal reweight + per-step twist) -------------------
+#
+# The critic is NOT a sampler -- it reweights the population. The burst scores it
+# via the SAME Controller._score_advance_terminate the slow loop uses (driven by
+# run_sync from the engine-thread draw), so a terminal reweight (ess=0, the
+# genlm-latent production regime) and a per-step twist (ess>0) are handled
+# identically to the slow path. There is deliberately NO critic-category gate
+# (is_terminal_only is not consulted): a critic is just a potential, scored the
+# same way regardless of where the rollout logits came from.
+
+
+class _TerminalContainsCritic(Potential):
+    """Terminal 0/-inf indicator critic (the genlm-latent CoTCritic shape): the
+    completed text must contain a space. ``prefix`` is 0 throughout; ``score``
+    returns the indicator on any termination (EOS or budget cutoff)."""
+
+    def __init__(self, vocab):
+        super().__init__(vocabulary=vocab)
+
+    async def _indicator(self, context):
+        bs = [t for t in context if not isinstance(t, EndOfSequence)]
+        try:
+            text = b"".join(bs).decode("utf-8")
+        except UnicodeDecodeError:
+            return float("-inf")
+        return 0.0 if " " in text else float("-inf")
+
+    async def complete(self, context):
+        return await self._indicator(context)
+
+    async def prefix(self, context):
+        return 0.0
+
+    async def score(self, context):
+        return await self._indicator(context)
+
+
+class _SoftVowelCritic(Potential):
+    """Soft, content-dependent critic: a -0.5 penalty per vowel in the decoded
+    text. Finite and non-trivial (so a per-step twist accumulates real weight),
+    and content-dependent (so particle weights diverge -> ESS drops -> the burst
+    actually resamples, exercising the twist + pop-out interaction). The penalty
+    is deliberately MODERATE: a stronger one (e.g. -1.0/vowel) collapses ESS to ~1
+    effective particle every step, which maximizes variance without testing
+    anything more and leaves the parity check unable to distinguish bias from
+    noise. Deterministic in the context."""
+
+    def __init__(self, vocab):
+        super().__init__(vocabulary=vocab)
+
+    def _pen(self, context):
+        bs = [t for t in context if not isinstance(t, EndOfSequence)]
+        try:
+            text = b"".join(bs).decode("utf-8")
+        except UnicodeDecodeError:
+            return float("-inf")
+        return -0.5 * sum(c in "aeiouAEIOU" for c in text)
+
+    async def complete(self, context):
+        return self._pen(context)
+
+    async def prefix(self, context):
+        return self._pen(context)
+
+
+def test_terminal_critic_burst_vs_slow(llm):
+    """DirectTokenSampler(llm) + a terminal indicator critic at ess=0 -- the
+    genlm-latent production regime: rollouts drawn from the backend, the indicator
+    applied once at termination (run_sync). No resampling (ess=0); the burst-vs-
+    slow log_ml must be unbiased across seeds."""
+    llm.set_prompt_from_str(_PROMPT)
+
+    def make():
+        return DirectTokenSampler(llm)
+
+    def make_critic():
+        return _TerminalContainsCritic(llm.vocab)
+
+    assert can_burst(_controller(make, 16, 0.0, 12, make_critic))
+
+    seeds = (1234, 7, 99, 2024, 555, 31)
+    diffs = []
+    for seed in seeds:
+        slow = _slow_cached("terminal-critic", make, 16, 0.0, 12, seed, make_critic)
+        burst = _run_burst(make, 16, 0.0, 12, seed, make_critic)
+        s = _compare("terminal-critic", 0.0, 16, slow, burst)
+        diffs.append(s["log_ml_diff"])
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nterminal critic over {len(seeds)} seeds: "
+        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
+    )
+    assert abs(diffs.mean()) <= max(0.3, 2.0 * sem), (
+        f"terminal-critic burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+    )
+
+
+def test_twisting_critic_burst_vs_slow(llm):
+    """DirectTokenSampler(llm) + a soft content-dependent critic at ess=0.5 -- the
+    per-step twist regime. Exercises untwist/twist accumulation and ESS resampling
+    on TWISTED weights inside the burst. Asserts the resample path ran (n_bursts>1)
+    and the burst-vs-slow log_ml + length are unbiased across seeds."""
+    llm.set_prompt_from_str(_PROMPT)
+
+    def make():
+        return DirectTokenSampler(llm)
+
+    def make_critic():
+        return _SoftVowelCritic(llm.vocab)
+
+    assert can_burst(_controller(make, 16, 0.5, 12, make_critic))
+
+    # Many seeds so the unbiasedness check has discriminating power (the warm-KV
+    # residual makes each run noisy; bias must show as a mean many sem from 0).
+    seeds = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)
+    diffs, len_gaps, any_resample = [], [], False
+    for seed in seeds:
+        slow = _slow_cached("twist-critic", make, 16, 0.5, 12, seed, make_critic)
+        burst = _run_burst(make, 16, 0.5, 12, seed, make_critic)
+        s = _compare("twist-critic", 0.5, 16, slow, burst)
+        diffs.append(s["log_ml_diff"])
+        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
+        any_resample = any_resample or s["n_bursts"] > 1
+    diffs = np.array(diffs)
+    len_gaps = np.array(len_gaps)
+    ml_sem = diffs.std() / np.sqrt(len(diffs))
+    len_sem = len_gaps.std() / np.sqrt(len(len_gaps))
+    print(
+        f"\ntwist critic over {len(seeds)} seeds: "
+        f"log_ml diff mean={diffs.mean():+.4f} sem={ml_sem:.4f} | "
+        f"len gap mean={len_gaps.mean():+.3f} sem={len_sem:.3f}"
+    )
+    assert any_resample, "twist-critic ess=0.5 never resampled; pop-out path unexercised"
+    # Both checks are sem-aware: unbiased means the mean sits within sampling
+    # noise of 0. A persistent same-sign gap many sem from 0 is the bug.
+    assert abs(diffs.mean()) <= max(0.3, 2.5 * ml_sem), (
+        f"twist-critic burst log_ml biased: mean {diffs.mean():+.4f} (sem {ml_sem:.4f})"
+    )
+    assert abs(len_gaps.mean()) <= max(0.5, 2.5 * len_sem), (
+        f"twist-critic burst length biased: mean gap {len_gaps.mean():+.3f} "
+        f"(sem {len_sem:.3f})"
+    )
+
+
+# ----- gate 2e: SetTokenSampler (trie set construction over warm-KV iter weights) ----
+
+
+def test_set_sampler_burst_vs_slow(llm):
+    """SetTokenSampler over an EagerSetSampler(iter=engine LM, item=byte FSA), in
+    the burst: the trie set construction runs over the engine's warm-KV iterable
+    weights (sample_set's iter_logws), the item potential replays from context
+    control-side -- exactly the slow path with only the iterable weights
+    substituted. Unbiased log_ml across seeds (the warm-KV residual only perturbs
+    the iterable weights). Small N/max_tokens because the trie set draw is
+    expensive."""
+    from genlm.control.sampler import EagerSetSampler
+    from genlm.control.sampler.token import SetTokenSampler
+
+    llm.set_prompt_from_str(_PROMPT)
+    item = BoolFSA.from_regex(r"[a-z ]+")
+    # Build the trie set sampler ONCE (heavy init over the LM vocab) and reuse it
+    # across seeds -- it carries no per-run RNG (the draw uses the global stream
+    # that `_seed` controls).
+    set_sampler = EagerSetSampler(iter_potential=llm, item_potential=item)
+
+    def make():
+        return SetTokenSampler(set_sampler)
+
+    try:
+        assert can_burst(_controller(make, 8, 0.0, 8))
+        seeds = (1234, 7, 99, 2024, 555, 31)
+        diffs = []
+        for seed in seeds:
+            slow = _slow_cached("set[a-z ]+", make, 8, 0.0, 8, seed)
+            burst = _run_burst(make, 8, 0.0, 8, seed)
+            s = _compare("set[a-z ]+", 0.0, 8, slow, burst)
+            diffs.append(s["log_ml_diff"])
+        diffs = np.array(diffs)
+        sem = diffs.std() / np.sqrt(len(diffs))
+        print(
+            f"\nset sampler over {len(seeds)} seeds: "
+            f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
+        )
+        assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
+            f"set-sampler burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+        )
+    finally:
+        asyncio.run(set_sampler.cleanup())
