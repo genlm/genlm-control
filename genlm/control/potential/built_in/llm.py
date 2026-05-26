@@ -482,6 +482,82 @@ class PromptedLLM(Potential):
         logp_eos = torch.logsumexp(logp_next[self.token_maps.eos_idxs], dim=0).item()
         return logp_context + logp_eos
 
+    def _eos_index_tensors(self, device):
+        """Cache (and return) the EOS / non-EOS column-index tensors used to fold
+        the engine vocab into the control vocab (EOS kept last). Shared by the
+        per-row :meth:`_process_logw_next` and the batched
+        :meth:`_process_logw_next_batch`."""
+        if (
+            not hasattr(self, "_eos_idxs_tensor")
+            or not hasattr(self, "_non_eos_indices")
+            or self._eos_idxs_tensor.device != device
+        ):
+            self._eos_idxs_tensor = torch.tensor(
+                self.token_maps.eos_idxs, device=device
+            )
+            all_indices = torch.arange(len(self.token_maps.decode), device=device)
+            self._non_eos_indices = all_indices[
+                ~torch.isin(all_indices, self._eos_idxs_tensor)
+            ]
+        return self._eos_idxs_tensor, self._non_eos_indices
+
+    def _verify_logit_padding(self, n_logits):
+        """Guard the tail-padding done when the model emits fewer logits than
+        ``len(token_maps.decode)`` (the tokenizer added tokens beyond the embedding
+        matrix, e.g. Gemma's <image_soft_token>). Padding the tail with -inf is only
+        correct if the model's logit indices are contiguous ``0..n_logits-1``;
+        verify that once. Shared by the per-row :meth:`_process_logw_next` and the
+        batched :meth:`_process_logw_next_batch` so both raise (rather than silently
+        mis-fold columns) on a model that violates the assumption."""
+        if not hasattr(self, "_logit_padding_verified"):
+            for i in range(n_logits):
+                if self.token_maps.decode[i].token_id != i:
+                    raise ValueError(
+                        f"Token ID / index mismatch at position {i}: "
+                        f"decode[{i}].token_id={self.token_maps.decode[i].token_id}. "
+                        f"Padding assumes added tokens are at indices >= vocab_size."
+                    )
+            self._logit_padding_verified = True
+
+    def _process_logw_next_batch(self, logits):
+        """Vectorized, on-device analog of :meth:`_process_logw_next`.
+
+        Maps a ``[N, n_logits]`` batch of raw engine logits to ``[N, V+1]``
+        control-vocab log-weights (EOS folded into the last column) ENTIRELY on
+        the device, with NO host transfer and NO Python per-row loop -- the engine
+        burst uses this so all N rows are processed and sampled in one GPU pass
+        instead of N separate 50k-vocab numpy passes (the per-row loop was ~19x
+        the engine's native decode cost).
+
+        Returns a ``torch.Tensor`` (NOT a ``LazyWeights``); the caller samples
+        from it on-device and transfers only the N drawn ids back.
+        """
+        eos_idxs, non_eos = self._eos_index_tensors(logits.device)
+        n_decode = len(self.token_maps.decode)
+        n_logits = logits.shape[1]
+        if n_logits < n_decode:
+            self._verify_logit_padding(n_logits)  # same guard as the per-row path
+            pad = torch.full(
+                (logits.shape[0], n_decode - n_logits),
+                float("-inf"),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            logits = torch.cat([logits, pad], dim=1)
+        logits = logits[:, :n_decode].log_softmax(dim=1)  # [N, n_decode]
+        out = torch.full(
+            (logits.shape[0], len(self.vocab) + 1),
+            float("-inf"),
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        out[:, : len(self.vocab)] = logits[:, non_eos]
+        if eos_idxs.numel() == 1:
+            out[:, -1] = logits[:, eos_idxs.item()]
+        else:
+            out[:, -1] = torch.logsumexp(logits[:, eos_idxs], dim=1)
+        return out
+
     def _process_logw_next(self, logw_next):
         """Process the log probabilities for the next tokens.
 
@@ -497,21 +573,8 @@ class PromptedLLM(Potential):
         # This is ugly, but it's useful for all potentials to adhere to the convention
         # of keeping the EOS token at the end of the weights array.
 
-        # Cache eos_idxs_tensor and non_eos_indices on first use
-        if (
-            not hasattr(self, "_eos_idxs_tensor")
-            or not hasattr(self, "_non_eos_indices")
-            or self._eos_idxs_tensor.device != logw_next.device
-        ):
-            self._eos_idxs_tensor = torch.tensor(
-                self.token_maps.eos_idxs, device=logw_next.device
-            )
-            all_indices = torch.arange(
-                len(self.token_maps.decode), device=logw_next.device
-            )
-            self._non_eos_indices = all_indices[
-                ~torch.isin(all_indices, self._eos_idxs_tensor)
-            ]
+        # EOS / non-EOS column-index tensors (cached, shared with the batched path).
+        self._eos_index_tensors(logw_next.device)
 
         # The model may produce fewer logits than len(token_maps.decode) when
         # the tokenizer has added tokens beyond the model's embedding matrix
@@ -522,17 +585,7 @@ class PromptedLLM(Potential):
         n_decode = len(self.token_maps.decode)
         n_logits = len(logw_next)
         if n_logits < n_decode:
-            # Verify (once) that token IDs in the model's logit range are
-            # contiguous 0..n_logits-1, so padding the tail is safe.
-            if not hasattr(self, "_logit_padding_verified"):
-                for i in range(n_logits):
-                    if self.token_maps.decode[i].token_id != i:
-                        raise ValueError(
-                            f"Token ID / index mismatch at position {i}: "
-                            f"decode[{i}].token_id={self.token_maps.decode[i].token_id}. "
-                            f"Padding assumes added tokens are at indices >= vocab_size."
-                        )
-                self._logit_padding_verified = True
+            self._verify_logit_padding(n_logits)
             pad = torch.full(
                 (n_decode - n_logits,),
                 float("-inf"),
