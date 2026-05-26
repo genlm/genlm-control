@@ -7,11 +7,12 @@ from arsenal import colors
 
 from llamppl import Model
 from llamppl import smc_standard
+from llamppl import csmc_standard
 
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.csmc import csmc_standard, RetainedTokenSampler
+from genlm.control.sampler.csmc_memory import RetainedTokenSampler
 from genlm.control.util import escape
 
 

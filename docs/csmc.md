@@ -2,18 +2,15 @@
 
 Conditional Sequential Monte Carlo (C-SMC) is a variant of SMC in which one slot in the particle population is *retained* across resampling rounds. This page covers the math, the API, and how to use it.
 
-C-SMC is implemented in [`genlm.control.sampler.csmc`][genlm.control.sampler.csmc] and surfaced through `SMC.__call__(retained_sequence=...)`.
+The C-SMC inference loop lives upstream in [`llamppl.csmc_standard`][llamppl.csmc_standard]; the retained-particle adapter that plugs it into genlm-control's token-sampler layer lives in [`genlm.control.sampler.csmc_memory`][genlm.control.sampler.csmc_memory]. The whole thing is surfaced through `SMC.__call__(retained_sequence=...)`.
 
 ## Why
 
-If you're doing **EM-style training** in which each training example $n$ maintains a persistent latent rationale $z_n^{[t]}$ that's updated each step, you want a transition kernel on $z_n$ that:
+Standard SMC produces a fresh set of independently-drawn particles each time you call it. That's fine for one-shot inference, but if you want a **transition kernel** that updates a single trajectory $z$ — for example, as the inner step of an MCMC or Particle Gibbs sampler over sequences — standard SMC doesn't fit: it has no notion of "previous state."
 
-- mixes over the current posterior $\pi_\theta(z_n \mid x_n, y_n)$ for fixed $\theta$,
-- exploits an informative shaping function or critic during generation (variance reduction over independence-MH),
-- carries forward information from previous EM steps (memory amortization),
-- and is provably $\pi_\theta$-invariant so the EM loop has the usual stochastic-approximation guarantees.
+C-SMC closes that gap. Given a current trajectory $z^{\ast}$ (the *retained particle*), it runs an SMC sweep that pins $z^{\ast}$ into one slot and exempts it from resampling, while the other $M - 1$ particles explore freely under the same proposal $r$ and shaping function $\psi$ that standard SMC would use. At termination, sampling an index $R$ from the normalized terminal weights gives the next state $z^{(R)}$.
 
-Independence-MH (TRICE-style) gives you memory but no informative-shaping benefit; standard SMC gives you the shaping but starts fresh every iteration. C-SMC gives you both.
+The resulting kernel $z^{\ast} \mapsto z^{(R)}$ is $\pi$-invariant for any $M \geq 1$, so iterating it produces a valid MCMC chain on sequence space whose stationary distribution is exactly the SMC target. Unlike Independence-MH, C-SMC uses the informative shaping function during proposal, so it inherits SMC's variance-reduction benefits.
 
 ## The target
 
@@ -82,7 +79,7 @@ new_memory_ids = llm.encode_tokens(sequences.contexts[r])
 
 - **`ess_threshold = 0` and a binary terminal critic.** If your critic returns $-\infty$ for partial trajectories (i.e., the answer isn't yet emitted), set `ess_threshold = 0` — `SMC` then skips mid-trajectory critic application and only applies it at termination. Otherwise the partial-trajectory $-\infty$ would kill every particle on the first step.
 - **`M = 1`** is the TRICE-degenerate case: the retained particle is the sole anchor and no exploratory particles exist. The kernel is trivially $\pi$-invariant but doesn't mix; useful only as a sanity check.
-- **Initialization.** At the start of an EM run there is no memory yet. The standard idiom is to draw $z_n^{[0]}$ from a fresh standard-SMC sweep (passing `retained_sequence=None`) once per training example, then run C-SMC from the next step onward.
+- **Initialization.** At the start of any C-SMC chain there is no previous trajectory yet. The standard idiom is to bootstrap by running standard SMC once (`retained_sequence=None`), then run C-SMC from the next step onward.
 
 ## References
 
