@@ -175,28 +175,28 @@ async def main() -> None:
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    async def estep(backend):
+    async def estep(accelerate):
         _seed()
         t0 = time.perf_counter()
         seqs = await SMC(sampler, critic=critic)(
             n_particles=args.n_particles,
             ess_threshold=0.0,
             max_tokens=args.max_tokens,
-            backend=backend,
+            accelerate=accelerate,
         )
         return time.perf_counter() - t0, seqs
 
-    await estep(model)  # warmup
+    await estep("require")  # warmup
 
     _reset()
-    step_wall, _ = await estep(None)
+    step_wall, _ = await estep("off")
     _dump(
         f"STEP  {args.model} sampler={args.sampler} critic={args.critic} N={args.n_particles}",
         step_wall,
     )
 
     _reset()
-    burst_wall, _ = await estep(model)
+    burst_wall, _ = await estep("require")
     draw_total = PROF.get("burst.draw_TOTAL", [0, 0])[0]
     print(
         f"\n[derived] engine forward+sched (burst_wall - draw_TOTAL) "

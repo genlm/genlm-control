@@ -180,16 +180,19 @@ async def main() -> None:
     else:
         raise ValueError(args.sampler)
 
-    async def once(backend):
+    async def once(accelerate):
         # Same seed each run so StepLoop and BurstLoop consume the same RNG stream
         # (they then differ only by the warm-KV-vs-reprefill logit residual).
+        # `accelerate="require"` forces the burst (and errors if not burst-capable
+        # -- a benchmark should never silently measure the slow path); "off" forces
+        # the exact per-token StepLoop.
         _seed(args.seed)
         t0 = time.perf_counter()
         seqs = await SMC(sampler, critic=critic)(
             n_particles=args.n_particles,
             ess_threshold=0.0,
             max_tokens=args.max_tokens,
-            backend=backend,
+            accelerate=accelerate,
         )
         return time.perf_counter() - t0, seqs
 
@@ -214,20 +217,20 @@ async def main() -> None:
 
     # Warm the engine (cold prefill / CUDA-graph capture) before timing.
     for _ in range(args.n_warmup):
-        await once(None)
-        await once(model)
+        await once("off")
+        await once("require")
         raw_batch_decode(args.max_tokens)
 
-    async def trials(backend):
+    async def trials(accelerate):
         dts, last = [], None
         for _ in range(args.n_trials):
-            dt, seqs = await once(backend)
+            dt, seqs = await once(accelerate)
             dts.append(dt)
             last = seqs
         return float(np.median(dts)), last
 
-    step_dt, step_seqs = await trials(None)
-    burst_dt, burst_seqs = await trials(model)
+    step_dt, step_seqs = await trials("off")
+    burst_dt, burst_seqs = await trials("require")
     raw_dt = float(np.median([raw_batch_decode(args.max_tokens) for _ in range(args.n_trials)]))
     await sampler.cleanup()
 

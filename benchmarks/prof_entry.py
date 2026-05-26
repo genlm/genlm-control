@@ -28,7 +28,7 @@ import shutil
 import numpy as np
 
 
-async def _run(sampler, critic, backend, args):
+async def _run(sampler, critic, accelerate, args):
     from genlm.control.sampler.sequence import SMC
 
     np.random.seed(args.seed)
@@ -39,7 +39,7 @@ async def _run(sampler, critic, backend, args):
         n_particles=args.n_particles,
         ess_threshold=0.0,
         max_tokens=args.max_tokens,
-        backend=backend,
+        accelerate=accelerate,
     )
 
 
@@ -115,10 +115,10 @@ def main() -> None:
         )
         sampler = SetTokenSampler(set_sampler)
 
-    backend = model if args.mode == "burst" else None
+    accelerate = "require" if args.mode == "burst" else "off"
 
     # warmup (untimed, unprofiled)
-    asyncio.run(_run(sampler, critic, backend, args))
+    asyncio.run(_run(sampler, critic, accelerate, args))
 
     # worker-thread profiler: wrap run_burst (the executor target)
     worker_prof = cProfile.Profile()
@@ -136,7 +136,7 @@ def main() -> None:
 
     main_prof = cProfile.Profile()
     main_prof.enable()
-    asyncio.run(_run(sampler, critic, backend, args))
+    asyncio.run(_run(sampler, critic, accelerate, args))
     main_prof.disable()
 
     main_prof.dump_stats(args.out + ".main.pstats")

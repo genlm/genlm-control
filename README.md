@@ -192,6 +192,41 @@ This distinction is important so your code doesn't raise a `SyntaxError` (if you
 
 See the [docs](https://genlm.github.io/genlm-control/getting_started) for more examples.
 
+## Acceleration
+
+SMC has one acceleration knob, `accelerate`, passed to `token_sampler.smc(...)` or `SMC(...)(...)`:
+
+| value        | behavior                                                                                    |
+|--------------|---------------------------------------------------------------------------------------------|
+| `"auto"` (default, `True`) | engine-accelerated when the config supports it, else the exact per-token path. Logs which ran. |
+| `"off"` (`False`)          | always the exact per-token path — **byte-reproducible** given a seed (the ground truth). |
+| `"require"`                | engine path, or raise `NotAcceleratable` with the reason if unsupported (use for benchmarks). |
+
+Acceleration is **vLLM-only** for now (`PromptedLLM.from_name(..., backend="vllm")`); other backends always run the exact per-token path. The engine is taken from the sampler's `PromptedLLM` — you don't pass it. To check what a config will do before running it:
+
+```python
+print(SMC(token_sampler, critic).acceleration_report())
+# "Engine-accelerated (vLLM · DirectTokenSampler): runs the in-engine burst, near the raw-decode ceiling."
+# "Not accelerated: sampler uses a separate proposal ... → exact per-token path."
+```
+
+What is accelerated (current reality):
+
+| Sampler / config                       | vLLM backend       | HF / MLX / SGLang |
+|-----------------------------------------|--------------------|-------------------|
+| `direct_token_sampler` (no proposal)    | **accelerated**    | per-token         |
+| `direct_token_sampler` + proposal       | per-token          | per-token         |
+| `AWRS` (sync-stateful boolean condition)| **accelerated**    | per-token         |
+| `AWRS` + separate proposal              | per-token          | per-token         |
+| `eager_/topk_token_sampler` (Set)       | per-token          | per-token         |
+| any of the above **+ critic**           | accelerated (a terminal critic at `ess_threshold=0` is the cleanest) | per-token |
+
+"per-token" = the exact path: correct, just not engine-accelerated.
+
+**Reproducibility.** `accelerate="off"` is byte-reproducible given a seed. `accelerate="auto" | "require"` is *statistically* identical (same target, unbiased weights) but **not byte-identical** (warm-KV-vs-reprefill numerical residual + a batched-draw RNG stream); use `"off"` for exact regression baselines.
+
+**How it works.** The accelerated path rides vLLM's warm-KV decode loop instead of re-prefilling the full context every token; the SMC algorithm stays exact (identical target and weights); resample / ESS / log_ml stay control-owned and are never pushed into the engine. To make a *custom* potential accelerable, implement the stateful interface (`state0` / `advance` / `logw_next_from_state` + sync `prefix_logw` / `complete_logw`); see `WFSA` / `BoolFSA`. Without it a custom potential still works correctly — it just runs on the per-token path.
+
 ## Development
 
 See [DEVELOPING.md](DEVELOPING.md) for details on how to install the project locally.
