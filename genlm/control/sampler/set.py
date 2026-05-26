@@ -30,7 +30,7 @@ class SetSampler(ABC):
         self.target = target
 
     @abstractmethod
-    async def sample_set(self, context):
+    async def sample_set(self, context, draw=None, iter_logws=None):
         """Sample a weighted set of tokens from the target potential's vocabulary."""
         pass  # pragma: no cover
 
@@ -99,7 +99,7 @@ class TrieSetSampler(SetSampler):
             word2leaf[get_word_key(token)]: lookup[token] for token in common_tokens
         }
 
-    async def sample_set(self, context):
+    async def sample_set(self, context, draw=None, iter_logws=None):
         """
         Sample a weighted set of tokens given a context.
 
@@ -132,19 +132,25 @@ class EagerSetSampler(TrieSetSampler):
     The sampled set is the set of sequences of items that correspond to valid tokens in `iter_potential`'s vocabulary.
     """
 
-    async def sample_set(self, context, draw=None):
+    async def sample_set(self, context, draw=None, iter_logws=None):
         """
         Sample a set of tokens given a context.
 
         Args:
             context (list): A sequence of tokens in the `iter_potential`'s vocabulary.
+            iter_logws (LazyWeights, optional): Precomputed `iter_potential.logw_next`
+                weights. The engine burst supplies these from the warm-KV decode
+                logits so the iterable potential is not re-prefilled; when `None`
+                (the slow path) they are computed here. Everything else (the trie
+                and `item_potential`) is identical either way.
 
         Returns:
             (LazyWeights, float): A weighted set of tokens and the log-probability of the sampled set.
         """
         if draw is None:
             draw = sample_dict
-        iter_logws = await self.iter_potential.logw_next(context)
+        if iter_logws is None:
+            iter_logws = await self.iter_potential.logw_next(context)
         item_ws = await self.trie_executor.weight_sum(iter_logws.exp().weights)
 
         logws = self.target.alloc_logws()
@@ -220,19 +226,23 @@ class TopKSetSampler(TrieSetSampler):
         super().__init__(iter_potential, item_potential)
         self.K = K
 
-    async def sample_set(self, context, draw=None):
+    async def sample_set(self, context, draw=None, iter_logws=None):
         """
         Sample a set of tokens given a context.
 
         Args:
             context (list): A sequence of tokens in the `iter_potential`'s vocabulary.
+            iter_logws (LazyWeights, optional): Precomputed `iter_potential.logw_next`
+                weights (the engine burst supplies these from warm-KV decode logits;
+                `None` computes them here, the slow path).
 
         Returns:
             (LazyWeights, float): A weighted set of tokens and the log-probability of the sampled set.
         """
         if draw is None:
             draw = sample_dict
-        iter_logws = await self.iter_potential.logw_next(context)
+        if iter_logws is None:
+            iter_logws = await self.iter_potential.logw_next(context)
         max_logws = await self.trie_executor.weight_max(iter_logws.weights)
 
         k = 0

@@ -87,6 +87,19 @@ class MultiTokenUnitSampler(TokenSampler):
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
 
+    def supports_burst(self) -> bool:
+        # Stays on StepLoop (the honest "back out", not a bandaid). A unit spans a
+        # VARIABLE number of subunit tokens, and the SMC ESS test fires once per
+        # UNIT -- in the slow loop every particle advances exactly one unit per
+        # transition, so the population is synchronized at unit boundaries. The
+        # engine decodes one token per row per step UNIFORMLY, so particles would
+        # reach unit boundaries at different engine steps; the per-step ESS/pop-out
+        # then cannot align to per-unit boundaries without either a unit-
+        # synchronization that breaks ESS-timing parity or segment-graining the
+        # algorithm. So a multi-token unit is not a clean per-engine-step draw and
+        # the burst correctly declines it (gate-1 covers MultiToken on StepLoop).
+        return False
+
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
         return await self.subunit_sampler.start_weight()

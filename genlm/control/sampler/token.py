@@ -1,5 +1,6 @@
 import asyncio
 import numpy as np
+import torch
 from arsenal import colors
 from arsenal.maths import log1mexp, logsumexp
 import warnings
@@ -8,6 +9,29 @@ from genlm.control.constant import EndOfSequence
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
+
+
+def _drive_sync(coro):
+    """Run a coroutine that never actually suspends to completion in the current
+    thread, returning its result.
+
+    The burst path runs AWRS's rejection from the engine's worker thread. Its
+    ``accept`` only calls the condition's *sync* stateful methods
+    (``advance``/``prefix_logw``/``complete_logw``), so the rejection coroutine
+    finishes on the first ``send(None)`` -- there is nothing to await. Driving it
+    inline here avoids the per-particle ``run_coroutine_threadsafe`` hop to the
+    main event loop (the worker-blocked ``lock.acquire`` that dominated AWRS
+    bursts). The guard turns a coroutine that *does* suspend into a loud failure
+    rather than a silent wrong result.
+    """
+    try:
+        coro.send(None)
+    except StopIteration as e:
+        return e.value
+    coro.close()
+    raise RuntimeError(
+        "coroutine suspended on a real await; it cannot be driven synchronously"
+    )
 
 
 class TokenSampler:
@@ -38,26 +62,34 @@ class TokenSampler:
 
     def supports_burst(self) -> bool:
         """Whether this sampler can be driven inside the engine burst -- i.e. it
-        implements :meth:`burst_draw`. Default ``False`` (stays on ``StepLoop``).
+        implements :meth:`burst_draw_batch`. Default ``False`` (stays on ``StepLoop``).
 
         The control loop (``Controller``/``BurstLoop``) is uniform; each
-        burst-capable sampler plugs its own per-row draw in via ``burst_draw``,
+        burst-capable sampler plugs its own batched draw in via ``burst_draw_batch``,
         the same way every sampler plugs its slow per-step draw in via
         ``transition`` -- no sampler-type dispatch in the loop.
         """
         return False
 
-    def burst_draw(self, lm_logws, factor_state, ctx):
-        """Engine-burst per-row draw (the burst analog of ``sample``).
+    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
+        """Engine-burst draw for the WHOLE batch of live rows (the burst analog of
+        ``sample``, vectorized).
 
-        Given the engine LM's next-token weights ``lm_logws``, the particle's
-        carried ``factor_state``, and the sampler-facing
-        :class:`~genlm.control.sampler.controller.BurstContext` ``ctx`` (which
-        exposes ``ctx.factor``, ``ctx.product_logws(lm_logws, state)``,
-        ``ctx.factor_logws(state)`` and ``ctx.run_sync(coro)``), return
-        ``(token, logw, logp, new_factor_state)``. The Controller banks the
-        weight, appends the token, sets the state, and runs termination -- the
-        sampler only computes the draw. Burst-capable samplers override.
+        ``lm_batch`` is the ``[L, V+1]`` on-device control-vocab log-weights for
+        the L live rows (``PromptedLLM._process_logw_next_batch`` -- the expensive
+        50k-vocab processing done ONCE for all rows, never per-row). ``factor_states``
+        / ``contexts`` are the L particles' carried factor states / token contexts;
+        ``ctx`` is the sampler-facing
+        :class:`~genlm.control.sampler.controller.BurstContext`.
+
+        Returns ``(tokens, logws, logps, new_factor_states)`` -- lists of length L,
+        the per-row analog of ``sample``'s ``(token, logw, logp)`` plus the advanced
+        factor state. The Controller banks weights / advances / terminates per
+        particle; the sampler only computes the draw. Samplers that ride the burst
+        (``supports_burst()``) override; the LM half is already batched, so a
+        sampler vectorizes its control where it can (Direct) or loops over the
+        cheap ``[V+1]`` proposals where the control is inherently per-particle
+        (AWRS rejection, Set trie).
         """
         raise NotImplementedError
 
@@ -158,23 +190,53 @@ class DirectTokenSampler(TokenSampler):
         # on the slow loop.
         return self.proposal is None
 
-    def burst_draw(self, lm_logws, factor_state, ctx):
-        """Shape the product proposal from the carried factor state, sample once,
-        bank ``logsumexp`` + the drawn lp (the burst analog of ``sample``)."""
-        factor = ctx.factor
-        new_state = factor_state
-        if factor is None:
-            logws = lm_logws
-        else:
-            # Reconstruct Product(llm, factor).logw_next over the product vocab,
-            # reading the factor from the carried state (the engine LM weights
-            # substitute the reprefilled ones) -- ctx owns the index maps.
-            logws = ctx.product_logws(lm_logws, factor_state)
-        logps = logws.normalize()
-        token = fast_sample_lazyweights(logps)
-        if factor is not None and not isinstance(token, EndOfSequence):
-            new_state = factor.advance(factor_state, token)
-        return token, logws.sum(), logps[token], new_state
+    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
+        """Batched burst draw (the burst analog of ``sample``).
+
+        ``lm_batch`` is the ``[L, V+1]`` on-device LM log-weights (already
+        processed ONCE for the whole batch). Two cases:
+
+        * **unconstrained** (no factor): normalize + Gumbel-max across all rows in
+          one on-device op; only the L drawn ids come back. This is a batched
+          torch Gumbel-max -- a different RNG stream than the slow numpy
+          ``fast_sample_lazyweights``, so the burst samples the same distribution
+          without tracking the slow path token-for-token (parity stays the no-bias
+          check the warm-KV residual already requires).
+        * **factored** (additive ``ctx.factor``): the LM half is already batched;
+          per particle, form ``Product(llm, factor).logw_next`` from the carried
+          state and draw with the slow path's exact numpy ``fast_sample_lazyweights``
+          (same RNG -> tight warm-KV-only parity). The per-particle product is the
+          one bit still looped -- vectorizing it is the eventual ideal.
+        """
+        if ctx.factor is None:
+            logZ = torch.logsumexp(lm_batch, dim=1)  # [L] proposal log-mass (~0)
+            logps = lm_batch - logZ[:, None]  # [L, V+1] normalized
+            u = torch.rand_like(logps).clamp_(min=torch.finfo(logps.dtype).tiny)
+            idx = (logps - torch.log(-torch.log(u))).argmax(dim=1)  # Gumbel-max, on-device
+            rows = torch.arange(idx.shape[0], device=idx.device)
+            logp_drawn = logps[rows, idx].tolist()
+            logZ = logZ.tolist()
+            vocab_eos = self.target.vocab_eos
+            tokens = [vocab_eos[j] for j in idx.tolist()]
+            return tokens, logZ, logp_drawn, list(factor_states)
+
+        # Factored: one host transfer of the batched LM weights, then per-particle
+        # product + numpy draw over the cheap [V+1] proposals (no 50k re-processing).
+        lm_np = lm_batch.cpu().numpy()
+        tokens, logws, logps, new_states = [], [], [], []
+        for k, state in enumerate(factor_states):
+            logw = ctx.product_logws(lm_np[k], state)
+            logp = logw.normalize()
+            token = fast_sample_lazyweights(logp)
+            new_states.append(
+                state
+                if isinstance(token, EndOfSequence)
+                else ctx.factor.advance(state, token)
+            )
+            tokens.append(token)
+            logws.append(logw.sum())
+            logps.append(logp[token])
+        return tokens, logws, logps, new_states
 
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
@@ -235,6 +297,51 @@ class SetTokenSampler(TokenSampler):
         assert isinstance(set_sampler, SetSampler)
         super().__init__(set_sampler.target)
         self.set_sampler = set_sampler
+
+    def supports_burst(self) -> bool:
+        # The only engine-dependent call in the set construction is
+        # iter_potential.logw_next; the burst supplies it from the warm-KV decode
+        # logits (sample_set's iter_logws). The trie + item_potential replay from
+        # context control-side -- exactly as the slow path -- so only the
+        # expensive LLM half is accelerated and the set-sampling weights/RNG are
+        # the slow path's, unchanged. can_burst still gates on split_engine_target
+        # recognizing the iterable potential as an engine LM.
+        return True
+
+    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
+        """Set construction over the engine's warm-KV iterable weights. The LM half
+        (``iter_potential.logw_next``) is batched ONCE; the per-particle set draw
+        (the exact slow ``sample`` with only the iterable weights substituted) is
+        then run for ALL rows in a SINGLE hop via ``asyncio.gather`` -- so the
+        backend trie / ``item_potential`` calls batch across the population exactly
+        as they do under the slow path's ``asyncio.gather``. (The old per-particle
+        ``run_sync`` serialized them, one hop each, losing that batching.)
+        ``factor_state`` is unused (the set sampler carries no additive factor)."""
+        iter_potential = self.set_sampler.iter_potential
+        lm_np = lm_batch.cpu().numpy()  # one host transfer of the batched LM weights
+        iter_logws = [
+            iter_potential.make_lazy_weights(lm_np[k]) for k in range(len(contexts))
+        ]
+
+        async def _draw_one(context, il):
+            # Mirrors the slow ``sample`` per particle, with iter weights substituted.
+            logws, logp = await self.set_sampler.sample_set(context, iter_logws=il)
+            logps = logws.normalize()
+            token = fast_sample_lazyweights(logps)
+            return token, logws.sum(), logp + logps[token]
+
+        async def _gather():
+            return await asyncio.gather(
+                *(_draw_one(c, il) for c, il in zip(contexts, iter_logws))
+            )
+
+        # ONE event-loop hop for the whole population; the concurrent sample_sets
+        # let the backend trie batch across particles.
+        results = ctx.run_sync(_gather())
+        tokens = [r[0] for r in results]
+        logws = [r[1] for r in results]
+        logps = [r[2] for r in results]
+        return tokens, logws, logps, list(factor_states)
 
     async def sample(self, context, draw=None):
         """Sample a token and weight by sampling a weighted set of tokens from the `set_sampler`
@@ -356,23 +463,76 @@ class AWRS(TokenSampler):
         # engine LM logits with the condition checked from its carried state.
         return self.proposal is None and hasattr(self.condition, "prefix_logw")
 
-    def burst_draw(self, lm_logws, factor_state, ctx):
-        """AWRS rejection over the engine LM logits with the boolean condition
-        checked from the carried state -- reuses the shared ``_run_rejection`` so
-        the rejection algorithm + returned weight match the slow path. ``logp`` is
-        ``nan`` (as in ``sample``)."""
+    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
+        """AWRS rejection over the engine LM weights with the boolean condition
+        checked from each particle's carried state. The LM half is batched ONCE;
+        per particle, reconstruct the cheap ``[V+1]`` proposal and run the shared
+        ``_run_rejection`` (so the rejection algorithm + returned weight match the
+        slow path; ``logp`` is ``nan`` as in ``sample``). The per-particle rejection
+        is the bit still looped -- vectorizing it is the eventual ideal.
+
+        The whole O(V) PREP -- prune, normalize (``logps``), the rejection
+        normalizer ``logZ``, and the Gumbel ``keys`` -- is built ON-DEVICE for all
+        rows here (one batched pass), then handed to ``_run_rejection``. That moves
+        the per-particle 50k-vocab numpy work (especially the ``-log(-log(u))``
+        key-gen, the dominant CPU cost) off the CPU and vectorizes it across the
+        whole population; only the cheap top-K sort + the sequential accept walk
+        stay per-particle. The keys use a torch (on-device) RNG stream rather than
+        the slow path's numpy one, so the burst is no-bias (like the Direct
+        unconstrained burst), not token-for-token tied to the slow path."""
         condition = ctx.factor
+        # Prune (mask non-valid columns to -inf) so they normalize/sort out and are
+        # never drawn -- the on-device form of `_prune_logws`.
+        if self.prune_logws:
+            vidx = torch.as_tensor(
+                self.valid_idxs, device=lm_batch.device, dtype=torch.long
+            )
+            masked = torch.full_like(lm_batch, float("-inf"))
+            masked[:, vidx] = lm_batch[:, vidx]
+        else:
+            masked = lm_batch
+        logZ_t = torch.logsumexp(masked, dim=1, keepdim=True)
+        logps_t = masked - logZ_t
+        # Gumbel keys; clamp u off 0 so a finite logps never yields a -inf key
+        # (key == -inf then iff logps == -inf, i.e. exactly the pruned tokens).
+        u = torch.rand_like(logps_t).clamp_(min=torch.finfo(logps_t.dtype).tiny)
+        keys_t = logps_t - torch.log(-torch.log(u))
+        # Sort on-device too -> transfer the descending order (ints), not the keys.
+        # Pruned (-inf) tokens sort last; the CPU walk stops at the first one.
+        order_t = torch.argsort(keys_t, dim=1, descending=True)
+        logps_np = logps_t.cpu().numpy()
+        order_np = order_t.cpu().numpy()
+        logZ_batch = logZ_t.squeeze(1).tolist()
+        tokens, logws, logps, new_states = [], [], [], []
+        for k, state in enumerate(factor_states):
+            lm_logws = self.potential.make_lazy_weights(logps_np[k])
 
-        async def accept(tok):
-            if isinstance(tok, EndOfSequence):
-                return condition.complete_logw(factor_state) == 0
-            return condition.prefix_logw(condition.advance(factor_state, tok)) == 0
+            async def accept(tok, st=state):
+                if isinstance(tok, EndOfSequence):
+                    return condition.complete_logw(st) == 0
+                return condition.prefix_logw(condition.advance(st, tok)) == 0
 
-        token, logw, _ = ctx.run_sync(self._run_rejection(lm_logws, accept))
-        new_state = factor_state
-        if not isinstance(token, EndOfSequence):
-            new_state = condition.advance(factor_state, token)
-        return token, logw, float("nan"), new_state
+            # Burst `accept` is sync underneath (carried-state condition), so the
+            # rejection runs inline in the worker -- no hop to the main loop. The
+            # prep (logps/order/logZ) is the on-device batch; only the walk is here.
+            token, logw, _ = _drive_sync(
+                self._run_rejection(
+                    lm_logws,
+                    accept,
+                    logZ=logZ_batch[k],
+                    logps=logps_np[k],
+                    order=order_np[k],
+                )
+            )
+            new_states.append(
+                state
+                if isinstance(token, EndOfSequence)
+                else condition.advance(state, token)
+            )
+            tokens.append(token)
+            logws.append(logw)
+            logps.append(float("nan"))
+        return tokens, logws, logps, new_states
 
     def _prune_logws(self, logws):
         # Prune the logws to only include the tokens in the
@@ -430,7 +590,9 @@ class AWRS(TokenSampler):
 
         return await self._run_rejection(logws, accept, target_logws)
 
-    async def _run_rejection(self, logws, accept, target_logws=None):
+    async def _run_rejection(
+        self, logws, accept, target_logws=None, logZ=None, logps=None, order=None
+    ):
         """Shared AWRS rejection over next-token ``logws`` with a boolean
         ``accept(tok)`` coroutine (and an optional ``target_logws`` proposal
         correction).
@@ -440,12 +602,20 @@ class AWRS(TokenSampler):
         ``accept``, ``logws`` from the engine LM logits) both call this, so the
         rejection algorithm and the returned weight stay identical -- only the
         source of ``logws`` and the form of ``accept`` differ.
-        """
-        if self.prune_logws:
-            logws = self._prune_logws(logws)
 
-        logZ = logsumexp(logws.weights)
-        logps = logws.weights - logZ
+        ``logZ``/``logps``/``order`` may be supplied pre-computed: the burst builds
+        all three ON-DEVICE for the whole batch (``logps`` = pruned+normalized LM
+        log-weights, ``order`` = descending Gumbel-key order, ``logZ`` = the
+        normalizer), so the per-particle O(V) numpy work (prune, logsumexp,
+        key-gen, AND the sort) moves off the CPU -- only the sequential accept walk
+        remains. When ``None`` (slow path) they are computed here in numpy as before.
+        """
+        if logps is None:
+            if self.prune_logws:
+                logws = self._prune_logws(logws)
+            if logZ is None:
+                logZ = logsumexp(logws.weights)
+            logps = logws.weights - logZ
         toks = logws.decode
 
         # Cache successful calls (geometric_awrs may revisit a token).
@@ -468,6 +638,7 @@ class AWRS(TokenSampler):
                 accept=cached_accept,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
+                order=order,
             )
         # geometric_awrs when max_accepts>2 (recursive_awrs ignores it) or when
         # the distribution is peaked (then geometric is more efficient).
@@ -479,6 +650,7 @@ class AWRS(TokenSampler):
                 rng=self.rng,
                 max_rejects=self.max_rejects,
                 max_accepts=self.max_accepts,
+                order=order,
             )
         else:
             tok, w, _ = await recursive_awrs(
@@ -487,6 +659,7 @@ class AWRS(TokenSampler):
                 accept=cached_accept,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
+                order=order,
             )
 
         if target_logws is None:
@@ -512,16 +685,67 @@ class AWRS(TokenSampler):
 GEOMETRIC_THRESHOLD = np.log(2 / 3)
 
 
-async def improper_sample(*, logps, toks, accept, rng, max_rejects):
+class _TopK:
+    """Descending-key order, computed lazily as a top-K ``argpartition`` instead
+    of a full ``argsort``.
+
+    The AWRS rejection walks tokens in descending Gumbel-key order and stops at
+    the first accepted one -- almost always within the first few -- so fully
+    sorting the ~50k-token vocabulary every step is wasted work (sort 50k, walk
+    1-2). This materializes only the top ``k`` (one O(V) ``argpartition`` + an
+    O(k log k) sort of those k); if a walk ever consumes past ``k`` (rare: the
+    top-k tokens all rejected), it falls back **once** to a full sort. Indexable
+    and ``len``-able like the ``np.argsort(-keys)`` array it replaces, and -- for
+    distinct keys (continuous Gumbel keys are distinct a.s.) -- produces the
+    identical index sequence, so parity is unchanged.
+    """
+
+    __slots__ = ("_keys", "_n", "_order", "_full")
+
+    def __init__(self, keys, k=256):
+        # Keep only a reference to ``keys`` (no full-array negate/copy); negate
+        # just the k-element top slice. ``argpartition(keys, n-k)[n-k:]`` are the
+        # k largest keys, unordered; sort that small slice descending.
+        self._keys = keys
+        self._n = len(keys)
+        k = min(k, self._n)
+        top = np.argpartition(keys, self._n - k)[self._n - k :]
+        self._order = top[np.argsort(-keys[top])]
+        self._full = self._n <= k
+
+    def __len__(self):
+        return self._n
+
+    def _ensure_full(self):
+        if not self._full:  # rare deep walk: one full sort
+            self._order = np.argsort(-self._keys)
+            self._full = True
+
+    def __getitem__(self, i):
+        if i < 0 or i >= self._n:
+            raise IndexError(i)
+        if i >= len(self._order):  # walked past the top-k -> one full-sort fallback
+            self._ensure_full()
+        return self._order[i]
+
+
+async def improper_sample(*, logps, toks, accept, rng, max_rejects, order=None):
     """Implements a single rejection sampling loop which returns
     the first value found with no attempt to make a properly
-    weighted sample."""
-    keys = logps - np.log(-np.log(rng.random((len(logps),))))
-    order = np.argsort(-keys)
-    if len(order) > max_rejects:
-        order = order[:max_rejects]
-    for item in order:
-        if keys[item] == -np.inf:
+    weighted sample. ``order`` (descending Gumbel-key order) may be precomputed --
+    the burst draws the keys AND sorts them on-device for the whole batch; when
+    ``None`` the keys are drawn and sorted here (slow path). The walk stops at the
+    first ``logps == -inf`` (a pruned / zero-probability token, which sorts last)."""
+    if order is None:
+        keys = logps - np.log(-np.log(rng.random((len(logps),))))
+        order = _TopK(keys)
+    else:
+        # Burst: the keys live on the GPU and aren't transferred; logps marks the
+        # pruned tokens with -inf identically (the on-device keys are clamped so a
+        # finite logps never yields a -inf key), so logps is the -inf sentinel.
+        keys = logps
+    for count, item in enumerate(order):
+        if count >= max_rejects or keys[item] == -np.inf:
             break
         tok = toks[item]
         if await accept(tok):
@@ -529,7 +753,7 @@ async def improper_sample(*, logps, toks, accept, rng, max_rejects):
     return tok, -float("inf"), np.nan
 
 
-async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
+async def recursive_awrs(*, logps, toks, accept, rng, max_rejects, order=None):
     """Implements Recursive AWRS.
 
     This uses the observation that
@@ -538,7 +762,9 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
 
     To construct a recursive estimator of the weight from a single
     sampling-with-rejection run. The first time accept(x) passes,
-    we use a simple coin flip estimator for the tail.
+    we use a simple coin flip estimator for the tail. ``order`` (descending
+    Gumbel-key order) may be precomputed (burst, on-device); when ``None`` the
+    keys are drawn and sorted here (slow path).
     """
     n_accepts = 0
     n_rejects = 0
@@ -551,8 +777,13 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     # cases are all ones where the remaining weight is very bad.
     error_tolerance = 10e-6
 
-    keys = logps - np.log(-np.log(rng.random((len(logps),))))
-    order = np.argsort(-keys)
+    if order is None:
+        keys = logps - np.log(-np.log(rng.random((len(logps),))))
+        order = _TopK(keys)
+    else:
+        # Burst: keys are on the GPU (not transferred); logps is the -inf sentinel
+        # (clamped on-device keys give key == -inf iff logps == -inf).
+        keys = logps
     for index_into_list, item in enumerate(order):
         assert n_accepts == 0
         tok = toks[item]
@@ -609,14 +840,16 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     raise AssertionError("Unreachable")
 
 
-async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
+async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts, order=None):
     """Implements Geometric AWRS.
 
     This simulates a single run of sampling with replacement from a sampling
     without replacement run, reconstructing the counts of "phantom" elements
     discarded from the without-replacement run as a series of draws from
     geometric distributions. We can then use an appropriate estimator
-    for the with-replacement run at the end.
+    for the with-replacement run at the end. ``order`` may be precomputed for the
+    FIRST pass (burst, on-device); subsequent passes redraw and re-sort (the
+    algorithm is adaptive -- it marks rejected tokens ``-inf`` and resamples).
     """
     n_accepts = 0
     n_rejects = 0
@@ -625,13 +858,17 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
     result = None
     rejected_token = None
 
-    for _ in range(max_accepts):
+    for pass_i in range(max_accepts):
         if n_rejects >= max_rejects:
             break
-        keys = logps - np.log(-np.log(rng.random((len(logps),))))
-        order = np.argsort(-keys)
-        for item in order:
-            if keys[item] == -np.inf:
+        if pass_i == 0 and order is not None:
+            cur_order = order
+            cur_keys = logps  # burst pass 0: logps is the -inf sentinel (see above)
+        else:
+            cur_keys = logps - np.log(-np.log(rng.random((len(logps),))))
+            cur_order = _TopK(cur_keys)
+        for item in cur_order:
+            if cur_keys[item] == -np.inf:
                 break
 
             tok = toks[item]
