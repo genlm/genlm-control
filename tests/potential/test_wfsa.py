@@ -258,9 +258,23 @@ def test_wfsa_spawn(log_wfsa):
 
 def test_wfsa_clear_cache(log_wfsa):
     pot = WFSA(wfsa=log_wfsa)
+    # The empty-prefix base chart lives outside the LRU (``_start_chart``), so the
+    # ``_consume`` cache holds only non-empty prefixes and is empty after a clear.
+    pot._consume(b"a")
+    assert len(pot.cache) > 0
     pot.clear_cache()
-    assert len(pot.cache) == 1
-    assert () in pot.cache
+    assert len(pot.cache) == 0
+    # `_consume(())` still returns the base chart after a clear (held separately).
+    assert pot._consume(()) is pot._start_chart
+
+
+def test_wfsa_consume_lru_evicts(log_wfsa):
+    # The LRU bounds the chart cache: with a tiny cap, consuming more distinct
+    # prefixes than the cap keeps the cache at the cap (no unbounded growth).
+    pot = WFSA(wfsa=log_wfsa, cache_maxsize=3)
+    for bs in [b"a", b"ab", b"abc", b"abcd", b"abcde"]:
+        pot._consume(bs)
+    assert len(pot.cache) <= 3
 
 
 @pytest.mark.asyncio

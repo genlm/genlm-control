@@ -8,30 +8,13 @@ import warnings
 from genlm.control.constant import EndOfSequence
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
-from genlm.control.sampler.util import _validate_proposal_vocab
+from genlm.control.sampler.util import _validate_proposal_vocab, _drive_or_hop
+from genlm.control.sampler.controller import BurstDraw
 
 
-def _drive_sync(coro):
-    """Run a coroutine that never actually suspends to completion in the current
-    thread, returning its result.
-
-    The burst path runs AWRS's rejection from the engine's worker thread. Its
-    ``accept`` only calls the condition's *sync* stateful methods
-    (``advance``/``prefix_logw``/``complete_logw``), so the rejection coroutine
-    finishes on the first ``send(None)`` -- there is nothing to await. Driving it
-    inline here avoids the per-particle ``run_coroutine_threadsafe`` hop to the
-    main event loop (the worker-blocked ``lock.acquire`` that dominated AWRS
-    bursts). The guard turns a coroutine that *does* suspend into a loud failure
-    rather than a silent wrong result.
-    """
-    try:
-        coro.send(None)
-    except StopIteration as e:
-        return e.value
-    coro.close()
-    raise RuntimeError(
-        "coroutine suspended on a real await; it cannot be driven synchronously"
-    )
+# `_drive_sync` / `_drive_or_hop` / `_CoroutineSuspended` live in `sampler.util`
+# so the Controller (which `token` imports from) can share the same inline-or-hop
+# primitive for its factor eval without a circular import.
 
 
 class TokenSampler:
@@ -71,25 +54,49 @@ class TokenSampler:
         """
         return False
 
-    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
+    def burst_free_running(self) -> bool:
+        """Whether this sampler's burst is FREE-RUNNING (token grain).
+
+        Free-running means the sampler completes one SMC step every engine decode
+        step, so all rows advance one token per step and stay synchronized for free:
+        the controller tests ESS after every step and pops every row at the
+        crossing. A SYNCHRONIZED grain (the unit sampler) returns ``False`` -- it
+        completes one SMC step (a whole unit) only at a per-row boundary, so the
+        controller runs exactly one unit round per burst, pops each row at its
+        boundary, and tests ESS once at the synced boundary (matching the slow
+        per-unit loop's timing). Default ``True`` (token grain)."""
+        return True
+
+    def burst_max_steps(self, live) -> int:
+        """Engine decode-step budget for ONE burst over the ``live`` particles.
+
+        Token grain: long enough to reach the longest particle's remaining token
+        budget (+1 so a budget-exhausted row is dropped by the control's abort, not
+        length-capped by the engine first). The unit sampler overrides this with one
+        unit's worth of subunit steps."""
+        return max(p.max_tokens_left for p in live) + 1
+
+    def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
         """Engine-burst draw for the WHOLE batch of live rows (the burst analog of
         ``sample``, vectorized).
 
         ``lm_batch`` is the ``[L, V+1]`` on-device control-vocab log-weights for
         the L live rows (``PromptedLLM._process_logw_next_batch`` -- the expensive
-        50k-vocab processing done ONCE for all rows, never per-row). ``factor_states``
-        / ``contexts`` are the L particles' carried factor states / token contexts;
-        ``ctx`` is the sampler-facing
-        :class:`~genlm.control.sampler.controller.BurstContext`.
+        50k-vocab processing done ONCE for all rows, never per-row). ``contexts``
+        are the L particles' token contexts (the factor is scored from them via
+        ``ctx.product_logws``; its ``_consume`` cache keeps that incremental), and
+        ``externals`` their stable particle indices (so a unit sampler can key a
+        per-burst accumulator across the shrinking live set); ``ctx`` is the
+        sampler-facing :class:`~genlm.control.sampler.controller.BurstContext`.
 
-        Returns ``(tokens, logws, logps, new_factor_states)`` -- lists of length L,
-        the per-row analog of ``sample``'s ``(token, logw, logp)`` plus the advanced
-        factor state. The Controller banks weights / advances / terminates per
-        particle; the sampler only computes the draw. Samplers that ride the burst
-        (``supports_burst()``) override; the LM half is already batched, so a
-        sampler vectorizes its control where it can (Direct) or loops over the
-        cheap ``[V+1]`` proposals where the control is inherently per-particle
-        (AWRS rejection, Set trie).
+        Returns a list of L :class:`~genlm.control.sampler.controller.BurstDraw`,
+        one per row -- the per-row analog of ``sample`` plus the engine-continuation
+        token and (for the unit grain) a completed-step / pop signal. The Controller
+        banks the step / advances / terminates per particle; the sampler only
+        computes the draw. Samplers that ride the burst (``supports_burst()``)
+        override; the LM half is already batched, so a sampler vectorizes its control
+        where it can (Direct) or loops over the cheap ``[V+1]`` proposals where the
+        control is inherently per-particle (AWRS rejection, Set trie).
         """
         raise NotImplementedError
 
@@ -206,8 +213,8 @@ class DirectTokenSampler(TokenSampler):
         # on the slow loop.
         return self.proposal is None
 
-    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
-        """Batched burst draw (the burst analog of ``sample``).
+    def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
+        """Batched burst draw (the burst analog of ``sample``), one BurstDraw per row.
 
         ``lm_batch`` is the ``[L, V+1]`` on-device LM log-weights (already
         processed ONCE for the whole batch). Two cases:
@@ -219,10 +226,17 @@ class DirectTokenSampler(TokenSampler):
           without tracking the slow path token-for-token (parity stays the no-bias
           check the warm-KV residual already requires).
         * **factored** (additive ``ctx.factor``): the LM half is already batched;
-          per particle, form ``Product(llm, factor).logw_next`` from the carried
-          state and draw with the slow path's exact numpy ``fast_sample_lazyweights``
-          (same RNG -> tight warm-KV-only parity). The per-particle product is the
-          one bit still looped -- vectorizing it is the eventual ideal.
+          per particle, form ``Product(llm, factor).logw_next`` from the row's
+          context (``ctx.product_logws`` scores ``factor.logw_next(context)``, kept
+          incremental by the factor's ``_consume`` cache) and draw with the slow
+          path's exact numpy ``fast_sample_lazyweights`` (same RNG -> tight
+          warm-KV-only parity). The per-particle product is the one bit still
+          looped -- vectorizing it is the eventual ideal.
+
+        Token grain: every row completes one SMC step every decode step, so each
+        ``BurstDraw`` carries ``step=([token], logw, logp)`` and never pops mid-burst
+        (the ESS crossing pops the whole population, controller-side). ``externals``
+        is unused (no per-row burst state to key).
         """
         if ctx.factor is None:
             logZ = torch.logsumexp(lm_batch, dim=1)  # [L] proposal log-mass (~0)
@@ -234,25 +248,21 @@ class DirectTokenSampler(TokenSampler):
             logZ = logZ.tolist()
             vocab_eos = self.target.vocab_eos
             tokens = [vocab_eos[j] for j in idx.tolist()]
-            return tokens, logZ, logp_drawn, list(factor_states)
+            return [
+                BurstDraw(token=t, step=([t], zt, lpt))
+                for t, zt, lpt in zip(tokens, logZ, logp_drawn)
+            ]
 
         # Factored: one host transfer of the batched LM weights, then per-particle
         # product + numpy draw over the cheap [V+1] proposals (no 50k re-processing).
         lm_np = lm_batch.cpu().numpy()
-        tokens, logws, logps, new_states = [], [], [], []
-        for k, state in enumerate(factor_states):
-            logw = ctx.product_logws(lm_np[k], state)
+        out = []
+        for k, context in enumerate(contexts):
+            logw = ctx.product_logws(lm_np[k], context)
             logp = logw.normalize()
             token = fast_sample_lazyweights(logp)
-            new_states.append(
-                state
-                if isinstance(token, EndOfSequence)
-                else ctx.factor.advance(state, token)
-            )
-            tokens.append(token)
-            logws.append(logw.sum())
-            logps.append(logp[token])
-        return tokens, logws, logps, new_states
+            out.append(BurstDraw(token=token, step=([token], logw.sum(), logp[token])))
+        return out
 
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
@@ -324,15 +334,17 @@ class SetTokenSampler(TokenSampler):
         # "SetTokenSampler is not engine-accelerated".
         return False
 
-    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
-        """Set construction over the engine's warm-KV iterable weights. The LM half
-        (``iter_potential.logw_next``) is batched ONCE; the per-particle set draw
-        (the exact slow ``sample`` with only the iterable weights substituted) is
-        then run for ALL rows in a SINGLE hop via ``asyncio.gather`` -- so the
-        backend trie / ``item_potential`` calls batch across the population exactly
-        as they do under the slow path's ``asyncio.gather``. (The old per-particle
-        ``run_sync`` serialized them, one hop each, losing that batching.)
-        ``factor_state`` is unused (the set sampler carries no additive factor)."""
+    def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
+        """Set construction over the engine's warm-KV iterable weights, one BurstDraw
+        per row. The LM half (``iter_potential.logw_next``) is batched ONCE; the
+        per-particle set draw (the exact slow ``sample`` with only the iterable
+        weights substituted) is then run for ALL rows in a SINGLE hop via
+        ``asyncio.gather`` -- so the backend trie / ``item_potential`` calls batch
+        across the population exactly as they do under the slow path's
+        ``asyncio.gather``. (The old per-particle ``run_sync`` serialized them, one
+        hop each, losing that batching.) Token grain: each row completes one SMC
+        step per decode step. ``externals`` is unused (the set sampler carries no
+        per-row burst state)."""
         iter_potential = self.set_sampler.iter_potential
         lm_np = lm_batch.cpu().numpy()  # one host transfer of the batched LM weights
         iter_logws = [
@@ -354,10 +366,10 @@ class SetTokenSampler(TokenSampler):
         # ONE event-loop hop for the whole population; the concurrent sample_sets
         # let the backend trie batch across particles.
         results = ctx.run_sync(_gather())
-        tokens = [r[0] for r in results]
-        logws = [r[1] for r in results]
-        logps = [r[2] for r in results]
-        return tokens, logws, logps, list(factor_states)
+        return [
+            BurstDraw(token=tok, step=([tok], logw, logp))
+            for (tok, logw, logp) in results
+        ]
 
     async def sample(self, context, draw=None):
         """Sample a token and weight by sampling a weighted set of tokens from the `set_sampler`
@@ -474,18 +486,24 @@ class AWRS(TokenSampler):
         self.rng = np.random.default_rng(seed=seed)
 
     def supports_burst(self) -> bool:
-        # No separate proposal, and the boolean condition is sync-stateful
-        # (exposes prefix_logw/complete_logw), so the rejection can run over the
-        # engine LM logits with the condition checked from its carried state.
-        return self.proposal is None and hasattr(self.condition, "prefix_logw")
+        # No separate proposal: the rejection runs over the engine LM logits with
+        # the boolean condition checked per probed token via `self._accept`
+        # (`condition.prefix`/`complete`), exactly as the slow `sample` path.
+        return self.proposal is None
 
-    def burst_draw_batch(self, lm_batch, factor_states, contexts, ctx):
-        """AWRS rejection over the engine LM weights with the boolean condition
-        checked from each particle's carried state. The LM half is batched ONCE;
-        per particle, reconstruct the cheap ``[V+1]`` proposal and run the shared
-        ``_run_rejection`` (so the rejection algorithm + returned weight match the
-        slow path; ``logp`` is ``nan`` as in ``sample``). The per-particle rejection
-        is the bit still looped -- vectorizing it is the eventual ideal.
+    def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
+        """AWRS rejection over the engine LM weights, one BurstDraw per row. The LM
+        half is batched ONCE; per particle, reconstruct the cheap ``[V+1]`` proposal
+        and run the shared ``_run_rejection`` with the SAME ``self._accept(context,
+        tok)`` the slow ``sample`` path uses -- ``condition.prefix(context + [tok]) ==
+        0`` (``complete(context)`` for EOS). Only the few tokens the rejection walk
+        PROBES are checked, NEVER the whole vocab; the condition's ``_consume`` cache
+        keeps each probe incremental (only ``f([tok])``'s bytes are newly consumed).
+        ``_accept`` is pure-CPU async for an FSA condition, so the rejection coroutine
+        never suspends and ``_drive_sync`` runs it inline (no per-particle event-loop
+        hop). Same rejection algorithm + returned weight as the slow path (``logp`` is
+        ``nan`` as in ``sample``). Token grain: each row completes one SMC step per
+        decode step; ``externals`` is unused.
 
         The whole O(V) PREP -- prune, normalize (``logps``), the rejection
         normalizer ``logZ``, and the Gumbel ``keys`` -- is built ON-DEVICE for all
@@ -496,7 +514,6 @@ class AWRS(TokenSampler):
         stay per-particle. The keys use a torch (on-device) RNG stream rather than
         the slow path's numpy one, so the burst is no-bias (like the Direct
         unconstrained burst), not token-for-token tied to the slow path."""
-        condition = ctx.factor
         # Prune (mask non-valid columns to -inf) so they normalize/sort out and are
         # never drawn -- the on-device form of `_prune_logws`.
         if self.prune_logws:
@@ -519,36 +536,29 @@ class AWRS(TokenSampler):
         logps_np = logps_t.cpu().numpy()
         order_np = order_t.cpu().numpy()
         logZ_batch = logZ_t.squeeze(1).tolist()
-        tokens, logws, logps, new_states = [], [], [], []
-        for k, state in enumerate(factor_states):
+
+        # Per particle, run the SAME ``self._accept`` the slow ``sample`` path uses,
+        # checking ONLY the tokens the rejection walk probes (never the whole vocab).
+        # ``_accept`` is pure-CPU async for an FSA condition, so ``_drive_sync`` runs
+        # the rejection inline -- no per-particle event-loop hop.
+        out = []
+        for k, context in enumerate(contexts):
             lm_logws = self.potential.make_lazy_weights(logps_np[k])
 
-            async def accept(tok, st=state):
-                if isinstance(tok, EndOfSequence):
-                    return condition.complete_logw(st) == 0
-                return condition.prefix_logw(condition.advance(st, tok)) == 0
+            async def accept(tok, c=context):
+                return await self._accept(c, tok)
 
-            # Burst `accept` is sync underneath (carried-state condition), so the
-            # rejection runs inline in the worker -- no hop to the main loop. The
-            # prep (logps/order/logZ) is the on-device batch; only the walk is here.
-            token, logw, _ = _drive_sync(
-                self._run_rejection(
-                    lm_logws,
-                    accept,
-                    logZ=logZ_batch[k],
-                    logps=logps_np[k],
-                    order=order_np[k],
+            # Inline for a non-suspending (FSA) condition; hop to the loop if the
+            # condition actually awaits (autobatched / LM-backed / IPC) -- correct
+            # either way, no per-particle hop in the common FSA case.
+            def _rej(lw=lm_logws, ac=accept, kk=k):
+                return self._run_rejection(
+                    lw, ac, logZ=logZ_batch[kk], logps=logps_np[kk], order=order_np[kk]
                 )
-            )
-            new_states.append(
-                state
-                if isinstance(token, EndOfSequence)
-                else condition.advance(state, token)
-            )
-            tokens.append(token)
-            logws.append(logw)
-            logps.append(float("nan"))
-        return tokens, logws, logps, new_states
+
+            token, logw, _ = _drive_or_hop(_rej, ctx.run_sync)
+            out.append(BurstDraw(token=token, step=([token], logw, float("nan"))))
+        return out
 
     def _prune_logws(self, logws):
         # Prune the logws to only include the tokens in the

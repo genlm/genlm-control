@@ -553,7 +553,13 @@ class PromptedLLM(Potential):
         )
         out[:, : len(self.vocab)] = logits[:, non_eos]
         if eos_idxs.numel() == 1:
-            out[:, -1] = logits[:, eos_idxs.item()]
+            # On-device single-EOS gather (mirrors the per-row `_process_logw_next`
+            # path, line ~609): index with the 0-dim tensor, NOT `eos_idxs.item()`,
+            # so the EOS column needs no host sync -- keeps this batch path fully on
+            # device as advertised. (The per-step forward-wait is inherent and lands
+            # at the drawn-token readback regardless; this only drops the redundant
+            # second sync, not the wait itself.)
+            out[:, -1] = logits[:, eos_idxs[0]]
         else:
             out[:, -1] = torch.logsumexp(logits[:, eos_idxs], dim=1)
         return out

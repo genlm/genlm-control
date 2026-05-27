@@ -1,5 +1,6 @@
 import string
 import numpy as np
+from collections import OrderedDict
 from arsenal.maths import logsumexp
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
@@ -19,12 +20,20 @@ class WFSA(Potential):
         wfsa (genlm_grammar.WFSA): The weighted finite state automaton used for potential calculations.
     """
 
-    def __init__(self, wfsa):
+    def __init__(self, wfsa, cache_maxsize=8_000_000):
         """
         Initializes the WFSA potential.
 
         Args:
             wfsa (genlm_grammar.WFSA): The weighted finite state automaton.
+            cache_maxsize (int): Max number of byte-prefix charts held in the
+                ``_consume`` LRU. The cache is keyed by the full byte-prefix, so a
+                long generation grows it ~`steps * vocab-prefixes` without a bound
+                (the old un-evicted dict OOM'd on long constrained runs). Size it to
+                comfortably exceed one decode step's working set
+                (`~N_particles * vocab-byte-trie nodes`) so the prefix-sharing
+                speedup isn't thrashed; the default (~8M charts) is a few GB for the
+                small FSAs here and holds ~2-3 steps at N=16.
 
         Raises:
             ValueError: If the semiring of the provided WFSA is not Float or Log.
@@ -40,7 +49,11 @@ class WFSA(Potential):
         else:
             self.wfsa = wfsa
 
-        self.cache = {(): self.wfsa.epsremove.start}
+        # The empty-prefix base chart is held OUTSIDE the LRU so the recursion base
+        # (`_consume(())`) is never evicted; the LRU holds only non-empty prefixes.
+        self._start_chart = self.wfsa.epsremove.start
+        self._cache_maxsize = cache_maxsize
+        self.cache = OrderedDict()
         super().__init__(vocabulary=list(self.wfsa.alphabet))
 
     @classmethod
@@ -89,13 +102,15 @@ class WFSA(Potential):
         return new
 
     def _consume(self, bs):
-        # XXX implement cache eviction
         bs = tuple(bs)
+        if not bs:
+            return self._start_chart  # recursion base, never evicted
 
-        try:
-            return self.cache[bs]
-        except KeyError:
-            pass
+        cache = self.cache
+        curr = cache.get(bs)
+        if curr is not None:
+            cache.move_to_end(bs)  # LRU touch -- keeps the active prefix chain hot
+            return curr
 
         wfsa = self.wfsa.epsremove
         curr = wfsa.R.chart()
@@ -104,7 +119,9 @@ class WFSA(Potential):
             for j, w in wfsa.arcs(i, bs[-1]):
                 curr[j] += prev[i] * w
 
-        self.cache[bs] = curr
+        cache[bs] = curr
+        if len(cache) > self._cache_maxsize:
+            cache.popitem(last=False)  # evict least-recently-used prefix
 
         return curr
 
@@ -130,8 +147,8 @@ class WFSA(Potential):
         """Prefix log weight of a carried `chart`: the logsumexp over its
         backward-weighted live states, collapsed to `-inf` for a dead (empty) or
         `nan` chart. The single source of the prefix normalizer shared by
-        `_prefix`, `prefix_logw`, and `logw_next_from_state` -- so the dead-state
-        boundary is decided in exactly one place."""
+        `_prefix` and the chart-scalar `prefix_logw` -- so the dead-state boundary
+        is decided in exactly one place."""
         if not chart:
             return float("-inf")
         bkwd = self.wfsa.epsremove.backward
@@ -139,9 +156,8 @@ class WFSA(Potential):
         return float("-inf") if np.isnan(log_ctx_w) else log_ctx_w
 
     def _logw_next_from_chart(self, chart, log_ctx_w):
-        """Next-token + EOS log weights from a carried `chart` and its prefix log
-        weight `log_ctx_w`. The shared chart->weights tail of both `logw_next`
-        (chart from `_consume`) and `logw_next_from_state` (carried chart)."""
+        """Next-token + EOS log weights from a `chart` and its prefix log weight
+        `log_ctx_w`. The chart->weights tail of `logw_next` (chart from `_consume`)."""
         bkwd = self.wfsa.epsremove.backward
         ws = self.wfsa.R.chart()
         for i in chart:
@@ -192,55 +208,19 @@ class WFSA(Potential):
             raise ValueError(f"Context {context!r} has zero weight.")
         return self._logw_next_from_chart(curr, log_ctx_w)
 
-    # -- stateful interface (the WFSA's state is its chart, what `_consume`
-    #    already maintains): carry + advance it instead of replaying `context` --
+    # -- chart-scalar accessors (a "chart" is what `_consume` returns): the
+    #    shared-prefix `Coerced._trie_logws` reads each token's prefix/complete
+    #    weight from a cached chart sync, with no `asyncio.gather` over the vocab --
 
-    def state0(self):
-        """Carried state for the empty context: the epsilon-removed start chart.
+    def prefix_logw(self, chart):
+        """Log prefix weight of a cached `chart` (sync; `-inf` if dead)."""
+        return float(self._chart_prefix_logw(chart))
 
-        This is a shared chart object (also cached by `_consume(())`); `advance`
-        and the readers only *read* it and allocate a fresh chart, so callers
-        must likewise treat a carried state as immutable.
-        """
-        return self.wfsa.epsremove.start
-
-    def advance(self, state, token):
-        """Advance the chart by one WFSA-alphabet symbol (one `_consume` step)."""
-        wfsa = self.wfsa.epsremove
-        curr = wfsa.R.chart()
-        for i in state:
-            for j, w in wfsa.arcs(i, token):
-                curr[j] += state[i] * w
-        return curr
-
-    async def logw_next_from_state(self, state):
-        """Next-token log weights from a carried chart `state`.
-
-        Reads the chart from `state` instead of `_consume`-ing the whole context,
-        then shares `logw_next`'s exact chart->weights tail
-        (`_logw_next_from_chart`). Bit-identical to `logw_next(context)` for the
-        state reached by advancing `state0()` through `context` -- the parity
-        contract.
-        """
-        log_ctx_w = self._chart_prefix_logw(state)
-        if log_ctx_w == float("-inf"):
-            raise ValueError("Context has zero weight (dead state).")
-        return self._logw_next_from_chart(state, log_ctx_w)
-
-    def prefix_logw(self, state):
-        """Log prefix weight from a carried chart `state` (sync; `-inf` if dead).
-
-        Sync stateful analog of `prefix` -- no `_consume`, no async. Lets a
-        coercion evaluate many candidate extensions from a carried chart without
-        an `asyncio.gather` over the vocabulary (the dominant per-step cost)."""
-        return float(self._chart_prefix_logw(state))
-
-    def complete_logw(self, state):
-        """Log complete weight from a carried chart `state` (sync). Sync stateful
-        analog of `complete` (the EOS column)."""
+    def complete_logw(self, chart):
+        """Log complete weight of a cached `chart` (sync; the EOS column)."""
         acc = self.wfsa.R.zero
         for j, w in self.wfsa.epsremove.F:
-            acc += state[j] * w
+            acc += chart[j] * w
         return float(acc.score)
 
     def _repr_svg_(self):
@@ -254,7 +234,7 @@ class WFSA(Potential):
         return cls(wfsa=self.wfsa)
 
     def clear_cache(self):
-        self.cache = {(): self.wfsa.epsremove.start}
+        self.cache = OrderedDict()
 
 
 class BoolFSA(WFSA):
@@ -318,18 +298,13 @@ class BoolFSA(WFSA):
         """
         return self._booleanize(await super().logw_next(context))
 
-    async def logw_next_from_state(self, state):
-        """Boolean next-token log weights from a carried chart `state` (mirrors
-        `logw_next` over the stateful path)."""
-        return self._booleanize(await super().logw_next_from_state(state))
+    def prefix_logw(self, chart):
+        """Boolean prefix weight of a cached chart (0 if alive, else -inf)."""
+        return self._bool(super().prefix_logw(chart))
 
-    def prefix_logw(self, state):
-        """Boolean prefix weight from a carried chart (0 if alive, else -inf)."""
-        return self._bool(super().prefix_logw(state))
-
-    def complete_logw(self, state):
-        """Boolean complete weight from a carried chart (0 if accepting, else -inf)."""
-        return self._bool(super().complete_logw(state))
+    def complete_logw(self, chart):
+        """Boolean complete weight of a cached chart (0 if accepting, else -inf)."""
+        return self._bool(super().complete_logw(chart))
 
     async def batch_logw_next(self, contexts):
         """

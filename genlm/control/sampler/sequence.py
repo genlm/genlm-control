@@ -38,6 +38,30 @@ def _normalize_accelerate(accelerate):
     )
 
 
+async def _drive(controller, mode):
+    """Select and run the SMC driver for ``mode`` (already-normalized
+    'off'/'auto'/'require'), returning the final particle population. The burst-
+    capability check, the ``require`` raise, and the ``auto`` fallback logging live
+    here so single (:meth:`SMC.__call__`) and batched (:func:`batched_smc`) runs
+    share one selection -- they cannot drift."""
+    if mode != "off":
+        cap = burst_capability(controller)
+        if mode == "require" and not cap.ok:
+            raise NotAcceleratable(cap.reason)
+        if cap.ok:
+            if mode == "auto":
+                logger.info("running the engine-accelerated burst path.")
+            return await BurstLoop(controller).run()
+        if mode == "auto":
+            logger.info(
+                "running the exact per-token path -- acceleration unavailable: %s. "
+                'Pass accelerate="off" to silence, or accelerate="require" to make '
+                "this an error.",
+                cap.reason,
+            )
+    return await StepLoop(controller).run()
+
+
 class SMC:
     """This class implements sequential Monte Carlo (SMC) inference for controlled text generation.
     The generation process works as follows:
@@ -99,6 +123,7 @@ class SMC:
         max_tokens,
         *,
         accelerate="auto",
+        slow_cadence=None,
         verbosity=0,
         json_path=None,
         **kwargs,
@@ -132,6 +157,24 @@ class SMC:
                 statistically identical to `"off"` (same target, unbiased weights)
                 but not byte-identical (warm-KV residual + batched-draw RNG); use
                 `"off"` for exact reproducibility.
+            slow_cadence (BoundaryPredicate, optional): keyword-only
+                :class:`~genlm.control.sampler.unit.BoundaryPredicate` marking steps
+                that are engine-INEXPRESSIBLE and must run on the slow lane -- "the
+                next step needs a non-burst op", e.g. a periodic second/larger
+                critic-LM forward. It is evaluated per row on the tokens drawn since
+                that row's last slow step, with the unit sampler's
+                ``(unit_context, subunit_buffer)`` signature -- reusing the same
+                boundary library: ``FixedLengthBoundary(N)`` -> a slow step every N
+                tokens, ``TokenSetBoundary({b"."})`` -> after each period,
+                ``CFGBoundary`` -> on grammar completion. The engine-accelerated path
+                then bursts the expressible runs and drops to the exact per-token
+                transition only for the cadence steps (engine free, no second forward
+                held inside the decode loop), re-entering the burst after each. It is
+                a **performance** hint, not a correctness knob: the per-step math is
+                identical on both lanes, so the result is unchanged (and unbiased) for
+                any cadence -- it only moves where the work runs. When it fires for any
+                live row the whole population takes one synced slow-lane step. ``None``
+                (default) keeps every step on the fast lane.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
@@ -159,31 +202,11 @@ class SMC:
             twist_with_critic=ess_threshold > 0,
             record=json_path is not None,
             verbosity=verbosity,
+            slow_cadence=slow_cadence,
             **kwargs,
         )
 
-        if mode == "off":
-            use_burst = False
-        else:
-            cap = burst_capability(controller)
-            if mode == "require" and not cap.ok:
-                raise NotAcceleratable(cap.reason)
-            use_burst = cap.ok
-            if mode == "auto":
-                if cap.ok:
-                    logger.info("running the engine-accelerated burst path.")
-                else:
-                    logger.info(
-                        "running the exact per-token path -- acceleration "
-                        "unavailable: %s. Pass accelerate=\"off\" to silence, or "
-                        "accelerate=\"require\" to make this an error.",
-                        cap.reason,
-                    )
-
-        if use_burst:
-            particles = await BurstLoop(controller).run()
-        else:
-            particles = await StepLoop(controller).run()
+        particles = await _drive(controller, mode)
 
         if json_path is not None:
             controller.save_record(json_path)
@@ -373,3 +396,62 @@ def _unpack_particles(particles):
         ),
     )
     return contexts, logws
+
+
+async def batched_smc(
+    samplers,
+    critics,
+    n_particles,
+    ess_threshold,
+    max_tokens,
+    *,
+    accelerate="off",
+    verbosity=0,
+    **kwargs,
+):
+    """Run ``B = len(samplers)`` SMC E-steps as ONE batched population.
+
+    The B examples share the engine but each has its own sampler (``samplers[g]`` --
+    a token sampler over example g's prompt) and critic (``critics[g]``). They run as
+    B independent sub-populations ("groups") of ``n_particles`` each in one
+    ``Controller``; ESS / resample / log_ml are per-group, so **each group is
+    statistically identical to running that example alone** (no cross-group coupling
+    -- the parity bar). Returns a list of B :class:`Sequences`, one per example, in
+    ``samplers`` order.
+
+    ``accelerate="off"`` runs the exact per-token slow loop (the only path wired for
+    groups today; the batched burst is the next phase). The single-example
+    :class:`SMC` path is unchanged and byte-identical to before.
+    """
+    B = len(samplers)
+    assert len(critics) == B, "need one critic per sampler/example"
+    # The controller's critic-presence branch uses the group-0 representative, so a
+    # mixed batch (some groups with a critic, some without) is unsupported -- make
+    # that contract explicit rather than crash deep in the per-step transition.
+    assert len({c is None for c in critics}) == 1, (
+        "all critics must be present or all absent (homogeneous batch)"
+    )
+    controller = Controller(
+        unit_sampler=samplers[0],
+        critic=critics[0],
+        n_particles=n_particles * B,  # TOTAL rows across all groups
+        ess_threshold=ess_threshold,
+        max_tokens=max_tokens,
+        twist_with_critic=ess_threshold > 0,
+        verbosity=verbosity,
+        group_sizes=[n_particles] * B,
+        samplers=samplers,
+        critics=critics,
+        **kwargs,
+    )
+
+    # Same driver selection as the single-example path: ``off`` -> exact per-token
+    # StepLoop; burst-capable -> ONE engine burst over all B*N rows (``draw`` resamples
+    # the crossing groups in place per ``_ess_crosses``; pure acceleration of the same
+    # per-group transition).
+    particles = await _drive(controller, _normalize_accelerate(accelerate))
+
+    return [
+        Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
+        for rows in controller._group_rows
+    ]

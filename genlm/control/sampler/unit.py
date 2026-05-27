@@ -1,10 +1,26 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from genlm.control.constant import EOS
+from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
+from genlm.control.sampler.controller import BurstDraw
 from lark import Lark
 from lark.exceptions import LarkError
+
+
+@dataclass
+class _UnitAccum:
+    """Per-row, per-burst accumulator for an in-progress unit: the subunits drawn
+    so far this unit round and their summed importance weight / log-prob.
+
+    Lives in the :class:`~genlm.control.sampler.controller.BurstContext`'s per-burst
+    ``scratch`` dict keyed by the row's external particle index, and is discarded
+    the moment the unit completes (one unit per burst, so nothing carries across)."""
+
+    buffer: list
+    logw: float
+    logp: float
 
 
 def flatten_units(context):
@@ -88,17 +104,98 @@ class MultiTokenUnitSampler(TokenSampler):
         self.max_subunits_per_unit = max_subunits_per_unit
 
     def supports_burst(self) -> bool:
-        # Stays on StepLoop (the honest "back out", not a bandaid). A unit spans a
-        # VARIABLE number of subunit tokens, and the SMC ESS test fires once per
-        # UNIT -- in the slow loop every particle advances exactly one unit per
-        # transition, so the population is synchronized at unit boundaries. The
-        # engine decodes one token per row per step UNIFORMLY, so particles would
-        # reach unit boundaries at different engine steps; the per-step ESS/pop-out
-        # then cannot align to per-unit boundaries without either a unit-
-        # synchronization that breaks ESS-timing parity or segment-graining the
-        # algorithm. So a multi-token unit is not a clean per-engine-step draw and
-        # the burst correctly declines it (gate-1 covers MultiToken on StepLoop).
+        # Rides the fast lane iff its subunit sampler can: the subunits ARE the
+        # burst draws (Direct/AWRS over the warm-KV logits). MultiToken adds only
+        # the unit accumulation + the synchronized per-unit pop-out on top, so its
+        # burst-capability is exactly the subunit sampler's.
+        return self.subunit_sampler.supports_burst()
+
+    def burst_free_running(self) -> bool:
+        # Synchronized (unit grain), NOT free-running: one SMC step is one whole
+        # unit, completed at a per-row boundary after a VARIABLE number of subunit
+        # decode steps. Because rows reach their boundary at different engine steps,
+        # each pops out and waits at its boundary; the controller runs exactly one
+        # unit round per burst and tests ESS once at the synced boundary -- identical
+        # timing to the slow per-unit loop (every particle advances one unit per
+        # transition). This is what made the per-step token-grain ESS wrong for
+        # units; the synchronized grain makes it exact.
         return False
+
+    def burst_max_steps(self, live) -> int:
+        # One unit's worth of subunit decode steps (+1 margin). The reject at
+        # ``max_subunits_per_unit`` subunits fires control-side (in burst_draw_batch)
+        # before this engine cap, so the engine never length-caps a row mid-unit.
+        return self.max_subunits_per_unit + 1
+
+    def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
+        """Burst draw for one unit round: accumulate subunits per row across engine
+        steps and complete an SMC step only at the unit boundary.
+
+        The subunits ARE the subunit sampler's own burst draws over the warm-KV
+        logits (one batched call for the whole live set), so the LM half / factor
+        advance exactly as in a token burst. On top, this carries each row's
+        in-progress unit in ``ctx.scratch`` (keyed by ``externals``) and, per row,
+        decides -- with the SAME EOS-split / boundary / max-subunit logic as the
+        slow ``sample``/``transition`` -- whether the unit is now complete:
+
+        * **EOS subunit** -> the unit ends with EOS; ``to_append`` splits the content
+          off so the controller's terminal check fires (the particle terminates).
+        * **boundary fires** -> finalize the unit; the row ``pop``s out and waits for
+          the population to sync at the unit boundary, then the driver runs ESS.
+        * **max subunits without a boundary** -> reject (``-inf`` weight -> the
+          particle finishes), the incomplete buffer as the unit.
+        * **otherwise** -> mid-unit: emit the subunit to extend the warm KV, bank
+          nothing (``step=None``).
+        """
+        accums = ctx.scratch  # external index -> _UnitAccum, fresh each burst
+        # Each row's subunit context for the subunit sampler's factor: completed
+        # units flattened to subunits + the in-progress subunits accumulated so far
+        # this burst (what the carried factor state used to thread). The subunit
+        # sampler scores its factor statelessly from this via ``logw_next``.
+        sub_contexts = []
+        for k, ext in enumerate(externals):
+            accum = accums.get(ext)
+            buf = accum.buffer if accum is not None else []
+            sub_contexts.append(flatten_units(contexts[k]) + list(buf))
+        sub_records = self.subunit_sampler.burst_draw_batch(
+            lm_batch, sub_contexts, externals, ctx
+        )
+        out = []
+        for k, ext in enumerate(externals):
+            sub = sub_records[k]
+            subunit = sub.token
+            _, sub_logw, sub_logp = sub.step
+
+            accum = accums.get(ext)
+            if accum is None:
+                accum = accums[ext] = _UnitAccum([], 0.0, 0.0)
+            accum.buffer.append(subunit)
+            accum.logw += sub_logw
+            accum.logp += sub_logp
+
+            if subunit is EOS:
+                # Unit ends with EOS: split the content off as one unit and append
+                # EOS separately so context[-1] is EOS -- exactly transition().
+                to_append = []
+                if len(accum.buffer) > 1:
+                    to_append.append(accum.buffer[:-1])
+                to_append.append(EOS)
+                step, pop = (to_append, accum.logw, accum.logp), False
+                accums.pop(ext, None)
+            elif self.boundary_predicate(contexts[k], accum.buffer):
+                unit = self.boundary_predicate.finalize_unit(accum.buffer)
+                step, pop = ([unit], accum.logw, accum.logp), True
+                accums.pop(ext, None)
+            elif len(accum.buffer) >= self.max_subunits_per_unit:
+                # Max subunits, no boundary: reject the unit (the slow sample()'s
+                # post-loop -inf return) -- the -inf weight finishes the particle.
+                step, pop = ([list(accum.buffer)], float("-inf"), accum.logp), False
+                accums.pop(ext, None)
+            else:
+                step, pop = None, False  # mid-unit: emit the subunit, bank nothing
+
+            out.append(BurstDraw(token=subunit, step=step, pop=pop))
+        return out
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
@@ -271,10 +368,29 @@ class TokenSetBoundary(BoundaryPredicate):
 
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
+        # Compare by BYTE CONTENT, not by hash-set membership. A real-LLM token is a
+        # ``Token`` (subclass of ``bytes`` that hashes by ``token_id``), so
+        # ``Token(13, b" ") in {b" "}`` is False even though the bytes match -- the
+        # boundary would silently never fire on the real-LLM grain. Precompute a
+        # plain-bytes set (``bytes(t)`` is the content for both ``Token`` and
+        # ``bytes``) plus an EOS flag (EOS is matched by identity, having no bytes).
+        self._eos_boundary = any(
+            isinstance(t, EndOfSequence) for t in self.boundary_tokens
+        )
+        self._byte_boundaries = {
+            bytes(t) for t in self.boundary_tokens if not isinstance(t, EndOfSequence)
+        }
 
     def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
-        """Check boundary (ignore unit_context for stateless predicate)."""
-        return bool(subunit_buffer and subunit_buffer[-1] in self.boundary_tokens)
+        """Check boundary (ignore unit_context for stateless predicate). Matches by
+        byte content so it fires identically on ``bytes`` and real-LLM ``Token``
+        subunits; EOS is matched by identity."""
+        if not subunit_buffer:
+            return False
+        last = subunit_buffer[-1]
+        if isinstance(last, EndOfSequence):
+            return self._eos_boundary
+        return bytes(last) in self._byte_boundaries
 
     def __repr__(self) -> str:
         return f"TokenSetBoundary({self.boundary_tokens!r})"

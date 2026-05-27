@@ -159,6 +159,32 @@ async def test_boundary_predicate_classes():
     assert "FixedLengthBoundary" in repr(boundary2)
 
 
+def test_token_set_boundary_real_token_grain():
+    """TokenSetBoundary fires by BYTE CONTENT, so it works on real-LLM ``Token``
+    subunits, not just the raw-``bytes`` mock grain. A ``Token`` subclasses ``bytes``
+    but hashes by ``token_id``, so plain set membership (``Token in {b" "}``) is
+    False despite matching content -- this guards that regression (the slow-lane
+    cadence and a real-LLM MultiTokenUnitSampler both depend on it)."""
+    from genlm.control.util import Token
+
+    boundary = TokenSetBoundary({b" ", b"!", EOS})
+
+    space = Token(220, b" ")
+    bang = Token(999, b"!")
+    word = Token(31373, b"hello")
+    # Sanity: this is exactly the membership that silently fails without the fix.
+    assert space not in {b" "} and space == b" "
+
+    assert boundary([], [word, space]) is True  # ends on a boundary Token
+    assert boundary([], [word, bang]) is True
+    assert boundary([], [word]) is False  # non-boundary Token
+    assert boundary([], [word, EOS]) is True  # EOS matched by identity
+    assert boundary([], []) is False
+    # Raw-bytes grain (the mock path) still works unchanged.
+    assert boundary([], [b"hi", b" "]) is True
+    assert boundary([], [b"hi"]) is False
+
+
 @pytest.mark.asyncio
 async def test_boundary_predicate_validation():
     """Test FixedLengthBoundary validation."""
