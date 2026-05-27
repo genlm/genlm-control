@@ -109,10 +109,6 @@ class SMC:
             twist_with_critic=ess_threshold > 0,
         )
 
-        # Default to stratified resampling: lower variance than multinomial.
-        # Caller can override via `resampling_method` in **kwargs.
-        kwargs.setdefault("resampling_method", "stratified")
-
         particles = await smc_standard(
             model=model,
             n_particles=n_particles,
