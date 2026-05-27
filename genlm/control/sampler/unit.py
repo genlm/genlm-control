@@ -1,3 +1,4 @@
+import inspect
 from abc import ABC, abstractmethod
 from typing import Any, Iterable, Optional
 
@@ -5,6 +6,29 @@ from genlm.control.constant import EOS
 from genlm.control.sampler.token import TokenSampler
 from lark import Lark
 from lark.exceptions import LarkError
+
+
+def _predicate_accepts_cumulative_logw(predicate) -> bool:
+    """Whether ``predicate.__call__`` can receive a ``cumulative_logw`` keyword.
+
+    True if it declares ``**kwargs`` or a ``cumulative_logw`` parameter. Predicates
+    using the original ``(unit_context, subunit_buffer)`` signature return False, so
+    the sampler falls back to the two-argument call (backward compatible).
+    """
+    try:
+        sig = inspect.signature(predicate.__call__)
+    except (TypeError, ValueError):  # pragma: no cover - C/builtin callables
+        # Can't introspect (e.g. a builtin). Be conservative and don't pass it.
+        return False
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "cumulative_logw" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 def flatten_units(context):
@@ -47,6 +71,12 @@ class MultiTokenUnitSampler(TokenSampler):
     $w_1, w_2, \\ldots, w_n$, the unit weight is $w = \\prod_{i=1}^{n} w_i$ (or
     $\\log w = \\sum_{i=1}^{n} \\log w_i$ in log-space).
 
+    **Weight- and critic-aware boundaries**: the predicate receives the running unit
+    log-weight via a ``cumulative_logw`` keyword, so boundaries can react to the
+    incremental importance weights (see `WeightGuidedBoundary`, `SurpriseBoundary`).
+    Predicates may also be ``async`` to ``await`` a critic potential mid-unit. Both are
+    opt-in; the original ``(unit_context, subunit_buffer)`` signature keeps working.
+
     Args:
         subunit_sampler (TokenSampler): Sampler for subunits $s \\in \\mathcal{B}$
         boundary_predicate (BoundaryPredicate): Determines when a sequence of tokens forms
@@ -86,6 +116,12 @@ class MultiTokenUnitSampler(TokenSampler):
         self.subunit_sampler = subunit_sampler
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
+
+        # Whether to forward the running unit log-weight to the predicate. Cached
+        # here so we don't re-introspect the signature on every subunit.
+        self._boundary_accepts_cumulative_logw = _predicate_accepts_cumulative_logw(
+            boundary_predicate
+        )
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
@@ -178,7 +214,19 @@ class MultiTokenUnitSampler(TokenSampler):
                 return subunit_buffer, cumulative_logw, cumulative_logp
 
             # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
-            if self.boundary_predicate(unit_context, subunit_buffer):
+            # Opt-in predicates also receive the running unit log-weight; async
+            # predicates (e.g. ones that query a critic) return a coroutine we await.
+            if self._boundary_accepts_cumulative_logw:
+                is_boundary = self.boundary_predicate(
+                    unit_context, subunit_buffer, cumulative_logw=cumulative_logw
+                )
+            else:
+                is_boundary = self.boundary_predicate(unit_context, subunit_buffer)
+
+            if inspect.iscoroutine(is_boundary):
+                is_boundary = await is_boundary
+
+            if is_boundary:
                 # Let the predicate finalize the unit (e.g., remove delimiter tokens)
                 unit = self.boundary_predicate.finalize_unit(subunit_buffer)
                 return unit, cumulative_logw, cumulative_logp
@@ -197,8 +245,14 @@ class BoundaryPredicate(ABC):
     A boundary predicate determines when a sequence of subunits $\\bm{s} \\in \\mathcal{B}^*$
     forms a complete unit $x \\in \\mathcal{A}$.
 
-    `__call__` method receives unit context and subunit buffer, allowing predicates
-    to be stateless and context-aware.
+    `__call__` receives unit context and subunit buffer plus keyword signals from the
+    sampler (currently ``cumulative_logw``); subclasses should accept ``**kwargs`` to
+    stay forward-compatible. The original two-argument signature still works — the
+    sampler detects it and omits the extra keyword.
+
+    `__call__` may be sync (returning ``bool``) or ``async`` (returning an awaitable
+    ``bool``); `MultiTokenUnitSampler` awaits coroutine results, so a predicate can
+    ``await`` a critic potential mid-unit before deciding.
 
     `finalize_unit` method transforms the buffer into the final unit after boundary
     detection, allowing predicates to control what tokens are included (e.g., removing
@@ -206,15 +260,21 @@ class BoundaryPredicate(ABC):
     """
 
     @abstractmethod
-    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
+    def __call__(self, unit_context: list, subunit_buffer: list, **kwargs) -> bool:
         """Check if subunit buffer forms a complete unit.
 
         Args:
             unit_context (list): Sequence of completed units $\\bm{x} \\in \\mathcal{A}^*$
             subunit_buffer (list): Current sequence of subunits $\\bm{s} \\in \\mathcal{B}^*$
+            **kwargs: Extra signals supplied by `MultiTokenUnitSampler`. Currently
+                includes ``cumulative_logw`` (float): the running log-weight
+                $\\sum_i \\log w_i$ accumulated over the subunits sampled so far for
+                the *current* unit. Predicates that don't need it should ignore it
+                via ``**kwargs``.
 
         Returns:
-            bool: True if $\\bm{s}$ forms a complete unit $x \\in \\mathcal{A}$
+            bool: True if $\\bm{s}$ forms a complete unit $x \\in \\mathcal{A}$. May also
+                return an awaitable resolving to ``bool`` (see class docstring).
         """
         pass  # pragma: no cover
 
@@ -253,7 +313,7 @@ class TokenSetBoundary(BoundaryPredicate):
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
 
-    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
+    def __call__(self, unit_context: list, subunit_buffer: list, **kwargs) -> bool:
         """Check boundary (ignore unit_context for stateless predicate)."""
         return bool(subunit_buffer and subunit_buffer[-1] in self.boundary_tokens)
 
@@ -279,7 +339,7 @@ class FixedLengthBoundary(BoundaryPredicate):
             raise ValueError(f"Length must be positive, got {length}")
         self.length = length
 
-    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
+    def __call__(self, unit_context: list, subunit_buffer: list, **kwargs) -> bool:
         """Check boundary (ignores unit_context for stateless predicate)."""
         return len(subunit_buffer) >= self.length
 
@@ -352,7 +412,7 @@ class CFGBoundary(BoundaryPredicate):
         except Exception as e:
             raise ValueError(f"Failed to create Lark parser: {e}") from e
 
-    def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
+    def __call__(self, unit_context: list, subunit_buffer: list, **kwargs) -> bool:
         """Check if buffer forms a complete syntactic unit.
 
         Args:
@@ -416,3 +476,178 @@ class CFGBoundary(BoundaryPredicate):
             f", complete_rules={self.complete_rules}" if self.complete_rules else ""
         )
         return f"CFGBoundary(start={self.start_rule!r}{rules_str})"
+
+
+def _validate_boundary_params(threshold, min_subunits, max_subunits, sign):
+    """Shared argument validation for the weight/critic boundary predicates."""
+    if sign not in ("abs", "down", "up"):
+        raise ValueError(f"sign must be 'abs', 'down', or 'up', got {sign!r}")
+    if threshold <= 0:
+        raise ValueError(f"threshold must be positive, got {threshold}")
+    if min_subunits < 1:
+        raise ValueError(f"min_subunits must be >= 1, got {min_subunits}")
+    if max_subunits < min_subunits:
+        raise ValueError(
+            f"max_subunits ({max_subunits}) must be >= min_subunits ({min_subunits})"
+        )
+
+
+def _length_gate(n_subunits, min_subunits, max_subunits):
+    """Resolve a boundary from length alone: True (force), False (too short), or
+    None (defer to the weight/critic signal)."""
+    if n_subunits >= max_subunits:
+        return True
+    if n_subunits < min_subunits:
+        return False
+    return None
+
+
+def _crosses_threshold(value, threshold, sign):
+    """Whether ``value`` crosses ``threshold`` in the given direction. NaN never does."""
+    if not isinstance(value, (int, float)) or value != value:  # type / NaN guard
+        return False
+    if sign == "abs":
+        return abs(value) >= threshold
+    if sign == "down":
+        return value <= -threshold
+    return value >= threshold  # sign == "up"
+
+
+class SurpriseBoundary(BoundaryPredicate):
+    """Boundary placed when the unit's accumulated log-weight crosses a threshold.
+
+    Reacts to the incremental importance weights (``cumulative_logw``) rather than the
+    surface tokens: a large deviation means the target potential is informative about
+    the current tokens, so a boundary here lets downstream SMC resample where the
+    weight signal is strongest. Domain-agnostic and requires no pilot run.
+
+    The ``sign`` controls which direction counts, which matters when the weight is
+    one-sided: grammar-only weights are bounded above by 0, so ``sign="down"`` fires
+    only on accumulated penalties and ignores positive noise.
+
+    Args:
+        threshold (float): Log-weight magnitude that fires a boundary. Default 1.5. > 0.
+        min_subunits (int): Minimum subunits before firing. Default 1.
+        max_subunits (int): Force a boundary after this many subunits. Default 50.
+        sign (str): ``"abs"`` (default) fires on ``|cumulative_logw| >= threshold``,
+            ``"down"`` on ``cumulative_logw <= -threshold``, ``"up"`` on
+            ``cumulative_logw >= +threshold``.
+
+    Example:
+        >>> boundary = SurpriseBoundary(threshold=1.0, sign="down", min_subunits=2)
+        >>> boundary([], [b"a", b"b"], cumulative_logw=2.0)   # wrong direction
+        False
+        >>> boundary([], [b"a", b"b"], cumulative_logw=-1.2)  # penalty crossed
+        True
+    """
+
+    def __init__(self, threshold=1.5, min_subunits=1, max_subunits=50, sign="abs"):
+        _validate_boundary_params(threshold, min_subunits, max_subunits, sign)
+        self.threshold = threshold
+        self.min_subunits = min_subunits
+        self.max_subunits = max_subunits
+        self.sign = sign
+
+    def __call__(self, unit_context, subunit_buffer, **kwargs):
+        gate = _length_gate(len(subunit_buffer), self.min_subunits, self.max_subunits)
+        if gate is not None:
+            return gate
+        cw = kwargs.get("cumulative_logw", 0.0)
+        return _crosses_threshold(cw, self.threshold, self.sign)
+
+    def __repr__(self):
+        return (
+            f"SurpriseBoundary(threshold={self.threshold}, sign={self.sign!r}, "
+            f"min_subunits={self.min_subunits}, max_subunits={self.max_subunits})"
+        )
+
+
+class CriticBoundary(BoundaryPredicate):
+    """Async boundary placed on a critic potential's per-unit log-weight change.
+
+    Reacts to an expensive ``critic`` rather than the surface tokens or the cheap
+    subunit weight. At each subunit it measures how much the critic's prefix score has
+    moved over the *current* (in-progress) unit::
+
+        delta = critic.prefix(ctx + buffer) - critic.prefix(ctx)
+
+    where ``ctx`` is the flattened completed `unit_context`. The baseline is derived
+    from ``unit_context`` (cached per unit), so the predicate is stateless across SMC
+    resampling. Fires when ``delta`` crosses ``threshold`` per ``sign``; a critic
+    returning ``-inf`` (dead particle) fires under ``"abs"``/``"down"``.
+
+    ``__call__`` is ``async`` and requires the sampler's await support.
+
+    Args:
+        critic: a `Potential` whose ``prefix(context)`` returns a float log-weight.
+            Called once per subunit, so it must be safe to evaluate mid-stream.
+        threshold, min_subunits, max_subunits, sign: as in `SurpriseBoundary`.
+        coalesce_grammar (bool): if True, add the subunit-side ``cumulative_logw`` to
+            the critic delta before thresholding. Default False (critic delta only).
+    """
+
+    def __init__(
+        self,
+        critic,
+        threshold=1.5,
+        min_subunits=1,
+        max_subunits=50,
+        sign="abs",
+        coalesce_grammar=False,
+    ):
+        _validate_boundary_params(threshold, min_subunits, max_subunits, sign)
+        self.critic = critic
+        self.threshold = threshold
+        self.min_subunits = min_subunits
+        self.max_subunits = max_subunits
+        self.sign = sign
+        self.coalesce_grammar = coalesce_grammar
+        # Per-unit baseline critic value, keyed by a hash of the completed context.
+        # Cleared by reset(); grows with the number of distinct contexts seen.
+        self._baseline_cache = {}
+
+    @staticmethod
+    def _critic_context(tokens):
+        """Flatten units and drop EOS for feeding the critic's ``prefix``."""
+        return [t for t in flatten_units(tokens) if t is not EOS]
+
+    def reset(self):
+        """Clear cached baselines. Call between independent generations."""
+        self._baseline_cache.clear()
+
+    async def _baseline(self, flat_ctx):
+        try:
+            key = hash(tuple(flat_ctx))
+        except TypeError:  # pragma: no cover - non-hashable tokens
+            key = hash(tuple(repr(t) for t in flat_ctx))
+        if key not in self._baseline_cache:
+            self._baseline_cache[key] = float(await self.critic.prefix(flat_ctx))
+        return self._baseline_cache[key]
+
+    async def __call__(self, unit_context, subunit_buffer, **kwargs):
+        gate = _length_gate(len(subunit_buffer), self.min_subunits, self.max_subunits)
+        if gate is not None:
+            return gate
+
+        baseline_ctx = self._critic_context(unit_context)
+        current_ctx = baseline_ctx + [t for t in subunit_buffer if t is not EOS]
+        try:
+            base = await self._baseline(baseline_ctx)
+            delta = float(await self.critic.prefix(current_ctx)) - base
+        except Exception:
+            # Critic failure: don't fire, don't poison the baseline cache.
+            return False
+
+        if self.coalesce_grammar:
+            cw = kwargs.get("cumulative_logw", 0.0)
+            if isinstance(cw, (int, float)) and cw == cw:  # ignore NaN/non-numeric
+                delta += cw
+
+        return _crosses_threshold(delta, self.threshold, self.sign)
+
+    def __repr__(self):
+        return (
+            f"CriticBoundary(threshold={self.threshold}, sign={self.sign!r}, "
+            f"coalesce_grammar={self.coalesce_grammar}, "
+            f"min_subunits={self.min_subunits}, max_subunits={self.max_subunits})"
+        )
