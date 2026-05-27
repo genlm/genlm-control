@@ -262,14 +262,13 @@ class BoundaryPredicate(ABC):
     def __call__(self, unit_context: list, subunit_buffer: list, **kwargs) -> bool:
         """Check if subunit buffer forms a complete unit.
 
+        `MultiTokenUnitSampler` passes the current unit's running log-weight
+        $\\sum_i \\log w_i$ as a ``cumulative_logw`` keyword; predicates that don't
+        need it should absorb it (and any future signals) via ``**kwargs``.
+
         Args:
             unit_context (list): Sequence of completed units $\\bm{x} \\in \\mathcal{A}^*$
             subunit_buffer (list): Current sequence of subunits $\\bm{s} \\in \\mathcal{B}^*$
-            **kwargs: Extra signals supplied by `MultiTokenUnitSampler`. Currently
-                includes ``cumulative_logw`` (float): the running log-weight
-                $\\sum_i \\log w_i$ accumulated over the subunits sampled so far for
-                the *current* unit. Predicates that don't need it should ignore it
-                via ``**kwargs``.
 
         Returns:
             bool: True if $\\bm{s}$ forms a complete unit $x \\in \\mathcal{A}$. May also
@@ -589,12 +588,14 @@ class CriticBoundary(_ThresholdBoundary):
     resampling. Fires when ``delta`` crosses ``threshold`` per ``sign``; a critic
     returning ``-inf`` (dead particle) fires under ``"abs"``/``"down"``.
 
-    ``__call__`` is ``async`` and requires the sampler's await support.
+    ``__call__`` is ``async`` and requires the sampler's await support. The
+    ``threshold``, ``min_subunits``, ``max_subunits``, and ``sign`` arguments behave
+    as in `SurpriseBoundary`.
 
     Args:
-        critic: a `Potential` whose ``prefix(context)`` returns a float log-weight.
-            Called once per subunit, so it must be safe to evaluate mid-stream.
-        threshold, min_subunits, max_subunits, sign: as in `SurpriseBoundary`.
+        critic (Potential): a potential whose ``prefix(context)`` returns a float
+            log-weight. Called once per subunit, so it must be safe to evaluate
+            mid-stream.
         coalesce_grammar (bool): if True, add the subunit-side ``cumulative_logw`` to
             the critic delta before thresholding. Default False (critic delta only).
     """
