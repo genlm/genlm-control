@@ -11,10 +11,7 @@ from genlm.control.sampler import (
     SurpriseBoundary,
     CriticBoundary,
 )
-from genlm.control.sampler.unit import (
-    flatten_units,
-    _predicate_accepts_cumulative_logw,
-)
+from genlm.control.sampler.unit import flatten_units
 from genlm.control.sampler import CFGBoundary
 from genlm.control.sampler.sequence import SMC
 from genlm.control.constant import EOS
@@ -865,9 +862,10 @@ def test_predicate_accepts_cumulative_logw_introspection():
         def __call__(self, unit_context, subunit_buffer):
             return False
 
-    assert _predicate_accepts_cumulative_logw(Kwargs()) is True
-    assert _predicate_accepts_cumulative_logw(Named()) is True
-    assert _predicate_accepts_cumulative_logw(Legacy()) is False
+    probe = MultiTokenUnitSampler._predicate_accepts_cumulative_logw
+    assert probe(Kwargs()) is True
+    assert probe(Named()) is True
+    assert probe(Legacy()) is False
 
 
 # ---------------------------------------------------------------------------

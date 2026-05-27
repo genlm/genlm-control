@@ -8,29 +8,6 @@ from lark import Lark
 from lark.exceptions import LarkError
 
 
-def _predicate_accepts_cumulative_logw(predicate) -> bool:
-    """Whether ``predicate.__call__`` can receive a ``cumulative_logw`` keyword.
-
-    True if it declares ``**kwargs`` or a ``cumulative_logw`` parameter. Predicates
-    using the original ``(unit_context, subunit_buffer)`` signature return False, so
-    the sampler falls back to the two-argument call (backward compatible).
-    """
-    try:
-        sig = inspect.signature(predicate.__call__)
-    except (TypeError, ValueError):  # pragma: no cover - C/builtin callables
-        # Can't introspect (e.g. a builtin). Be conservative and don't pass it.
-        return False
-    for param in sig.parameters.values():
-        if param.kind is inspect.Parameter.VAR_KEYWORD:
-            return True
-        if param.name == "cumulative_logw" and param.kind in (
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        ):
-            return True
-    return False
-
-
 def flatten_units(context):
     """
     Flatten nested unit context to a flat token list. When using MultiTokenUnitSampler, token_ctx becomes nested [[...], [...], ...].
@@ -73,8 +50,8 @@ class MultiTokenUnitSampler(TokenSampler):
 
     **Weight- and critic-aware boundaries**: the predicate receives the running unit
     log-weight via a ``cumulative_logw`` keyword, so boundaries can react to the
-    incremental importance weights (see `WeightGuidedBoundary`, `SurpriseBoundary`).
-    Predicates may also be ``async`` to ``await`` a critic potential mid-unit. Both are
+    incremental importance weights (see `SurpriseBoundary`). Predicates may also be
+    ``async`` to ``await`` a critic potential mid-unit (see `CriticBoundary`). Both are
     opt-in; the original ``(unit_context, subunit_buffer)`` signature keeps working.
 
     Args:
@@ -119,9 +96,31 @@ class MultiTokenUnitSampler(TokenSampler):
 
         # Whether to forward the running unit log-weight to the predicate. Cached
         # here so we don't re-introspect the signature on every subunit.
-        self._boundary_accepts_cumulative_logw = _predicate_accepts_cumulative_logw(
-            boundary_predicate
+        self._boundary_accepts_cumulative_logw = (
+            self._predicate_accepts_cumulative_logw(boundary_predicate)
         )
+
+    @staticmethod
+    def _predicate_accepts_cumulative_logw(predicate) -> bool:
+        """Whether ``predicate.__call__`` can receive a ``cumulative_logw`` keyword.
+
+        True if it declares ``**kwargs`` or a ``cumulative_logw`` parameter. Predicates
+        using the original ``(unit_context, subunit_buffer)`` signature return False, so
+        the sampler falls back to the two-argument call (backward compatible).
+        """
+        try:
+            sig = inspect.signature(predicate.__call__)
+        except (TypeError, ValueError):  # pragma: no cover - C/builtin callables
+            return False  # can't introspect; be conservative and don't pass it
+        for param in sig.parameters.values():
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                return True
+            if param.name == "cumulative_logw" and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return True
+        return False
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
@@ -478,42 +477,61 @@ class CFGBoundary(BoundaryPredicate):
         return f"CFGBoundary(start={self.start_rule!r}{rules_str})"
 
 
-def _validate_boundary_params(threshold, min_subunits, max_subunits, sign):
-    """Shared argument validation for the weight/critic boundary predicates."""
-    if sign not in ("abs", "down", "up"):
-        raise ValueError(f"sign must be 'abs', 'down', or 'up', got {sign!r}")
-    if threshold <= 0:
-        raise ValueError(f"threshold must be positive, got {threshold}")
-    if min_subunits < 1:
-        raise ValueError(f"min_subunits must be >= 1, got {min_subunits}")
-    if max_subunits < min_subunits:
-        raise ValueError(
-            f"max_subunits ({max_subunits}) must be >= min_subunits ({min_subunits})"
-        )
+class _ThresholdBoundary(BoundaryPredicate):
+    """Base for boundaries that fire when a scalar signal crosses a threshold.
+
+    Concrete subclasses implement `__call__` and obtain their signal differently
+    (the cheap ``cumulative_logw``, or an expensive critic delta), but share the
+    argument validation, the length-based gating (`_gate`), and the signed
+    threshold test (`_crosses`).
+
+    Args:
+        threshold (float): Signal magnitude that fires a boundary. Must be > 0.
+        min_subunits (int): Minimum subunits before firing.
+        max_subunits (int): Force a boundary after this many subunits.
+        sign (str): ``"abs"`` fires on ``|signal| >= threshold``, ``"down"`` on
+            ``signal <= -threshold``, ``"up"`` on ``signal >= +threshold``.
+    """
+
+    def __init__(self, threshold, min_subunits, max_subunits, sign):
+        if sign not in ("abs", "down", "up"):
+            raise ValueError(f"sign must be 'abs', 'down', or 'up', got {sign!r}")
+        if threshold <= 0:
+            raise ValueError(f"threshold must be positive, got {threshold}")
+        if min_subunits < 1:
+            raise ValueError(f"min_subunits must be >= 1, got {min_subunits}")
+        if max_subunits < min_subunits:
+            raise ValueError(
+                f"max_subunits ({max_subunits}) must be >= min_subunits "
+                f"({min_subunits})"
+            )
+        self.threshold = threshold
+        self.min_subunits = min_subunits
+        self.max_subunits = max_subunits
+        self.sign = sign
+
+    def _gate(self, n_subunits):
+        """Decide from length alone: True (force), False (too short), or None
+        (defer to the signal)."""
+        if n_subunits >= self.max_subunits:
+            return True
+        if n_subunits < self.min_subunits:
+            return False
+        return None
+
+    def _crosses(self, value):
+        """Whether ``value`` crosses the threshold in ``sign``'s direction. NaN and
+        non-numeric values never cross."""
+        if not isinstance(value, (int, float)) or value != value:
+            return False
+        if self.sign == "abs":
+            return abs(value) >= self.threshold
+        if self.sign == "down":
+            return value <= -self.threshold
+        return value >= self.threshold  # sign == "up"
 
 
-def _length_gate(n_subunits, min_subunits, max_subunits):
-    """Resolve a boundary from length alone: True (force), False (too short), or
-    None (defer to the weight/critic signal)."""
-    if n_subunits >= max_subunits:
-        return True
-    if n_subunits < min_subunits:
-        return False
-    return None
-
-
-def _crosses_threshold(value, threshold, sign):
-    """Whether ``value`` crosses ``threshold`` in the given direction. NaN never does."""
-    if not isinstance(value, (int, float)) or value != value:  # type / NaN guard
-        return False
-    if sign == "abs":
-        return abs(value) >= threshold
-    if sign == "down":
-        return value <= -threshold
-    return value >= threshold  # sign == "up"
-
-
-class SurpriseBoundary(BoundaryPredicate):
+class SurpriseBoundary(_ThresholdBoundary):
     """Boundary placed when the unit's accumulated log-weight crosses a threshold.
 
     Reacts to the incremental importance weights (``cumulative_logw``) rather than the
@@ -542,18 +560,13 @@ class SurpriseBoundary(BoundaryPredicate):
     """
 
     def __init__(self, threshold=1.5, min_subunits=1, max_subunits=50, sign="abs"):
-        _validate_boundary_params(threshold, min_subunits, max_subunits, sign)
-        self.threshold = threshold
-        self.min_subunits = min_subunits
-        self.max_subunits = max_subunits
-        self.sign = sign
+        super().__init__(threshold, min_subunits, max_subunits, sign)
 
     def __call__(self, unit_context, subunit_buffer, **kwargs):
-        gate = _length_gate(len(subunit_buffer), self.min_subunits, self.max_subunits)
+        gate = self._gate(len(subunit_buffer))
         if gate is not None:
             return gate
-        cw = kwargs.get("cumulative_logw", 0.0)
-        return _crosses_threshold(cw, self.threshold, self.sign)
+        return self._crosses(kwargs.get("cumulative_logw", 0.0))
 
     def __repr__(self):
         return (
@@ -562,7 +575,7 @@ class SurpriseBoundary(BoundaryPredicate):
         )
 
 
-class CriticBoundary(BoundaryPredicate):
+class CriticBoundary(_ThresholdBoundary):
     """Async boundary placed on a critic potential's per-unit log-weight change.
 
     Reacts to an expensive ``critic`` rather than the surface tokens or the cheap
@@ -595,12 +608,8 @@ class CriticBoundary(BoundaryPredicate):
         sign="abs",
         coalesce_grammar=False,
     ):
-        _validate_boundary_params(threshold, min_subunits, max_subunits, sign)
+        super().__init__(threshold, min_subunits, max_subunits, sign)
         self.critic = critic
-        self.threshold = threshold
-        self.min_subunits = min_subunits
-        self.max_subunits = max_subunits
-        self.sign = sign
         self.coalesce_grammar = coalesce_grammar
         # Per-unit baseline critic value, keyed by a hash of the completed context.
         # Cleared by reset(); grows with the number of distinct contexts seen.
@@ -625,7 +634,7 @@ class CriticBoundary(BoundaryPredicate):
         return self._baseline_cache[key]
 
     async def __call__(self, unit_context, subunit_buffer, **kwargs):
-        gate = _length_gate(len(subunit_buffer), self.min_subunits, self.max_subunits)
+        gate = self._gate(len(subunit_buffer))
         if gate is not None:
             return gate
 
@@ -643,7 +652,7 @@ class CriticBoundary(BoundaryPredicate):
             if isinstance(cw, (int, float)) and cw == cw:  # ignore NaN/non-numeric
                 delta += cw
 
-        return _crosses_threshold(delta, self.threshold, self.sign)
+        return self._crosses(delta)
 
     def __repr__(self):
         return (
