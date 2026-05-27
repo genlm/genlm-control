@@ -113,6 +113,48 @@ topk_sampler = topk_token_sampler(llm, fsa, K=10)
 eager_sampler = eager_token_sampler(llm, fsa)
 ```
 
+## Unit Sampling
+
+The samplers above generate one token at a time. A [`MultiTokenUnitSampler`][genlm.control.sampler.unit.MultiTokenUnitSampler] instead generates at a *unit* consisting of one or more tokens by repeatedly drawing tokens from an inner `subunit_sampler` (any `TokenSampler`) until a [`BoundaryPredicate`][genlm.control.sampler.unit.BoundaryPredicate] signals that the unit is complete. Typical units are words, lines, or grammar terminals.
+
+Because it is itself a `TokenSampler`, it plugs into the same SMC loop as the samplers above. Its `context` and the units it returns are *nested* lists of tokens; use [`flatten_units`][genlm.control.sampler.unit.flatten_units] when feeding them to a potential.
+
+```python
+from genlm.control.sampler import (
+    direct_token_sampler, MultiTokenUnitSampler, TokenSetBoundary,
+)
+
+# Inner per-token sampler, plus a rule for where units end.
+subunit_sampler = direct_token_sampler(llm)
+boundary = TokenSetBoundary({b" ", b"\n"})  # a unit ends at whitespace or newline
+
+unit_sampler = MultiTokenUnitSampler(subunit_sampler, boundary)
+unit, logw, _ = await unit_sampler.sample(context)  # e.g. unit == [b"hello", b" "]
+```
+
+A unit's weight is the product of its tokens' weights, so sampling stays properly weighted with respect to the target potential.
+
+### Boundary predicates
+
+A boundary predicate decides when the accumulated tokens form a complete unit. The built-in predicates are:
+
+| Predicate | A unit ends when… |
+|-----------|-------------------|
+| [`TokenSetBoundary`][genlm.control.sampler.unit.TokenSetBoundary] | the last token is in a given set (e.g. whitespace) |
+| [`FixedLengthBoundary`][genlm.control.sampler.unit.FixedLengthBoundary] | a fixed number of tokens is reached |
+| [`CFGBoundary`][genlm.control.sampler.unit.CFGBoundary] | the tokens parse as a complete unit of a Lark grammar |
+| [`SurpriseBoundary`][genlm.control.sampler.unit.SurpriseBoundary] | the unit's accumulated log-weight crosses a threshold |
+
+### Custom boundary predicates
+
+Subclass [`BoundaryPredicate`][genlm.control.sampler.unit.BoundaryPredicate] and implement `__call__`, returning `True` once the buffer forms a complete unit.
+
+```python
+class EndsWithPeriod(BoundaryPredicate):
+    def __call__(self, unit_context, subunit_buffer, **kwargs):
+        return subunit_buffer[-1] == b"."
+```
+
 ## Sampler Selection Guide for Controlled Generation
 
 The following table provides general guidelines for selecting a sampler in the context of controlled generation from an LLM. Note that the best sampler may vary depending on the specific controlled generation task.
