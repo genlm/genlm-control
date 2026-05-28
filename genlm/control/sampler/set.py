@@ -57,7 +57,6 @@ class TrieSetSampler(SetSampler):
         Initialize the `TrieSetSampler`.
 
         Args:
-            iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
 
         Raises:
