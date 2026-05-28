@@ -548,6 +548,17 @@ class Controller:
         self.ess_threshold = ess_threshold
         self.max_tokens = max_tokens
         self.twist_with_critic = twist_with_critic
+        # A terminal-only critic (``prefix == 0`` for every proper prefix) carries no
+        # per-step twist signal -- its per-step twist is ``twist(0)``, a no-op -- so
+        # reweight ONLY at termination. Byte-identical to twisting per step (the
+        # provisional ``twist(0)`` adds then untwists 0), but skips the per-step
+        # critic call. ``is_terminal_only()`` defaults to ``False``, so this never
+        # fires unless a critic explicitly opts in. Population-wide flag -> require
+        # every group's critic to be terminal-only.
+        if twist_with_critic and all(
+            c is not None and c.is_terminal_only() for c in critics
+        ):
+            self.twist_with_critic = False
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
         self.slow_cadence = slow_cadence
@@ -705,19 +716,24 @@ class Controller:
     # -- the controller-owned loop --------------------------------------------------
 
     async def start(self):
-        """Initialize particles from the sampler's start weight.
+        """Initialize particles from each group's start weight.
 
         Mirrors ``SequenceModel.start``: scores every particle by the empty
-        sequence's prefix weight under the target potential.
+        sequence's prefix weight under ITS GROUP's target potential. For a single
+        group this is one weight applied to all (byte-identical to the unbatched
+        path); for a batch each group uses its own sampler's ``start_weight`` (the
+        empty-prefix weight can differ per example).
         """
-        start_w = await self.unit_sampler.start_weight()
-        if start_w == float("-inf"):
-            raise ValueError(
-                "Start weight is -inf (log(0)). This is likely because a potential assigns zero weight to "
-                "the empty sequence under `prefix`, which violates the potential contract."
-            )
+        start_ws = [await s.start_weight() for s in self.samplers]
+        for g, start_w in enumerate(start_ws):
+            if start_w == float("-inf"):
+                raise ValueError(
+                    f"Start weight is -inf (log(0)) for group {g}. This is likely "
+                    "because a potential assigns zero weight to the empty sequence "
+                    "under `prefix`, which violates the potential contract."
+                )
         for p in self.particles:
-            p.score(start_w)
+            p.score(start_ws[self.particles.group[p._i]])
 
     async def run(self):
         """Run the slow (ground-truth) SMC loop to completion.
@@ -981,6 +997,14 @@ class Controller:
                 # when the sampler asks it to wait at a step boundary (a completed
                 # unit, synchronized grain) -- both leave the engine the same way.
                 w.abort_rows.add(externals[k])
+                # When the burst continues past this row (Plan B in-place resample),
+                # drop the terminated row's ext<->row entries so the maps stay tight
+                # rather than leaning on run_burst's gone-filter to mask a stale
+                # lookup. Single-group / Plan-A bursts rebuild the maps each burst,
+                # so this is a no-op there.
+                if self._in_place_resample and p.done:
+                    w.ext_to_row.pop(externals[k], None)
+                    w.row_to_ext.pop(p._i, None)
 
         # End-of-step ESS test (the predicate the slow path applies after every
         # token) -- the TOKEN-grain (free-running) pop-out only. If it crosses,
@@ -1193,10 +1217,50 @@ def burst_capability(controller):
     if not getattr(sampler, "supports_burst", lambda: False)():
         return BurstCapability(False, _sampler_burst_blocker(sampler))
 
-    if split_engine_target(sampler.target) is None:
+    decomposed = split_engine_target(sampler.target)
+    if decomposed is None:
         return BurstCapability(False, _target_burst_blocker(sampler.target))
 
+    # Batched (B>1): the burst draws the WHOLE population through the group-0
+    # representative -- one engine forward, ``unit_sampler.burst_draw_batch``, the
+    # group-0 factor fold (``draw`` / ``_run_burst``). That is correct only if every
+    # group shares the same engine model, temperature, sampler kind, and in-logit
+    # factor; groups may differ ONLY in prompt and critic (both handled per-group in
+    # scoring). Reject a heterogeneous batch so ``accelerate='require'`` fails loud
+    # and ``'auto'`` falls back to the exact per-token StepLoop instead of silently
+    # drawing later groups against group 0's configuration.
+    if len(controller.samplers) > 1:
+        reason = _batch_homogeneity_blocker(controller.samplers, decomposed)
+        if reason is not None:
+            return BurstCapability(False, reason)
+
     return BurstCapability(True)
+
+
+def _batch_homogeneity_blocker(samplers, ref_decomposed):
+    """Reason a batched burst can't use the group-0 representative for all groups,
+    or ``None`` if the batch is burst-homogeneous (see :func:`burst_capability`)."""
+    ref_llm, ref_factor, _ = ref_decomposed
+    ref_type = type(samplers[0])
+    for g, s in enumerate(samplers[1:], start=1):
+        if type(s) is not ref_type:
+            return (
+                f"group {g} sampler is {type(s).__name__} but group 0 is "
+                f"{ref_type.__name__}; batched burst needs one sampler kind"
+            )
+        dec = split_engine_target(s.target)
+        if dec is None:
+            return f"group {g} target is not burst-expressible"
+        llm, factor, _ = dec
+        if llm.model is not ref_llm.model:
+            return f"group {g} uses a different engine; batched burst needs one shared engine"
+        if getattr(llm, "temperature", None) != getattr(ref_llm, "temperature", None):
+            return f"group {g} temperature differs from group 0; batched burst uses one temperature"
+        if (factor is None) != (ref_factor is None) or (
+            factor is not None and factor is not ref_factor
+        ):
+            return f"group {g} has a different in-logit factor; batched burst folds one shared factor"
+    return None
 
 
 def _sampler_burst_blocker(sampler):
@@ -1298,6 +1362,13 @@ class BurstLoop:
         # for those); they differ ONLY in ``prompt_ids``. ``_context_ids`` picks the
         # row's group's prompt. For a single group this is just ``[self.llm]``.
         self.llms = [split_engine_target(s.target)[0] for s in controller.samplers]
+        # Snapshot each group's prompt prefix HERE (main thread). ``prompt_ids`` is a
+        # thread-local ``ContextVar`` (PromptedLLM): the initial prefill reads it on
+        # the main thread, but the mid-burst in-place re-add (``_resample_in_place``)
+        # runs on the ``run_burst`` worker thread, where the override is invisible and
+        # the live read would silently fall back to the default prompt. The prefix is
+        # fixed for the whole run, so one main-thread snapshot is exact for both.
+        self._group_prefixes = [list(llm.prompt_ids) for llm in self.llms]
 
         # Gather maps onto the product's vocab_eos (the same maps Product.logw_next
         # uses, but resolved explicitly against llm/factor so p1/p2 order is
@@ -1314,8 +1385,17 @@ class BurstLoop:
             )
 
         # The engine token id used as the committed placeholder for an aborted /
-        # EOS row (EOS carries no token_id). Fixed for the run -> resolved once.
-        self.eos_id = list(self.llm.token_maps.eos_idxs)[0]
+        # EOS row (EOS carries no token_id). Fixed for the run -> resolved once. The
+        # row is aborted regardless, so any of the model's EOS ids serves; we take
+        # the first. A model with no EOS configured can't burst (the placeholder is
+        # undefined) -> fail loud rather than IndexError deep in a burst.
+        eos_idxs = list(self.llm.token_maps.eos_idxs)
+        if not eos_idxs:
+            raise ValueError(
+                "Engine LM has no EOS token id; the burst path needs one as the "
+                'committed placeholder for aborted rows. Use accelerate="off".'
+            )
+        self.eos_id = eos_idxs[0]
 
     def _context_ids(self, p):
         """Engine prompt for a particle: prompt prefix + its drawn token ids.
@@ -1326,7 +1406,9 @@ class BurstLoop:
         (a finished particle is never relaunched, but a context may carry a trailing
         EOS)."""
         # Per-group prompt prefix (the row's example); the engine itself is shared.
-        ids = list(self.llms[self.controller.particles.group[p._i]].prompt_ids)
+        # Read from the main-thread snapshot, NOT the live ``prompt_ids`` ContextVar
+        # (this runs on the worker thread during in-place re-add).
+        ids = list(self._group_prefixes[self.controller.particles.group[p._i]])
 
         def _emit(item):
             if isinstance(item, EndOfSequence):

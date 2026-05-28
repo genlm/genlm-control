@@ -128,12 +128,14 @@ class Potential(ABC, PotentialOps, PotentialTests):
         ``complete`` (equivalently, ``score`` at EOS). Indicator critics like
         ``1[f(z) == y]`` are the canonical example.
 
-        Returning ``True`` lets the SMC burst driver skip per-step twisting for
-        this potential and, when the rest of the configuration allows it, draw
-        whole bursts from the backend natively and reweight only at termination.
-        The default is ``False``: a potential is assumed to reweight per step
-        unless it explicitly opts in. Override in subclasses that satisfy the
-        ``prefix == 0`` invariant.
+        When used as an SMC critic, returning ``True`` makes the Controller skip
+        the per-step critic twist (both the slow and burst lanes) and reweight only
+        at termination -- byte-identical to twisting per step, since a terminal-only
+        critic's per-step twist is ``twist(0)``, but it avoids the per-step critic
+        call. In a batched run this fires only when EVERY group's critic is
+        terminal-only (the flag is population-wide). The default is ``False``: a
+        potential is assumed to reweight per step unless it explicitly opts in.
+        Override in subclasses that satisfy the ``prefix == 0`` invariant.
         """
         return False
 

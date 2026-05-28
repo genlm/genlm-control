@@ -45,7 +45,7 @@ class Coerced(Potential):
         no such assumption -- so a non-homomorphic `f` is correct, just not accelerated.
     """
 
-    def __init__(self, potential, target_vocab, f, prune=True):
+    def __init__(self, potential, target_vocab, f, prune=True, homomorphic=None):
         """
         Initialize a Coerced potential.
 
@@ -57,6 +57,13 @@ class Coerced(Potential):
                 to the original potential's vocabulary.
             prune (bool): Whether to prune the coerced potential's vocabulary to only include tokens that can be mapped to the original potential's vocabulary.
                 If `False`, the coerced potential's vocabulary will include all tokens from the target vocabulary.
+            homomorphic (bool | None): Whether `f` distributes over concatenation
+                (`f(xs+[t]) == f(xs)+f([t])`), which enables the `_trie_logws` fast
+                path. `None` (default) probes it at construction (`b"".join` passes);
+                pass `True`/`False` to declare it explicitly and skip the probe. The
+                probe is a finite heuristic, not a proof, so a custom `f` that is only
+                locally homomorphic should pass `homomorphic=False` to force the safe
+                (assumption-free) path.
 
         Raises:
             ValueError: If no valid tokens are found in the target vocabulary that can be mapped to the original potential's vocabulary.
@@ -90,12 +97,18 @@ class Coerced(Potential):
         super().__init__(tokens)
 
         # The `_trie_logws` fast path assumes `f` distributes over token-sequence
-        # concatenation (`f(xs+[t]) == f(xs)+f([t])`); see `logw_next`. Probe that
-        # identity once here. A non-homomorphic `f` (which the `Coerced` contract
-        # permits) routes `logw_next` to the assumption-free `batch_prefix` path
-        # instead of silently mis-scoring on the trie. `b"".join` -- the only
-        # coercion shipped -- passes.
-        self._f_homomorphic = self._is_homomorphic(f, self.vocab)
+        # concatenation (`f(xs+[t]) == f(xs)+f([t])`); see `logw_next`. A
+        # non-homomorphic `f` (which the `Coerced` contract permits) routes
+        # `logw_next` to the assumption-free `batch_prefix` path instead of silently
+        # mis-scoring on the trie. The caller may declare it (`homomorphic=`); else
+        # probe the identity once here (`b"".join` -- the only coercion shipped --
+        # passes). The probe is a heuristic, not a proof: prefer an explicit
+        # declaration for a custom `f`.
+        self._f_homomorphic = (
+            self._is_homomorphic(f, self.vocab)
+            if homomorphic is None
+            else bool(homomorphic)
+        )
 
     @staticmethod
     def _is_homomorphic(f, vocab):
