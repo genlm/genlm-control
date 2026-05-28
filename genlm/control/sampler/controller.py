@@ -383,9 +383,9 @@ class BurstDraw:
 # * ``_EXIT_TERMINATED`` -- every flagged row finished on its own (drawn EOS /
 #   budget / -inf weight). Nothing for the driver to do; the population shrinks
 #   and the loop either re-enters or exits.
-# * ``_EXIT_ESS`` -- the ESS test crossed at the end of a step (token grain only),
-#   so the burst aborted every live row to hand control back; the driver resamples
-#   the full population and relaunches.
+# * (ESS is NOT an exit reason: a token-grain ESS crossing resamples IN PLACE
+#   mid-burst -- drop + re-add the crossing group's rows -- and the burst keeps
+#   running; a single population is just one group.)
 # * ``_EXIT_UNIT_SYNC`` -- a synchronized (unit-grain) burst ran exactly one SMC
 #   step (one unit) for every live row and they have all popped at their unit
 #   boundaries; the driver runs the controller-owned ESS test + resample over the
@@ -398,7 +398,6 @@ class BurstDraw:
 #   a free-running burst all live rows advance in lockstep, so a length-based cadence
 #   is due for all of them at once.
 _EXIT_TERMINATED = "terminated"
-_EXIT_ESS = "ess"
 _EXIT_UNIT_SYNC = "unit_sync"
 _EXIT_SLOW_STEP = "slow_step"
 
@@ -415,10 +414,11 @@ class _Burst:
     object; only ``ctx``.
 
     Pop-out is out-of-band: ``draw`` adds a row's external index to ``abort_rows``
-    (one row when it terminates; every live row when ESS crosses), and ``run_burst``
-    drains them via :meth:`Controller.drain_aborts` and calls ``abort_request`` --
-    no forced-EOS, no discard forward. ``exit_reason`` starts ``_EXIT_TERMINATED``
-    and is raised to ``_EXIT_ESS`` by ``draw`` when the ESS test crosses.
+    (when it terminates, or when an in-place resample drops it for re-add), and
+    ``run_burst`` drains them via :meth:`Controller.drain_aborts` and calls
+    ``abort_request`` -- no forced-EOS, no discard forward. ``exit_reason`` stays
+    ``_EXIT_TERMINATED`` for a free-running burst (ESS resamples in place mid-burst,
+    no exit); a unit-grain burst sets ``_EXIT_UNIT_SYNC``.
     """
 
     __slots__ = (
@@ -573,13 +573,14 @@ class Controller:
         self._group_rows = [
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
-        # Plan B (in-place per-group resample in the burst) for a batched run; a
-        # single group keeps the validated pop+relaunch path (gate-2). Set by
-        # ``_maybe_resample`` each call to the group indices it resampled, read by
-        # the in-place burst handler.
-        self._in_place_resample = len(group_sizes) > 1
+        # Set by ``_maybe_resample`` each call to the group indices it resampled,
+        # read by the in-place burst resample handler.
         self._last_resampled_groups = []
         self.record = SMCRecord(n_particles) if record else None
+        # Burst-lane record cadence: a resample sets these so the NEXT recorded step
+        # is tagged ``add_resample`` (mirrors the slow loop's lazy tag-at-next-step).
+        self._burst_resampled = False
+        self._burst_ancestors = list(range(n_particles))
 
         # ``log(ess_threshold)`` -- the per-group ESS RHS adds ``log(group_size)`` (so
         # the test is ``log(ESS_g) < log(ess_threshold * N_g)``). For one group of
@@ -849,6 +850,33 @@ class Controller:
             f.write(self.record.to_json())
         print(f"Saved record to {json_path}")
 
+    def _record_step(self):
+        """Append one banked SMC step to the record from the burst lane, mirroring
+        the slow ``run`` loop's cadence: ``add_init`` for the first entry,
+        ``add_resample`` if a resample preceded this step, else ``add_smc_step``.
+        No-op without a record. (The slow ``run`` loop records inline and is left
+        untouched; this is the burst/cadence lane's equivalent, which previously
+        recorded nothing.)"""
+        if self.record is None:
+            return
+        if len(self.record.history) == 0:
+            self.record.add_init(self.particles)
+        elif self._burst_resampled:
+            self.record.add_resample(self._burst_ancestors, self.particles)
+        else:
+            self.record.add_smc_step(self.particles)
+        self._burst_resampled = False
+
+    def _resample_record(self):
+        """``_maybe_resample`` for the burst lane, remembering ``(did, ancestors)``
+        so the NEXT :meth:`_record_step` tags it ``add_resample`` (the slow loop's
+        lazy tag-at-next-step). Returns ``(did_resample, ancestor_indices)``."""
+        did, ancestors = self._maybe_resample(sort_ancestors=self.record is not None)
+        if did and self.record is not None:
+            self._burst_resampled = True
+            self._burst_ancestors = ancestors
+        return did, ancestors
+
     # -- the engine callback draw (used only by the BurstLoop) ---------------
     #
     # This reproduces, on raw engine logits, exactly what ``_draw_and_score``
@@ -885,25 +913,26 @@ class Controller:
     def drain_adds(self):
         """Rows the controller asks ``run_burst`` to (re-)add to the live engine batch this
         step, as ``(ext_id, prompt_ids)`` (consumed). The in-place per-group resample
-        (:meth:`_resample_in_place`) queues a resampled group's surviving rows
+        (:meth:`_resample_burst`) queues a resampled group's surviving rows
         here so they rejoin WITHOUT draining the engine; empty otherwise."""
         rows = self._burst.add_rows
         self._burst.add_rows = []
         return rows
 
-    def _resample_in_place(self, w):
-        """Plan B's mid-burst per-group resample: reindex the groups that crossed
+    def _resample_burst(self, w):
+        """The burst's mid-stream per-group resample: reindex the groups that crossed
         ESS, then -- WITHOUT draining the burst -- drop each resampled group's current
         engine rows and re-add its surviving rows at their resampled contexts (fresh
-        ids). The other groups never pause; the engine re-prefills the re-added rows
-        (prefix-cache-warm). ESS / resample / weights stay controller-owned -- this
-        only translates a completed resample into engine abort/add plumbing.
+        ids). Other groups never pause; the engine re-prefills the re-added rows
+        (prefix-cache-warm). A single population is just one group. ESS / resample /
+        weights stay controller-owned -- this only translates a completed resample
+        into engine abort/add plumbing.
 
         Resampling can flip a row done<->live (a slot reindexed to a finished vs an
         unfinished ancestor), so re-adds are decided over each group's FULL post-
         reindex state: every still-live row is re-added, finished rows are not.
         """
-        self._maybe_resample()  # reindexes the crossing groups; sets _last_resampled_groups
+        self._resample_record()  # reindexes crossing groups; sets _last_resampled_groups + record tag
         for g in self._last_resampled_groups:
             rows = self._group_rows[g]
             # Drop the group's current engine rows -- their KV holds pre-resample
@@ -989,6 +1018,10 @@ class Controller:
         # critic forward per particle. Runs before the token map + abort checks
         # because scoring sets ``p.done`` on termination.
         self._bank_burst_steps(parts, records)
+        # Record this engine step as one SMC step (when any row banked one) -- the
+        # burst lane's equivalent of the slow loop's per-step record entry.
+        if any(rec.step is not None for rec in records):
+            self._record_step()
         out = [0] * len(parts)
         for k, p in enumerate(parts):
             out[k] = self._burst_token_id(p, records[k])
@@ -997,12 +1030,10 @@ class Controller:
                 # when the sampler asks it to wait at a step boundary (a completed
                 # unit, synchronized grain) -- both leave the engine the same way.
                 w.abort_rows.add(externals[k])
-                # When the burst continues past this row (Plan B in-place resample),
-                # drop the terminated row's ext<->row entries so the maps stay tight
-                # rather than leaning on run_burst's gone-filter to mask a stale
-                # lookup. Single-group / Plan-A bursts rebuild the maps each burst,
-                # so this is a no-op there.
-                if self._in_place_resample and p.done:
+                # The burst continues past this terminated row, so drop its ext<->row
+                # entries to keep the maps tight rather than leaning on run_burst's
+                # gone-filter to mask a stale lookup.
+                if p.done:
                     w.ext_to_row.pop(externals[k], None)
                     w.row_to_ext.pop(p._i, None)
 
@@ -1015,17 +1046,12 @@ class Controller:
         # mid-unit -- it pops every row at its unit boundary and the driver runs
         # ESS once per round (``_EXIT_UNIT_SYNC``, set in ``_run_burst``).
         if sampler.burst_free_running() and self._ess_crosses():
-            if self._in_place_resample:
-                # Plan B (batched): resample the crossing groups IN PLACE and re-add
-                # their surviving rows mid-burst -- the burst keeps running (no engine
-                # drain), the other groups never pause. No ``exit_reason``: the burst
-                # ends only when every particle is done.
-                self._resample_in_place(w)
-            else:
-                # Plan A (single population): pop every live row; the driver resamples
-                # and relaunches the next burst from each survivor's prefix.
-                w.abort_rows.update(externals)
-                w.exit_reason = _EXIT_ESS
+            # Resample the crossing groups IN PLACE and re-add their surviving rows
+            # mid-burst -- the burst keeps running (no engine drain), other groups
+            # never pause, and a single population is just one group (no special
+            # "drain + relaunch" case). No ``exit_reason``: the burst ends only when
+            # every particle is done.
+            self._resample_burst(w)
         elif self._slow_cadence_due(parts):
             # The next step is engine-inexpressible (a cadence) -- pop every live
             # row BEFORE the burst draws it, so the driver runs it on the slow lane
@@ -1364,7 +1390,7 @@ class BurstLoop:
         self.llms = [split_engine_target(s.target)[0] for s in controller.samplers]
         # Snapshot each group's prompt prefix HERE (main thread). ``prompt_ids`` is a
         # thread-local ``ContextVar`` (PromptedLLM): the initial prefill reads it on
-        # the main thread, but the mid-burst in-place re-add (``_resample_in_place``)
+        # the main thread, but the mid-burst in-place re-add (``_resample_burst``)
         # runs on the ``run_burst`` worker thread, where the override is invisible and
         # the live read would silently fall back to the default prompt. The prefix is
         # fixed for the whole run, so one main-thread snapshot is exact for both.
@@ -1488,8 +1514,9 @@ class BurstLoop:
         # A synchronized (unit-grain) burst always runs exactly one SMC step (one
         # unit) per row and hands back at the synced boundary for the controller-
         # owned ESS test -- so its exit reason is fixed up front. A free-running
-        # (token-grain) burst stays ``_EXIT_TERMINATED`` until ``draw`` raises it to
-        # ``_EXIT_ESS`` at an ESS crossing.
+        # (token-grain) burst stays ``_EXIT_TERMINATED``: it resamples in place at
+        # ESS crossings without exiting, ending only when every row terminates (or a
+        # cadence pops it via ``_EXIT_SLOW_STEP``).
         if not self.sampler.burst_free_running():
             burst.exit_reason = _EXIT_UNIT_SYNC
         controller._burst = burst
@@ -1539,21 +1566,16 @@ class BurstLoop:
                 # The next step is engine-inexpressible for the (lockstep) live
                 # rows -- run it on the slow lane, then the controller-owned ESS.
                 await self._slow_step(live)
-                controller._maybe_resample(
-                    sort_ancestors=controller.record is not None
-                )
+                controller._resample_record()
                 continue
 
             reason = await self._run_burst(live, eval_factor, run_async, loop)
-            # Resample triggers: a token-grain ESS crossing, the synced boundary of
-            # a unit-grain round, or just before a cadence step (the next iteration
-            # runs that step on the slow lane). Either way ``_maybe_resample`` owns
-            # the test + resample over the full population; a terminated exit needs
-            # no dispatch.
-            if reason in (_EXIT_ESS, _EXIT_UNIT_SYNC, _EXIT_SLOW_STEP):
-                controller._maybe_resample(
-                    sort_ancestors=controller.record is not None
-                )
+            # Resample triggers at a burst exit: the synced boundary of a unit-grain
+            # round, or just before a cadence step (the next iteration runs that step
+            # on the slow lane). (A token-grain ESS crossing does NOT exit -- it
+            # resamples in place mid-burst.) A terminated exit needs no dispatch.
+            if reason in (_EXIT_UNIT_SYNC, _EXIT_SLOW_STEP):
+                controller._resample_record()
 
         return controller.particles
 
@@ -1581,5 +1603,6 @@ class BurstLoop:
         self.n_slow_steps += 1
         controller.particles.untwist_subset([p._i for p in live])
         await asyncio.gather(*[controller._draw_and_score(p) for p in live])
+        controller._record_step()
         for p in live:
             p.reset_run()
