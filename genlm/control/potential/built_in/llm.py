@@ -126,6 +126,9 @@ class TokenMappings(NamedTuple):
             eos_byte_strings (list[bytes]): List of byte strings representing EOS tokens.
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
+        # Coerce to bytes -> make spawn_new_eos accept tokens, bytes, or any
+        # mix without the caller having to remember.
+        eos_byte_strings = [bytes(bs) for bs in eos_byte_strings]
         if len(set(eos_byte_strings)) != len(eos_byte_strings):
             raise ValueError("Duplicate eos byte strings")
 

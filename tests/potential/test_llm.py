@@ -197,6 +197,22 @@ def test_invalid_eos_tokens(llm):
         llm.eos_byte_strings = [llm.token_maps.decode[0].byte_string]
 
 
+def test_eos_accepts_token_object(llm):
+    """A `Token` as EOS is coerced to bytes and recognised (used to raise
+    "EOS token not in language model vocabulary")."""
+    tok = llm.vocab[5]
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[tok])
+    assert type(new_llm.eos_byte_strings[0]) is bytes
+    assert tok.token_id in new_llm.token_maps.eos_idxs
+
+
+def test_eos_token_and_equal_bytes_are_duplicates(llm):
+    """A `Token` and its equal plain bytes are the same EOS by content."""
+    tok = llm.vocab[5]
+    with pytest.raises(ValueError, match="Duplicate eos byte strings"):
+        llm.spawn_new_eos(eos_byte_strings=[tok, bytes(tok)])
+
+
 def test_invalid_token_encoding(llm):
     # Test encoding invalid tokens
     invalid_tokens = [b"INVALID_TOKEN"]
