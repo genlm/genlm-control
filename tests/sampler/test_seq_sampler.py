@@ -134,9 +134,51 @@ async def test_smc_weights(params):
 
     logeps = await p.prefix([])
     for seq, logw in sequences:
-        logZ = sum([(await p.logw_next(seq[:n])).sum() for n in range(len(seq))])
+        L = len(seq)
+        # Sequences hitting the max_tokens boundary have EOS deterministically
+        # appended, so the final-position IS correction is the unnormalized
+        # target log-weight on EOS (not the partition sum used elsewhere).
+        if L < stop_point:
+            logZ = sum([(await p.logw_next(seq[:n])).sum() for n in range(L)])
+        else:
+            natural = sum(
+                [(await p.logw_next(seq[:n])).sum() for n in range(L - 1)]
+            )
+            boundary = (await p.logw_next(seq[:-1]))[p.eos]
+            logZ = natural + boundary
         twist = await critic.score(seq)
         assert np.isclose(logw, logZ + logeps + twist)
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_boundary_forces_eos():
+    """Every returned sequence ends with EOS, and the boundary weight is the
+    target's unnormalized log-weight on EOS at the boundary context."""
+    seqs = ["a", "ab"]  # prefix-overlap: 'a' is both complete and a prefix
+    p = WeightedSet(seqs, [1.0, 2.0])
+    unit_sampler = DirectTokenSampler(p)
+    sampler = SMC(unit_sampler)
+
+    out = await sampler(n_particles=8, ess_threshold=0, max_tokens=2)
+    logeps = await p.prefix([])
+
+    for seq, logw in out:
+        assert seq[-1] == p.eos
+        L = len(seq)
+        if L < 2:
+            expected = (
+                logeps
+                + sum([(await p.logw_next(seq[:n])).sum() for n in range(L)])
+            )
+        else:
+            expected = (
+                logeps
+                + sum(
+                    [(await p.logw_next(seq[:n])).sum() for n in range(L - 1)]
+                )
+                + (await p.logw_next(seq[:-1]))[p.eos]
+            )
+        assert np.isclose(logw, expected)
 
 
 @pytest.mark.asyncio

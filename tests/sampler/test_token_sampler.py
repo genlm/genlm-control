@@ -337,18 +337,27 @@ async def test_sis_with_proposal_weights_match_manual_computation(
 
     proposal_logZ = logsumexp(proposal_ws)
 
+    max_tokens = 5
     seqs = await DirectTokenSampler(target, proposal=proposal).smc(
         n_particles=10,
         ess_threshold=0.0,
-        max_tokens=5,
+        max_tokens=max_tokens,
     )
 
     for ctx, actual_logw in zip(seqs.contexts, seqs.log_weights):
         # start_weight = target.prefix([]) = 0 for MockPotential.
+        # Sequences of length == max_tokens had EOS forced at the boundary, so
+        # their final-position IS correction is target.logw_next[EOS] rather
+        # than the natural-sampling formula used at every other position.
         expected_logw = 0.0
-        for tok in ctx:
+        L = len(ctx)
+        boundary_forced = L == max_tokens
+        for i, tok in enumerate(ctx):
             tid = len(vocab) if tok is EOS else target.lookup[tok]
-            expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
+            if boundary_forced and i == L - 1:
+                expected_logw += target_ws[tid]
+            else:
+                expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
 
         np.testing.assert_allclose(
             actual_logw, expected_logw, rtol=1e-10,
