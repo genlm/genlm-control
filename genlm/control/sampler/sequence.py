@@ -449,7 +449,7 @@ async def batched_smc(
     # StepLoop; burst-capable -> ONE engine burst over all B*N rows (``draw`` resamples
     # the crossing groups in place per ``_ess_crosses``; pure acceleration of the same
     # per-group transition).
-    particles = await _drive(controller, _normalize_accelerate(accelerate))
+    await _drive(controller, _normalize_accelerate(accelerate))
 
     return [
         Sequences(*_unpack_particles([controller.particles[i] for i in rows]))

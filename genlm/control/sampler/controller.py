@@ -445,7 +445,7 @@ class _Burst:
         # re-prefill re-added rows, but it lives on BurstLoop -> passed in here.
         self.context_ids = context_ids
         self.abort_rows = set()
-        # In-place per-group resample (Plan B): rows the hub asks the engine to
+        # In-place per-group resample (Plan B): rows the controller asks the engine to
         # (re-)add mid-burst, as ``(ext_id, prompt_ids)``. ``ext_to_row`` /
         # ``row_to_ext`` map an engine request's external id <-> its POPULATION row
         # (``p._i``); ``next_ext`` hands out a FRESH id per re-add (so an abort and a
@@ -883,9 +883,9 @@ class Controller:
         return self.particles[self._burst.ext_to_row[self._burst_external(request_id)]]
 
     def drain_adds(self):
-        """Rows the hub asks ``run_burst`` to (re-)add to the live engine batch this
+        """Rows the controller asks ``run_burst`` to (re-)add to the live engine batch this
         step, as ``(ext_id, prompt_ids)`` (consumed). The in-place per-group resample
-        (:meth:`_resample_groups_in_place`) queues a resampled group's surviving rows
+        (:meth:`_resample_in_place`) queues a resampled group's surviving rows
         here so they rejoin WITHOUT draining the engine; empty otherwise."""
         rows = self._burst.add_rows
         self._burst.add_rows = []
@@ -1306,10 +1306,10 @@ def _target_burst_blocker(target):
 
 
 def can_burst(controller):
-    """Whether the ``BurstLoop`` can drive this configuration (back-compat).
+    """Whether the ``BurstLoop`` can drive this configuration.
 
-    Thin boolean wrapper over :func:`burst_capability`; see there for the gate
-    and the failure reasons.
+    Thin boolean convenience wrapper over :func:`burst_capability`; see there for
+    the gate and the failure reasons.
     """
     return burst_capability(controller).ok
 
@@ -1500,7 +1500,6 @@ class BurstLoop:
                     prompts=prompts,
                     control=controller,
                     max_steps=max_steps,
-                    temperature=self.llm.temperature,
                 ),
             )
             return controller._burst.exit_reason

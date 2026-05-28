@@ -5,7 +5,6 @@ from arsenal import colors
 from arsenal.maths import log1mexp, logsumexp
 import warnings
 
-from genlm.control.constant import EndOfSequence
 from genlm.control.util import fast_sample_lazyweights
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab, _drive_or_hop
