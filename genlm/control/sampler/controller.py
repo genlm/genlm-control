@@ -44,6 +44,7 @@ class Population:
         "max_tokens_left",
         "contexts",
         "group",
+        "_views",
     )
 
     def __init__(self, n, max_tokens, group=None):
@@ -59,15 +60,18 @@ class Population:
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
         self.contexts = [[] for _ in range(n)]
+        # Row views built once and reused (a view is a stateless (pop, row) pointer;
+        # reindex mutates the arrays in place, so row i staying row i keeps them valid).
+        self._views = [Particle(self, i) for i in range(n)]
 
     def __len__(self):
         return self.n
 
     def __getitem__(self, i):
-        return Particle(self, i)
+        return self._views[i]
 
     def __iter__(self):
-        return (Particle(self, i) for i in range(self.n))
+        return iter(self._views)
 
     def untwist_all(self):
         """Vectorized untwist over the whole population (done rows carry 0)."""
@@ -267,8 +271,10 @@ class _Burst:
         # Every row here is live (aborted/terminated rows were dropped from the engine).
         parts = [self.particle_of(h) for h in handles]
 
-        # Untwist last step's critic twist before this step's score (no-op w/o critic).
-        c.particles.untwist_subset([p._i for p in parts])
+        # Untwist last step's critic twist before this step's score (only the
+        # twisting critic ever sets twist_amount; otherwise it's a no-op).
+        if c.twist_with_critic:
+            c.particles.untwist_subset([p._i for p in parts])
 
         # Engine warm logits -> per-row LM logw_next; the sampler injects them and runs
         # the real per-step draw. ONE event-loop hop for the whole batch.
@@ -291,8 +297,8 @@ class _Burst:
                     self.handle_to_row.pop(handles[k], None)
                     self.row_to_handle.pop(p._i, None)
 
-        if sampler.burst_free_running() and c._ess_crosses():
-            self.resample_realize()  # token-grain crossing: resample in place, no exit
+        if sampler.burst_free_running():
+            self.resample_realize()  # resamples in place on an ESS crossing, else no-op
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
@@ -311,8 +317,8 @@ class _Burst:
         resampled to itself keeps its live engine request -- its context (hence KV) is
         unchanged. ESS/resample stay Controller-owned (``_maybe_resample``)."""
         c = self.d.controller
-        _, ancestors = c._maybe_resample()
-        for g in c._last_resampled_groups:
+        groups, ancestors = c._maybe_resample()
+        for g in groups:
             for row in c._group_rows[g]:
                 row = int(row)
                 if ancestors[row] == row:
@@ -406,8 +412,6 @@ class Controller:
         self._group_rows = [
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
-        # Group indices the last ``_maybe_resample`` resampled (read by the burst).
-        self._last_resampled_groups = []
         self.record = SMCRecord(n_particles) if record else None
         # Resample tag: ``_maybe_resample`` sets it so the next ``_record_step`` is
         # tagged ``add_resample`` (lazy tag-at-next-step).
@@ -518,7 +522,8 @@ class Controller:
     async def run(self):
         """Run the slow (ground-truth) SMC loop to completion."""
         while any(not p.done for p in self.particles):
-            self.particles.untwist_all()
+            if self.twist_with_critic:
+                self.particles.untwist_all()
 
             await asyncio.gather(
                 *[self._draw_and_score(p) for p in self.particles if not p.done]
@@ -529,63 +534,42 @@ class Controller:
 
         return self.particles
 
-    def _ess_below_threshold(self, normalized_weights, ng):
-        """Per-group ESS resample predicate (ESS_g < ess_threshold * ng); shared by
-        ``_ess_crosses`` and ``_maybe_resample``."""
-        return -logsumexp(normalized_weights * 2) < self._log_ess_threshold + np.log(ng)
-
-    def _ess_crosses(self):
-        """Whether the ESS test triggers a resample for any group (test only, no
-        mutation) -- the burst's pop-out trigger."""
-        W = self.particles.logw
-        for rows in self._group_rows:
-            Wg = W[rows]
-            if np.all(Wg == -np.inf):
-                continue
-            normalized_weights = Wg - logsumexp(Wg)
-            if self._ess_below_threshold(normalized_weights, len(rows)):
-                return True
-        return False
-
     def _maybe_resample(self):
         """Per-group ESS test + resample (the only ESS/resample impl; both lanes call
         it). Group-local: each crossing group reindexes within its own rows. Mutates
-        ``self.particles`` on a resample. Returns ``(did_resample, ancestor_indices)``."""
-        n = self.n_particles
-        sort_ancestors = self.record is not None  # only matters for a reproducible record
+        ``self.particles`` on a resample. Returns ``(crossing_groups, ancestors)`` --
+        ``([], None)`` when nothing crossed (no global vector built)."""
         W = self.particles.logw
-        global_ancestors = np.arange(n)
-        resets = []  # (rows, target_logw) for the groups that resampled
-        resampled_groups = []  # group indices that crossed (for the in-place handler)
-
+        crossings = []  # (g, rows, local_ancestors, reset_logw) per crossing group
         for g, rows in enumerate(self._group_rows):
             Wg = W[rows]
             if np.all(Wg == -np.inf):
                 continue
             w_sum = logsumexp(Wg)
-            normalized_weights = Wg - w_sum
-            if self._ess_below_threshold(normalized_weights, len(rows)):
-                probs = np.exp(normalized_weights)
-                local = np.asarray(self.resample_fn(probs))  # ancestors in 0..ng-1
-                if sort_ancestors:
-                    local = np.sort(local)
-                global_ancestors[rows] = rows[local]  # map group-local -> global rows
-                resets.append((rows, w_sum - np.log(len(rows))))
-                resampled_groups.append(g)
+            nw = Wg - w_sum
+            if -logsumexp(nw * 2) < self._log_ess_threshold + np.log(len(rows)):
+                local = np.asarray(self.resample_fn(np.exp(nw)))  # ancestors in 0..ng-1
+                if self.record is not None:
+                    local = np.sort(local)  # only matters for a reproducible record
+                crossings.append((g, rows, local, w_sum - np.log(len(rows))))
 
-        self._last_resampled_groups = resampled_groups
-        if resampled_groups:
-            self.n_resamples += 1
-            self.particles.reindex(global_ancestors)
-            for rows, target in resets:
-                self.particles.logw[rows] = target
-            if self.record is not None:
-                # Tag the NEXT recorded step as a resample (the lazy tag-at-next-step
-                # the record cadence relies on); consumed by ``_record_step``.
-                self._pending_resample = True
-                self._pending_ancestors = global_ancestors.tolist()
+        if not crossings:
+            return [], None  # no-cross early-out: no arange / reindex / tolist
 
-        return bool(resampled_groups), global_ancestors.tolist()
+        ancestors = np.arange(self.n_particles)
+        for _g, rows, local, _t in crossings:
+            ancestors[rows] = rows[local]  # group-local -> global rows
+        self.n_resamples += 1
+        self.particles.reindex(ancestors)
+        for _g, rows, _l, target in crossings:
+            self.particles.logw[rows] = target
+        ancestors = ancestors.tolist()
+        if self.record is not None:
+            # Tag the NEXT recorded step as a resample (lazy tag-at-next-step,
+            # consumed by ``_record_step``).
+            self._pending_resample = True
+            self._pending_ancestors = ancestors
+        return [c[0] for c in crossings], ancestors
 
     def save_record(self, json_path):
         """Write the SMC record JSON."""
