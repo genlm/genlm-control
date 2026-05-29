@@ -634,7 +634,7 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
     result = None
     rejected_token = None
 
-    for pass_i in range(max_accepts):
+    for _ in range(max_accepts):
         if n_rejects >= max_rejects:
             break
         cur_keys = logps - np.log(-np.log(rng.random((len(logps),))))

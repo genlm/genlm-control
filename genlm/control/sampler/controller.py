@@ -804,7 +804,7 @@ class BurstLoop:
 
         while any(not p.done for p in controller.particles):
             live = [p for p in controller.particles if not p.done]
-            if self._next_step_is_slow(live):
+            if controller._cadence_due(live):
                 # Next step is inexpressible -- run it slow, then ESS.
                 await self._slow_step(live)
                 controller._maybe_resample()
@@ -821,11 +821,6 @@ class BurstLoop:
                 controller._maybe_resample()
 
         return controller.particles
-
-    def _next_step_is_slow(self, live):
-        """Whether any live row's next step is a slow-lane cadence (the burst-entry
-        check; same test as mid-burst)."""
-        return self.controller._cadence_due(live)
 
     async def _slow_step(self, live):
         """Run one slow-lane transition for the live rows (the inexpressible step,

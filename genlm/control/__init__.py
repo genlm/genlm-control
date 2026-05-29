@@ -12,6 +12,7 @@ from .potential import (
 )
 from .sampler import (
     SMC,
+    batched_smc,
     direct_token_sampler,
     eager_token_sampler,
     topk_token_sampler,
@@ -23,6 +24,7 @@ __all__ = [
     "EOS",
     "EOT",
     "SMC",
+    "batched_smc",
     "Potential",
     "PromptedLLM",
     "ByteLLM",
