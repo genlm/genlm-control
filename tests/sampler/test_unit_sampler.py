@@ -20,6 +20,7 @@ from conftest import MockPotential
 async def test_multi_token_unit_sampler_basic():
     """Test basic multi-token unit sampling with boundary tokens."""
     # Create a simple mock potential
+    np.random.seed(0) # Seed deterministic sampling
     vocab = [b"hello", b" ", b"world", b"!"]
     logws = np.log([0.4, 0.1, 0.3, 0.1, 0.1])
     mock_potential = MockPotential(vocab, logws)
