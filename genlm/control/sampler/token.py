@@ -200,20 +200,22 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            logps = logws.normalize()
+            logZ = logws.sum()  # normalizer == the returned weight; compute logsumexp once
+            logps = logws.spawn(logws.weights - logZ)  # == logws.normalize()
             token = select(logps) if draw is None else draw(logps.exp().materialize())
-            return token, logws.sum(), logps[token]
+            return token, logZ, logps[token]
 
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context),
             self.potential.logw_next(context),
         )
-        proposal_logps = proposal_logws.normalize()
+        proposal_logZ = proposal_logws.sum()  # one logsumexp, reused below
+        proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_logZ)
         if draw is None:
             token = select(proposal_logps)
         else:
             token = draw(proposal_logps.exp().materialize())
-        logw = target_logws[token] - proposal_logws[token] + proposal_logws.sum()
+        logw = target_logws[token] - proposal_logws[token] + proposal_logZ
         return token, logw, proposal_logps[token]
 
     async def cleanup(self):
@@ -266,9 +268,10 @@ class SetTokenSampler(TokenSampler):
             `SetSampler` for more details.
         """
         logws, logp = await self.set_sampler.sample_set(context, draw=draw)
-        logps = logws.normalize()
+        logZ = logws.sum()  # one logsumexp, reused as the weight
+        logps = logws.spawn(logws.weights - logZ)  # == logws.normalize()
         token = select(logps) if draw is None else draw(logps.exp().materialize())
-        return token, logws.sum(), logp + logps[token]
+        return token, logZ, logp + logps[token]
 
     async def cleanup(self):
         """Clean up the sampler.
