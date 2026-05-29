@@ -327,7 +327,7 @@ def test_constrained_forces_resample_burst_vs_slow(llm):
     def make():
         return DirectTokenSampler(target)
 
-    seeds = (1234, 7, 99, 2024, 555, 31)
+    seeds = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)  # enough to cross ESS
     diffs, len_gaps = [], []
     any_resample = False
     for seed in seeds:
@@ -522,7 +522,7 @@ def test_twisting_critic_burst_vs_slow(llm):
 
     # Many seeds so the unbiasedness check has discriminating power (the warm-KV
     # residual makes each run noisy; bias must show as a mean many sem from 0).
-    seeds = (1234, 7, 99, 2024, 555, 31)
+    seeds = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)  # enough to resample
     diffs, len_gaps, any_resample = [], [], False
     for seed in seeds:
         slow = _ref("twist-critic", 16, 0.5, 12, seed)
@@ -612,7 +612,7 @@ def test_multitoken_burst_vs_slow(llm):
 
     # Many seeds: the no-bias check needs discriminating power (each run is noisy;
     # a real bias must show as a mean many sem from 0).
-    seeds = (1234, 7, 99, 2024, 555, 31)
+    seeds = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)
     diffs, len_gaps = [], []
     n_rounds = 0
     for seed in seeds:
