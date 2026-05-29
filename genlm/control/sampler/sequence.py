@@ -12,7 +12,7 @@ from genlm.control.sampler.controller import (
     Controller,
     StepLoop,
     BurstLoop,
-    burst_capability,
+    burst_blocker,
     NotAcceleratable,
 )
 
@@ -45,10 +45,10 @@ async def _drive(controller, mode):
     here so single (:meth:`SMC.__call__`) and batched (:func:`batched_smc`) runs
     share one selection -- they cannot drift."""
     if mode != "off":
-        cap = burst_capability(controller)
-        if mode == "require" and not cap.ok:
-            raise NotAcceleratable(cap.reason)
-        if cap.ok:
+        reason = burst_blocker(controller)
+        if mode == "require" and reason is not None:
+            raise NotAcceleratable(reason)
+        if reason is None:
             if mode == "auto":
                 logger.info("running the engine-accelerated burst path.")
             return await BurstLoop(controller).run()
@@ -57,7 +57,7 @@ async def _drive(controller, mode):
                 "running the exact per-token path -- acceleration unavailable: %s. "
                 'Pass accelerate="off" to silence, or accelerate="require" to make '
                 "this an error.",
-                cap.reason,
+                reason,
             )
     return await StepLoop(controller).run()
 
@@ -212,38 +212,6 @@ class SMC:
             controller.save_record(json_path)
 
         return Sequences(*_unpack_particles(particles))
-
-    def acceleration_report(self):
-        """One-line human summary of whether this config engine-accelerates, and why.
-
-        Backed by :func:`~genlm.control.sampler.controller.burst_capability` -- the
-        same source of truth as the runtime fallback/raise text -- so a user can
-        ask the object what it will do before committing a long run, without an
-        engine.
-
-        Returns:
-            (str): e.g. "Engine-accelerated (vLLM): runs the in-engine burst." or
-                "Not accelerated: <reason> -> exact per-token path."
-        """
-        controller = Controller(
-            unit_sampler=self.unit_sampler,
-            critic=self.critic,
-            n_particles=1,
-            ess_threshold=0.0,
-            max_tokens=1,
-            twist_with_critic=False,
-            record=False,
-            verbosity=0,
-        )
-        cap = burst_capability(controller)
-        sampler_name = type(self.unit_sampler).__name__
-        if cap.ok:
-            critic_note = " + terminal critic" if self.critic is not None else ""
-            return (
-                f"Engine-accelerated (vLLM · {sampler_name}{critic_note}): "
-                "runs the in-engine burst, near the raw-decode ceiling."
-            )
-        return f"Not accelerated: {cap.reason} → exact per-token path."
 
     async def cleanup(self):
         """Clean up resources used by the inference engine.

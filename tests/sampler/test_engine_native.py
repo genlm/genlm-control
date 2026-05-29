@@ -53,14 +53,13 @@ from genlm.control.sampler.unit import (  # noqa: E402
 from genlm.control.sampler.controller import (  # noqa: E402
     Controller,
     BurstLoop,
-    burst_capability,
+    burst_blocker,
 )
 
 
 def can_burst(controller):
-    """Test-local ergonomics: the library exposes only ``burst_capability(...)``;
-    this was a public wrapper, now lives here since only the tests want it."""
-    return burst_capability(controller).ok
+    """Test-local: can this config run the engine burst (no blocker reason)?"""
+    return burst_blocker(controller) is None
 
 
 MODEL = "gpt2"
@@ -739,8 +738,8 @@ def test_set_sampler_burst_vs_slow(llm):
         # accelerated -- the capability gate routes it to StepLoop. The numerical
         # parity check still drives BurstLoop directly via `_run_burst`.
         assert not can_burst(_controller(make, 8, 0.0, 8))
-        cap = burst_capability(_controller(make, 8, 0.0, 8))
-        assert cap.reason == "SetTokenSampler is not engine-accelerated"
+        reason = burst_blocker(_controller(make, 8, 0.0, 8))
+        assert reason == "SetTokenSampler does not support the engine burst"
         seeds = (1234, 7, 99, 2024, 555, 31)
         diffs = []
         for seed in seeds:

@@ -1,3 +1,4 @@
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -5,6 +6,7 @@ from typing import Any, Iterable, Optional
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.controller import BurstDraw
+from genlm.control.potential.built_in.llm import burst_logw_next
 from lark import Lark
 from lark.exceptions import LarkError
 
@@ -127,75 +129,53 @@ class MultiTokenUnitSampler(TokenSampler):
         # before this engine cap, so the engine never length-caps a row mid-unit.
         return self.max_subunits_per_unit + 1
 
-    def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
-        """Burst draw for one unit round: accumulate subunits per row across engine
-        steps and complete an SMC step only at the unit boundary.
+    async def burst_draw_batch(self, warm_logws, contexts, handles, burst):
+        """Burst draw for one unit round: one subunit per decode step, completing an
+        SMC step only at the unit boundary. Per row, inject the engine's warm logits
+        and run the subunit sampler's REAL ``sample`` (one subunit); accumulate it in
+        ``burst.scratch`` (keyed by ``handle``); then apply the SAME EOS-split /
+        boundary / max-subunit logic as the slow ``sample``/``transition``:
 
-        The subunits ARE the subunit sampler's own burst draws over the warm-KV
-        logits (one batched call for the whole live set), so the LM half / factor
-        advance exactly as in a token burst. On top, this carries each row's
-        in-progress unit in ``ctx.scratch`` (keyed by ``externals``) and, per row,
-        decides -- with the SAME EOS-split / boundary / max-subunit logic as the
-        slow ``sample``/``transition`` -- whether the unit is now complete:
+        * EOS subunit -> split the content off so ``context[-1]`` is EOS (terminate).
+        * boundary fires -> finalize the unit; the row pops out at the synced boundary.
+        * max subunits without a boundary -> reject (``-inf`` weight, finishes).
+        * otherwise -> mid-unit: emit the subunit, bank nothing (``step=None``)."""
+        accums = burst.scratch  # handle -> _UnitAccum, fresh each burst
+        llm = burst.engine_lm
 
-        * **EOS subunit** -> the unit ends with EOS; ``to_append`` splits the content
-          off so the controller's terminal check fires (the particle terminates).
-        * **boundary fires** -> finalize the unit; the row ``pop``s out and waits for
-          the population to sync at the unit boundary, then the driver runs ESS.
-        * **max subunits without a boundary** -> reject (``-inf`` weight -> the
-          particle finishes), the incomplete buffer as the unit.
-        * **otherwise** -> mid-unit: emit the subunit to extend the warm KV, bank
-          nothing (``step=None``).
-        """
-        accums = ctx.scratch  # external index -> _UnitAccum, fresh each burst
-        # Each row's subunit context for the subunit sampler's factor: completed
-        # units flattened to subunits + the in-progress subunits accumulated so far
-        # this burst (what the carried factor state used to thread). The subunit
-        # sampler scores its factor statelessly from this via ``logw_next``.
-        sub_contexts = []
-        for k, ext in enumerate(externals):
-            accum = accums.get(ext)
+        async def one(context, warm, handle):
+            accum = accums.get(handle)
             buf = accum.buffer if accum is not None else []
-            sub_contexts.append(flatten_units(contexts[k]) + list(buf))
-        sub_records = self.subunit_sampler.burst_draw_batch(
-            lm_batch, sub_contexts, externals, ctx
-        )
-        out = []
-        for k, ext in enumerate(externals):
-            sub = sub_records[k]
-            subunit = sub.token
-            _, sub_logw, sub_logp = sub.step
+            # Subunit context: completed units flattened to subunits + in-progress
+            # subunits this unit, so the subunit sampler's factor scores statelessly.
+            sub_context = flatten_units(context) + list(buf)
+            with burst_logw_next(llm, warm):
+                subunit, sub_logw, sub_logp = await self.subunit_sampler.sample(sub_context)
 
-            accum = accums.get(ext)
             if accum is None:
-                accum = accums[ext] = _UnitAccum([], 0.0, 0.0)
+                accum = accums[handle] = _UnitAccum([], 0.0, 0.0)
             accum.buffer.append(subunit)
             accum.logw += sub_logw
             accum.logp += sub_logp
 
             if subunit is EOS:
-                # Unit ends with EOS: split the content off as one unit and append
-                # EOS separately so context[-1] is EOS -- exactly transition().
-                to_append = []
-                if len(accum.buffer) > 1:
-                    to_append.append(accum.buffer[:-1])
-                to_append.append(EOS)
-                step, pop = (to_append, accum.logw, accum.logp), False
-                accums.pop(ext, None)
-            elif self.boundary_predicate(contexts[k], accum.buffer):
+                step, pop = (self._to_append(accum.buffer), accum.logw, accum.logp), False
+                accums.pop(handle, None)
+            elif self.boundary_predicate(context, accum.buffer):
                 unit = self.boundary_predicate.finalize_unit(accum.buffer)
-                step, pop = ([unit], accum.logw, accum.logp), True
-                accums.pop(ext, None)
+                step, pop = (self._to_append(unit), accum.logw, accum.logp), True
+                accums.pop(handle, None)
             elif len(accum.buffer) >= self.max_subunits_per_unit:
-                # Max subunits, no boundary: reject the unit (the slow sample()'s
-                # post-loop -inf return) -- the -inf weight finishes the particle.
-                step, pop = ([list(accum.buffer)], float("-inf"), accum.logp), False
-                accums.pop(ext, None)
+                step, pop = (self._to_append(list(accum.buffer)), float("-inf"), accum.logp), False
+                accums.pop(handle, None)
             else:
                 step, pop = None, False  # mid-unit: emit the subunit, bank nothing
 
-            out.append(BurstDraw(token=subunit, step=step, pop=pop))
-        return out
+            return BurstDraw(token=subunit, step=step, pop=pop)
+
+        return await asyncio.gather(
+            *(one(c, w, h) for c, w, h in zip(contexts, warm_logws, handles))
+        )
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
@@ -223,19 +203,20 @@ class MultiTokenUnitSampler(TokenSampler):
                 weight increment, and the log-probability of random choices.
         """
         flat_context = flatten_units(context)
-
         unit, logw, logp = await self.sample(
             flat_context, unit_context=context, draw=None
         )
+        return self._to_append(unit), logw, logp
 
+    @staticmethod
+    def _to_append(unit):
+        """Controller ``to_append`` from a completed unit, shared by the slow
+        ``transition`` and the burst: if the unit ends with EOS, split the content off
+        and append EOS separately so ``context[-1] is EOS`` (the terminal check fires);
+        otherwise the unit is a single item."""
         if unit and unit[-1] is EOS:
-            to_append = []
-            if len(unit) > 1:
-                to_append.append(unit[:-1])  # unit content without EOS
-            to_append.append(EOS)
-            return to_append, logw, logp
-
-        return [unit], logw, logp
+            return ([unit[:-1]] if len(unit) > 1 else []) + [EOS]
+        return [unit]
 
     async def sample(self, flat_token_context, unit_context=None, draw=None):
         """Sample a multi-token unit by running sequence sampling for $\\varphi_{\\bm{x}}$.

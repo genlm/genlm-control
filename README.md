@@ -202,13 +202,7 @@ SMC has one acceleration knob, `accelerate`, passed to `token_sampler.smc(...)` 
 | `"off"` (`False`)          | always the exact per-token path — **byte-reproducible** given a seed (the ground truth). |
 | `"require"`                | engine path, or raise `NotAcceleratable` with the reason if unsupported (use for benchmarks). |
 
-Acceleration is **vLLM-only** for now (`PromptedLLM.from_name(..., backend="vllm")`); other backends always run the exact per-token path. The engine is taken from the sampler's `PromptedLLM` — you don't pass it. To check what a config will do before running it:
-
-```python
-print(SMC(token_sampler, critic).acceleration_report())
-# "Engine-accelerated (vLLM · DirectTokenSampler): runs the in-engine burst, near the raw-decode ceiling."
-# "Not accelerated: sampler uses a separate proposal ... → exact per-token path."
-```
+Acceleration is **vLLM-only** for now (`PromptedLLM.from_name(..., backend="vllm")`); other backends always run the exact per-token path. The engine is taken from the sampler's `PromptedLLM` — you don't pass it. Use `accelerate="auto"` (it logs which lane ran) or `accelerate="require"` (raises `NotAcceleratable` with the reason if the config can't burst).
 
 What is accelerated (current reality):
 

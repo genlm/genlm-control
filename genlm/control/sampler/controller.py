@@ -1,22 +1,10 @@
-"""The SMC controller: a single, engine-independent owner of the entire SMC algorithm.
+"""The SMC controller: the single owner of the SMC algorithm (population, per-step
+transition, ESS, resample/fork, log_ml).
 
-This module replaces the previous llamppl ``smc_standard`` + ``SequenceModel``
-coupling. The controller owns the particle population, the per-step transition, the
-ESS test, resampling/forking and the log marginal likelihood accumulation --
-*always*. It is exact per token: there is no segment-graining and no
-hard/soft constraint fork. ``logw_next`` is one operation.
-
-Two drivers turn the population. ``StepLoop`` is the slow per-token Python loop --
-it fuses shaping + drawing inside the sampler's ``transition`` and is the byte-exact
-ground truth. ``BurstLoop`` is the engine-accelerated outer/inner driver: it runs
-each SMC step on the FAST lane (an engine burst, :meth:`Controller.draw` row-wise on
-raw warm-KV logits) when the step is engine-expressible, and drops to the SLOW lane
-(one ``StepLoop`` transition) for an inexpressible step (a ``slow_cadence``, e.g. a
-periodic critic-LM forward). The burst handles both the token grain (one SMC step
-per decode step, ESS every step) and the synchronized unit grain (one whole unit per
-step, ESS once per unit round). Either way, resample / fork / ESS / log_ml are
-controller-owned and NEVER delegated to the engine; the burst and the slow-lane
-transition are the two step-runners, nothing more.
+Two drivers turn the population: ``StepLoop`` (per-token, the byte-exact ground
+truth) and ``BurstLoop`` (engine-accelerated; bursts expressible steps, drops to the
+slow lane for a ``slow_cadence`` step). Resample/ESS/log_ml are always
+controller-owned, never delegated to the engine.
 """
 
 import asyncio
@@ -27,20 +15,14 @@ import torch
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.util import logsumexp
+from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
-from genlm.control.sampler.source import PushSource
 
 
 class NotAcceleratable(Exception):
-    """Raised when engine acceleration was *required* but the configuration can't
-    be driven by the engine burst.
-
-    The message is the same human-readable ``reason`` that
-    :func:`burst_capability` reports and that an ``accelerate="auto"`` fallback
-    logs, so the explanation a user sees on an explicit failure matches the one
-    they get from introspection (:meth:`SMC.acceleration_report`).
-    """
+    """Engine acceleration was required but the config can't be driven by the burst.
+    Message is ``burst_blocker``'s reason."""
 
 
 # ---------------------------------------------------------------------------
@@ -49,30 +31,10 @@ class NotAcceleratable(Exception):
 
 
 class Population:
-    """The SMC particle population, stored columnar.
-
-    The per-particle scalars that the algorithm reads in bulk (ESS, resample,
-    log_ml) live as parallel numpy arrays -- the *single source of truth* -- so
-    those tests are array ops, not a fresh ``np.array([p.logw for p in ...])``
-    rebuilt every step. The ragged per-particle token ``contexts`` stay as Python
-    lists.
-
-    A :class:`Particle` is a thin *view* onto row ``i`` (see below); there is no
-    second copy of ``logw`` to keep in sync. ``Population`` is iterable / indexable
-    / ``len``-able and yields views, so the rest of the controller (and the
-    vendored ``SMCRecord``, which reads ``p.weight`` / ``p.string_for_serialization``
-    at call time) is unchanged.
-
-    Attributes (arrays are length ``n``):
-        logw: current (twisted) log importance weights.
-        logp: accumulated log-probabilities of the sampler's random choices.
-        twist_amount: amount currently added to ``logw`` by the critic twist;
-            subtracted back out (``untwist``) before each step and on termination,
-            exactly as llamppl's ``Model.twist``/``untwist``.
-        done: whether each particle has finished stepping.
-        max_tokens_left: remaining per-particle token budget.
-        contexts: list of token lists sampled so far.
-    """
+    """The SMC particle population, stored columnar: bulk scalars (``logw``,
+    ``logp``, ``twist_amount``, ``done``, ``max_tokens_left``) are parallel numpy
+    arrays; ``contexts`` are Python lists. Indexing/iterating yields :class:`Particle`
+    views onto a row (no second copy to sync)."""
 
     __slots__ = (
         "n",
@@ -88,10 +50,7 @@ class Population:
 
     def __init__(self, n, max_tokens, group=None):
         self.n = n
-        # Which example (sub-population) each row belongs to. A *batched* E-step runs
-        # B examples in one population of ``B*N`` rows; ESS / resample / log_ml are
-        # per-group (array-masked), the per-row hot paths are group-agnostic. The
-        # default -- one group -- makes a single-example run byte-identical to before.
+        # Sub-population id per row (batched runs); ESS/resample/log_ml are per-group.
         self.group = (
             np.zeros(n, dtype=np.int64) if group is None
             else np.asarray(group, dtype=np.int64)
@@ -102,13 +61,8 @@ class Population:
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
         self.contexts = [[] for _ in range(n)]
-        # Per-particle context length at the last slow-lane step. The slow-lane
-        # :class:`BoundaryPredicate` cadence is evaluated on the *run buffer*
-        # ``context[pop_anchor:]`` (tokens drawn since the last slow step) with the
-        # completed run ``context[:pop_anchor]`` as its unit-context -- so
-        # ``FixedLengthBoundary(N)`` fires a slow step every N tokens,
-        # ``TokenSetBoundary({b"."})`` after a period, etc. Derived from ``contexts``
-        # (no parallel buffer to keep in sync); reindexed on resample like the rest.
+        # Context length at the last slow-lane step; the cadence predicate sees
+        # ``context[pop_anchor:]`` as its buffer, ``context[:pop_anchor]`` as context.
         self.pop_anchor = np.zeros(n, dtype=np.int64)
 
     def __len__(self):
@@ -121,26 +75,18 @@ class Population:
         return (Particle(self, i) for i in range(self.n))
 
     def untwist_all(self):
-        """Vectorized per-step untwist over the whole population (the slow loop's
-        ``for p: p.untwist()``). Done particles carry ``twist_amount == 0`` (their
-        ``finish`` already untwisted), so this is a no-op for them -- identical to
-        looping."""
+        """Vectorized untwist over the whole population (done rows carry 0)."""
         self.logw -= self.twist_amount
         self.twist_amount[:] = 0.0
 
     def untwist_subset(self, idx):
-        """Vectorized untwist of the rows ``idx`` (the burst's live, not-popped
-        particles); ``idx`` are distinct so the in-place scatter is well-defined.
-        The burst untwists only live rows (done/popped rows already finished),
-        matching the old per-row ``for i in live: parts[i].untwist()``."""
+        """Vectorized untwist of rows ``idx`` (the burst's live rows; ``idx`` distinct)."""
         self.logw[idx] -= self.twist_amount[idx]
         self.twist_amount[idx] = 0.0
 
     def reindex(self, ancestor_indices):
-        """Resample/fork: reindex every column by ``ancestor_indices`` (the
-        columnar form of the old per-particle ``clone()``). Contexts are
-        shallow-copied (their token elements are immutable), matching the old
-        ``clone``."""
+        """Resample/fork: reindex every column by ``ancestor_indices`` (contexts
+        shallow-copied; their token elements are immutable)."""
         idx = ancestor_indices
         self.logw = self.logw[idx]
         self.logp = self.logp[idx]
@@ -149,21 +95,12 @@ class Population:
         self.max_tokens_left = self.max_tokens_left[idx]
         self.contexts = [list(self.contexts[i]) for i in idx]
         self.pop_anchor = self.pop_anchor[idx]
-        # Group labels reindex like every other column. Resample is group-local (a
-        # row's ancestor is always in its own group), so this preserves the labels;
-        # carried for consistency / correctness under any global ancestor vector.
         self.group = self.group[idx]
 
 
 class Particle:
-    """A thin view onto one row of a :class:`Population`.
-
-    All scalar reads/writes go through to the population's arrays (single source
-    of truth, no sync), so the existing per-particle bookkeeping
-    (``score``/``twist``/``untwist``/``finish`` -- mirroring ``llamppl.modeling.Model``)
-    reads exactly as before. The vectorized paths (ESS, resample, untwist) operate
-    on the arrays directly and never go through a view.
-    """
+    """A thin view onto one row of a :class:`Population`; scalar reads/writes go
+    through to the population arrays (no second copy to sync)."""
 
     __slots__ = ("_pop", "_i")
 
@@ -211,22 +148,19 @@ class Particle:
 
     @property
     def run_prefix(self):
-        """Completed runs before the current one -- the ``unit_context`` arg of the
-        slow-lane :class:`BoundaryPredicate`."""
+        """Tokens before the current run -- the cadence predicate's ``unit_context``."""
         return self._pop.contexts[self._i][: self._pop.pop_anchor[self._i]]
 
     @property
     def run_buffer(self):
-        """Tokens drawn since the last slow step -- the ``subunit_buffer`` the
-        slow-lane :class:`BoundaryPredicate` decides the next cadence step on."""
+        """Tokens drawn since the last slow step -- the cadence predicate's buffer."""
         return self._pop.contexts[self._i][self._pop.pop_anchor[self._i] :]
 
     def reset_run(self):
-        """Close the current run (anchor at the live context end) -- called right
-        after a slow step so the cadence predicate starts the next run empty."""
+        """Close the current run (anchor at context end) so the cadence predicate re-arms."""
         self._pop.pop_anchor[self._i] = len(self._pop.contexts[self._i])
 
-    # -- weight bookkeeping, mirroring llamppl.modeling.Model exactly --
+    # -- weight bookkeeping --
 
     def score(self, amt):
         self._pop.logw[self._i] += amt
@@ -255,29 +189,14 @@ class Particle:
 
 @dataclass
 class BurstDraw:
-    """One live row's result from a sampler's ``burst_draw_batch`` -- the burst
-    analog of a slow ``transition`` outcome, plus the engine-continuation token.
-
-    The single per-row contract between a sampler and the Controller's ``draw``,
-    uniform across grains: a token sampler completes one SMC step every decode
-    step; a unit sampler accumulates subunits and completes one only at a unit
-    boundary. ``draw`` banks the step (if any), emits the token to the engine, and
-    pops the row (if asked) without ever branching on the sampler's type.
+    """One live row's result from ``burst_draw_batch``.
 
     Fields:
-        token: the ``Token`` (or ``EOS``) drawn this decode step; the Controller
-            maps it to the engine token id that extends this row's warm KV. For a
-            unit sampler mid-unit it is the latest subunit; ``EOS`` maps to the
-            engine eos placeholder (never banked, only fed to the engine, and the
-            row is dropped immediately after).
-        step: ``(to_append, logw, logp)`` when an SMC step COMPLETED this decode
-            step -- the Controller banks it (score / advance the context by
-            ``to_append`` / critic-twist / terminate), exactly the slow
-            transition's payload. ``None`` when the row is mid-step (a unit still
-            accumulating): only the engine token is emitted, nothing is banked.
-        pop: pop this row OUT of the burst after this step even though it did not
-            terminate -- the synchronized unit-boundary wait (the row is relaunched
-            next burst). A terminated row is always popped regardless of ``pop``.
+        token: the ``Token``/``EOS`` drawn this decode step (mapped to an engine id).
+        step: ``(to_append, logw, logp)`` if an SMC step completed, else ``None``
+            (mid-step, e.g. a unit still accumulating).
+        pop: pop this row out of the burst after this step without terminating
+            (the unit-boundary wait). Terminated rows are always popped.
     """
 
     token: object
@@ -285,32 +204,154 @@ class BurstDraw:
     pop: bool = False
 
 
-# -- burst exit reasons -------------------------------------------------------
-#
-# Why one engine burst returned, so the outer driver (:class:`BurstLoop`) can
-# dispatch. A burst is a stateless enter-run-exit unit; it never resamples. It
-# ends for one of:
-#
-# * ``_EXIT_TERMINATED`` -- every flagged row finished on its own (drawn EOS /
-#   budget / -inf weight). Nothing for the driver to do; the population shrinks
-#   and the loop either re-enters or exits.
-# * (ESS is NOT an exit reason: a token-grain ESS crossing resamples IN PLACE
-#   mid-burst -- drop + re-add the crossing group's rows -- and the burst keeps
-#   running; a single population is just one group.)
-# * ``_EXIT_UNIT_SYNC`` -- a synchronized (unit-grain) burst ran exactly one SMC
-#   step (one unit) for every live row and they have all popped at their unit
-#   boundaries; the driver runs the controller-owned ESS test + resample over the
-#   synced population, identical timing to the slow per-unit loop, then relaunches.
-#
-# * ``_EXIT_SLOW_STEP`` -- the next step is engine-INEXPRESSIBLE for the live rows
-#   (a cadence: e.g. a periodic critic-LM forward). The burst popped every live row
-#   BEFORE drawing that step; the driver runs one per-token slow-lane transition for
-#   it (engine free) and then re-enters the burst. Like ESS it is synchronized -- in
-#   a free-running burst all live rows advance in lockstep, so a length-based cadence
-#   is due for all of them at once.
-_EXIT_TERMINATED = "terminated"
-_EXIT_UNIT_SYNC = "unit_sync"
-_EXIT_SLOW_STEP = "slow_step"
+# -- burst exit reasons: why one burst returned, so BurstLoop can dispatch. A burst
+# never resamples. ESS is NOT an exit reason (a token-grain crossing resamples in
+# place and the burst keeps running).
+_EXIT_TERMINATED = "terminated"  # every flagged row finished on its own
+_EXIT_UNIT_SYNC = "unit_sync"  # unit-grain round done; driver runs ESS/resample
+_EXIT_SLOW_STEP = "slow_step"  # next step is inexpressible; driver runs it slow
+
+
+class _Burst:
+    """Per-burst engine state, set on the Controller for one ``run_burst``: the live
+    row<->particle handle maps, the abort/re-add queues, the sampler scratch, and the
+    exit reason. Run config (the engine LM, eos, the event-loop hop) is borrowed from
+    the ``BurstLoop`` ``d``. The sampler-facing surface is ``engine_lm``/``warm_logws``
+    (inject + draw), ``scratch`` (unit accumulation), and ``run_sync``."""
+
+    def __init__(self, d, live):
+        self.d = d
+        self.particles = live
+        self.abort_rows = set()
+        self.add_rows = []
+        # handle <-> population row. The engine hands ``draw`` the handle owning each
+        # row; ``next_handle`` issues a fresh one per mid-burst re-add.
+        self.handle_to_row = {i: p._i for i, p in enumerate(live)}
+        self.row_to_handle = {p._i: i for i, p in enumerate(live)}
+        self.next_handle = len(live)
+        self.scratch = {}
+        self.exit_reason = _EXIT_TERMINATED
+
+    @property
+    def engine_lm(self):
+        return self.d.llm
+
+    def warm_logws(self, logits):
+        """The engine's warm logits -> one per-row LazyWeights == the engine LM's
+        ``logw_next`` for each row's context (folded once on-device, transferred once).
+        The sampler injects these as the LM's ``logw_next`` and runs the real draw."""
+        llm = self.d.llm
+        batch = llm._process_logw_next_batch(llm._maybe_temper(logits.float()))
+        return [llm.make_lazy_weights(row) for row in batch.cpu().numpy()]
+
+    def run_sync(self, coro):
+        """Run an async helper to completion on the driver loop (one hop)."""
+        return self.d.run_async(coro)
+
+    def particle_of(self, handle):
+        return self.d.controller.particles[self.handle_to_row[handle]]
+
+    def context_ids(self, p):
+        """Engine prompt: the row's group prefix + its drawn token ids (EOS dropped)."""
+        ids = list(self.d.group_prefixes[self.d.controller.particles.group[p._i]])
+
+        def _emit(item):
+            if isinstance(item, EndOfSequence):
+                return
+            if isinstance(item, list):
+                for sub in item:
+                    _emit(sub)
+            else:
+                ids.append(item.token_id)
+
+        for item in p.context:
+            _emit(item)
+        return ids
+
+    def drain_aborts(self):
+        rows = self.abort_rows
+        self.abort_rows = set()
+        return list(rows)
+
+    def drain_adds(self):
+        rows = self.add_rows
+        self.add_rows = []
+        return rows
+
+    def draw(self, logits, handles):
+        """The engine callback (``run_burst`` calls this), one token per live row: the
+        engine's warm logits become each row's engine-LM ``logw_next``, the sampler runs
+        its REAL ``burst_draw_batch`` (inject + ``transition``), and the Controller banks
+        the completed SMC steps. ``handles[i]`` owns row ``i``. Pop-out is out-of-band
+        (``drain_aborts``); a token-grain ESS crossing resamples in place (no exit)."""
+        c = self.d.controller
+        sampler = self.d.sampler
+        # Every row here is live (aborted/terminated rows were dropped from the engine).
+        parts = [self.particle_of(h) for h in handles]
+
+        # Untwist last step's critic twist before this step's score (no-op w/o critic).
+        c.particles.untwist_subset([p._i for p in parts])
+
+        # Engine warm logits -> per-row LM logw_next; the sampler injects them and runs
+        # the real per-step draw. ONE event-loop hop for the whole batch.
+        warm = self.warm_logws(logits)
+        records = self.run_sync(
+            sampler.burst_draw_batch(warm, [p.context for p in parts], handles, self)
+        )
+        # Bank steps before the token map: scoring sets p.done on termination.
+        c._bank_burst_steps(parts, records, self.run_sync)
+        # Token grain records per step here; unit grain once per round in BurstLoop.run.
+        if sampler.burst_free_running() and any(rec.step is not None for rec in records):
+            c._record_step()
+        out = [0] * len(parts)
+        for k, p in enumerate(parts):
+            out[k] = self._burst_token_id(p, records[k])
+            if p.done or records[k].pop:
+                # Drop the row: terminated, or waiting at a unit boundary.
+                self.abort_rows.add(handles[k])
+                if p.done:
+                    self.handle_to_row.pop(handles[k], None)
+                    self.row_to_handle.pop(p._i, None)
+
+        if sampler.burst_free_running() and c._ess_crosses():
+            self.resample_realize()  # token-grain crossing: resample in place, no exit
+        elif c._slow_cadence_due(parts):
+            self.abort_rows.update(handles)  # next step is slow-lane: pop all
+            self.exit_reason = _EXIT_SLOW_STEP
+
+        return torch.tensor(out, dtype=torch.int64, device=logits.device)
+
+    def _burst_token_id(self, p, rec):
+        """Map a banked row's drawn token to the engine token id (after banking set
+        ``p.done`` on termination). EOS has no token_id -> the eos placeholder."""
+        token = rec.token
+        if isinstance(token, EndOfSequence):
+            assert p.done, "burst drew EOS for a particle that did not terminate"
+            return self.d.eos_id
+        return token.token_id
+
+    def resample_realize(self):
+        """Translate a completed per-group resample into engine abort/re-add: drop the
+        crossing groups' current rows, re-add their still-live rows at the resampled
+        context (fresh handle). ESS/resample stay Controller-owned (``_maybe_resample``)."""
+        c = self.d.controller
+        c._maybe_resample()
+        for g in c._last_resampled_groups:
+            rows = c._group_rows[g]
+            for row in rows:
+                h = self.row_to_handle.pop(int(row), None)
+                if h is not None:
+                    self.abort_rows.add(h)
+                    self.handle_to_row.pop(h, None)
+            for row in rows:
+                p = c.particles[int(row)]
+                if p.done:
+                    continue
+                h = self.next_handle
+                self.next_handle += 1
+                self.handle_to_row[h] = int(row)
+                self.row_to_handle[int(row)] = h
+                self.add_rows.append((h, self.context_ids(p)))
 
 
 # ---------------------------------------------------------------------------
@@ -319,39 +360,22 @@ _EXIT_SLOW_STEP = "slow_step"
 
 
 class Controller:
-    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml.
-
-    A "sampler" collapses to a single per-step transition
-    ``state -> (token, logw[, logp])`` that this controller calls. The controller is owned
-    once; no sampler reimplements the loop.
+    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. A
+    sampler collapses to one per-step ``transition``; no sampler reimplements the loop.
 
     Args:
-        unit_sampler (TokenSampler): Produces ``(token, logw, logp)`` per step.
-        critic (Potential, optional): Reweights/twists particles.
-        n_particles (int): Number of particles.
+        unit_sampler (TokenSampler): produces ``(to_append, logw, logp)`` per step.
+        critic (Potential, optional): reweights/twists particles.
+        n_particles (int): number of particles.
         ess_threshold (float): ESS fraction below which we resample.
-        max_tokens (int): Per-particle token budget.
-        twist_with_critic (bool): Whether the critic twists during stepping
-            (True iff ``ess_threshold > 0``), matching the old SequenceModel.
-        resampling_method (str): One of multinomial/stratified/systematic/residual.
-        record (bool): Whether to build an :class:`SMCRecord`.
+        max_tokens (int): per-particle token budget.
+        twist_with_critic (bool): whether the critic twists during stepping.
+        resampling_method (str): multinomial/stratified/systematic/residual.
+        record (bool): build an :class:`SMCRecord`.
         verbosity (int): 0 silent, 1 prints particles per step.
-        slow_cadence (BoundaryPredicate, optional): a
-            :class:`~genlm.control.sampler.unit.BoundaryPredicate` marking when "the
-            NEXT step is engine-INEXPRESSIBLE and must run on the slow lane" (a
-            cadence, e.g. a periodic critic-LM forward). It is evaluated per row on
-            the row's *run buffer* -- the tokens drawn since its last slow step --
-            with the same ``(unit_context, subunit_buffer)`` signature the unit
-            sampler uses: ``FixedLengthBoundary(N)`` -> a slow step every N tokens,
-            ``TokenSetBoundary({b"."})`` -> a slow step after each period,
-            ``CFGBoundary`` -> on grammar completion. When set, the ``BurstLoop``
-            runs the cadence steps as per-token transitions (engine free) and bursts
-            the rest; ``None`` (default) means every step is engine-expressible (the
-            burst never drops to the slow lane). Only the ``BurstLoop`` reads it --
-            the all-slow ``StepLoop`` runs every step slow regardless. When it fires
-            for any live row the whole population takes one synced slow-lane step (the
-            non-firing rows run the identical per-step math), so the cadence is
-            math-neutral: a pure performance hint, never an algorithm change.
+        slow_cadence (BoundaryPredicate, optional): marks steps the burst must run on
+            the slow lane (evaluated per row on its run buffer). Performance hint only;
+            the per-step math is identical on both lanes. ``None`` = burst every step.
     """
 
     def __init__(
@@ -371,11 +395,7 @@ class Controller:
         critics=None,
     ):
         assert max_tokens > 0
-        # Batched (B-example) SMC runs B independent sub-populations ("groups") in
-        # ONE population of ``sum(group_sizes)`` rows -- ESS / resample / log_ml are
-        # per-group (array-masked), the per-row paths dispatch the group's sampler /
-        # critic. The default -- a single group of ``n_particles`` with the lone
-        # ``unit_sampler`` / ``critic`` -- is byte-identical to the unbatched path.
+        # Batched runs: B groups in one population; default is a single group.
         if group_sizes is None:
             group_sizes = [n_particles]
             samplers = [unit_sampler]
@@ -386,21 +406,15 @@ class Controller:
         self.samplers = samplers
         self.critics = critics
         self.group_sizes = group_sizes
-        # B-agnostic representatives for the burst-capability check / BurstLoop seam
-        # (all groups share sampler/target STRUCTURE; only prompt + critic differ).
+        # Representatives for the capability check / BurstLoop (groups share structure).
         self.unit_sampler = samplers[0]
         self.critic = critics[0]
         self.n_particles = n_particles
         self.ess_threshold = ess_threshold
         self.max_tokens = max_tokens
         self.twist_with_critic = twist_with_critic
-        # A terminal-only critic (``prefix == 0`` for every proper prefix) carries no
-        # per-step twist signal -- its per-step twist is ``twist(0)``, a no-op -- so
-        # reweight ONLY at termination. Byte-identical to twisting per step (the
-        # provisional ``twist(0)`` adds then untwists 0), but skips the per-step
-        # critic call. ``is_terminal_only()`` defaults to ``False``, so this never
-        # fires unless a critic explicitly opts in. Population-wide flag -> require
-        # every group's critic to be terminal-only.
+        # A terminal-only critic carries no per-step signal, so reweight only at
+        # termination (skips the per-step critic call; same result).
         if twist_with_critic and all(
             c is not None and c.is_terminal_only() for c in critics
         ):
@@ -413,78 +427,47 @@ class Controller:
             [np.full(ng, g, dtype=np.int64) for g, ng in enumerate(group_sizes)]
         )
         self.particles = Population(n_particles, max_tokens, group=group)
-        # Per-group row indices. Resample is group-local (a row's ancestor is always
-        # in its own group), so group labels -- and therefore these index sets -- are
-        # invariant across reindex; precompute once.
+        # Per-group row indices (invariant across reindex; resample is group-local).
         self._group_rows = [
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
-        # Set by ``_maybe_resample`` each call to the group indices it resampled,
-        # read by the in-place burst resample handler.
+        # Group indices the last ``_maybe_resample`` resampled (read by the burst).
         self._last_resampled_groups = []
         self.record = SMCRecord(n_particles) if record else None
-        # Record cadence (lane-neutral): a resample sets these so the NEXT recorded
-        # step is tagged ``add_resample`` (the lazy tag-at-next-step). Set by
-        # ``_maybe_resample``, consumed by ``_record_step`` -- every lane uses it.
+        # Resample tag: ``_maybe_resample`` sets it so the next ``_record_step`` is
+        # tagged ``add_resample`` (lazy tag-at-next-step).
         self._pending_resample = False
         self._pending_ancestors = list(range(n_particles))
 
-        # ``log(ess_threshold)`` -- the per-group ESS RHS adds ``log(group_size)`` (so
-        # the test is ``log(ESS_g) < log(ess_threshold * N_g)``). For one group of
-        # ``n_particles`` this is exactly the old ``log(ess_threshold)+log(n)``.
+        # log(ess_threshold); the per-group ESS test adds log(group_size).
         with np.errstate(divide="ignore"):
             self._log_ess_threshold = np.log(ess_threshold)
 
-        # The :class:`~genlm.control.sampler.source.PushSource` set by the BurstLoop
-        # for the duration of a single engine burst; read by the ``draw`` callback
-        # the engine invokes row-wise. ``None`` outside a burst.
-        self._source = None
-
-    # -- the per-step transition for ONE particle ----------------------------
-    #
-    # In the slow path drawing is fused inside the sampler's ``transition``
-    # coroutine (which computes logw_next, draws, and returns the importance
-    # weight). The burst path instead calls ``draw`` row-wise; both paths apply
-    # the identical SMC weight/termination math via the ``_terminate_*`` helpers
-    # below.
+    # -- the per-step transition for ONE particle --
 
     async def _draw_and_score(self, p):
-        """The slow per-step transition for one particle.
-
-        Draws a token + weight increment from the sampler, then applies the
-        shared SMC scoring/twist/termination math (:meth:`_score_advance_terminate`).
-
-        ``unit_sampler.transition`` returns ``(to_append, logw, logp)`` where
-        ``to_append`` is the list of items to extend the particle context with
-        (a single token for token samplers; a unit -- possibly split around a
-        trailing EOS -- for the multi-token unit sampler).
-        """
+        """Slow per-step transition: draw from the sampler, then apply the shared
+        score/twist/terminate math."""
         to_append, logw, logp = await self._sampler_of(p).transition(p.context)
         await self._score_advance_terminate(p, to_append, logw, logp)
 
     def _sampler_of(self, p):
-        """The unit sampler for particle ``p``'s group (``samplers[0]`` when
-        unbatched). Per-group dispatch is the only group-awareness on the hot path."""
+        """The sampler for particle ``p``'s group."""
         return self.samplers[self.particles.group[p._i]]
 
     def _critic_of(self, p):
-        """The critic for particle ``p``'s group (``critics[0]`` when unbatched)."""
+        """The critic for particle ``p``'s group."""
         return self.critics[self.particles.group[p._i]]
 
     def _advance_no_critic(self, p, to_append, logw, logp):
-        """Sync score + advance + terminate for the NO-CRITIC path. Shared by the
-        slow :meth:`_score_advance_terminate` (its no-critic branch) and the burst
-        bookkeeping (:meth:`_bank_burst_steps`) -- the burst calls it directly so a
-        no-critic step needs NO event-loop hop, which would otherwise be the new
-        per-particle bottleneck once the LM draw is batched."""
+        """Sync score + advance + terminate for the no-critic path (shared by the slow
+        path and the burst; no event-loop hop)."""
         p.score(logw)
         p.logp += logp
         p.context.extend(to_append)
         if p.logw == float("-inf"):
             p.finish()
             return
-        # Post-draw termination (the no-critic tail): verbosity, budget decrement,
-        # and finish on budget exhaustion or a terminal EOS.
         if self.verbosity > 0:
             print(self._repr_particle(p))
         p.max_tokens_left -= 1
@@ -492,18 +475,9 @@ class Controller:
             p.finish()
 
     async def _score_advance_terminate(self, p, to_append, logw, logp):
-        """The post-draw SMC math: score, advance the context, apply the critic
-        twist (per-step when ``twist_with_critic``) and reweight at termination,
-        and terminate. This is the ONE implementation of the per-step math; both
-        the slow loop (:meth:`_draw_and_score`, ``await``) and the engine burst
-        (:meth:`draw`, via ``run_sync``) call it after obtaining their draw, so
-        the critic is handled identically regardless of where the logits came
-        from -- no per-driver critic logic, no critic-category dispatch.
-
-        The caller is responsible for untwisting ``p`` before the draw (the slow
-        ``run`` loop and the burst ``draw`` both untwist each live particle at the
-        start of the step, mirroring llamppl's ``smc_standard``).
-        """
+        """The post-draw SMC math (one implementation, shared by both lanes): score,
+        advance the context, critic-twist per step, reweight + terminate. The caller
+        untwists ``p`` before the draw."""
         if not self.critic:
             self._advance_no_critic(p, to_append, logw, logp)
             return
@@ -517,7 +491,6 @@ class Controller:
             p.finish()
             return
 
-        # From here on the critic is non-None (the no-critic case returned above).
         if self.twist_with_critic:
             twist_amt = await self._critic_of(p).score(p.context)
             if twist_amt != float("-inf"):
@@ -555,14 +528,7 @@ class Controller:
     # -- the controller-owned loop --------------------------------------------------
 
     async def start(self):
-        """Initialize particles from each group's start weight.
-
-        Mirrors ``SequenceModel.start``: scores every particle by the empty
-        sequence's prefix weight under ITS GROUP's target potential. For a single
-        group this is one weight applied to all (byte-identical to the unbatched
-        path); for a batch each group uses its own sampler's ``start_weight`` (the
-        empty-prefix weight can differ per example).
-        """
+        """Score every particle by its group's empty-sequence prefix weight."""
         start_ws = [await s.start_weight() for s in self.samplers]
         for g, start_w in enumerate(start_ws):
             if start_w == float("-inf"):
@@ -575,12 +541,7 @@ class Controller:
             p.score(start_ws[self.particles.group[p._i]])
 
     async def run(self):
-        """Run the slow (ground-truth) SMC loop to completion.
-
-        Exact per-token re-implementation of llamppl's ``smc_standard``: untwist
-        all particles, step the live ones (batched), record, then ESS-test and
-        resample. Returns the final particle population.
-        """
+        """Run the slow (ground-truth) SMC loop to completion."""
         while any(not p.done for p in self.particles):
             self.particles.untwist_all()
 
@@ -594,26 +555,13 @@ class Controller:
         return self.particles
 
     def _ess_below_threshold(self, normalized_weights, ng):
-        """The per-group ESS resample predicate, shared by the test-only
-        ``_ess_crosses`` and the mutating ``_maybe_resample`` so both decide
-        identically.
-
-        Given a group's (log) normalized weights and its size ``ng``, returns
-        whether its effective sample size has fallen below ``ess_threshold * ng``.
-        ``-logsumexp(2w)`` is ``log(ESS)``; the RHS ``log(ess_threshold)+log(ng)``.
-        For one group of ``n_particles`` this is the old whole-population test.
-        """
+        """Per-group ESS resample predicate (ESS_g < ess_threshold * ng); shared by
+        ``_ess_crosses`` and ``_maybe_resample``."""
         return -logsumexp(normalized_weights * 2) < self._log_ess_threshold + np.log(ng)
 
     def _ess_crosses(self):
-        """Whether the ESS test triggers a resample for ANY group on the current
-        population (the burst's pop-out trigger).
-
-        Test only -- does not mutate. Uses the identical per-group predicate as
-        ``_maybe_resample`` so the burst's pop-out decision matches the slow path's
-        resample decision exactly. A group whose weights are all ``-inf`` never
-        crosses (matching the slow path's ``continue``). One group -> the old test.
-        """
+        """Whether the ESS test triggers a resample for any group (test only, no
+        mutation) -- the burst's pop-out trigger."""
         W = self.particles.logw
         for rows in self._group_rows:
             Wg = W[rows]
@@ -625,23 +573,11 @@ class Controller:
         return False
 
     def _maybe_resample(self):
-        """Run the per-group ESS test and resample each group that crosses.
-
-        This is the *only* implementation of the ESS/resample math; both the slow
-        ``run`` loop and the ``BurstLoop`` call it so the two paths are bit-identical
-        here. Resampling is group-LOCAL: a group that crosses is reindexed within its
-        own rows (its ancestors are drawn only from itself), other groups are left
-        as-is. Builds ONE global ancestor vector (identity outside crossing groups)
-        and reindexes once. For a single group this reduces exactly to the old
-        whole-population resample. Mutates ``self.particles`` on a resample.
-
-        Returns ``(did_resample, ancestor_indices)`` where ``did_resample`` is True
-        iff ANY group resampled and ``ancestor_indices`` is the global vector.
-        """
+        """Per-group ESS test + resample (the only ESS/resample impl; both lanes call
+        it). Group-local: each crossing group reindexes within its own rows. Mutates
+        ``self.particles`` on a resample. Returns ``(did_resample, ancestor_indices)``."""
         n = self.n_particles
-        # ``sort_ancestors`` only matters for a reproducible record; derive it here so
-        # every caller (slow loop, burst, cadence) gets identical behavior.
-        sort_ancestors = self.record is not None
+        sort_ancestors = self.record is not None  # only matters for a reproducible record
         W = self.particles.logw
         global_ancestors = np.arange(n)
         resets = []  # (rows, target_logw) for the groups that resampled
@@ -676,7 +612,7 @@ class Controller:
         return bool(resampled_groups), global_ancestors.tolist()
 
     def save_record(self, json_path):
-        """Write the SMC record JSON, matching the old smc_standard json_file path."""
+        """Write the SMC record JSON."""
         if self.record is None:
             return
         with open(json_path, "w") as f:
@@ -684,11 +620,9 @@ class Controller:
         print(f"Saved record to {json_path}")
 
     def _record_step(self):
-        """Record one completed SMC step (lane-neutral): ``add_init`` for the first
-        entry, ``add_resample`` if a resample preceded it (the pending tag set by
-        ``_maybe_resample``), else ``add_smc_step``. No-op without a record. Called
-        wherever a step completes -- the slow ``run`` loop, the token-grain ``draw``,
-        the unit-grain round boundary, and the cadence ``_slow_step``."""
+        """Record one completed SMC step (lane-neutral): ``add_init`` first,
+        ``add_resample`` if a resample preceded it, else ``add_smc_step``. No-op
+        without a record."""
         if self.record is None:
             return
         if len(self.record.history) == 0:
@@ -699,173 +633,28 @@ class Controller:
             self.record.add_smc_step(self.particles)
         self._pending_resample = False
 
-    # -- the engine callback draw (used only by the BurstLoop) ---------------
+    # -- burst-lane math the engine seam (_Burst) calls into --
     #
-    # This reproduces, on raw engine logits, exactly what ``_draw_and_score``
-    # does for a burst-capable sampler over an engine LM (and, with an additive
-    # control-side factor, the constrained extension). The engine IS the language
-    # model; the draw works in the same control-side V+1 vocabulary as the slow
-    # path, turning the batched proposal into one :class:`BurstDraw` per live row
-    # via the sampler's ``burst_draw_batch`` (which adds any non-LM factor's
-    # per-token log-weights). Each sampler's draw picks its RNG stream -- the slow
-    # path's numpy ``select`` or a batched torch draw -- so parity
-    # stays the no-bias check the warm-KV residual already requires (see the
-    # per-sampler docstrings in ``token.py``).
-    #
-    # The live burst's engine state lives on ``self._source`` (a
-    # :class:`~genlm.control.sampler.source.PushSource`): the live row-map, the
-    # engine LM fold, the EOS placeholder id, the abort/re-add plumbing, and the
-    # sampler-facing factor surface. ``draw`` reads it; resample / ESS / log_ml stay
-    # Controller-owned. Pop-out is the explicit ``abort_request`` ``run_burst``
-    # issues from :meth:`drain_aborts` -- no forced-EOS, no discard forward.
-
-    def drain_adds(self):
-        """Backend hook (``run_burst`` calls it): rows the controller asks to (re-)add
-        this step as ``(ext_id, prompt_ids)`` (consumed). Delegates to the PushSource,
-        whose in-place resample queues a resampled group's survivors; empty otherwise."""
-        return self._source.drain_adds()
-
-    def drain_aborts(self):
-        """Backend hook (``run_burst`` calls it after each step): external row indices
-        ``draw`` flagged to abort since the last call (consumed) -- the out-of-band
-        pop-out that replaces the old forced-EOS. Delegates to the PushSource."""
-        return self._source.drain_aborts()
-
-    def draw(self, logits, request_ids):
-        """Draw one token per live row, reproducing the slow path's per-step draw.
-
-        The expensive 50k-vocab LM processing runs ONCE for the whole batch
-        on-device (``_process_logw_next_batch``); the sampler's
-        :meth:`~TokenSampler.burst_draw_batch` then turns that batched proposal
-        into one :class:`BurstDraw` per live row -- the burst analog of ``sample``
-        (see the per-sampler docstrings in ``token.py`` for how each reconstructs
-        ``Product(llm, factor).logw_next`` from the carried factor state and which
-        RNG stream it draws with). The Controller banks any completed SMC step,
-        advances, and terminates each particle (:meth:`_bank_burst_steps`). Pop-out
-        is out-of-band -- a row is added to ``abort_rows`` for ``run_burst`` to
-        ``abort_request`` (:meth:`drain_aborts`) when its particle terminates, when
-        it asks to wait at a unit boundary (``BurstDraw.pop``), when the ESS test
-        crosses (every live row, token grain), or just before a cadence step (every
-        live row) -- no forced EOS, no discard forward.
-
-        The engine's ``SamplingMetadata`` is intentionally not taken: this draw
-        works entirely in the control-side V+1 vocab (temperature via
-        ``_maybe_temper``, no top-k/p), so the engine's per-row sampling params
-        play no role.
-        """
-        source = self._source
-        sampler = self.unit_sampler
-        # Every row in request_ids is live: an aborted/terminated row was dropped
-        # from the engine, so it never reappears here.
-        parts = [source.particle_of(rid) for rid in request_ids]
-        externals = [source.external_of(rid) for rid in request_ids]
-
-        # Untwist last step's provisional critic twist before this step's score
-        # (mirrors the slow loop's per-step untwist; no-op without a critic).
-        self.particles.untwist_subset([p._i for p in parts])
-
-        # The expensive 50k-vocab LM processing happens ONCE for the whole batch,
-        # on-device -- never per row. The sampler then draws all rows from this
-        # batched proposal (Direct vectorizes; AWRS/Set loop their cheap
-        # per-particle control over the [V+1] rows), returning one BurstDraw per
-        # row. ``externals`` are the rows' stable particle indices, so a unit
-        # sampler can key its per-burst accumulator across the shrinking live set.
-        lm_batch = source.fold(logits)
-        records = sampler.burst_draw_batch(
-            lm_batch,
-            [p.context for p in parts],
-            externals,
-            source,
-        )
-        # Score every row's completed SMC step. With a critic, ALL rows are gathered
-        # into ONE event-loop hop so the critic LM autobatches across the population
-        # (mirrors the slow loop's per-step ``gather``) instead of a hop + serial
-        # critic forward per particle. Runs before the token map + abort checks
-        # because scoring sets ``p.done`` on termination.
-        self._bank_burst_steps(parts, records)
-        # Record this engine step as one SMC step (when any row banked one) -- the
-        # burst lane's equivalent of the slow loop's per-step record entry.
-        # Token grain completes one SMC step per decode step -> record here, every
-        # step. Unit grain completes a step only at the synced boundary, so it records
-        # once per round in ``BurstLoop.run`` (not per decode-step-with-a-completion).
-        if sampler.burst_free_running() and any(rec.step is not None for rec in records):
-            self._record_step()
-        out = [0] * len(parts)
-        for k, p in enumerate(parts):
-            out[k] = self._burst_token_id(p, records[k])
-            if p.done or records[k].pop:
-                # Staggered pop-out: drop the row when the particle terminated, or
-                # when the sampler asks it to wait at a step boundary (a completed
-                # unit, synchronized grain) -- both leave the engine the same way.
-                source.abort_rows.add(externals[k])
-                # The burst continues past this terminated row, so drop its ext<->row
-                # entries to keep the maps tight rather than leaning on run_burst's
-                # gone-filter to mask a stale lookup.
-                if p.done:
-                    source.ext_to_row.pop(externals[k], None)
-                    source.row_to_ext.pop(p._i, None)
-
-        # End-of-step ESS test (the predicate the slow path applies after every
-        # token) -- the TOKEN-grain (free-running) pop-out only. If it crosses,
-        # abort every live row so the burst ends and the driver resamples; tag the
-        # reason. ``draw`` uses the identical predicate (``_ess_crosses``) the
-        # driver's ``_maybe_resample`` re-tests on the unchanged population, so the
-        # tag is exact. A synchronized (unit-grain) sampler does NOT test ESS
-        # mid-unit -- it pops every row at its unit boundary and the driver runs
-        # ESS once per round (``_EXIT_UNIT_SYNC``, set in ``_run_burst``).
-        if sampler.burst_free_running() and self._ess_crosses():
-            # Resample the crossing groups IN PLACE and re-add their surviving rows
-            # mid-burst -- the burst keeps running (no engine drain), other groups
-            # never pause, and a single population is just one group (no special
-            # "drain + relaunch" case). No ``exit_reason``: the burst ends only when
-            # every particle is done.
-            source.resample_realize()
-        elif self._slow_cadence_due(parts):
-            # The next step is engine-inexpressible (a cadence) -- pop every live
-            # row BEFORE the burst draws it, so the driver runs it on the slow lane
-            # (ESS takes precedence above: if it crossed, resample first, then the
-            # driver's burst-entry check runs this same cadence step next).
-            source.abort_rows.update(externals)
-            source.exit_reason = _EXIT_SLOW_STEP
-
-        return torch.tensor(out, dtype=torch.int64, device=logits.device)
+    # The seam (draw / drain_* / token-id mapping) lives on _Burst; what stays here is
+    # the SMC math it banks into: per-step banking, the cadence test, ESS/resample.
 
     def _slow_cadence_due(self, parts):
-        """Whether the NEXT step is engine-inexpressible (a slow-lane cadence) for
-        ANY still-live row. ``parts`` are this step's rows just banked.
-
-        The cadence is a :class:`~genlm.control.sampler.unit.BoundaryPredicate`
-        evaluated per row on its run buffer (``run_prefix`` as ``unit_context``,
-        ``run_buffer`` as ``subunit_buffer``) -- the same boundary library the unit
-        sampler uses, reused as the cadence. So it covers a length cadence
-        (``FixedLengthBoundary(N)``, due for every lockstep-synced row at the same
-        step) and a CONTENT cadence (``TokenSetBoundary``/``CFGBoundary``, due for
-        different rows at different steps) uniformly. When it fires for any row, the
-        driver runs ONE slow-lane step for the WHOLE live population -- the rows that
-        did not hit the cadence simply run their (still expressible) transition on
-        the slow lane that step, which is the identical per-step math, so the
-        population stays synced and the result is unchanged."""
+        """Whether the next step is a slow-lane cadence for any still-live row
+        (mid-burst check). When it fires, the driver runs one slow-lane step for the
+        whole live population."""
         return self._cadence_due(p for p in parts if not p.done)
 
     def _cadence_due(self, live):
-        """Shared boundary-predicate cadence test over ``live`` particles (used by
-        both the mid-burst :meth:`_slow_cadence_due` and the driver's burst-entry
-        check). ``False`` without a cadence (the burst owns every step)."""
+        """Boundary-predicate cadence test over ``live`` (shared by the mid-burst and
+        burst-entry checks). ``False`` without a cadence."""
         if self.slow_cadence is None:
             return False
         return any(self.slow_cadence(p.run_prefix, p.run_buffer) for p in live)
 
-    def _bank_burst_steps(self, parts, records):
-        """Bank every row's completed SMC step this engine step, with the SAME math
-        the slow loop uses. A mid-step row (``rec.step is None``: a unit still
-        accumulating subunits) banks nothing; only its subunit extends the warm KV.
-
-        Without a critic the advance is sync (:meth:`_advance_no_critic`, no hop).
-        With a critic, ALL rows' :meth:`_score_advance_terminate` are gathered into
-        ONE ``run_sync`` hop, so the critic's per-particle ``score`` calls are
-        concurrent and the critic LM's autobatcher coalesces them into a single
-        forward -- the same per-step ``gather`` the slow ``run`` loop uses, instead
-        of a hop (and a serial critic forward) per particle."""
+    def _bank_burst_steps(self, parts, records, run_sync):
+        """Bank every row's completed SMC step (``rec.step``), same math as the slow
+        loop. No-critic: sync, no hop. With a critic: all rows gathered into ONE
+        ``run_sync`` hop (passed in by the seam) so the critic LM autobatches."""
         steps = [
             (p, rec.step) for p, rec in zip(parts, records) if rec.step is not None
         ]
@@ -884,20 +673,7 @@ class Controller:
                 )
             )
 
-        self._source.run_sync(_score_all())
-
-    def _burst_token_id(self, p, rec):
-        """Map a banked row's drawn token to the engine token id to emit. Must run
-        after :meth:`_bank_burst_steps` (which sets ``p.done`` on termination)."""
-        token = rec.token
-        if isinstance(token, EndOfSequence):
-            # A drawn EOS always completes the step and terminates the particle
-            # (token grain: the token IS the step; unit grain: EOS ends the unit).
-            # EOS has no token_id, so commit the engine eos id as the (unused)
-            # placeholder -- the assert keeps a slow/burst termination divergence loud.
-            assert p.done, "burst drew EOS for a particle that did not terminate"
-            return self._source.eos_id
-        return token.token_id
+        run_sync(_score_all())
 
 
 # ---------------------------------------------------------------------------
@@ -906,13 +682,8 @@ class Controller:
 
 
 class StepLoop:
-    """Per-token round-trip driver (the ground-truth path).
-
-    Each step batches ``unit_sampler.sample(context)`` over the live particles
-    via ``asyncio.gather`` -- the same batching shape as the old
-    ``smc_standard`` ``asyncio.gather(p.step())`` -- so the per-token logprobs
-    are recomputed from the full context every step.
-    """
+    """Per-token round-trip driver (the ground-truth path); recomputes logprobs from
+    the full context every step."""
 
     def __init__(self, controller):
         self.controller = controller
@@ -922,330 +693,105 @@ class StepLoop:
         return await self.controller.run()
 
 
-def _is_engine_llm(potential):
-    """Whether ``potential`` is a single LM backed by a vLLM engine."""
-    model = getattr(potential, "model", None)
-    return model is not None and hasattr(model, "llm_engine")
-
-
-def split_engine_target(potential):
-    """Split a sampler target into ``(llm, factor, target)`` for the burst.
-
-    Recognizes two shapes:
-
-    * a bare engine LM -> ``(llm, None, llm)`` (unconstrained);
-    * ``Product(llm, factor)`` / ``Product(factor, llm)`` where exactly one side
-      is an engine LM and the other is an additive control-side ``factor`` with
-      the same token type -> ``(llm, factor, product)``.
-
-    For the product case, ``draw`` reconstructs ``Product.logw_next`` over the
-    product's (possibly narrowed) vocabulary by gathering the engine-derived LM
-    weights and the factor's ``logw_next`` through ``Product``'s own
-    ``v1_idxs``/``v2_idxs`` -- i.e. the exact slow-path index maps -- so vocab
-    narrowing (a coerced ``BoolFSA`` prunes to its accepted bytes) is handled the
-    same way the slow path handles it. Returns ``None`` if not expressible.
-    """
-    if _is_engine_llm(potential):
-        return potential, None, potential
-
-    p1 = getattr(potential, "p1", None)
-    p2 = getattr(potential, "p2", None)
-    if p1 is None or p2 is None:
-        return None
-
-    if _is_engine_llm(p1) and not _is_engine_llm(p2):
-        llm, factor = p1, p2
-    elif _is_engine_llm(p2) and not _is_engine_llm(p1):
-        llm, factor = p2, p1
-    else:
-        return None
-
-    return llm, factor, potential
-
-
-@dataclass
-class BurstCapability:
-    """Whether a configuration can be engine-accelerated, and (if not) why.
-
-    Args:
-        ok (bool): True iff the :class:`BurstLoop` can drive this configuration.
-        reason (str | None): Human-readable blocker, naming the exact reason the
-            burst is unavailable. ``None`` when ``ok`` is True.
-
-    This single result backs both the runtime fallback/raise text and the
-    user-facing :meth:`SMC.acceleration_report`, so the message a user sees on
-    fallback is the same one introspection reports.
-    """
-
-    ok: bool
-    reason: str | None = None
-
-
-def burst_capability(controller):
-    """Whether the ``BurstLoop`` can drive this configuration, and why not.
-
-    The burst fast path requires:
-
-    * the unit sampler is **burst-capable** -- it implements ``burst_draw_batch``,
-      declared via ``supports_burst()`` (DirectTokenSampler with no separate
-      proposal, or AWRS with no separate proposal). The Controller asks the
-      sampler; it does not branch on the sampler's type.
-    * the sampler target decomposes (:func:`split_engine_target`) into a single
-      engine LM, optionally times one additive same-vocab factor (e.g. a coerced
-      ``BoolFSA``).
-
-    A critic does NOT disqualify the burst: it is scored/twisted/terminated by the
-    same :meth:`Controller._score_advance_terminate` the slow loop uses (driven
-    via ``run_sync`` from the engine-thread draw), so a per-step twist
-    (``ess_threshold > 0``) or a terminal reweight (``ess_threshold == 0``) is
-    handled identically to the slow path -- no critic-category gate.
-
-    Anything else (e.g. a two-LM proposal the engine can't express) falls back to
-    :class:`StepLoop`, with the ``reason`` naming the blocker.
-
-    Returns:
-        (BurstCapability): ``ok`` plus a human-readable ``reason`` on failure.
-    """
-    sampler = controller.unit_sampler
-
-    if not getattr(sampler, "supports_burst", lambda: False)():
-        return BurstCapability(False, _sampler_burst_blocker(sampler))
-
-    decomposed = split_engine_target(sampler.target)
-    if decomposed is None:
-        return BurstCapability(False, _target_burst_blocker(sampler.target))
-
-    # Batched (B>1): the burst draws the WHOLE population through the group-0
-    # representative -- one engine forward, ``unit_sampler.burst_draw_batch``, the
-    # group-0 factor fold (``draw`` / ``_run_burst``). That is correct only if every
-    # group shares the same engine model, temperature, sampler kind, and in-logit
-    # factor; groups may differ ONLY in prompt and critic (both handled per-group in
-    # scoring). Reject a heterogeneous batch so ``accelerate='require'`` fails loud
-    # and ``'auto'`` falls back to the exact per-token StepLoop instead of silently
-    # drawing later groups against group 0's configuration.
+def burst_blocker(controller):
+    """Why this config can't run the engine burst, or ``None`` if it can. The burst
+    needs a burst-capable sampler (``supports_burst()``) over a target with exactly
+    one engine-burst LM leaf (:func:`find_engine_lm`). A critic does not disqualify
+    it. ``auto`` falls back to ``StepLoop`` on a non-None reason; ``require`` raises it."""
+    s = controller.unit_sampler
+    if not s.supports_burst():
+        return f"{type(s).__name__} does not support the engine burst"
+    if find_engine_lm(s.target) is None:
+        return "sampler target has no single engine-burst LM leaf"
     if len(controller.samplers) > 1:
-        reason = _batch_homogeneity_blocker(controller.samplers, decomposed)
-        if reason is not None:
-            return BurstCapability(False, reason)
-
-    return BurstCapability(True)
-
-
-def _batch_homogeneity_blocker(samplers, ref_decomposed):
-    """Reason a batched burst can't use the group-0 representative for all groups,
-    or ``None`` if the batch is burst-homogeneous (see :func:`burst_capability`)."""
-    ref_llm, ref_factor, _ = ref_decomposed
-    ref_type = type(samplers[0])
-    for g, s in enumerate(samplers[1:], start=1):
-        if type(s) is not ref_type:
-            return (
-                f"group {g} sampler is {type(s).__name__} but group 0 is "
-                f"{ref_type.__name__}; batched burst needs one sampler kind"
-            )
-        dec = split_engine_target(s.target)
-        if dec is None:
-            return f"group {g} target is not burst-expressible"
-        llm, factor, _ = dec
-        if llm.model is not ref_llm.model:
-            return f"group {g} uses a different engine; batched burst needs one shared engine"
-        if getattr(llm, "temperature", None) != getattr(ref_llm, "temperature", None):
-            return f"group {g} temperature differs from group 0; batched burst uses one temperature"
-        if (factor is None) != (ref_factor is None) or (
-            factor is not None and factor is not ref_factor
-        ):
-            return f"group {g} has a different in-logit factor; batched burst folds one shared factor"
+        return "batched burst is not yet wired (use accelerate='off')"
     return None
 
 
-def _sampler_burst_blocker(sampler):
-    """Human-readable reason the unit sampler is not burst-capable.
-
-    Mirrors the per-sampler ``supports_burst()`` conditions (which the
-    Controller does not otherwise branch on) so the blocker text is precise."""
-    # Decision 2: the Set sampler's in-engine path is marginal/at-best and can
-    # regress, so it is reported as not accelerated until the trie is vectorized.
-    if type(sampler).__name__ == "SetTokenSampler":
-        return "SetTokenSampler is not engine-accelerated"
-    # A separate importance-sampling proposal makes the per-step weight
-    # non-engine-expressible (DirectTokenSampler / AWRS with `proposal=`).
-    if getattr(sampler, "proposal", None) is not None:
-        return (
-            "sampler uses a separate proposal; the importance weight isn't "
-            "engine-expressible"
-        )
-    # MultiToken rides the burst iff its subunit sampler does (the subunits ARE the
-    # burst draws); point at the subunit's blocker rather than the wrapper.
-    subunit = getattr(sampler, "subunit_sampler", None)
-    if subunit is not None and not subunit.supports_burst():
-        return f"multi-token subunit sampler is not burst-capable: {_sampler_burst_blocker(subunit)}"
-    return "this sampler is not engine-accelerated (no burst draw)"
-
-
-def _target_burst_blocker(target):
-    """Human-readable reason the sampler target does not decompose for the burst."""
-    p1 = getattr(target, "p1", None)
-    p2 = getattr(target, "p2", None)
-    if p1 is not None and p2 is not None:
-        if _is_engine_llm(p1) and _is_engine_llm(p2):
-            return "two-LM product can't be expressed in one decode stream"
-        if not _is_engine_llm(p1) and not _is_engine_llm(p2):
-            return (
-                "neither side of the product is a vLLM-engine LM — acceleration "
-                "is vLLM-only"
-            )
-    return (
-        f"target is not a single vLLM-engine LM (got {type(target).__name__}) — "
-        "acceleration is vLLM-only"
-    )
-
-
 class BurstLoop:
-    """The outer/inner SMC driver: the slow lane's burst-accelerated counterpart.
-
-    The driver runs SMC steps over the population, entering the **fast lane** -- an
-    engine *burst* = one ``AsyncVirtualLM.run_burst`` over the live particles' token
-    contexts -- whenever the next step is engine-expressible. For an inexpressible
-    step (a ``slow_cadence``, e.g. a periodic critic-LM forward) it drops to the
-    SLOW lane: one ``StepLoop`` transition with the engine free, re-entering the
-    burst after. The controller's :meth:`Controller.draw` runs per engine decode
-    step, advancing/banking each particle exactly as the slow path's transition
-    would.
-
-    A burst is a **stateless enter-run-exit** unit and NEVER resamples: it pops at a
-    tagged boundary -- the ESS crossing (token grain), the synced unit boundary
-    (unit grain), or just before a cadence step -- by aborting the relevant rows
-    (``abort_request``, not a forced EOS -- nothing extra is banked). ``run_burst``
-    returns and :meth:`run` dispatches the controller-owned resample over the full
-    population (and any slow-lane step), then relaunches the next burst from each
-    survivor's token prefix. ESS / resample / log_ml stay entirely controller-owned
-    -- the engine only produces logits.
-
-    :class:`StepLoop` is this driver's all-slow degenerate case (the byte-exact
-    parity ground truth, ``accelerate="off"``).
-
-    Only valid when :func:`burst_capability` is ``ok`` (checked by the caller).
-    """
+    """The engine-accelerated SMC driver. Runs the next step on the fast lane (an
+    engine burst over the live contexts) when it's expressible, dropping to the slow
+    lane for a ``slow_cadence`` step. The burst never resamples -- it pops at a tagged
+    boundary and :meth:`run` dispatches the controller-owned resample. :class:`StepLoop`
+    is the all-slow degenerate case. Only valid when :func:`burst_blocker` is ``None``."""
 
     def __init__(self, controller):
         self.controller = controller
-        # Number of engine bursts opened (>1 iff a resample / unit-sync / cadence
-        # popped a burst out mid-generation) and number of slow-lane steps run (the
-        # cadence handoffs). Useful for verifying the pop-out / slow-lane paths ran.
+        # Counts (bursts opened, slow-lane steps) -- for verifying which paths ran.
         self.n_bursts = 0
         self.n_slow_steps = 0
         self.sampler = controller.unit_sampler
-        # `target` decomposes uniformly: DirectTokenSampler.target == its
-        # potential; AWRS.target == potential * condition (so factor == the
-        # condition). split_engine_target peels the engine LM off either.
-        decomposed = split_engine_target(self.sampler.target)
-        if decomposed is None:  # pragma: no cover - guarded by burst_capability
-            raise ValueError("target is not burst-expressible")
-        self.llm, factor, target = decomposed
+        # The single engine LM the burst drives (run_burst + warm-logits injection).
+        self.llm = find_engine_lm(self.sampler.target)
+        if self.llm is None:  # pragma: no cover - guarded by burst_blocker
+            raise ValueError("sampler target has no single engine-burst LM leaf")
 
-        # Per-group engine LMs share ONE engine (same model / vocab / eos / factor
-        # structure -- so ``self.llm`` is a fine representative); they differ ONLY in
-        # ``prompt_ids``. Snapshot each group's prefix HERE (main thread):
-        # ``prompt_ids`` is a thread-local ``ContextVar``, and the mid-burst in-place
-        # re-add runs on the ``run_burst`` worker thread, where the override is
-        # invisible. The prefix is fixed for the run, so one snapshot serves both.
-        llms = [split_engine_target(s.target)[0] for s in controller.samplers]
-        group_prefixes = [list(lm.prompt_ids) for lm in llms]
+        # Groups share one engine, differing only in ``prompt_ids``. Snapshot each
+        # prefix on the main thread: ``prompt_ids`` is a ContextVar, invisible on the
+        # ``run_burst`` worker thread where the mid-burst re-add runs.
+        llms = [find_engine_lm(s.target) for s in controller.samplers]
+        self.group_prefixes = [list(lm.prompt_ids) for lm in llms]
 
-        # The engine logit source owns ALL engine-coupled state -- the row<->req-id
-        # maps, the LM fold, abort/re-add, the sampler-facing factor surface, the eos
-        # placeholder, and the gather maps onto the product vocab. Built once per run;
-        # its per-burst state resets via ``begin_burst``.
-        self.source = PushSource(controller, self.llm, factor, target, group_prefixes)
+        # Engine token id committed as the placeholder for an aborted/EOS row.
+        eos_idxs = list(self.llm.token_maps.eos_idxs)
+        if not eos_idxs:
+            raise ValueError(
+                'Engine LM has no EOS token id; the burst needs one. Use accelerate="off".'
+            )
+        self.eos_id = eos_idxs[0]
+        self.run_async = None  # the worker-thread -> loop hop, bound in run()
 
     async def _run_burst(self, live, loop):
-        """Enter one stateless engine burst over the ``live`` particles, run it to
-        a pop-out, and return WHY it exited (an ``_EXIT_*`` reason) so the driver
-        can dispatch.
-
-        Resets the :class:`~genlm.control.sampler.source.PushSource`'s per-burst
-        state, runs the engine decode loop in a worker thread (so this event loop
-        stays free to service the ``draw``'s ``run_coroutine_threadsafe`` hops), and
-        reads the exit reason ``draw`` set before clearing ``controller._source``.
-        """
-        controller = self.controller
+        """Run one stateless burst over ``live`` to a pop-out; return its ``_EXIT_*``
+        reason. Runs the engine decode loop in a worker thread so this loop stays free
+        for the ``draw`` hops."""
         self.n_bursts += 1
-        source = self.source
-        source.begin_burst(live)
-        prompts = [source.context_ids(p) for p in live]
-        # The engine decode budget for ONE burst, asked of the sampler: a token
-        # sampler bursts until the longest particle's token budget (free-running,
-        # pops at the ESS crossing); a unit sampler bursts one unit round (capped
-        # at the subunit budget, pops each row at its boundary).
-        max_steps = self.sampler.burst_max_steps(live)
-        # A synchronized (unit-grain) burst always runs exactly one SMC step (one
-        # unit) per row and hands back at the synced boundary for the controller-
-        # owned ESS test -- so its exit reason is fixed up front. A free-running
-        # (token-grain) burst stays ``_EXIT_TERMINATED``: it resamples in place at
-        # ESS crossings without exiting, ending only when every row terminates (or a
-        # cadence pops it via ``_EXIT_SLOW_STEP``).
-        source.exit_reason = (
+        b = _Burst(self, live)
+        # Unit grain hands back at the synced boundary (fixed reason); token grain
+        # stays terminated, resampling in place at ESS crossings.
+        b.exit_reason = (
             _EXIT_TERMINATED if self.sampler.burst_free_running() else _EXIT_UNIT_SYNC
         )
-        controller._source = source
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: self.llm.model.run_burst(
-                    prompts=prompts,
-                    control=controller,
-                    max_steps=max_steps,
-                ),
-            )
-            return controller._source.exit_reason
-        finally:
-            controller._source = None
+        prompts = [b.context_ids(p) for p in live]
+        # Decode budget for one burst (token grain: longest token budget; unit grain:
+        # one unit's subunits).
+        max_steps = self.sampler.burst_max_steps(live)
+        # The _Burst IS the engine seam (draw / drain_* the engine calls back into);
+        # the Controller stays pure SMC math that the seam banks into.
+        await loop.run_in_executor(
+            None,
+            lambda: self.llm.model.run_burst(
+                prompts=prompts,
+                control=b,
+                max_steps=max_steps,
+            ),
+        )
+        return b.exit_reason
 
     async def run(self):
-        """The outer driver: per iteration, run the next step on the fast lane (an
-        engine burst) or the slow lane (one per-token transition), then dispatch the
-        controller-owned ESS/resample. Repeat until every particle is done.
-
-        Each iteration picks the lane for the live rows' NEXT step:
-
-        * **inexpressible** (the ``slow_cadence`` is due -- e.g. a periodic
-          critic-LM forward): run ONE slow-lane transition for the live rows
-          (:meth:`_slow_step`), engine free, then the controller-owned ESS test.
-        * **expressible** (the common case): enter a stateless burst that runs a
-          run of expressible steps and pops at a tagged boundary -- the ESS
-          crossing (token grain), the synced unit boundary (unit grain), or just
-          before the next cadence step (``_EXIT_SLOW_STEP``, handled by the next
-          iteration's burst-entry check). Then the controller-owned ESS test.
-
-        A burst that ends because all its rows terminated needs no dispatch
-        (``_maybe_resample`` would be a no-op). ESS / resample / log_ml stay
-        entirely controller-owned -- the burst and the slow-lane transition are the
-        two step-runners, nothing more.
-        """
+        """The outer driver: each iteration run the live rows' next step on the slow
+        lane (a ``slow_cadence`` step) or the fast lane (a burst), then dispatch the
+        controller-owned ESS/resample. Repeat until every particle is done."""
         controller = self.controller
         await controller.start()
 
         loop = asyncio.get_running_loop()
-        self.source.bind_loop(loop)
+        self.run_async = lambda coro: asyncio.run_coroutine_threadsafe(coro, loop).result()
 
         while any(not p.done for p in controller.particles):
             live = [p for p in controller.particles if not p.done]
             if self._next_step_is_slow(live):
-                # The next step is engine-inexpressible for the (lockstep) live
-                # rows -- run it on the slow lane, then the controller-owned ESS.
+                # Next step is inexpressible -- run it slow, then ESS.
                 await self._slow_step(live)
                 controller._maybe_resample()
                 continue
 
             reason = await self._run_burst(live, loop)
-            # Resample triggers at a burst exit: the synced boundary of a unit-grain
-            # round, or just before a cadence step (the next iteration runs that step
-            # on the slow lane). (A token-grain ESS crossing does NOT exit -- it
-            # resamples in place mid-burst.) A terminated exit needs no dispatch.
+            # Resample at a burst exit (unit-grain boundary, or before a cadence step).
+            # A token-grain ESS crossing resamples in place, no exit.
             if reason == _EXIT_UNIT_SYNC:
-                # One record entry for the completed unit round (the grain's single
-                # SMC step), before its resample -- keeps the lazy resample tag order.
-                # Not on _EXIT_SLOW_STEP: that step is recorded by the next
-                # iteration's _slow_step.
+                # One record entry for the completed unit round, before its resample.
+                # Not on _EXIT_SLOW_STEP (recorded by the next _slow_step).
                 controller._record_step()
             if reason in (_EXIT_UNIT_SYNC, _EXIT_SLOW_STEP):
                 controller._maybe_resample()
@@ -1253,25 +799,14 @@ class BurstLoop:
         return controller.particles
 
     def _next_step_is_slow(self, live):
-        """Whether ANY live row's next step is engine-inexpressible (a slow-lane
-        cadence) -- the burst-entry check. Delegates to the same
-        :meth:`Controller._cadence_due` boundary-predicate test ``draw`` applies
-        mid-burst, so entry and pop-out fire on the identical condition. ``False``
-        without a cadence (the burst owns every step)."""
+        """Whether any live row's next step is a slow-lane cadence (the burst-entry
+        check; same test as mid-burst)."""
         return self.controller._cadence_due(live)
 
     async def _slow_step(self, live):
-        """Run ONE per-token slow-lane transition for the live rows -- the
-        inexpressible step (a critic-LM forward + reweight, a second LM, ...) with
-        the engine free. Mirrors one iteration of the slow ``StepLoop``: untwist the
-        live rows, then their shared per-step transition (which scores / advances /
-        twists / terminates identically); the driver runs ESS after, so the cadence
-        step has the exact per-step timing of the all-slow loop.
-
-        Closing each row's cadence run (``reset_run``) after the draw is what lets a
-        :class:`~genlm.control.sampler.unit.BoundaryPredicate` like
-        ``FixedLengthBoundary`` re-arm: the next run starts empty, so the predicate
-        does not immediately re-fire on the same buffer."""
+        """Run one slow-lane transition for the live rows (the inexpressible step,
+        engine free): untwist, the shared per-step transition, then ``reset_run`` so
+        the cadence predicate re-arms (next run starts empty)."""
         controller = self.controller
         self.n_slow_steps += 1
         controller.particles.untwist_subset([p._i for p in live])

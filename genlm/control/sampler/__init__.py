@@ -2,8 +2,6 @@ from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
 from .sequence import SMC
 from .controller import (
-    BurstCapability,
-    burst_capability,
     NotAcceleratable,
 )
 from .unit import (
@@ -80,7 +78,6 @@ __all__ = [
     "TopKSetSampler",
     "SetTokenSampler",
     "TokenSampler",
-    "Importance",
     "SMC",
     "MultiTokenUnitSampler",
     "BoundaryPredicate",
@@ -88,7 +85,5 @@ __all__ = [
     "FixedLengthBoundary",
     "CFGBoundary",
     "flatten_units",
-    "BurstCapability",
-    "burst_capability",
     "NotAcceleratable",
 ]

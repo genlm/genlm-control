@@ -1,3 +1,4 @@
+import contextlib
 import contextvars
 import weakref
 import torch
@@ -10,6 +11,43 @@ from genlm.backend.tokenization import Token
 _prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_prompt_ids_overrides", default=None
 )
+
+# Per-task override: within ``burst_logw_next``, a PromptedLLM's ``logw_next``
+# returns the injected warm logits (the engine's forward for this decode step)
+# instead of forwarding -- the one seam between the slow and burst lanes.
+_burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_logw_next", default=None
+)
+
+
+@contextlib.contextmanager
+def burst_logw_next(llm, logws):
+    """Make ``llm.logw_next`` return ``logws`` (the engine's warm logits for this
+    step) instead of forwarding, for the duration of the context. Set inside each
+    per-row burst task, so concurrent rows each inject their own warm logits."""
+    token = _burst_logw_next_overrides.set({llm: logws})
+    try:
+        yield
+    finally:
+        _burst_logw_next_overrides.reset(token)
+
+
+def find_engine_lm(potential):
+    """The single burst-capable engine LM leaf in ``potential`` (recursing into
+    ``Product``), or ``None`` if there isn't exactly one. No structural assumption
+    beyond "one engine LM somewhere in the product"."""
+    found = []
+
+    def walk(p):
+        if isinstance(p, PromptedLLM) and p.model.supports_burst:
+            found.append(p)
+            return
+        for child in (getattr(p, "p1", None), getattr(p, "p2", None)):
+            if child is not None:
+                walk(child)
+
+    walk(potential)
+    return found[0] if len(found) == 1 else None
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):
@@ -627,6 +665,9 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
+        override = _burst_logw_next_overrides.get()
+        if override is not None and self in override:
+            return override[self]  # burst: serve the engine's warm logits, no forward
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
             await self.model.next_token_logprobs(self.prompt_ids + context_ids)
