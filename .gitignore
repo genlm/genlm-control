@@ -169,3 +169,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Generated gate references (regenerated per-environment via gen scripts; never commit)
+tests/sampler/*_snapshot.json
