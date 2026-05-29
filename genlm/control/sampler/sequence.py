@@ -1,7 +1,7 @@
 import logging
 import numpy as np
 from genlm.grammar import Float
-from arsenal.maths import logsumexp
+from genlm.control.util import logsumexp
 from functools import cached_property
 from dataclasses import dataclass
 

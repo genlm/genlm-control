@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from genlm.control.constant import EOS, EndOfSequence
+from genlm.control.util import logsumexp
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
 from genlm.control.sampler.util import _drive_or_hop
@@ -40,15 +41,6 @@ class NotAcceleratable(Exception):
     logs, so the explanation a user sees on an explicit failure matches the one
     they get from introspection (:meth:`SMC.acceleration_report`).
     """
-
-
-def logsumexp(nums):
-    """logsumexp matching llamppl.util.logsumexp exactly (for parity)."""
-    nums = np.asarray(nums)
-    if np.all(nums == -np.inf):
-        return -np.inf
-    m = np.max(nums)
-    return np.log(np.sum(np.exp(nums - m))) + m
 
 
 # ---------------------------------------------------------------------------
@@ -433,10 +425,9 @@ class _Burst:
         "context_ids",
         "ctx",
         "exit_reason",
-        "_run_async",
     )
 
-    def __init__(self, particles, llm, eos_id, ctx, run_async, context_ids):
+    def __init__(self, particles, llm, eos_id, ctx, context_ids):
         self.particles = particles
         self.llm = llm
         self.eos_id = eos_id
@@ -445,7 +436,7 @@ class _Burst:
         # re-prefill re-added rows, but it lives on BurstLoop -> passed in here.
         self.context_ids = context_ids
         self.abort_rows = set()
-        # In-place per-group resample (Plan B): rows the controller asks the engine to
+        # In-place per-group resample: rows the controller asks the engine to
         # (re-)add mid-burst, as ``(ext_id, prompt_ids)``. ``ext_to_row`` /
         # ``row_to_ext`` map an engine request's external id <-> its POPULATION row
         # (``p._i``); ``next_ext`` hands out a FRESH id per re-add (so an abort and a
@@ -457,14 +448,6 @@ class _Burst:
         self.next_ext = len(particles)
         self.ctx = ctx
         self.exit_reason = _EXIT_TERMINATED
-        self._run_async = run_async
-
-    def run_sync(self, coro):
-        """Drive a coroutine to completion on the driver's event loop and block
-        for the result (one event-loop hop). The Controller uses this to evaluate
-        the async critic from the synchronous engine-thread ``draw``, the same hop
-        ``BurstContext.run_sync`` gives samplers."""
-        return self._run_async(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -577,10 +560,11 @@ class Controller:
         # read by the in-place burst resample handler.
         self._last_resampled_groups = []
         self.record = SMCRecord(n_particles) if record else None
-        # Burst-lane record cadence: a resample sets these so the NEXT recorded step
-        # is tagged ``add_resample`` (mirrors the slow loop's lazy tag-at-next-step).
-        self._burst_resampled = False
-        self._burst_ancestors = list(range(n_particles))
+        # Record cadence (lane-neutral): a resample sets these so the NEXT recorded
+        # step is tagged ``add_resample`` (the lazy tag-at-next-step). Set by
+        # ``_maybe_resample``, consumed by ``_record_step`` -- every lane uses it.
+        self._pending_resample = False
+        self._pending_ancestors = list(range(n_particles))
 
         # ``log(ess_threshold)`` -- the per-group ESS RHS adds ``log(group_size)`` (so
         # the test is ``log(ESS_g) < log(ess_threshold * N_g)``). For one group of
@@ -635,8 +619,14 @@ class Controller:
         p.context.extend(to_append)
         if p.logw == float("-inf"):
             p.finish()
-        else:
-            self._terminate_if_done(p)
+            return
+        # Post-draw termination (the no-critic tail): verbosity, budget decrement,
+        # and finish on budget exhaustion or a terminal EOS.
+        if self.verbosity > 0:
+            print(self._repr_particle(p))
+        p.max_tokens_left -= 1
+        if p.max_tokens_left == 0 or self._is_terminal(p):
+            p.finish()
 
     async def _score_advance_terminate(self, p, to_append, logw, logp):
         """The post-draw SMC math: score, advance the context, apply the critic
@@ -685,21 +675,6 @@ class Controller:
             p.score(twist_amt)
             return
 
-    def _terminate_if_done(self, p):
-        """Synchronous post-draw termination for the NO-CRITIC path.
-
-        Exactly the tail of ``_draw_and_score`` when ``self.critic`` is None:
-        verbosity print, budget decrement, and finish on budget exhaustion or a
-        terminal EOS. Shared with the burst driver's synchronous ``draw`` so the
-        two paths terminate particles identically.
-        """
-        assert not self.critic
-        if self.verbosity > 0:
-            print(self._repr_particle(p))
-        p.max_tokens_left -= 1
-        if p.max_tokens_left == 0 or self._is_terminal(p):
-            p.finish()
-
     def _is_terminal(self, p):
         return bool(p.context) and p.context[-1] is EOS
 
@@ -743,10 +718,6 @@ class Controller:
         all particles, step the live ones (batched), record, then ESS-test and
         resample. Returns the final particle population.
         """
-        n = self.n_particles
-        ancestor_indices = list(range(n))
-        did_resample = False
-
         while any(not p.done for p in self.particles):
             self.particles.untwist_all()
 
@@ -754,17 +725,8 @@ class Controller:
                 *[self._draw_and_score(p) for p in self.particles if not p.done]
             )
 
-            if self.record is not None:
-                if len(self.record.history) == 0:
-                    self.record.add_init(self.particles)
-                elif did_resample:
-                    self.record.add_resample(ancestor_indices, self.particles)
-                else:
-                    self.record.add_smc_step(self.particles)
-
-            did_resample, ancestor_indices = self._maybe_resample(
-                sort_ancestors=self.record is not None
-            )
+            self._record_step()
+            self._maybe_resample()
 
         return self.particles
 
@@ -799,7 +761,7 @@ class Controller:
                 return True
         return False
 
-    def _maybe_resample(self, sort_ancestors=False):
+    def _maybe_resample(self):
         """Run the per-group ESS test and resample each group that crosses.
 
         This is the *only* implementation of the ESS/resample math; both the slow
@@ -814,6 +776,9 @@ class Controller:
         iff ANY group resampled and ``ancestor_indices`` is the global vector.
         """
         n = self.n_particles
+        # ``sort_ancestors`` only matters for a reproducible record; derive it here so
+        # every caller (slow loop, burst, cadence) gets identical behavior.
+        sort_ancestors = self.record is not None
         W = self.particles.logw
         global_ancestors = np.arange(n)
         resets = []  # (rows, target_logw) for the groups that resampled
@@ -839,6 +804,11 @@ class Controller:
             self.particles.reindex(global_ancestors)
             for rows, target in resets:
                 self.particles.logw[rows] = target
+            if self.record is not None:
+                # Tag the NEXT recorded step as a resample (the lazy tag-at-next-step
+                # the record cadence relies on); consumed by ``_record_step``.
+                self._pending_resample = True
+                self._pending_ancestors = global_ancestors.tolist()
 
         return bool(resampled_groups), global_ancestors.tolist()
 
@@ -851,31 +821,20 @@ class Controller:
         print(f"Saved record to {json_path}")
 
     def _record_step(self):
-        """Append one banked SMC step to the record from the burst lane, mirroring
-        the slow ``run`` loop's cadence: ``add_init`` for the first entry,
-        ``add_resample`` if a resample preceded this step, else ``add_smc_step``.
-        No-op without a record. (The slow ``run`` loop records inline and is left
-        untouched; this is the burst/cadence lane's equivalent, which previously
-        recorded nothing.)"""
+        """Record one completed SMC step (lane-neutral): ``add_init`` for the first
+        entry, ``add_resample`` if a resample preceded it (the pending tag set by
+        ``_maybe_resample``), else ``add_smc_step``. No-op without a record. Called
+        wherever a step completes -- the slow ``run`` loop, the token-grain ``draw``,
+        the unit-grain round boundary, and the cadence ``_slow_step``."""
         if self.record is None:
             return
         if len(self.record.history) == 0:
             self.record.add_init(self.particles)
-        elif self._burst_resampled:
-            self.record.add_resample(self._burst_ancestors, self.particles)
+        elif self._pending_resample:
+            self.record.add_resample(self._pending_ancestors, self.particles)
         else:
             self.record.add_smc_step(self.particles)
-        self._burst_resampled = False
-
-    def _resample_record(self):
-        """``_maybe_resample`` for the burst lane, remembering ``(did, ancestors)``
-        so the NEXT :meth:`_record_step` tags it ``add_resample`` (the slow loop's
-        lazy tag-at-next-step). Returns ``(did_resample, ancestor_indices)``."""
-        did, ancestors = self._maybe_resample(sort_ancestors=self.record is not None)
-        if did and self.record is not None:
-            self._burst_resampled = True
-            self._burst_ancestors = ancestors
-        return did, ancestors
+        self._pending_resample = False
 
     # -- the engine callback draw (used only by the BurstLoop) ---------------
     #
@@ -932,7 +891,7 @@ class Controller:
         unfinished ancestor), so re-adds are decided over each group's FULL post-
         reindex state: every still-live row is re-added, finished rows are not.
         """
-        self._resample_record()  # reindexes crossing groups; sets _last_resampled_groups + record tag
+        self._maybe_resample()  # reindexes crossing groups; sets _last_resampled_groups + record tag
         for g in self._last_resampled_groups:
             rows = self._group_rows[g]
             # Drop the group's current engine rows -- their KV holds pre-resample
@@ -1020,7 +979,10 @@ class Controller:
         self._bank_burst_steps(parts, records)
         # Record this engine step as one SMC step (when any row banked one) -- the
         # burst lane's equivalent of the slow loop's per-step record entry.
-        if any(rec.step is not None for rec in records):
+        # Token grain completes one SMC step per decode step -> record here, every
+        # step. Unit grain completes a step only at the synced boundary, so it records
+        # once per round in ``BurstLoop.run`` (not per decode-step-with-a-completion).
+        if sampler.burst_free_running() and any(rec.step is not None for rec in records):
             self._record_step()
         out = [0] * len(parts)
         for k, p in enumerate(parts):
@@ -1116,7 +1078,7 @@ class Controller:
                 )
             )
 
-        self._burst.run_sync(_score_all())
+        self._burst.ctx.run_sync(_score_all())
 
     def _burst_token_id(self, p, rec):
         """Map a banked row's drawn token to the engine token id to emit. Must run
@@ -1331,15 +1293,6 @@ def _target_burst_blocker(target):
     )
 
 
-def can_burst(controller):
-    """Whether the ``BurstLoop`` can drive this configuration.
-
-    Thin boolean convenience wrapper over :func:`burst_capability`; see there for
-    the gate and the failure reasons.
-    """
-    return burst_capability(controller).ok
-
-
 class BurstLoop:
     """The outer/inner SMC driver: the slow lane's burst-accelerated counterpart.
 
@@ -1364,7 +1317,7 @@ class BurstLoop:
     :class:`StepLoop` is this driver's all-slow degenerate case (the byte-exact
     parity ground truth, ``accelerate="off"``).
 
-    Only valid when :func:`can_burst` is True (checked by the caller).
+    Only valid when :func:`burst_capability` is ``ok`` (checked by the caller).
     """
 
     def __init__(self, controller):
@@ -1379,7 +1332,7 @@ class BurstLoop:
         # potential; AWRS.target == potential * condition (so factor == the
         # condition). split_engine_target peels the engine LM off either.
         decomposed = split_engine_target(self.sampler.target)
-        if decomposed is None:  # pragma: no cover - guarded by can_burst
+        if decomposed is None:  # pragma: no cover - guarded by burst_capability
             raise ValueError("target is not burst-expressible")
         self.llm, self.factor, self.target = decomposed
 
@@ -1508,7 +1461,6 @@ class BurstLoop:
             llm=self.llm,
             eos_id=self.eos_id,
             ctx=ctx,
-            run_async=run_async,
             context_ids=self._context_ids,
         )
         # A synchronized (unit-grain) burst always runs exactly one SMC step (one
@@ -1566,7 +1518,7 @@ class BurstLoop:
                 # The next step is engine-inexpressible for the (lockstep) live
                 # rows -- run it on the slow lane, then the controller-owned ESS.
                 await self._slow_step(live)
-                controller._resample_record()
+                controller._maybe_resample()
                 continue
 
             reason = await self._run_burst(live, eval_factor, run_async, loop)
@@ -1574,8 +1526,14 @@ class BurstLoop:
             # round, or just before a cadence step (the next iteration runs that step
             # on the slow lane). (A token-grain ESS crossing does NOT exit -- it
             # resamples in place mid-burst.) A terminated exit needs no dispatch.
+            if reason == _EXIT_UNIT_SYNC:
+                # One record entry for the completed unit round (the grain's single
+                # SMC step), before its resample -- keeps the lazy resample tag order.
+                # Not on _EXIT_SLOW_STEP: that step is recorded by the next
+                # iteration's _slow_step.
+                controller._record_step()
             if reason in (_EXIT_UNIT_SYNC, _EXIT_SLOW_STEP):
-                controller._resample_record()
+                controller._maybe_resample()
 
         return controller.particles
 

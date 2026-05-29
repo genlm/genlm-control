@@ -4,7 +4,6 @@ from .sequence import SMC
 from .controller import (
     BurstCapability,
     burst_capability,
-    can_burst,
     NotAcceleratable,
 )
 from .unit import (
@@ -91,6 +90,5 @@ __all__ = [
     "flatten_units",
     "BurstCapability",
     "burst_capability",
-    "can_burst",
     "NotAcceleratable",
 ]

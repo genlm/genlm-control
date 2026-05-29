@@ -1,9 +1,9 @@
 import string
 import numpy as np
 from collections import OrderedDict
-from arsenal.maths import logsumexp
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
+from genlm.control.util import logsumexp
 from genlm.grammar.lark_interface import interegular_to_wfsa
 
 from genlm.control.potential.base import Potential

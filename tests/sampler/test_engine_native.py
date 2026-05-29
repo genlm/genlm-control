@@ -53,9 +53,15 @@ from genlm.control.sampler.unit import (  # noqa: E402
 from genlm.control.sampler.controller import (  # noqa: E402
     Controller,
     BurstLoop,
-    can_burst,
     burst_capability,
 )
+
+
+def can_burst(controller):
+    """Test-local ergonomics: the library exposes only ``burst_capability(...)``;
+    this was a public wrapper, now lives here since only the tests want it."""
+    return burst_capability(controller).ok
+
 
 MODEL = "gpt2"
 SEED = 1234

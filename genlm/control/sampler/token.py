@@ -2,7 +2,8 @@ import asyncio
 import numpy as np
 import torch
 from arsenal import colors
-from arsenal.maths import log1mexp, logsumexp
+from arsenal.maths import log1mexp
+from genlm.control.util import logsumexp
 import warnings
 
 from genlm.control.util import fast_sample_lazyweights

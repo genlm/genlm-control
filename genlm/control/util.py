@@ -2,10 +2,23 @@ import warnings
 
 import numpy as np
 from genlm.grammar import Float, Log
-from arsenal.maths import logsumexp
 
 from genlm.control.constant import EndOfSequence
 from genlm.backend.tokenization import Token
+
+
+def logsumexp(x):
+    """Numerically-stable log-sum-exp over a 1-D array, correct on the zero-mass
+    edge: returns ``-inf`` for an all-(-inf) input (log of zero total mass), where
+    the bare max-subtraction (and arsenal's ``logsumexp``) yields ``nan`` from
+    ``-inf - (-inf)``. This is THE CPU/numpy log-sum-exp for the SMC paths; for
+    weights already on the GPU as a torch tensor, use ``torch.logsumexp`` (the
+    on-device burst ops do). Bit-identical to the max-trick on finite inputs."""
+    x = np.asarray(x)
+    if np.all(x == -np.inf):
+        return -np.inf
+    m = np.max(x)
+    return np.log(np.sum(np.exp(x - m))) + m
 
 
 class LazyWeights:
