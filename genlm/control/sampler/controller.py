@@ -352,7 +352,7 @@ class _Burst:
                 self.next_handle += 1
                 self.handle_to_row[h] = row
                 self.row_to_handle[row] = h
-                self.add_rows.append((h, self.context_ids(p)))
+                self.add_rows.append((h, self.context_ids(p), None))
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +747,10 @@ class BurstLoop:
         b.exit_reason = (
             _EXIT_TERMINATED if self.sampler.burst_free_running() else _EXIT_UNIT_SYNC
         )
-        prompts = [b.context_ids(p) for p in live]
+        # One substream per live particle (K=1): (handle, prompt_ids, lora_name=None).
+        # Handle ``i`` matches ``_Burst``'s handle_to_row for live[i]. Multi-view (K>1)
+        # extends this to K substreams per particle.
+        requests = [(i, b.context_ids(p), None) for i, p in enumerate(live)]
         # Decode budget for one burst (token grain: longest token budget; unit grain:
         # one unit's subunits).
         max_steps = self.sampler.burst_max_steps(live)
@@ -756,7 +759,7 @@ class BurstLoop:
         await loop.run_in_executor(
             None,
             lambda: self.llm.model.run_burst(
-                prompts=prompts,
+                requests=requests,
                 control=b,
                 max_steps=max_steps,
             ),
