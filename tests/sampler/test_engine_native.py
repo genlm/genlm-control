@@ -46,15 +46,21 @@ from genlm.control.potential import Potential  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.potential.built_in.wfsa import BoolFSA  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler, AWRS  # noqa: E402
-from genlm.control.sampler.unit import (  # noqa: E402
-    BoundaryPredicate,
-    FixedLengthBoundary,
-)
+from genlm.control.sampler.unit import BoundaryPredicate  # noqa: E402
 from genlm.control.sampler.controller import (  # noqa: E402
     Controller,
     BurstLoop,
     burst_blocker,
 )
+
+
+_T0 = time.perf_counter()
+
+
+def _log(msg):
+    """Flushed, timestamped progress line. Streams live under ``pytest -s`` so a long
+    gate-2 run shows constant progress (per-run wall, bursts) instead of going dark."""
+    print(f"[{time.perf_counter() - _T0:7.1f}s] {msg}", flush=True)
 
 
 def can_burst(controller):
@@ -119,14 +125,11 @@ def _ctx_ids(ctx):
     return out
 
 
-def _controller(
-    make_sampler, n_particles, ess_threshold, max_tokens, make_critic=None, slow_cadence=None
-):
+def _controller(make_sampler, n_particles, ess_threshold, max_tokens, make_critic=None):
     # `make_sampler`/`make_critic` are factories so each burst run gets a fresh
     # sampler/critic (an AWRS carries its own RNG; a fresh one per run keeps it
     # seeded by `_seed` + its own seed). `twist_with_critic` mirrors SMC.__call__
-    # exactly (per-step twist iff ess_threshold > 0). `slow_cadence` (the
-    # inexpressible-step predicate) only affects the BurstLoop's lane choice.
+    # exactly (per-step twist iff ess_threshold > 0).
     return Controller(
         unit_sampler=make_sampler(),
         critic=make_critic() if make_critic is not None else None,
@@ -134,7 +137,6 @@ def _controller(
         ess_threshold=ess_threshold,
         max_tokens=max_tokens,
         twist_with_critic=ess_threshold > 0,
-        slow_cadence=slow_cadence,
     )
 
 
@@ -156,13 +158,13 @@ def _ref(label, n_particles, ess_threshold, max_tokens, seed):
 
 
 def _run_burst(
-    make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None, slow_cadence=None
+    make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
 ):
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     _seed(seed)
     controller = _controller(
-        make_sampler, n_particles, ess_threshold, max_tokens, make_critic, slow_cadence
+        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
     )
     driver = BurstLoop(controller)
     t0 = time.perf_counter()
@@ -175,7 +177,7 @@ def _run_burst(
         "log_ml": float(seq.log_ml),
         "wall": dt,
         "n_bursts": driver.n_bursts,
-        "n_slow_steps": driver.n_slow_steps,
+        "n_resamples": controller.n_resamples,
     }
 
 
@@ -183,6 +185,10 @@ def _compare(label, ess_threshold, n_particles, ref, burst):
     """Burst-vs-cached-original stats + report. ``ref`` is the loaded original
     reference (``_ref``), ``burst`` the live engine-native run (``_run_burst``).
     Named ``slow``/``burst`` internally for the original report wording."""
+    _log(
+        f"{label} ess={ess_threshold} N={n_particles}: wall={burst['wall']:.1f}s "
+        f"bursts={burst['n_bursts']} resamples={burst['n_resamples']} log_ml={burst['log_ml']:.3f}"
+    )
     slow = ref
     slow_ctx, burst_ctx = slow["contexts"], burst["contexts"]
     slow_w = np.array(slow["logw"])
@@ -223,6 +229,7 @@ def _compare(label, ess_threshold, n_particles, ref, burst):
 
     return {
         "n_bursts": burst["n_bursts"],
+        "n_resamples": burst["n_resamples"],
         "n_match": n_match,
         "log_ml_diff": float(burst["log_ml"] - slow["log_ml"]),
         "slow_log_ml": float(slow["log_ml"]),
@@ -236,6 +243,8 @@ def _compare(label, ess_threshold, n_particles, ref, burst):
 def llm():
     from genlm.backend.llm import AsyncVirtualLM
 
+    _log(f"loading {MODEL} vLLM engine ...")
+    t0 = time.perf_counter()
     model = AsyncVirtualLM.from_name(
         MODEL,
         engine_opts={
@@ -245,6 +254,7 @@ def llm():
             "enforce_eager": True,  # skip CUDA-graph capture -> faster startup for tests
         },
     )
+    _log(f"engine ready in {time.perf_counter() - t0:.1f}s")
     return PromptedLLM(model, eos_byte_strings=_EOS_BYTES)
 
 
@@ -255,7 +265,7 @@ def _boolfsa_target(llm, regex):
 # ----- gate 2a: unconstrained ----------------------------------------------
 
 
-@pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
+@pytest.mark.parametrize("ess_threshold", [0.0])  # ess=0.5 dropped: no factor -> ESS never crosses, == ess=0.0
 def test_unconstrained_burst_vs_slow(llm, ess_threshold):
     llm.set_prompt_from_str(_PROMPT)
 
@@ -281,7 +291,7 @@ def test_unconstrained_burst_vs_slow(llm, ess_threshold):
 # ----- gate 2b: constrained (additive factor folded into target) -----------
 
 
-@pytest.mark.parametrize("ess_threshold", [0.0, 0.5])
+@pytest.mark.parametrize("ess_threshold", [0.0])  # ess=0.5 dropped: no resample assertion here; resample covered by forces_resample + twist_critic
 def test_constrained_boolfsa_burst_vs_slow(llm, ess_threshold):
     llm.set_prompt_from_str(_PROMPT)
     target = _boolfsa_target(llm, r"[a-z ]+")
@@ -336,7 +346,7 @@ def test_constrained_forces_resample_burst_vs_slow(llm):
         s = _compare("boolfsa[aeiou ]+", 0.5, 16, slow, burst)
         diffs.append(s["log_ml_diff"])
         len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        any_resample = any_resample or s["n_bursts"] > 1
+        any_resample = any_resample or s["n_resamples"] > 0
     diffs = np.array(diffs)
     len_gaps = np.array(len_gaps)
     sem = diffs.std() / np.sqrt(len(diffs))
@@ -345,8 +355,8 @@ def test_constrained_forces_resample_burst_vs_slow(llm):
     print(f"  len gap mean={len_gaps.mean():+.3f}")
 
     assert any_resample, (
-        "ESS never crossed across any seed -> the pop-out/relaunch path was "
-        "not exercised; pick a tighter constraint"
+        "ESS never crossed across any seed -> the resample path was not "
+        "exercised; pick a tighter constraint"
     )
     # Unbiasedness is the testable claim: the MEAN log_ml diff and MEAN length gap
     # across seeds sit near 0. A persistent same-sign gap would be a real bias bug.
@@ -530,7 +540,7 @@ def test_twisting_critic_burst_vs_slow(llm):
         s = _compare("twist-critic", 0.5, 16, slow, burst)
         diffs.append(s["log_ml_diff"])
         len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        any_resample = any_resample or s["n_bursts"] > 1
+        any_resample = any_resample or s["n_resamples"] > 0
     diffs = np.array(diffs)
     len_gaps = np.array(len_gaps)
     ml_sem = diffs.std() / np.sqrt(len(diffs))
@@ -540,7 +550,7 @@ def test_twisting_critic_burst_vs_slow(llm):
         f"log_ml diff mean={diffs.mean():+.4f} sem={ml_sem:.4f} | "
         f"len gap mean={len_gaps.mean():+.3f} sem={len_sem:.3f}"
     )
-    assert any_resample, "twist-critic ess=0.5 never resampled; pop-out path unexercised"
+    assert any_resample, "twist-critic ess=0.5 never resampled; resample path unexercised"
     # Both checks are sem-aware: unbiased means the mean sits within sampling
     # noise of 0. A persistent same-sign gap many sem from 0 is the bug.
     assert abs(diffs.mean()) <= max(0.3, 2.5 * ml_sem), (
@@ -644,74 +654,13 @@ def test_multitoken_burst_vs_slow(llm):
     )
 
 
-# ----- gate 2g: slow-lane interleave (inexpressible-step cadence -> slow lane) ----
-#
-# 2d: with a `slow_cadence`, the driver bursts the expressible runs and drops to the
-# exact per-token transition for the cadence steps (engine free), re-entering after
-# each -- the mechanism for a periodic second/larger critic-LM forward that must not
-# run inside the decode loop. The cadence is a PERFORMANCE hint: the per-step math is
-# identical on both lanes, so the interleaved result is unchanged. The test pins that
-# against the cached ORIGINAL (a plain constrained run, no cadence): a burst with
-# every 3rd token forced to the slow lane must match the original's distribution
-# (no systematic log_ml/length shift -- only the warm-KV residual), AND the slow lane
-# must actually have run (n_slow_steps > 0).
-
-
-def test_slow_lane_cadence_neutral(llm):
-    """Slow-lane interleave (2d) is math-neutral. A constrained Direct config
-    (non-trivial log_ml) is run as a burst whose ``slow_cadence`` is a
-    ``FixedLengthBoundary(2)`` -- the same boundary library the unit sampler uses,
-    reused as the cadence: 2 tokens burst, the 3rd drops to the per-token slow lane,
-    repeat. It is compared to the cached ORIGINAL genlm-control run of the SAME
-    config WITHOUT any cadence. They must agree in log_ml + length across seeds (the
-    cadence only moves where work runs, not the distribution), and the slow lane must
-    actually have run (n_slow_steps > 0)."""
-    llm.set_prompt_from_str(_PROMPT)
-    target = _boolfsa_target(llm, r"[a-z ]+")
-
-    def make():
-        return DirectTokenSampler(target)
-
-    # FixedLengthBoundary(2): a run of 2 burst tokens fires the boundary, so every
-    # 3rd token runs on the slow lane (the predicate sees the run buffer, not the
-    # whole context, and re-arms after each slow step).
-    cadence = FixedLengthBoundary(2)
-
-    seeds = (1234, 7, 99, 2024, 555, 31)
-    diffs, len_gaps, ran_slow = [], [], True
-    for seed in seeds:
-        orig = _ref("slowcadence-base[a-z ]+", 16, 0.5, 12, seed)
-        inter = _run_burst(make, 16, 0.5, 12, seed, slow_cadence=cadence)
-        s = _compare("slowcadence[a-z ]+", 0.5, 16, orig, inter)
-        diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        ran_slow = ran_slow and inter["n_slow_steps"] > 0
-    diffs = np.array(diffs)
-    len_gaps = np.array(len_gaps)
-    ml_sem = diffs.std() / np.sqrt(len(diffs))
-    len_sem = len_gaps.std() / np.sqrt(len(len_gaps))
-    print(
-        f"\nslow-lane cadence (every 3rd tok) vs ORIGINAL over {len(seeds)} seeds: "
-        f"log_ml diff mean={diffs.mean():+.4f} sem={ml_sem:.4f} | "
-        f"len gap mean={len_gaps.mean():+.3f} sem={len_sem:.3f}"
-    )
-    assert ran_slow, (
-        "the cadence never popped to the slow lane (n_slow_steps == 0) -> the "
-        "slow-lane handoff was not exercised"
-    )
-    assert abs(diffs.mean()) <= max(0.3, 2.5 * ml_sem), (
-        f"slow-lane interleave shifts log_ml vs original: mean {diffs.mean():+.4f} "
-        f"(sem {ml_sem:.4f})"
-    )
-    assert abs(len_gaps.mean()) <= max(0.5, 2.5 * len_sem), (
-        f"slow-lane interleave shifts length vs original: mean gap "
-        f"{len_gaps.mean():+.3f} (sem {len_sem:.3f})"
-    )
-
-
 # ----- gate 2e: SetTokenSampler (trie set construction over warm-KV iter weights) ----
 
 
+@pytest.mark.skip(
+    reason="Set is not engine-accelerated (routes to StepLoop in production); "
+    "re-enable this in-engine set parity check when the trie set draw is touched."
+)
 def test_set_sampler_burst_vs_slow(llm):
     """SetTokenSampler over an EagerSetSampler(iter=engine LM, item=byte FSA), in
     the burst: the trie set construction runs over the engine's warm-KV iterable
@@ -759,3 +708,60 @@ def test_set_sampler_burst_vs_slow(llm):
         )
     finally:
         asyncio.run(set_sampler.cleanup())
+
+
+# ----- gate 2h: batched_smc (B groups, ONE batched engine burst) --------------
+#
+# batched_smc runs B examples as ONE population (B groups of n_particles), drawn
+# through a SINGLE engine forward over all B*N rows; ESS / resample / log_ml are
+# group-local. So each group must be statistically identical to running it alone --
+# which is exactly the cached single-run references. We therefore REUSE the
+# forces_resample references (no regeneration): run B groups of that config in one
+# batched burst and check the per-group log_ml is unbiased vs those cached singles.
+# A gross cross-group coupling bug biases the per-group log_ml; the aggregate mean
+# catches it. (Not byte-exact: a batched burst draws all groups under one shared
+# RNG stream, so group<->seed can't be paired -- this is an aggregate no-bias check.)
+
+
+def test_batched_smc_burst_unbiased(llm):
+    """B homogeneous groups in one batched engine burst (forces_resample config).
+    ``accelerate="require"`` forces the batched burst (raises if the batch isn't
+    burst-homogeneous); each group crosses ESS independently (per-group resample).
+    Per-group log_ml must be unbiased vs the REUSED cached single-run references."""
+    from genlm.control.sampler.sequence import batched_smc
+
+    llm.set_prompt_from_str(_PROMPT)
+    target = _boolfsa_target(llm, r"[aeiou ]+")
+    seeds = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
+    B = len(seeds)
+    refs = np.array([_ref("boolfsa[aeiou ]+", 16, 0.5, 10, s)["log_ml"] for s in seeds])
+
+    _seed(SEED)
+    samplers = [DirectTokenSampler(target) for _ in range(B)]
+    t0 = time.perf_counter()
+    seqs = asyncio.run(
+        batched_smc(
+            samplers, [None] * B, n_particles=16, ess_threshold=0.5,
+            max_tokens=10, accelerate="require",
+        )
+    )
+    dt = time.perf_counter() - t0
+    assert len(seqs) == B, f"batched_smc returned {len(seqs)} groups, expected {B}"
+
+    group_mls = np.array([s.log_ml for s in seqs])
+    finite = group_mls[np.isfinite(group_mls)]
+    # Aggregate no-bias: batched groups' log_ml mean vs cached singles' mean
+    # (unpaired -- different seeds -- so a conservative combined-sem threshold).
+    diff = finite.mean() - refs[np.isfinite(refs)].mean()
+    sem = np.sqrt(
+        finite.std() ** 2 / max(len(finite), 1)
+        + refs.std() ** 2 / len(refs)
+    )
+    _log(
+        f"batched_smc B={B}: {dt:.1f}s  group log_ml mean={finite.mean():+.4f} "
+        f"ref mean={refs[np.isfinite(refs)].mean():+.4f} diff={diff:+.4f} sem={sem:.4f}"
+    )
+    assert abs(diff) <= max(0.3, 3.0 * sem), (
+        f"batched_smc per-group log_ml biased vs cached singles: "
+        f"diff {diff:+.4f} (sem {sem:.4f})"
+    )

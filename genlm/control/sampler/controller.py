@@ -2,9 +2,8 @@
 transition, ESS, resample/fork, log_ml).
 
 Two drivers turn the population: ``StepLoop`` (per-token, the byte-exact ground
-truth) and ``BurstLoop`` (engine-accelerated; bursts expressible steps, drops to the
-slow lane for a ``slow_cadence`` step). Resample/ESS/log_ml are always
-controller-owned, never delegated to the engine.
+truth) and ``BurstLoop`` (engine-accelerated; bursts expressible steps). Resample/ESS/
+log_ml are always controller-owned, never delegated to the engine.
 """
 
 import asyncio
@@ -44,7 +43,6 @@ class Population:
         "done",
         "max_tokens_left",
         "contexts",
-        "pop_anchor",
         "group",
     )
 
@@ -61,9 +59,6 @@ class Population:
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
         self.contexts = [[] for _ in range(n)]
-        # Context length at the last slow-lane step; the cadence predicate sees
-        # ``context[pop_anchor:]`` as its buffer, ``context[:pop_anchor]`` as context.
-        self.pop_anchor = np.zeros(n, dtype=np.int64)
 
     def __len__(self):
         return self.n
@@ -94,7 +89,6 @@ class Population:
         self.done = self.done[idx]
         self.max_tokens_left = self.max_tokens_left[idx]
         self.contexts = [list(self.contexts[i]) for i in idx]
-        self.pop_anchor = self.pop_anchor[idx]
         self.group = self.group[idx]
 
 
@@ -143,22 +137,6 @@ class Particle:
     @property
     def context(self):
         return self._pop.contexts[self._i]
-
-    # -- slow-lane cadence run buffer (see Population.pop_anchor) --
-
-    @property
-    def run_prefix(self):
-        """Tokens before the current run -- the cadence predicate's ``unit_context``."""
-        return self._pop.contexts[self._i][: self._pop.pop_anchor[self._i]]
-
-    @property
-    def run_buffer(self):
-        """Tokens drawn since the last slow step -- the cadence predicate's buffer."""
-        return self._pop.contexts[self._i][self._pop.pop_anchor[self._i] :]
-
-    def reset_run(self):
-        """Close the current run (anchor at context end) so the cadence predicate re-arms."""
-        self._pop.pop_anchor[self._i] = len(self._pop.contexts[self._i])
 
     # -- weight bookkeeping --
 
@@ -209,7 +187,6 @@ class BurstDraw:
 # place and the burst keeps running).
 _EXIT_TERMINATED = "terminated"  # every flagged row finished on its own
 _EXIT_UNIT_SYNC = "unit_sync"  # unit-grain round done; driver runs ESS/resample
-_EXIT_SLOW_STEP = "slow_step"  # next step is inexpressible; driver runs it slow
 
 
 class _Burst:
@@ -316,9 +293,6 @@ class _Burst:
 
         if sampler.burst_free_running() and c._ess_crosses():
             self.resample_realize()  # token-grain crossing: resample in place, no exit
-        elif c._slow_cadence_due(parts):
-            self.abort_rows.update(handles)  # next step is slow-lane: pop all
-            self.exit_reason = _EXIT_SLOW_STEP
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
@@ -332,26 +306,30 @@ class _Burst:
         return token.token_id
 
     def resample_realize(self):
-        """Translate a completed per-group resample into engine abort/re-add: drop the
-        crossing groups' current rows, re-add their still-live rows at the resampled
-        context (fresh handle). ESS/resample stay Controller-owned (``_maybe_resample``)."""
+        """Translate a completed per-group resample into engine abort/re-add: for the
+        crossing groups, drop+re-add only rows whose ancestor CHANGED. A row that
+        resampled to itself keeps its live engine request -- its context (hence KV) is
+        unchanged. ESS/resample stay Controller-owned (``_maybe_resample``)."""
         c = self.d.controller
-        c._maybe_resample()
+        _, ancestors = c._maybe_resample()
         for g in c._last_resampled_groups:
-            rows = c._group_rows[g]
-            for row in rows:
-                h = self.row_to_handle.pop(int(row), None)
+            for row in c._group_rows[g]:
+                row = int(row)
+                if ancestors[row] == row:
+                    continue  # unchanged context -> engine row still valid, leave it
+                h = self.row_to_handle.pop(row, None)
                 if h is not None:
                     self.abort_rows.add(h)
                     self.handle_to_row.pop(h, None)
-            for row in rows:
-                p = c.particles[int(row)]
-                if p.done:
+            for row in c._group_rows[g]:
+                row = int(row)
+                p = c.particles[row]
+                if p.done or ancestors[row] == row:
                     continue
                 h = self.next_handle
                 self.next_handle += 1
-                self.handle_to_row[h] = int(row)
-                self.row_to_handle[int(row)] = h
+                self.handle_to_row[h] = row
+                self.row_to_handle[row] = h
                 self.add_rows.append((h, self.context_ids(p)))
 
 
@@ -374,9 +352,6 @@ class Controller:
         resampling_method (str): multinomial/stratified/systematic/residual.
         record (bool): build an :class:`SMCRecord`.
         verbosity (int): 0 silent, 1 prints particles per step.
-        slow_cadence (BoundaryPredicate, optional): marks steps the burst must run on
-            the slow lane (evaluated per row on its run buffer). Performance hint only;
-            the per-step math is identical on both lanes. ``None`` = burst every step.
     """
 
     def __init__(
@@ -390,7 +365,6 @@ class Controller:
         resampling_method="multinomial",
         record=False,
         verbosity=0,
-        slow_cadence=None,
         group_sizes=None,
         samplers=None,
         critics=None,
@@ -411,6 +385,7 @@ class Controller:
         self.unit_sampler = samplers[0]
         self.critic = critics[0]
         self.n_particles = n_particles
+        self.n_resamples = 0  # resample events (any lane); guards verify the resample path fired
         self.ess_threshold = ess_threshold
         self.max_tokens = max_tokens
         self.twist_with_critic = twist_with_critic
@@ -422,7 +397,6 @@ class Controller:
             self.twist_with_critic = False
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
-        self.slow_cadence = slow_cadence
 
         group = np.concatenate(
             [np.full(ng, g, dtype=np.int64) for g, ng in enumerate(group_sizes)]
@@ -601,6 +575,7 @@ class Controller:
 
         self._last_resampled_groups = resampled_groups
         if resampled_groups:
+            self.n_resamples += 1
             self.particles.reindex(global_ancestors)
             for rows, target in resets:
                 self.particles.logw[rows] = target
@@ -637,20 +612,7 @@ class Controller:
     # -- burst-lane math the engine seam (_Burst) calls into --
     #
     # The seam (draw / drain_* / token-id mapping) lives on _Burst; what stays here is
-    # the SMC math it banks into: per-step banking, the cadence test, ESS/resample.
-
-    def _slow_cadence_due(self, parts):
-        """Whether the next step is a slow-lane cadence for any still-live row
-        (mid-burst check). When it fires, the driver runs one slow-lane step for the
-        whole live population."""
-        return self._cadence_due(p for p in parts if not p.done)
-
-    def _cadence_due(self, live):
-        """Boundary-predicate cadence test over ``live`` (shared by the mid-burst and
-        burst-entry checks). ``False`` without a cadence."""
-        if self.slow_cadence is None:
-            return False
-        return any(self.slow_cadence(p.run_prefix, p.run_buffer) for p in live)
+    # the SMC math it banks into: per-step banking + ESS/resample.
 
     def _bank_burst_steps(self, parts, records, run_sync):
         """Bank every row's completed SMC step (``rec.step``), same math as the slow
@@ -733,17 +695,14 @@ def _batch_blocker(samplers):
 
 
 class BurstLoop:
-    """The engine-accelerated SMC driver. Runs the next step on the fast lane (an
-    engine burst over the live contexts) when it's expressible, dropping to the slow
-    lane for a ``slow_cadence`` step. The burst never resamples -- it pops at a tagged
-    boundary and :meth:`run` dispatches the controller-owned resample. :class:`StepLoop`
-    is the all-slow degenerate case. Only valid when :func:`burst_blocker` is ``None``."""
+    """The engine-accelerated SMC driver. Runs each step on the fast lane (an engine
+    burst over the live contexts). The burst never resamples -- it pops at a tagged
+    boundary and :meth:`run` dispatches the controller-owned resample (a token-grain
+    ESS crossing resamples in place). Only valid when :func:`burst_blocker` is ``None``."""
 
     def __init__(self, controller):
         self.controller = controller
-        # Counts (bursts opened, slow-lane steps) -- for verifying which paths ran.
-        self.n_bursts = 0
-        self.n_slow_steps = 0
+        self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         self.sampler = controller.unit_sampler
         # The single engine LM the burst drives (run_burst + warm-logits injection).
         self.llm = find_engine_lm(self.sampler.target)
@@ -793,9 +752,9 @@ class BurstLoop:
         return b.exit_reason
 
     async def run(self):
-        """The outer driver: each iteration run the live rows' next step on the slow
-        lane (a ``slow_cadence`` step) or the fast lane (a burst), then dispatch the
-        controller-owned ESS/resample. Repeat until every particle is done."""
+        """The outer driver: each iteration runs the live rows' next step as a burst,
+        then dispatches the controller-owned ESS/resample. Repeat until every particle
+        is done."""
         controller = self.controller
         await controller.start()
 
@@ -804,32 +763,11 @@ class BurstLoop:
 
         while any(not p.done for p in controller.particles):
             live = [p for p in controller.particles if not p.done]
-            if controller._cadence_due(live):
-                # Next step is inexpressible -- run it slow, then ESS.
-                await self._slow_step(live)
-                controller._maybe_resample()
-                continue
-
             reason = await self._run_burst(live, loop)
-            # Resample at a burst exit (unit-grain boundary, or before a cadence step).
-            # A token-grain ESS crossing resamples in place, no exit.
+            # Token grain resamples in place at ESS crossings (no exit); a unit-grain
+            # round hands back here to record + resample at the synced boundary.
             if reason == _EXIT_UNIT_SYNC:
-                # One record entry for the completed unit round, before its resample.
-                # Not on _EXIT_SLOW_STEP (recorded by the next _slow_step).
                 controller._record_step()
-            if reason in (_EXIT_UNIT_SYNC, _EXIT_SLOW_STEP):
                 controller._maybe_resample()
 
         return controller.particles
-
-    async def _slow_step(self, live):
-        """Run one slow-lane transition for the live rows (the inexpressible step,
-        engine free): untwist, the shared per-step transition, then ``reset_run`` so
-        the cadence predicate re-arms (next run starts empty)."""
-        controller = self.controller
-        self.n_slow_steps += 1
-        controller.particles.untwist_subset([p._i for p in live])
-        await asyncio.gather(*[controller._draw_and_score(p) for p in live])
-        controller._record_step()
-        for p in live:
-            p.reset_run()

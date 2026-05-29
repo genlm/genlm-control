@@ -123,7 +123,6 @@ class SMC:
         max_tokens,
         *,
         accelerate="auto",
-        slow_cadence=None,
         verbosity=0,
         json_path=None,
         **kwargs,
@@ -157,24 +156,6 @@ class SMC:
                 statistically identical to `"off"` (same target, unbiased weights)
                 but not byte-identical (warm-KV residual + batched-draw RNG); use
                 `"off"` for exact reproducibility.
-            slow_cadence (BoundaryPredicate, optional): keyword-only
-                :class:`~genlm.control.sampler.unit.BoundaryPredicate` marking steps
-                that are engine-INEXPRESSIBLE and must run on the slow lane -- "the
-                next step needs a non-burst op", e.g. a periodic second/larger
-                critic-LM forward. It is evaluated per row on the tokens drawn since
-                that row's last slow step, with the unit sampler's
-                ``(unit_context, subunit_buffer)`` signature -- reusing the same
-                boundary library: ``FixedLengthBoundary(N)`` -> a slow step every N
-                tokens, ``TokenSetBoundary({b"."})`` -> after each period,
-                ``CFGBoundary`` -> on grammar completion. The engine-accelerated path
-                then bursts the expressible runs and drops to the exact per-token
-                transition only for the cadence steps (engine free, no second forward
-                held inside the decode loop), re-entering the burst after each. It is
-                a **performance** hint, not a correctness knob: the per-step math is
-                identical on both lanes, so the result is unchanged (and unbiased) for
-                any cadence -- it only moves where the work runs. When it fires for any
-                live row the whole population takes one synced slow-lane step. ``None``
-                (default) keeps every step on the fast lane.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
@@ -202,7 +183,6 @@ class SMC:
             twist_with_critic=ess_threshold > 0,
             record=json_path is not None,
             verbosity=verbosity,
-            slow_cadence=slow_cadence,
             **kwargs,
         )
 
