@@ -11,7 +11,7 @@ speedup is never bought by changing the algorithm.
 
 Run on the GPU box (vLLM is not installed on macOS):
 
-    VLLM_USE_FLASHINFER_SAMPLER=0 OMP_NUM_THREADS=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
         /root/genlm-venv/bin/python benchmarks/bench_burst.py \
         --model gpt2 --n-particles 16 --max-tokens 128
 

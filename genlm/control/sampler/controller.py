@@ -13,8 +13,12 @@ import numpy as np
 import torch
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import logsumexp
-from genlm.control.potential.built_in.llm import find_engine_lm, constraint_leaf_ids
+from genlm.control.util import logsumexp, inline_drive
+from genlm.control.potential.built_in.llm import (
+    find_engine_lm,
+    constraint_leaf_ids,
+    lm_leaves,
+)
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
 
@@ -193,13 +197,29 @@ _EXIT_TERMINATED = "terminated"  # every flagged row finished on its own
 _EXIT_UNIT_SYNC = "unit_sync"  # unit-grain round done; driver runs ESS/resample
 
 
+def _run_pure_cpu(coro):
+    """Drive a forward-free coroutine to completion on the worker thread (no loop).
+    A suspend means a forward leaked past ``burst_blocker``."""
+    token = inline_drive.set(True)
+    try:
+        coro.send(None)
+    except StopIteration as e:
+        return e.value
+    finally:
+        inline_drive.reset(token)
+    coro.close()
+    raise RuntimeError(
+        "burst step suspended on a non-injected forward; use accelerate='off'"
+    )
+
+
 class _Burst:
     """Per-burst engine state, set on the Controller for one ``run_burst``: the live
     row<->particle handle maps, the abort/re-add queues, the sampler scratch, and the
-    exit reason. Run config (the engine LM, eos, the event-loop hop) is borrowed from
-    the ``BurstLoop`` ``d``. The sampler-facing surface is ``engine_lm``/``warm_logws``
-    (inject + draw) and ``scratch`` (unit accumulation); ``draw``/``drain_*``/
-    ``run_sync`` are the internal engine seam."""
+    exit reason. Run config (the engine LM, eos) is borrowed from the ``BurstLoop``
+    ``d``. The sampler-facing surface is ``engine_lm``/``warm_logws`` (inject + draw)
+    and ``scratch`` (unit accumulation); ``draw``/``drain_*`` are the internal engine
+    seam."""
 
     def __init__(self, d, live):
         self.d = d
@@ -225,10 +245,6 @@ class _Burst:
         llm = self.d.llm
         batch = llm._process_logw_next_batch(llm._maybe_temper(logits.float()))
         return [llm.make_lazy_weights(row) for row in batch.cpu().numpy()]
-
-    def run_sync(self, coro):
-        """Run an async helper to completion on the driver loop (one hop)."""
-        return self.d.run_async(coro)
 
     def particle_of(self, handle):
         return self.d.controller.particles[self.handle_to_row[handle]]
@@ -277,13 +293,13 @@ class _Burst:
             c.particles.untwist_subset([p._i for p in parts])
 
         # Engine warm logits -> per-row LM logw_next; the sampler injects them and runs
-        # the real per-step draw. ONE event-loop hop for the whole batch.
+        # the real per-step draw, inline-driven on this worker thread (no hop).
         warm = self.warm_logws(logits)
-        records = self.run_sync(
+        records = _run_pure_cpu(
             sampler.burst_draw_batch(warm, [p.context for p in parts], handles, self)
         )
         # Bank steps before the token map: scoring sets p.done on termination.
-        c._bank_burst_steps(parts, records, self.run_sync)
+        c._bank_burst_steps(parts, records)
         # Token grain records per step here; unit grain once per round in BurstLoop.run.
         if sampler.burst_free_running() and any(rec.step is not None for rec in records):
             c._record_step()
@@ -440,7 +456,7 @@ class Controller:
 
     def _advance_no_critic(self, p, to_append, logw, logp):
         """Sync score + advance + terminate for the no-critic path (shared by the slow
-        path and the burst; no event-loop hop)."""
+        path and the burst)."""
         p.score(logw)
         p.logp += logp
         p.context.extend(to_append)
@@ -598,10 +614,10 @@ class Controller:
     # The seam (draw / drain_* / token-id mapping) lives on _Burst; what stays here is
     # the SMC math it banks into: per-step banking + ESS/resample.
 
-    def _bank_burst_steps(self, parts, records, run_sync):
+    def _bank_burst_steps(self, parts, records):
         """Bank every row's completed SMC step (``rec.step``), same math as the slow
-        loop. No-critic: sync, no hop. With a critic: all rows gathered into ONE
-        ``run_sync`` hop (passed in by the seam) so the critic LM autobatches."""
+        loop. The critic is CPU-only inside a burst (the forward-free gate), so the
+        per-step scoring is inline-driven on the worker thread -- no hop."""
         steps = [
             (p, rec.step) for p, rec in zip(parts, records) if rec.step is not None
         ]
@@ -613,14 +629,10 @@ class Controller:
             return
 
         async def _score_all():
-            await asyncio.gather(
-                *(
-                    self._score_advance_terminate(p, to_append, logw, logp)
-                    for p, (to_append, logw, logp) in steps
-                )
-            )
+            for p, (to_append, logw, logp) in steps:
+                await self._score_advance_terminate(p, to_append, logw, logp)
 
-        run_sync(_score_all())
+        _run_pure_cpu(_score_all())
 
 
 # ---------------------------------------------------------------------------
@@ -643,14 +655,31 @@ class StepLoop:
 def burst_blocker(controller):
     """Why this config can't run the engine burst, or ``None`` if it can. The burst
     needs a burst-capable sampler (``supports_burst()``) over a target with exactly
-    one engine-burst LM leaf (:func:`find_engine_lm`). A critic does not disqualify
-    it. A batched (B>1) population must be burst-homogeneous (:func:`_batch_blocker`).
-    ``auto`` falls back to ``StepLoop`` on a non-None reason; ``require`` raises it."""
+    one engine-burst LM leaf (:func:`find_engine_lm`), and must be **forward-free**:
+    every LM leaf in the per-step path (each group's target AND critic) must be that
+    injected view, else it would forward inside the burst (a non-injected leaf, or an
+    LM critic). A batched (B>1) population must be burst-homogeneous
+    (:func:`_batch_blocker`). ``auto`` falls back to ``StepLoop`` on a non-None reason;
+    ``require`` raises it."""
     s = controller.unit_sampler
     if not s.supports_burst():
         return f"{type(s).__name__} does not support the engine burst"
     if find_engine_lm(s.target) is None:
         return "sampler target has no single engine-burst LM leaf"
+    # Forward-free invariant: any LM leaf that isn't the injected engine view would
+    # forward inside the burst (with no hop, that suspends and raises). Route such
+    # configs to the slow lane here.
+    for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
+        injected = find_engine_lm(samp.target)
+        for pot in (samp.target, crit):
+            if pot is None:
+                continue
+            if any(lm is not injected for lm in lm_leaves(pot)):
+                return (
+                    f"group {g}: an LM leaf can't be assembled into the burst as an "
+                    "injected view (it would forward) -- e.g. an LM critic or a "
+                    "second engine LM"
+                )
     if len(controller.samplers) > 1:
         return _batch_blocker(controller.samplers)
     return None
@@ -706,12 +735,11 @@ class BurstLoop:
                 'Engine LM has no EOS token id; the burst needs one. Use accelerate="off".'
             )
         self.eos_id = eos_idxs[0]
-        self.run_async = None  # the worker-thread -> loop hop, bound in run()
 
     async def _run_burst(self, live, loop):
         """Run one stateless burst over ``live`` to a pop-out; return its ``_EXIT_*``
-        reason. Runs the engine decode loop in a worker thread so this loop stays free
-        for the ``draw`` hops."""
+        reason. Runs the engine decode loop in a worker thread; the per-step draw is
+        inline-driven there (no hop back to this loop)."""
         self.n_bursts += 1
         b = _Burst(self, live)
         # Unit grain hands back at the synced boundary (fixed reason); token grain
@@ -743,7 +771,6 @@ class BurstLoop:
         await controller.start()
 
         loop = asyncio.get_running_loop()
-        self.run_async = lambda coro: asyncio.run_coroutine_threadsafe(coro, loop).result()
 
         while any(not p.done for p in controller.particles):
             live = [p for p in controller.particles if not p.done]

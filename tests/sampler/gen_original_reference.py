@@ -13,7 +13,7 @@ the same builders as ``test_engine_native.py``, just run through main's llamppl 
 Run on the box, shadowing our genlm.control with main's:
 
     PYTHONPATH=/root/genlm/genlm-control-main VLLM_USE_FLASHINFER_SAMPLER=0 \
-        OMP_NUM_THREADS=1 /root/genlm-venv/bin/python \
+        /root/genlm-venv/bin/python \
         tests/sampler/gen_original_reference.py
 
 Writes ``gate2_snapshot.json`` next to this file (the same path + key format the

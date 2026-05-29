@@ -1,3 +1,4 @@
+import contextvars
 import warnings
 
 import numpy as np
@@ -5,6 +6,13 @@ from genlm.grammar import Float, Log
 
 from genlm.control.constant import EndOfSequence
 from genlm.backend.tokenization import Token
+
+
+# True while a coroutine is being driven by ``coro.send`` on the burst worker thread
+# (no event loop). Combinators that would ``asyncio.gather`` await sequentially instead.
+inline_drive: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_inline_drive", default=False
+)
 
 
 def logsumexp(x):

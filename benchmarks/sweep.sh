@@ -4,7 +4,7 @@
 # accumulation / OOM. max_model_len is per-model (gpt2 caps at 1024).
 set -u
 cd /root/genlm/genlm-control
-export VLLM_USE_FLASHINFER_SAMPLER=0 OMP_NUM_THREADS=1 VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0
 PY=/root/genlm-venv/bin/python
 
 # model:max_model_len  (cached on the box: a 124M -> 7B ladder)

@@ -5,7 +5,7 @@ from arsenal.maths import log1mexp
 from genlm.control.util import logsumexp
 import warnings
 
-from genlm.control.util import select
+from genlm.control.util import select, inline_drive
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 from genlm.control.sampler.controller import BurstDraw
@@ -66,7 +66,10 @@ class TokenSampler:
                 to_append, logw, logp = await self.transition(context)
             return BurstDraw(token=to_append[-1], step=(to_append, logw, logp))
 
-        return await asyncio.gather(*(one(c, w) for c, w in zip(contexts, warm_logws)))
+        if not inline_drive.get():
+            return await asyncio.gather(*(one(c, w) for c, w in zip(contexts, warm_logws)))
+        # Burst inline-drive (no loop): drive sequentially.
+        return [await one(c, w) for c, w in zip(contexts, warm_logws)]
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""

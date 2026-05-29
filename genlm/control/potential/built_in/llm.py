@@ -52,6 +52,23 @@ def find_engine_lm(potential):
     return found[0] if len(found) == 1 else None
 
 
+def lm_leaves(potential):
+    """All ``PromptedLLM`` leaves in ``potential`` (recursing ``Product`` ``p1``/``p2``).
+    The burst gate uses this: every LM leaf must be an injected view, else it forwards."""
+    found = []
+
+    def walk(p):
+        if isinstance(p, PromptedLLM):
+            found.append(p)
+            return
+        for child in (getattr(p, "p1", None), getattr(p, "p2", None)):
+            if child is not None:
+                walk(child)
+
+    walk(potential)
+    return found
+
+
 def constraint_leaf_ids(potential):
     """``id``s of the non-engine-LM leaves of ``potential`` (recursing ``Product``).
     Two targets share a constraint iff these match -- the burst homogeneity check for

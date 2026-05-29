@@ -13,7 +13,7 @@ CPU frame first *synchronizes* on the result (a ``.cpu()`` / ``.tolist()`` / a r
 So a frame's cumulative time can include GPU waits, not just CPU work.
 
 Run on the box (writes <out>.pstats):
-  VLLM_USE_FLASHINFER_SAMPLER=0 OMP_NUM_THREADS=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
     python benchmarks/prof_entry.py --mode burst --model gpt2 --sampler direct --out /tmp/p_burst_direct
 """
 

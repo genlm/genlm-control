@@ -11,7 +11,7 @@ Monkeypatches each segment function with an accumulating ``perf_counter`` timer
   trip = ``step_wall − Σ(sync) − resample`` (the awaits release the loop).
 
 Run on the box, one config per invocation:
-    VLLM_USE_FLASHINFER_SAMPLER=0 OMP_NUM_THREADS=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
         python benchmarks/profile_segments.py --model gpt2 --sampler direct [--critic]
 """
 

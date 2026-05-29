@@ -20,13 +20,13 @@ Regenerate it (e.g. after changing configs / model) by running the ORIGINAL on t
 box, shadowing our genlm.control with main's::
 
     PYTHONPATH=/root/genlm/genlm-control-main VLLM_USE_FLASHINFER_SAMPLER=0 \\
-        OMP_NUM_THREADS=1 /root/genlm-venv/bin/python \\
+        /root/genlm-venv/bin/python \\
         tests/sampler/gen_original_reference.py
 
 A missing key is a hard error (run the generator) -- never a silent self-comparison.
 
 Requires CUDA + vLLM; uses gpt2. Run on the box with
-``VLLM_USE_FLASHINFER_SAMPLER=0 OMP_NUM_THREADS=1``.
+``VLLM_USE_FLASHINFER_SAMPLER=0``.
 """
 
 import asyncio
@@ -560,6 +560,33 @@ def test_twisting_critic_burst_vs_slow(llm):
         f"twist-critic burst length biased: mean gap {len_gaps.mean():+.3f} "
         f"(sem {len_sem:.3f})"
     )
+
+
+# ----- gate 2e: forward-free gate (an LM critic must NOT burst) ---------------
+#
+# A CPU critic is fine in a burst (the cases above). An LM critic is a non-injected
+# forward inside the burst -- on the same engine it would reenter run_burst's step
+# (deadlock); with the hop deleted there is nothing to even attempt it. The gate must
+# route such a config off the fast lane.
+
+
+def test_lm_critic_routed_to_slow_lane(llm):
+    """An LM critic (a second PromptedLLM on the SAME engine) would forward inside the
+    burst. The forward-free gate must catch it: burst_blocker gives a reason, and
+    accelerate="require" raises instead of bursting."""
+    from genlm.control.sampler.controller import NotAcceleratable
+
+    def make():
+        return DirectTokenSampler(llm)
+
+    lm_critic = PromptedLLM(llm.model, eos_byte_strings=_EOS_BYTES)
+    reason = burst_blocker(_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic))
+    assert reason is not None and "forward" in reason.lower(), reason
+
+    llm.set_prompt_from_str(_PROMPT)
+    _seed(SEED)
+    with pytest.raises(NotAcceleratable):
+        asyncio.run(make().smc(8, 0.0, 8, critic=lm_critic, accelerate="require"))
 
 
 # ----- gate 2f: MultiTokenUnitSampler (synchronized unit-grain burst) ---------

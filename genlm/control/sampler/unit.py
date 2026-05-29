@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from genlm.control.constant import EOS, EndOfSequence
+from genlm.control.util import inline_drive
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.controller import BurstDraw
 from genlm.control.potential.built_in.llm import burst_logw_next
@@ -161,9 +162,12 @@ class MultiTokenUnitSampler(TokenSampler):
             step = (self._to_append(unit), weight, accum.logp)
             return BurstDraw(token=subunit, step=step, pop=status == "boundary")
 
-        return await asyncio.gather(
-            *(one(c, w, h) for c, w, h in zip(contexts, warm_logws, handles))
-        )
+        if not inline_drive.get():
+            return await asyncio.gather(
+                *(one(c, w, h) for c, w, h in zip(contexts, warm_logws, handles))
+            )
+        # Burst inline-drive (no loop): drive sequentially.
+        return [await one(c, w, h) for c, w, h in zip(contexts, warm_logws, handles)]
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
