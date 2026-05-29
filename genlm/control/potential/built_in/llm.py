@@ -33,9 +33,9 @@ def burst_logw_next(llm, logws):
 
 
 def find_engine_lm(potential):
-    """The single burst-capable engine LM leaf in ``potential`` (recursing into
-    ``Product``), or ``None`` if there isn't exactly one. No structural assumption
-    beyond "one engine LM somewhere in the product"."""
+    """The single burst-capable engine LM leaf in ``potential``, recursing through
+    ``Product`` (``p1``/``p2``); ``None`` if not exactly one. An LM nested in a
+    non-``Product`` wrapper isn't found -> declines to the slow path (safe)."""
     found = []
 
     def walk(p):

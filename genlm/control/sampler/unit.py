@@ -16,8 +16,7 @@ class _UnitAccum:
     """Per-row, per-burst accumulator for an in-progress unit: the subunits drawn
     so far this unit round and their summed importance weight / log-prob.
 
-    Lives in the :class:`~genlm.control.sampler.controller.BurstContext`'s per-burst
-    ``scratch`` dict keyed by the row's external particle index, and is discarded
+    Lives in the burst's ``scratch`` dict keyed by the row's handle, and is discarded
     the moment the unit completes (one unit per burst, so nothing carries across)."""
 
     buffer: list

@@ -217,7 +217,8 @@ class _Burst:
     row<->particle handle maps, the abort/re-add queues, the sampler scratch, and the
     exit reason. Run config (the engine LM, eos, the event-loop hop) is borrowed from
     the ``BurstLoop`` ``d``. The sampler-facing surface is ``engine_lm``/``warm_logws``
-    (inject + draw), ``scratch`` (unit accumulation), and ``run_sync``."""
+    (inject + draw) and ``scratch`` (unit accumulation); ``draw``/``drain_*``/
+    ``run_sync`` are the internal engine seam."""
 
     def __init__(self, d, live):
         self.d = d
