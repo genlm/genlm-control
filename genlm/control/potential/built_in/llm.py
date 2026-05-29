@@ -34,8 +34,10 @@ def burst_logw_next(llm, logws):
 
 def find_engine_lm(potential):
     """The single burst-capable engine LM leaf in ``potential``, recursing through
-    ``Product`` (``p1``/``p2``); ``None`` if not exactly one. An LM nested in a
-    non-``Product`` wrapper isn't found -> declines to the slow path (safe)."""
+    ``Product`` (``p1``/``p2``); ``None`` if not exactly one. A ``Coerced`` LM is
+    intentionally not found -> declines to the slow path: ``Coerced`` scores via
+    ``prefix``/``complete``, not ``logw_next``, so the warm-logit injection wouldn't
+    apply (the common case coerces the constraint, not the LM, and is unaffected)."""
     found = []
 
     def walk(p):
@@ -48,6 +50,27 @@ def find_engine_lm(potential):
 
     walk(potential)
     return found[0] if len(found) == 1 else None
+
+
+def constraint_leaf_ids(potential):
+    """``id``s of the non-engine-LM leaves of ``potential`` (recursing ``Product``).
+    Two targets share a constraint iff these match -- the burst homogeneity check for
+    a batched run, where all groups draw through group 0's sampler."""
+    ids = set()
+
+    def walk(p):
+        if isinstance(p, PromptedLLM) and p.model.supports_burst:
+            return
+        children = [getattr(p, "p1", None), getattr(p, "p2", None)]
+        if all(c is None for c in children):
+            ids.add(id(p))
+            return
+        for c in children:
+            if c is not None:
+                walk(c)
+
+    walk(potential)
+    return frozenset(ids)
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):

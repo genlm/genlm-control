@@ -387,9 +387,11 @@ async def batched_smc(
     -- the parity bar). Returns a list of B :class:`Sequences`, one per example, in
     ``samplers`` order.
 
-    ``accelerate="off"`` runs the exact per-token slow loop (the only path wired for
-    groups today; the batched burst is the next phase). The single-example
-    :class:`SMC` path is unchanged and byte-identical to before.
+    ``accelerate`` selects the lane as in the single-example path: ``"off"`` the exact
+    per-token slow loop; ``"auto"``/``"require"`` the engine burst when the batch is
+    burst-homogeneous (one shared forward over all B*N rows, drawn through group 0's
+    sampler -- see :func:`~genlm.control.sampler.controller._batch_blocker`), else the
+    slow loop. Per-group ESS/resample/log_ml are identical on both lanes.
     """
     B = len(samplers)
     assert len(critics) == B, "need one critic per sampler/example"

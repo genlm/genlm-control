@@ -15,7 +15,7 @@ import torch
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.util import logsumexp
-from genlm.control.potential.built_in.llm import find_engine_lm
+from genlm.control.potential.built_in.llm import find_engine_lm, constraint_leaf_ids
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
 
@@ -698,14 +698,37 @@ def burst_blocker(controller):
     """Why this config can't run the engine burst, or ``None`` if it can. The burst
     needs a burst-capable sampler (``supports_burst()``) over a target with exactly
     one engine-burst LM leaf (:func:`find_engine_lm`). A critic does not disqualify
-    it. ``auto`` falls back to ``StepLoop`` on a non-None reason; ``require`` raises it."""
+    it. A batched (B>1) population must be burst-homogeneous (:func:`_batch_blocker`).
+    ``auto`` falls back to ``StepLoop`` on a non-None reason; ``require`` raises it."""
     s = controller.unit_sampler
     if not s.supports_burst():
         return f"{type(s).__name__} does not support the engine burst"
     if find_engine_lm(s.target) is None:
         return "sampler target has no single engine-burst LM leaf"
     if len(controller.samplers) > 1:
-        return "batched burst is not yet wired (use accelerate='off')"
+        return _batch_blocker(controller.samplers)
+    return None
+
+
+def _batch_blocker(samplers):
+    """Why a batched burst can't draw every group through group 0's sampler, or
+    ``None`` if burst-homogeneous. The burst runs one engine forward over all B*N rows
+    and draws them with ``samplers[0]``, so groups must share sampler kind, engine
+    model, temperature, and constraint -- they may differ only in prompt (the warm
+    logits carry it) and critic (scored per group)."""
+    s0 = samplers[0]
+    lm0 = find_engine_lm(s0.target)
+    constraint0 = constraint_leaf_ids(s0.target)
+    for g, s in enumerate(samplers[1:], start=1):
+        if type(s) is not type(s0):
+            return f"group {g} sampler is {type(s).__name__}, not {type(s0).__name__}"
+        lm = find_engine_lm(s.target)
+        if lm is None or lm.model is not lm0.model:
+            return f"group {g} uses a different engine"
+        if getattr(lm, "temperature", None) != getattr(lm0, "temperature", None):
+            return f"group {g} temperature differs from group 0"
+        if constraint_leaf_ids(s.target) != constraint0:
+            return f"group {g} has a different constraint"
     return None
 
 
