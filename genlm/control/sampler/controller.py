@@ -708,7 +708,7 @@ class Controller:
     # path, turning the batched proposal into one :class:`BurstDraw` per live row
     # via the sampler's ``burst_draw_batch`` (which adds any non-LM factor's
     # per-token log-weights). Each sampler's draw picks its RNG stream -- the slow
-    # path's numpy ``fast_sample_lazyweights`` or a batched torch draw -- so parity
+    # path's numpy ``select`` or a batched torch draw -- so parity
     # stays the no-bias check the warm-KV residual already requires (see the
     # per-sampler docstrings in ``token.py``).
     #

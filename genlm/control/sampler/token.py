@@ -6,7 +6,7 @@ from arsenal.maths import log1mexp
 from genlm.control.util import logsumexp
 import warnings
 
-from genlm.control.util import fast_sample_lazyweights
+from genlm.control.util import select
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab, _drive_or_hop
 from genlm.control.sampler.controller import BurstDraw
@@ -213,6 +213,16 @@ class DirectTokenSampler(TokenSampler):
         # on the slow loop.
         return self.proposal is None
 
+    def _draw_from(self, logws, draw=None):
+        """The single token-pick shared by the no-proposal slow and burst draws:
+        normalize, pick (``select`` by default, or a supplied ``draw`` override), and
+        return ``(token, logZ, logp)`` -- the importance weight is the log normalizer
+        ``logws.sum()``. Both lanes route through this so the draw exists once; only
+        where ``logws`` comes from differs (await ``logw_next`` vs the warm-KV product)."""
+        logps = logws.normalize()
+        token = select(logps) if draw is None else draw(logps.exp().materialize())
+        return token, logws.sum(), logps[token]
+
     def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
         """Batched burst draw (the burst analog of ``sample``), one BurstDraw per row.
 
@@ -222,14 +232,14 @@ class DirectTokenSampler(TokenSampler):
         * **unconstrained** (no factor): normalize + Gumbel-max across all rows in
           one on-device op; only the L drawn ids come back. This is a batched
           torch Gumbel-max -- a different RNG stream than the slow numpy
-          ``fast_sample_lazyweights``, so the burst samples the same distribution
+          numpy ``select``, so the burst samples the same distribution
           without tracking the slow path token-for-token (parity stays the no-bias
           check the warm-KV residual already requires).
         * **factored** (additive ``ctx.factor``): the LM half is already batched;
           per particle, form ``Product(llm, factor).logw_next`` from the row's
           context (``ctx.product_logws`` scores ``factor.logw_next(context)``, kept
           incremental by the factor's ``_consume`` cache) and draw with the slow
-          path's exact numpy ``fast_sample_lazyweights`` (same RNG -> tight
+          path's exact numpy ``select`` (same RNG -> tight
           warm-KV-only parity). The per-particle product is the one bit still
           looped -- vectorizing it is the eventual ideal.
 
@@ -259,9 +269,8 @@ class DirectTokenSampler(TokenSampler):
         out = []
         for k, context in enumerate(contexts):
             logw = ctx.product_logws(lm_np[k], context)
-            logp = logw.normalize()
-            token = fast_sample_lazyweights(logp)
-            out.append(BurstDraw(token=token, step=([token], logw.sum(), logp[token])))
+            token, w, lp = self._draw_from(logw)
+            out.append(BurstDraw(token=token, step=([token], w, lp)))
         return out
 
     async def sample(self, context, draw=None):
@@ -285,13 +294,7 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            logps = logws.normalize()
-            if draw is None:
-                # fast sampling from logps using gumbel-max trick
-                token = fast_sample_lazyweights(logps)
-            else:
-                token = draw(logps.exp().materialize())
-            return token, logws.sum(), logps[token]
+            return self._draw_from(logws, draw)
 
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context),
@@ -299,7 +302,7 @@ class DirectTokenSampler(TokenSampler):
         )
         proposal_logps = proposal_logws.normalize()
         if draw is None:
-            token = fast_sample_lazyweights(proposal_logps)
+            token = select(proposal_logps)
         else:
             token = draw(proposal_logps.exp().materialize())
         logw = target_logws[token] - proposal_logws[token] + proposal_logws.sum()
@@ -334,6 +337,14 @@ class SetTokenSampler(TokenSampler):
         # "SetTokenSampler is not engine-accelerated".
         return False
 
+    def _select_from(self, logws, set_logp, draw=None):
+        """Shared set-draw tail (slow + burst): normalize, pick (``select`` default
+        or a ``draw`` override), and fold the set's own log-prob ``set_logp`` (from
+        ``sample_set``) into the choice log-prob. Both lanes route through this."""
+        logps = logws.normalize()
+        token = select(logps) if draw is None else draw(logps.exp().materialize())
+        return token, logws.sum(), set_logp + logps[token]
+
     def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
         """Set construction over the engine's warm-KV iterable weights, one BurstDraw
         per row. The LM half (``iter_potential.logw_next``) is batched ONCE; the
@@ -354,9 +365,7 @@ class SetTokenSampler(TokenSampler):
         async def _draw_one(context, il):
             # Mirrors the slow ``sample`` per particle, with iter weights substituted.
             logws, logp = await self.set_sampler.sample_set(context, iter_logws=il)
-            logps = logws.normalize()
-            token = fast_sample_lazyweights(logps)
-            return token, logws.sum(), logp + logps[token]
+            return self._select_from(logws, logp)
 
         async def _gather():
             return await asyncio.gather(
@@ -397,12 +406,7 @@ class SetTokenSampler(TokenSampler):
             `SetSampler` for more details.
         """
         logws, logp = await self.set_sampler.sample_set(context, draw=draw)
-        logps = logws.normalize()
-        if draw is None:
-            token = fast_sample_lazyweights(logps)
-        else:
-            token = draw(logps.exp().materialize())
-        return token, logws.sum(), logp + logps[token]
+        return self._select_from(logws, logp, draw)
 
     async def cleanup(self):
         """Clean up the sampler.

@@ -318,14 +318,20 @@ def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
     return (logprobs + noise).argmax(axis=1)
 
 
-def fast_sample_lazyweights(lazyweights):
-    """Sample a token from a LazyWeights instance using the Gumbel-max trick.
+def select(lazyweights):
+    """Select (sample) a token from a LazyWeights instance -- the default token
+    picker, Gumbel-max.
+
+    Named so the picker is a single, swappable seam: samplers call ``select`` rather
+    than inlining the draw, so an alternative method (inverse-CDF, multinomial, a
+    test tracer) can plug in via a sampler's ``draw=`` override without touching the
+    sampler bodies.
 
     Args:
-        lazyweights (LazyWeights): A LazyWeights instance
+        lazyweights (LazyWeights): A LazyWeights instance (log weights).
 
     Returns:
-        (Any): Sampled token
+        (Any): the selected token.
     """
     assert lazyweights.is_log
     token_id = fast_sample_logprobs(lazyweights.weights, size=1)[0]
