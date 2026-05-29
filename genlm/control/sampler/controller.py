@@ -29,7 +29,7 @@ from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.util import logsumexp
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
-from genlm.control.sampler.util import _drive_or_hop
+from genlm.control.sampler.source import PushSource
 
 
 class NotAcceleratable(Exception):
@@ -253,87 +253,6 @@ class Particle:
         return string_for_serialization(self._pop.contexts[self._i])
 
 
-# ---------------------------------------------------------------------------
-# The burst context (the only thing a sampler's burst_draw_batch sees)
-# ---------------------------------------------------------------------------
-
-
-class BurstContext:
-    """The per-burst context handed to a burst-capable sampler's ``burst_draw_batch``.
-
-    This is the burst analog of the slow path handing a sampler a ``context``
-    and letting it call its potentials' async methods. In the burst, the engine
-    supplies the LM half (the batched ``lm_batch``) and the particle's token
-    ``context`` is passed to ``burst_draw_batch``; this object exposes the two
-    substitutions that stand in for the slow path's async potential calls:
-
-    * :meth:`product_logws` -- reconstruct ``Product(llm, factor).logw_next`` over
-      the target vocab from the engine LM weights + ``factor.logw_next(context)``
-      (the DirectTokenSampler proposal);
-    * :meth:`run_sync` -- run a sampler's own async helper (e.g. AWRS's rejection)
-      to completion on the driver's event loop.
-
-    ``factor`` (the additive control-side factor / AWRS boolean condition, or
-    ``None``) is exposed directly so the sampler can score it from a context. The
-    Controller's row-map / pop-out / engine-LM runtime is deliberately NOT on this
-    object -- a sampler only ever sees this narrow, named interface, never the
-    Controller's private burst state.
-
-    ``scratch`` is a fresh per-burst dict the sampler may use to carry its own
-    state across the burst's engine steps (the unit sampler keeps each row's
-    in-progress subunit buffer there, keyed by the row's external index). It is
-    re-created for every burst, so nothing leaks across resamples; token samplers
-    ignore it.
-    """
-
-    __slots__ = (
-        "factor",
-        "scratch",
-        "_target",
-        "_llm_idxs",
-        "_factor_idxs",
-        "_eval_factor",
-        "_run_async",
-    )
-
-    def __init__(self, factor, target, llm_idxs, factor_idxs, eval_factor, run_async):
-        self.factor = factor
-        self.scratch = {}
-        self._target = target
-        self._llm_idxs = llm_idxs
-        self._factor_idxs = factor_idxs
-        self._eval_factor = eval_factor
-        self._run_async = run_async
-
-    def factor_logws(self, context):
-        """The factor's ``logw_next`` over ``context``, evaluated on the driver's
-        event loop -- the burst stand-in for the slow path's
-        ``factor.logw_next(context)`` (the wrapped potential's ``_consume`` cache
-        carries it incrementally across the burst, so this is not a full replay)."""
-        return self._eval_factor(self.factor, context)
-
-    def product_logws(self, lm_weights, context):
-        """Reconstruct ``Product(llm, factor).logw_next`` over the target vocab
-        from the engine LM weights (``lm_weights``, a length-``V+1`` array in the
-        LM's vocab-eos order -- one row of the batched ``_process_logw_next_batch``)
-        and ``factor.logw_next(context)``.
-
-        Gathers through ``Product``'s own ``v1_idxs``/``v2_idxs`` (resolved here
-        as ``llm_idxs``/``factor_idxs``) -- the exact slow-path index maps -- with
-        the engine LM half substituting the reprefilled one, so vocab narrowing
-        matches the slow path.
-        """
-        factor_logws = self.factor_logws(context)
-        return self._target.make_lazy_weights(
-            lm_weights[self._llm_idxs] + factor_logws.weights[self._factor_idxs]
-        )
-
-    def run_sync(self, coro):
-        """Run a sampler's async helper to completion on the driver's event loop
-        and block for the result -- one event-loop hop, no inner gather."""
-        return self._run_async(coro)
-
-
 @dataclass
 class BurstDraw:
     """One live row's result from a sampler's ``burst_draw_batch`` -- the burst
@@ -392,62 +311,6 @@ class BurstDraw:
 _EXIT_TERMINATED = "terminated"
 _EXIT_UNIT_SYNC = "unit_sync"
 _EXIT_SLOW_STEP = "slow_step"
-
-
-class _Burst:
-    """The Controller's private per-engine-burst runtime (set by the BurstLoop
-    for the duration of one ``run_burst``; ``None`` outside a burst).
-
-    Holds what the Controller's ``draw`` needs -- the live particle row-map, the
-    engine LM (to batch the rows' ``lm_batch``), the EOS id, ``abort_rows``
-    (external row indices the draw has flagged to drop from the burst), and
-    ``exit_reason`` (why the burst ended, read by the driver to dispatch) -- plus
-    the sampler-facing :class:`BurstContext` (``ctx``). Samplers never see this
-    object; only ``ctx``.
-
-    Pop-out is out-of-band: ``draw`` adds a row's external index to ``abort_rows``
-    (when it terminates, or when an in-place resample drops it for re-add), and
-    ``run_burst`` drains them via :meth:`Controller.drain_aborts` and calls
-    ``abort_request`` -- no forced-EOS, no discard forward. ``exit_reason`` stays
-    ``_EXIT_TERMINATED`` for a free-running burst (ESS resamples in place mid-burst,
-    no exit); a unit-grain burst sets ``_EXIT_UNIT_SYNC``.
-    """
-
-    __slots__ = (
-        "particles",
-        "llm",
-        "eos_id",
-        "abort_rows",
-        "add_rows",
-        "ext_to_row",
-        "row_to_ext",
-        "next_ext",
-        "context_ids",
-        "ctx",
-        "exit_reason",
-    )
-
-    def __init__(self, particles, llm, eos_id, ctx, context_ids):
-        self.particles = particles
-        self.llm = llm
-        self.eos_id = eos_id
-        # BurstLoop._context_ids: builds a particle's engine prompt (its group's
-        # prompt + drawn tokens). The Controller's in-place resample needs it to
-        # re-prefill re-added rows, but it lives on BurstLoop -> passed in here.
-        self.context_ids = context_ids
-        self.abort_rows = set()
-        # In-place per-group resample: rows the controller asks the engine to
-        # (re-)add mid-burst, as ``(ext_id, prompt_ids)``. ``ext_to_row`` /
-        # ``row_to_ext`` map an engine request's external id <-> its POPULATION row
-        # (``p._i``); ``next_ext`` hands out a FRESH id per re-add (so an abort and a
-        # re-add of the same slot never collide on an id). Initial rows: ext i is the
-        # entry-order index, mapping to that live particle's population row.
-        self.add_rows = []
-        self.ext_to_row = {i: p._i for i, p in enumerate(particles)}
-        self.row_to_ext = {p._i: i for i, p in enumerate(particles)}
-        self.next_ext = len(particles)
-        self.ctx = ctx
-        self.exit_reason = _EXIT_TERMINATED
 
 
 # ---------------------------------------------------------------------------
@@ -572,10 +435,10 @@ class Controller:
         with np.errstate(divide="ignore"):
             self._log_ess_threshold = np.log(ess_threshold)
 
-        # The :class:`_Burst` runtime set by the BurstLoop for the duration of a
-        # single engine burst; read by the ``draw`` callback the engine invokes
-        # row-wise. ``None`` outside a burst.
-        self._burst = None
+        # The :class:`~genlm.control.sampler.source.PushSource` set by the BurstLoop
+        # for the duration of a single engine burst; read by the ``draw`` callback
+        # the engine invokes row-wise. ``None`` outside a burst.
+        self._source = None
 
     # -- the per-step transition for ONE particle ----------------------------
     #
@@ -849,80 +712,24 @@ class Controller:
     # stays the no-bias check the warm-KV residual already requires (see the
     # per-sampler docstrings in ``token.py``).
     #
-    # A live burst is described by ``self._burst`` (a :class:`_Burst` set by
-    # the BurstLoop): ``particles`` (the live row-map), ``llm`` (the engine
-    # PromptedLLM, supplying ``_process_logw_next_batch`` / ``_maybe_temper``),
-    # ``eos_id`` (the engine token id used as the committed placeholder for an
-    # aborted row), ``abort_rows`` (external indices ``draw`` flags to drop), and
-    # ``ctx`` (the sampler-facing :class:`BurstContext`). Pop-out is the explicit
-    # ``abort_request`` ``run_burst`` issues from :meth:`drain_aborts` -- no
-    # forced-EOS, no discard forward.
-
-    def _burst_external(self, request_id):
-        """The external particle index for a vLLM internal request id
-        (``"{external}-{8 chars}"``); the BurstLoop assigned ``str(index)``."""
-        return int(request_id.rsplit("-", 1)[0])
-
-    def _burst_particle(self, request_id):
-        """Map a vLLM internal request id to its particle via its external id ->
-        population row (so in-place re-added rows, which carry fresh ids, resolve to
-        the right resampled slot)."""
-        return self.particles[self._burst.ext_to_row[self._burst_external(request_id)]]
+    # The live burst's engine state lives on ``self._source`` (a
+    # :class:`~genlm.control.sampler.source.PushSource`): the live row-map, the
+    # engine LM fold, the EOS placeholder id, the abort/re-add plumbing, and the
+    # sampler-facing factor surface. ``draw`` reads it; resample / ESS / log_ml stay
+    # Controller-owned. Pop-out is the explicit ``abort_request`` ``run_burst``
+    # issues from :meth:`drain_aborts` -- no forced-EOS, no discard forward.
 
     def drain_adds(self):
-        """Rows the controller asks ``run_burst`` to (re-)add to the live engine batch this
-        step, as ``(ext_id, prompt_ids)`` (consumed). The in-place per-group resample
-        (:meth:`_resample_burst`) queues a resampled group's surviving rows
-        here so they rejoin WITHOUT draining the engine; empty otherwise."""
-        rows = self._burst.add_rows
-        self._burst.add_rows = []
-        return rows
-
-    def _resample_burst(self, w):
-        """The burst's mid-stream per-group resample: reindex the groups that crossed
-        ESS, then -- WITHOUT draining the burst -- drop each resampled group's current
-        engine rows and re-add its surviving rows at their resampled contexts (fresh
-        ids). Other groups never pause; the engine re-prefills the re-added rows
-        (prefix-cache-warm). A single population is just one group. ESS / resample /
-        weights stay controller-owned -- this only translates a completed resample
-        into engine abort/add plumbing.
-
-        Resampling can flip a row done<->live (a slot reindexed to a finished vs an
-        unfinished ancestor), so re-adds are decided over each group's FULL post-
-        reindex state: every still-live row is re-added, finished rows are not.
-        """
-        self._maybe_resample()  # reindexes crossing groups; sets _last_resampled_groups + record tag
-        for g in self._last_resampled_groups:
-            rows = self._group_rows[g]
-            # Drop the group's current engine rows -- their KV holds pre-resample
-            # tokens. (A row already aborted on termination is harmless to re-abort.)
-            for row in rows:
-                ext = w.row_to_ext.pop(int(row), None)
-                if ext is not None:
-                    w.abort_rows.add(ext)
-                    w.ext_to_row.pop(ext, None)
-            # Re-add the still-live rows at their resampled context (fresh id).
-            for row in rows:
-                p = self.particles[int(row)]
-                if p.done:
-                    continue
-                ext = w.next_ext
-                w.next_ext += 1
-                w.ext_to_row[ext] = int(row)
-                w.row_to_ext[int(row)] = ext
-                w.add_rows.append((ext, w.context_ids(p)))
+        """Backend hook (``run_burst`` calls it): rows the controller asks to (re-)add
+        this step as ``(ext_id, prompt_ids)`` (consumed). Delegates to the PushSource,
+        whose in-place resample queues a resampled group's survivors; empty otherwise."""
+        return self._source.drain_adds()
 
     def drain_aborts(self):
-        """External row indices ``draw`` has flagged to abort since the last call
-        (consumed). ``run_burst`` calls this after each engine step and issues
-        ``abort_request`` for them -- the out-of-band pop-out that replaces the old
-        forced-EOS. A row is flagged when its particle terminates, when it completes
-        a unit and must wait at the synced boundary (unit grain), when the ESS test
-        crosses (all live rows, ending the burst for resample), or just before a
-        cadence step the slow lane must run (all live rows)."""
-        rows = self._burst.abort_rows
-        self._burst.abort_rows = set()
-        return list(rows)
+        """Backend hook (``run_burst`` calls it after each step): external row indices
+        ``draw`` flagged to abort since the last call (consumed) -- the out-of-band
+        pop-out that replaces the old forced-EOS. Delegates to the PushSource."""
+        return self._source.drain_aborts()
 
     def draw(self, logits, request_ids):
         """Draw one token per live row, reproducing the slow path's per-step draw.
@@ -946,12 +753,12 @@ class Controller:
         ``_maybe_temper``, no top-k/p), so the engine's per-row sampling params
         play no role.
         """
-        w = self._burst
+        source = self._source
         sampler = self.unit_sampler
         # Every row in request_ids is live: an aborted/terminated row was dropped
         # from the engine, so it never reappears here.
-        parts = [self._burst_particle(rid) for rid in request_ids]
-        externals = [self._burst_external(rid) for rid in request_ids]
+        parts = [source.particle_of(rid) for rid in request_ids]
+        externals = [source.external_of(rid) for rid in request_ids]
 
         # Untwist last step's provisional critic twist before this step's score
         # (mirrors the slow loop's per-step untwist; no-op without a critic).
@@ -963,13 +770,12 @@ class Controller:
         # per-particle control over the [V+1] rows), returning one BurstDraw per
         # row. ``externals`` are the rows' stable particle indices, so a unit
         # sampler can key its per-burst accumulator across the shrinking live set.
-        llm = w.llm
-        lm_batch = llm._process_logw_next_batch(llm._maybe_temper(logits.float()))
+        lm_batch = source.fold(logits)
         records = sampler.burst_draw_batch(
             lm_batch,
             [p.context for p in parts],
             externals,
-            w.ctx,
+            source,
         )
         # Score every row's completed SMC step. With a critic, ALL rows are gathered
         # into ONE event-loop hop so the critic LM autobatches across the population
@@ -991,13 +797,13 @@ class Controller:
                 # Staggered pop-out: drop the row when the particle terminated, or
                 # when the sampler asks it to wait at a step boundary (a completed
                 # unit, synchronized grain) -- both leave the engine the same way.
-                w.abort_rows.add(externals[k])
+                source.abort_rows.add(externals[k])
                 # The burst continues past this terminated row, so drop its ext<->row
                 # entries to keep the maps tight rather than leaning on run_burst's
                 # gone-filter to mask a stale lookup.
                 if p.done:
-                    w.ext_to_row.pop(externals[k], None)
-                    w.row_to_ext.pop(p._i, None)
+                    source.ext_to_row.pop(externals[k], None)
+                    source.row_to_ext.pop(p._i, None)
 
         # End-of-step ESS test (the predicate the slow path applies after every
         # token) -- the TOKEN-grain (free-running) pop-out only. If it crosses,
@@ -1013,14 +819,14 @@ class Controller:
             # never pause, and a single population is just one group (no special
             # "drain + relaunch" case). No ``exit_reason``: the burst ends only when
             # every particle is done.
-            self._resample_burst(w)
+            source.resample_realize()
         elif self._slow_cadence_due(parts):
             # The next step is engine-inexpressible (a cadence) -- pop every live
             # row BEFORE the burst draws it, so the driver runs it on the slow lane
             # (ESS takes precedence above: if it crossed, resample first, then the
             # driver's burst-entry check runs this same cadence step next).
-            w.abort_rows.update(externals)
-            w.exit_reason = _EXIT_SLOW_STEP
+            source.abort_rows.update(externals)
+            source.exit_reason = _EXIT_SLOW_STEP
 
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
@@ -1078,7 +884,7 @@ class Controller:
                 )
             )
 
-        self._burst.ctx.run_sync(_score_all())
+        self._source.run_sync(_score_all())
 
     def _burst_token_id(self, p, rec):
         """Map a banked row's drawn token to the engine token id to emit. Must run
@@ -1090,7 +896,7 @@ class Controller:
             # EOS has no token_id, so commit the engine eos id as the (unused)
             # placeholder -- the assert keeps a slow/burst termination divergence loud.
             assert p.done, "burst drew EOS for a particle that did not terminate"
-            return self._burst.eos_id
+            return self._source.eos_id
         return token.token_id
 
 
@@ -1334,144 +1140,53 @@ class BurstLoop:
         decomposed = split_engine_target(self.sampler.target)
         if decomposed is None:  # pragma: no cover - guarded by burst_capability
             raise ValueError("target is not burst-expressible")
-        self.llm, self.factor, self.target = decomposed
+        self.llm, factor, target = decomposed
 
-        # Per-group engine LMs. All groups share ONE engine (same model / vocab /
-        # eos / factor structure -- so ``self.llm`` above is a fine representative
-        # for those); they differ ONLY in ``prompt_ids``. ``_context_ids`` picks the
-        # row's group's prompt. For a single group this is just ``[self.llm]``.
-        self.llms = [split_engine_target(s.target)[0] for s in controller.samplers]
-        # Snapshot each group's prompt prefix HERE (main thread). ``prompt_ids`` is a
-        # thread-local ``ContextVar`` (PromptedLLM): the initial prefill reads it on
-        # the main thread, but the mid-burst in-place re-add (``_resample_burst``)
-        # runs on the ``run_burst`` worker thread, where the override is invisible and
-        # the live read would silently fall back to the default prompt. The prefix is
-        # fixed for the whole run, so one main-thread snapshot is exact for both.
-        self._group_prefixes = [list(llm.prompt_ids) for llm in self.llms]
+        # Per-group engine LMs share ONE engine (same model / vocab / eos / factor
+        # structure -- so ``self.llm`` is a fine representative); they differ ONLY in
+        # ``prompt_ids``. Snapshot each group's prefix HERE (main thread):
+        # ``prompt_ids`` is a thread-local ``ContextVar``, and the mid-burst in-place
+        # re-add runs on the ``run_burst`` worker thread, where the override is
+        # invisible. The prefix is fixed for the run, so one snapshot serves both.
+        llms = [split_engine_target(s.target)[0] for s in controller.samplers]
+        group_prefixes = [list(lm.prompt_ids) for lm in llms]
 
-        # Gather maps onto the product's vocab_eos (the same maps Product.logw_next
-        # uses, but resolved explicitly against llm/factor so p1/p2 order is
-        # irrelevant). None in the unconstrained case.
-        if self.factor is None:
-            self.llm_idxs = None
-            self.factor_idxs = None
-        else:
-            self.llm_idxs = np.array(
-                [self.llm.lookup[t] for t in self.target.vocab_eos]
-            )
-            self.factor_idxs = np.array(
-                [self.factor.lookup[t] for t in self.target.vocab_eos]
-            )
+        # The engine logit source owns ALL engine-coupled state -- the row<->req-id
+        # maps, the LM fold, abort/re-add, the sampler-facing factor surface, the eos
+        # placeholder, and the gather maps onto the product vocab. Built once per run;
+        # its per-burst state resets via ``begin_burst``.
+        self.source = PushSource(controller, self.llm, factor, target, group_prefixes)
 
-        # The engine token id used as the committed placeholder for an aborted /
-        # EOS row (EOS carries no token_id). Fixed for the run -> resolved once. The
-        # row is aborted regardless, so any of the model's EOS ids serves; we take
-        # the first. A model with no EOS configured can't burst (the placeholder is
-        # undefined) -> fail loud rather than IndexError deep in a burst.
-        eos_idxs = list(self.llm.token_maps.eos_idxs)
-        if not eos_idxs:
-            raise ValueError(
-                "Engine LM has no EOS token id; the burst path needs one as the "
-                'committed placeholder for aborted rows. Use accelerate="off".'
-            )
-        self.eos_id = eos_idxs[0]
-
-    def _context_ids(self, p):
-        """Engine prompt for a particle: prompt prefix + its drawn token ids.
-
-        A token-grain context is a flat list of ``Token``s; a unit-grain context is
-        a list of units, each a list of subunit ``Token``s. Both flatten the same
-        way: recurse into unit lists, take each token's id, and drop EOS sentinels
-        (a finished particle is never relaunched, but a context may carry a trailing
-        EOS)."""
-        # Per-group prompt prefix (the row's example); the engine itself is shared.
-        # Read from the main-thread snapshot, NOT the live ``prompt_ids`` ContextVar
-        # (this runs on the worker thread during in-place re-add).
-        ids = list(self._group_prefixes[self.controller.particles.group[p._i]])
-
-        def _emit(item):
-            if isinstance(item, EndOfSequence):
-                return
-            if isinstance(item, list):
-                for sub in item:
-                    _emit(sub)
-            else:
-                ids.append(item.token_id)
-
-        for item in p.context:
-            _emit(item)
-        return ids
-
-    def _make_engine_callbacks(self, loop):
-        """The two event-loop hops the worker-thread ``draw`` uses.
-
-        * ``eval_factor`` -- the factor's ``logw_next(context)``: ``draw`` runs in a
-          worker thread, so it schedules the coroutine back onto this loop and
-          blocks for the result. The wrapped potential's ``_consume`` cache carries
-          the chart incrementally across the burst, so each call is one arc-step,
-          not a full context replay.
-        * ``run_async`` -- run a sampler's async helper (e.g. AWRS's rejection)
-          from the worker-thread draw and block -- one event-loop hop, no inner
-          gather.
-        """
-
-        def run_async(coro):
-            return asyncio.run_coroutine_threadsafe(coro, loop).result()
-
-        def eval_factor(factor, context):
-            # Inline if `factor.logw_next` is non-suspending (an FSA: pure-CPU
-            # async); hop to the loop only if it actually awaits (a critic LM /
-            # autobatched / IPC factor). Same value either way -- the hop is just
-            # threading -- so this drops the per-step hop for the FSA-factor case,
-            # using the SAME inline-or-hop primitive AWRS's draw uses.
-            return _drive_or_hop(lambda: factor.logw_next(context), run_async)
-
-        return eval_factor, run_async
-
-    async def _run_burst(self, live, eval_factor, run_async, loop):
+    async def _run_burst(self, live, loop):
         """Enter one stateless engine burst over the ``live`` particles, run it to
         a pop-out, and return WHY it exited (an ``_EXIT_*`` reason) so the driver
         can dispatch.
 
-        Installs the per-burst :class:`BurstContext` (the sampler-facing surface)
-        wrapped in the Controller's private :class:`_Burst` runtime, runs the
-        engine decode loop in a worker thread (so this event loop stays free to
-        service the ``draw``'s ``run_coroutine_threadsafe`` hops), and reads the
-        ``_Burst.exit_reason`` ``draw`` set before clearing the runtime.
+        Resets the :class:`~genlm.control.sampler.source.PushSource`'s per-burst
+        state, runs the engine decode loop in a worker thread (so this event loop
+        stays free to service the ``draw``'s ``run_coroutine_threadsafe`` hops), and
+        reads the exit reason ``draw`` set before clearing ``controller._source``.
         """
         controller = self.controller
         self.n_bursts += 1
-        prompts = [self._context_ids(p) for p in live]
+        source = self.source
+        source.begin_burst(live)
+        prompts = [source.context_ids(p) for p in live]
         # The engine decode budget for ONE burst, asked of the sampler: a token
         # sampler bursts until the longest particle's token budget (free-running,
         # pops at the ESS crossing); a unit sampler bursts one unit round (capped
         # at the subunit budget, pops each row at its boundary).
         max_steps = self.sampler.burst_max_steps(live)
-
-        ctx = BurstContext(
-            factor=self.factor,
-            target=self.target,
-            llm_idxs=self.llm_idxs,
-            factor_idxs=self.factor_idxs,
-            eval_factor=eval_factor,
-            run_async=run_async,
-        )
-        burst = _Burst(
-            particles=live,
-            llm=self.llm,
-            eos_id=self.eos_id,
-            ctx=ctx,
-            context_ids=self._context_ids,
-        )
         # A synchronized (unit-grain) burst always runs exactly one SMC step (one
         # unit) per row and hands back at the synced boundary for the controller-
         # owned ESS test -- so its exit reason is fixed up front. A free-running
         # (token-grain) burst stays ``_EXIT_TERMINATED``: it resamples in place at
         # ESS crossings without exiting, ending only when every row terminates (or a
         # cadence pops it via ``_EXIT_SLOW_STEP``).
-        if not self.sampler.burst_free_running():
-            burst.exit_reason = _EXIT_UNIT_SYNC
-        controller._burst = burst
+        source.exit_reason = (
+            _EXIT_TERMINATED if self.sampler.burst_free_running() else _EXIT_UNIT_SYNC
+        )
+        controller._source = source
         try:
             await loop.run_in_executor(
                 None,
@@ -1481,9 +1196,9 @@ class BurstLoop:
                     max_steps=max_steps,
                 ),
             )
-            return controller._burst.exit_reason
+            return controller._source.exit_reason
         finally:
-            controller._burst = None
+            controller._source = None
 
     async def run(self):
         """The outer driver: per iteration, run the next step on the fast lane (an
@@ -1510,7 +1225,7 @@ class BurstLoop:
         await controller.start()
 
         loop = asyncio.get_running_loop()
-        eval_factor, run_async = self._make_engine_callbacks(loop)
+        self.source.bind_loop(loop)
 
         while any(not p.done for p in controller.particles):
             live = [p for p in controller.particles if not p.done]
@@ -1521,7 +1236,7 @@ class BurstLoop:
                 controller._maybe_resample()
                 continue
 
-            reason = await self._run_burst(live, eval_factor, run_async, loop)
+            reason = await self._run_burst(live, loop)
             # Resample triggers at a burst exit: the synced boundary of a unit-grain
             # round, or just before a cadence step (the next iteration runs that step
             # on the slow lane). (A token-grain ESS crossing does NOT exit -- it
