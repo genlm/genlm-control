@@ -213,16 +213,6 @@ class DirectTokenSampler(TokenSampler):
         # on the slow loop.
         return self.proposal is None
 
-    def _draw_from(self, logws, draw=None):
-        """The single token-pick shared by the no-proposal slow and burst draws:
-        normalize, pick (``select`` by default, or a supplied ``draw`` override), and
-        return ``(token, logZ, logp)`` -- the importance weight is the log normalizer
-        ``logws.sum()``. Both lanes route through this so the draw exists once; only
-        where ``logws`` comes from differs (await ``logw_next`` vs the warm-KV product)."""
-        logps = logws.normalize()
-        token = select(logps) if draw is None else draw(logps.exp().materialize())
-        return token, logws.sum(), logps[token]
-
     def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
         """Batched burst draw (the burst analog of ``sample``), one BurstDraw per row.
 
@@ -269,8 +259,9 @@ class DirectTokenSampler(TokenSampler):
         out = []
         for k, context in enumerate(contexts):
             logw = ctx.product_logws(lm_np[k], context)
-            token, w, lp = self._draw_from(logw)
-            out.append(BurstDraw(token=token, step=([token], w, lp)))
+            logps = logw.normalize()
+            token = select(logps)
+            out.append(BurstDraw(token=token, step=([token], logw.sum(), logps[token])))
         return out
 
     async def sample(self, context, draw=None):
@@ -294,7 +285,9 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            return self._draw_from(logws, draw)
+            logps = logws.normalize()
+            token = select(logps) if draw is None else draw(logps.exp().materialize())
+            return token, logws.sum(), logps[token]
 
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context),
@@ -337,14 +330,6 @@ class SetTokenSampler(TokenSampler):
         # "SetTokenSampler is not engine-accelerated".
         return False
 
-    def _select_from(self, logws, set_logp, draw=None):
-        """Shared set-draw tail (slow + burst): normalize, pick (``select`` default
-        or a ``draw`` override), and fold the set's own log-prob ``set_logp`` (from
-        ``sample_set``) into the choice log-prob. Both lanes route through this."""
-        logps = logws.normalize()
-        token = select(logps) if draw is None else draw(logps.exp().materialize())
-        return token, logws.sum(), set_logp + logps[token]
-
     def burst_draw_batch(self, lm_batch, contexts, externals, ctx):
         """Set construction over the engine's warm-KV iterable weights, one BurstDraw
         per row. The LM half (``iter_potential.logw_next``) is batched ONCE; the
@@ -365,7 +350,9 @@ class SetTokenSampler(TokenSampler):
         async def _draw_one(context, il):
             # Mirrors the slow ``sample`` per particle, with iter weights substituted.
             logws, logp = await self.set_sampler.sample_set(context, iter_logws=il)
-            return self._select_from(logws, logp)
+            logps = logws.normalize()
+            token = select(logps)
+            return token, logws.sum(), logp + logps[token]
 
         async def _gather():
             return await asyncio.gather(
@@ -406,7 +393,9 @@ class SetTokenSampler(TokenSampler):
             `SetSampler` for more details.
         """
         logws, logp = await self.set_sampler.sample_set(context, draw=draw)
-        return self._select_from(logws, logp, draw)
+        logps = logws.normalize()
+        token = select(logps) if draw is None else draw(logps.exp().materialize())
+        return token, logws.sum(), logp + logps[token]
 
     async def cleanup(self):
         """Clean up the sampler.
