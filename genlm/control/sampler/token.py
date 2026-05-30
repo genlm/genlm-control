@@ -42,6 +42,12 @@ class TokenSampler:
         :meth:`burst_draw_batch`). Default ``False`` (stays on ``StepLoop``)."""
         return False
 
+    def burst_draw_sampler(self):
+        """The sampler whose per-step ``sample`` the burst actually injects logits for
+        -- i.e. whose ``target``/``proposal`` are the injected views. ``self`` for a
+        token-grain sampler; a unit sampler delegates to its subunit."""
+        return self
+
     def burst_free_running(self) -> bool:
         """Whether the burst is free-running (token grain): one SMC step per decode
         step, ESS tested every step. ``False`` = synchronized (unit grain): one SMC
@@ -236,8 +242,10 @@ class SetTokenSampler(TokenSampler):
         self.set_sampler = set_sampler
 
     def supports_burst(self) -> bool:
-        # Reported as not accelerated: the in-engine set draw is marginal/at-best
-        # until the trie is vectorized, so route Set to StepLoop.
+        # Slow lane: the set draw runs over an ASYNC trie (background asyncio task +
+        # per-node futures, backend/trie/async_impl.py) that needs a running event
+        # loop -- which the inline-driven burst (coro.send, no loop) doesn't have.
+        # Re-enabling needs a loop-free (sync) set draw, not just flipping this.
         return False
 
     async def sample(self, context, draw=None):

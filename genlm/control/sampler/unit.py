@@ -111,6 +111,11 @@ class MultiTokenUnitSampler(TokenSampler):
         # burst-capability is exactly the subunit sampler's.
         return self.subunit_sampler.supports_burst()
 
+    def burst_draw_sampler(self):
+        # The subunit does the per-step draw, so its target/proposal are the injected
+        # views (recurse, in case of nested unit samplers).
+        return self.subunit_sampler.burst_draw_sampler()
+
     def burst_free_running(self) -> bool:
         # Synchronized (unit grain), NOT free-running: one SMC step is one whole
         # unit, completed at a per-row boundary after a VARIABLE number of subunit

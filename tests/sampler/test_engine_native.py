@@ -799,58 +799,64 @@ def test_multitoken_burst_vs_slow(llm):
     )
 
 
+def test_multitoken_multiview_burst_vs_steploop(llm):
+    """Unit grain x multi-view: MultiToken over a K=2 subunit (DirectTokenSampler with
+    q proposal + p0 prior, differing by prompt). ``burst_draw_sampler`` surfaces the
+    subunit's two views, so the synchronized unit burst injects both per particle and
+    draws subunits from q reweighted by p0/q. Unbiased log_ml vs StepLoop across seeds
+    -- group/view/grain all compose."""
+    from genlm.control.sampler.unit import MultiTokenUnitSampler
+
+    base = llm.model
+    q_ids = base.tokenizer.encode("Once upon a")
+    p0_ids = base.tokenizer.encode(_PROMPT)
+
+    def make():
+        q = PromptedLLM(base, prompt_ids=q_ids, eos_byte_strings=_EOS_BYTES)
+        p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=_EOS_BYTES)
+        return MultiTokenUnitSampler(
+            subunit_sampler=DirectTokenSampler(potential=p0, proposal=q),
+            boundary_predicate=_ByteLengthBoundary(3),
+        )
+
+    assert can_burst(_controller(make, 8, 0.5, 6))  # unit-grain multi-view fast lane
+
+    seeds = (1234, 7, 99, 2024, 555, 31)
+    diffs, n_bursts = [], 0
+    for seed in seeds:
+        slow = _run_steploop(make, 8, 0.5, 6, seed)
+        burst = _run_burst(make, 8, 0.5, 6, seed)
+        s = _compare("multitoken-multiview", 0.5, 8, slow, burst)
+        diffs.append(s["log_ml_diff"])
+        n_bursts = max(n_bursts, s["n_bursts"])
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nmultitoken multiview over {len(seeds)} seeds: "
+        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
+    )
+    assert n_bursts > 0, "multitoken multiview did not burst"
+    assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
+        f"multitoken multiview burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+    )
+
+
 # ----- gate 2e: SetTokenSampler (trie set construction over warm-KV iter weights) ----
 
 
-@pytest.mark.skip(
-    reason="Set is not engine-accelerated (routes to StepLoop in production); "
-    "re-enable this in-engine set parity check when the trie set draw is touched."
-)
-def test_set_sampler_burst_vs_slow(llm):
-    """SetTokenSampler over an EagerSetSampler(iter=engine LM, item=byte FSA), in
-    the burst: the trie set construction runs over the engine's warm-KV iterable
-    weights (sample_set's iter_logws), the item potential replays from context
-    control-side -- exactly the slow path with only the iterable weights
-    substituted. Unbiased log_ml across seeds (the warm-KV residual only perturbs
-    the iterable weights). Small N/max_tokens because the trie set draw is
-    expensive."""
+def test_set_sampler_routed_to_slow_lane(llm):
+    """SetTokenSampler stays on StepLoop: its set draw runs over an ASYNC trie
+    (background asyncio task + per-node futures) that needs a running event loop, which
+    the inline-driven burst doesn't have. The gate must route it to the slow lane (a
+    loop-free set draw would be needed to burst it)."""
     from genlm.control.sampler import EagerSetSampler
     from genlm.control.sampler.token import SetTokenSampler
 
-    llm.set_prompt_from_str(_PROMPT)
     item = BoolFSA.from_regex(r"[a-z ]+")
-    # Build the trie set sampler ONCE (heavy init over the LM vocab) and reuse it
-    # across seeds -- it carries no per-run RNG (the draw uses the global stream
-    # that `_seed` controls).
     set_sampler = EagerSetSampler(iter_potential=llm, item_potential=item)
-
-    def make():
-        return SetTokenSampler(set_sampler)
-
     try:
-        # Decision 2 (UX): the Set sampler's in-engine path exists and is correct
-        # (the burst-vs-slow parity below proves it) but is reported as NOT
-        # accelerated -- the capability gate routes it to StepLoop. The numerical
-        # parity check still drives BurstLoop directly via `_run_burst`.
-        assert not can_burst(_controller(make, 8, 0.0, 8))
-        reason = burst_blocker(_controller(make, 8, 0.0, 8))
-        assert reason == "SetTokenSampler does not support the engine burst"
-        seeds = (1234, 7, 99, 2024, 555, 31)
-        diffs = []
-        for seed in seeds:
-            slow = _ref("set[a-z ]+", 8, 0.0, 8, seed)
-            burst = _run_burst(make, 8, 0.0, 8, seed)
-            s = _compare("set[a-z ]+", 0.0, 8, slow, burst)
-            diffs.append(s["log_ml_diff"])
-        diffs = np.array(diffs)
-        sem = diffs.std() / np.sqrt(len(diffs))
-        print(
-            f"\nset sampler over {len(seeds)} seeds: "
-            f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
-        )
-        assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
-            f"set-sampler burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
-        )
+        reason = burst_blocker(_controller(lambda: SetTokenSampler(set_sampler), 8, 0.0, 8))
+        assert reason is not None and "does not support" in reason, reason
     finally:
         asyncio.run(set_sampler.cleanup())
 

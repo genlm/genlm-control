@@ -679,11 +679,14 @@ class StepLoop:
 
 
 def _views_of(sampler):
-    """The LM views a burst injects for ``sampler``: its target's engine leaf plus its
-    proposal's (if any). K=1 (no proposal) is the common case; K=2 is proposal + prior.
-    A view is ``None`` if its potential has no single engine-burst leaf."""
-    proposal = getattr(sampler, "proposal", None)
-    views = [find_engine_lm(sampler.target)]
+    """The LM views a burst injects for ``sampler``: the leaves its per-step draw reads
+    -- the draw sampler's target leaf plus its proposal's (if any). The draw sampler is
+    the sampler itself for token grain, or its subunit for a unit sampler. K=1 (no
+    proposal) is the common case; K=2 is proposal + prior. A view is ``None`` if its
+    potential has no single engine-burst leaf."""
+    s = sampler.burst_draw_sampler()
+    proposal = getattr(s, "proposal", None)
+    views = [find_engine_lm(s.target)]
     if proposal is not None:
         views.append(find_engine_lm(proposal))
     return views
@@ -709,7 +712,8 @@ def burst_blocker(controller):
     # burst (with no hop, that suspends and raises). Route such configs to slow lane.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
-        for pot in (samp.target, getattr(samp, "proposal", None), crit):
+        draw = samp.burst_draw_sampler()
+        for pot in (draw.target, getattr(draw, "proposal", None), crit):
             if pot is None:
                 continue
             if any(lm not in injected for lm in lm_leaves(pot)):
