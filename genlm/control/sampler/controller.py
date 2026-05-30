@@ -7,6 +7,7 @@ log_ml are always controller-owned, never delegated to the engine.
 """
 
 import asyncio
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -78,13 +79,22 @@ class Population:
         return iter(self._views)
 
     def untwist_all(self):
-        """Vectorized untwist over the whole population (done rows carry 0)."""
-        self.logw -= self.twist_amount
+        """Vectorized untwist over the whole population (done rows carry 0).
+
+        Skip dead rows so ``-inf - (-inf) = NaN`` can't poison resample.
+        """
+        live = self.twist_amount != -np.inf
+        np.subtract(self.logw, self.twist_amount, out=self.logw, where=live)
         self.twist_amount[:] = 0.0
 
     def untwist_subset(self, idx):
-        """Vectorized untwist of rows ``idx`` (the burst's live rows; ``idx`` distinct)."""
-        self.logw[idx] -= self.twist_amount[idx]
+        """Vectorized untwist of rows ``idx`` (the burst's live rows; ``idx`` distinct).
+
+        Skip dead rows (see :meth:`untwist_all`).
+        """
+        idx = np.asarray(idx)
+        live = idx[self.twist_amount[idx] != -np.inf]
+        self.logw[live] -= self.twist_amount[live]
         self.twist_amount[idx] = 0.0
 
     def reindex(self, ancestor_indices):
@@ -156,7 +166,10 @@ class Particle:
         self._pop.logw[self._i] += amt
 
     def untwist(self):
-        self._pop.logw[self._i] -= self._pop.twist_amount[self._i]
+        # Skip dead rows (twist_amount == -inf) so logw stays -inf, not NaN.
+        ta = self._pop.twist_amount[self._i]
+        if ta != -np.inf:
+            self._pop.logw[self._i] -= ta
         self._pop.twist_amount[self._i] = 0.0
 
     def finish(self):
@@ -197,20 +210,32 @@ _EXIT_TERMINATED = "terminated"  # every flagged row finished on its own
 _EXIT_UNIT_SYNC = "unit_sync"  # unit-grain round done; driver runs ESS/resample
 
 
+_thread_loops: dict[int, asyncio.AbstractEventLoop] = {}
+_thread_loops_lock = threading.Lock()
+
+
+def _get_thread_loop() -> asyncio.AbstractEventLoop:
+    """Lazily create/return a persistent event loop pinned to the calling thread."""
+    tid = threading.get_ident()
+    with _thread_loops_lock:
+        loop = _thread_loops.get(tid)
+        if loop is None or loop.is_closed():
+            loop = _thread_loops[tid] = asyncio.new_event_loop()
+        return loop
+
+
 def _run_pure_cpu(coro):
     """Drive a forward-free coroutine to completion on the worker thread (no loop).
-    A suspend means a forward leaked past ``burst_blocker``."""
+    A suspend means a forward leaked past ``burst_blocker``.
+
+    Drives on a thread-local loop so I/O awaits (e.g. subprocess critics) work
+    while forwards are still rejected by ``burst_blocker``.
+    """
     token = inline_drive.set(True)
     try:
-        coro.send(None)
-    except StopIteration as e:
-        return e.value
+        return _get_thread_loop().run_until_complete(coro)
     finally:
         inline_drive.reset(token)
-    coro.close()
-    raise RuntimeError(
-        "burst step suspended on a non-injected forward; use accelerate='off'"
-    )
 
 
 class _Burst:
