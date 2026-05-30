@@ -1,6 +1,6 @@
 from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
-from .sequence import SMC, batched_smc
+from .sequence import SMC
 from .controller import (
     NotAcceleratable,
 )
@@ -79,7 +79,6 @@ __all__ = [
     "SetTokenSampler",
     "TokenSampler",
     "SMC",
-    "batched_smc",
     "MultiTokenUnitSampler",
     "BoundaryPredicate",
     "TokenSetBoundary",

@@ -42,7 +42,7 @@ async def _drive(controller, mode):
     """Select and run the SMC driver for ``mode`` (already-normalized
     'off'/'auto'/'require'), returning the final particle population. The burst-
     capability check, the ``require`` raise, and the ``auto`` fallback logging live
-    here so single (:meth:`SMC.__call__`) and batched (:func:`batched_smc`) runs
+    here so single (:meth:`SMC.__call__`) and batched (:meth:`SMC.batched`) runs
     share one selection -- they cannot drift."""
     if mode != "off":
         reason = burst_blocker(controller)
@@ -211,6 +211,62 @@ class SMC:
         if self.critic:
             await self.critic.cleanup()
 
+    @classmethod
+    async def batched(
+        cls,
+        smcs,
+        n_particles,
+        ess_threshold,
+        max_tokens,
+        *,
+        accelerate="auto",
+        verbosity=0,
+        **kwargs,
+    ):
+        """Run ``B = len(smcs)`` :class:`SMC` problems as ONE batched population.
+
+        ``smcs`` is a list of :class:`SMC` instances (each its own
+        ``unit_sampler`` + ``critic``, validated at construction). They run as B
+        independent sub-populations ("groups") of ``n_particles`` each in one
+        ``Controller``; ESS / resample / log_ml are per-group, so **each group is
+        statistically identical to running that ``SMC`` alone** (no cross-group
+        coupling -- the parity bar). Returns a list of B :class:`Sequences`, one
+        per problem, in ``smcs`` order.
+
+        Run params and ``accelerate`` carry the same meaning as
+        :meth:`__call__`; the burst lane needs the batch to be burst-homogeneous
+        (one shared forward over all B*N rows -- see
+        :func:`~genlm.control.sampler.controller._batch_blocker`), else it falls
+        back to the exact per-token loop.
+        """
+        samplers = [s.unit_sampler for s in smcs]
+        critics = [s.critic for s in smcs]
+        B = len(smcs)
+        # The controller's critic-presence branch uses the group-0 representative,
+        # so a mixed batch (some groups with a critic, some without) is unsupported
+        # -- make that contract explicit rather than crash deep in the transition.
+        assert len({c is None for c in critics}) == 1, (
+            "all SMC problems must have a critic or all none (homogeneous batch)"
+        )
+        controller = Controller(
+            unit_sampler=samplers[0],
+            critic=critics[0],
+            n_particles=n_particles * B,  # TOTAL rows across all groups
+            ess_threshold=ess_threshold,
+            max_tokens=max_tokens,
+            twist_with_critic=ess_threshold > 0,
+            verbosity=verbosity,
+            group_sizes=[n_particles] * B,
+            samplers=samplers,
+            critics=critics,
+            **kwargs,
+        )
+        await _drive(controller, _normalize_accelerate(accelerate))
+        return [
+            Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
+            for rows in controller._group_rows
+        ]
+
 
 @dataclass
 class Sequences:
@@ -344,64 +400,3 @@ def _unpack_particles(particles):
         ),
     )
     return contexts, logws
-
-
-async def batched_smc(
-    samplers,
-    critics,
-    n_particles,
-    ess_threshold,
-    max_tokens,
-    *,
-    accelerate="off",
-    verbosity=0,
-    **kwargs,
-):
-    """Run ``B = len(samplers)`` SMC E-steps as ONE batched population.
-
-    The B examples share the engine but each has its own sampler (``samplers[g]`` --
-    a token sampler over example g's prompt) and critic (``critics[g]``). They run as
-    B independent sub-populations ("groups") of ``n_particles`` each in one
-    ``Controller``; ESS / resample / log_ml are per-group, so **each group is
-    statistically identical to running that example alone** (no cross-group coupling
-    -- the parity bar). Returns a list of B :class:`Sequences`, one per example, in
-    ``samplers`` order.
-
-    ``accelerate`` selects the lane as in the single-example path: ``"off"`` the exact
-    per-token slow loop; ``"auto"``/``"require"`` the engine burst when the batch is
-    burst-homogeneous (one shared forward over all B*N rows, drawn through group 0's
-    sampler -- see :func:`~genlm.control.sampler.controller._batch_blocker`), else the
-    slow loop. Per-group ESS/resample/log_ml are identical on both lanes.
-    """
-    B = len(samplers)
-    assert len(critics) == B, "need one critic per sampler/example"
-    # The controller's critic-presence branch uses the group-0 representative, so a
-    # mixed batch (some groups with a critic, some without) is unsupported -- make
-    # that contract explicit rather than crash deep in the per-step transition.
-    assert len({c is None for c in critics}) == 1, (
-        "all critics must be present or all absent (homogeneous batch)"
-    )
-    controller = Controller(
-        unit_sampler=samplers[0],
-        critic=critics[0],
-        n_particles=n_particles * B,  # TOTAL rows across all groups
-        ess_threshold=ess_threshold,
-        max_tokens=max_tokens,
-        twist_with_critic=ess_threshold > 0,
-        verbosity=verbosity,
-        group_sizes=[n_particles] * B,
-        samplers=samplers,
-        critics=critics,
-        **kwargs,
-    )
-
-    # Same driver selection as the single-example path: ``off`` -> exact per-token
-    # StepLoop; burst-capable -> ONE engine burst over all B*N rows (``draw`` resamples
-    # the crossing groups in place per ``_ess_crosses``; pure acceleration of the same
-    # per-group transition).
-    await _drive(controller, _normalize_accelerate(accelerate))
-
-    return [
-        Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
-        for rows in controller._group_rows
-    ]

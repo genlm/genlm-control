@@ -665,7 +665,7 @@ def test_batched_multiview_burst_unbiased(llm):
     vs a single-run StepLoop of each group: group and view are orthogonal, so there is
     no cross-group coupling. ``accelerate="require"`` forces the batched multi-view
     burst (raises if the B>1 x K>1 gate wrongly rejects it)."""
-    from genlm.control.sampler.sequence import batched_smc
+    from genlm.control.sampler.sequence import SMC
 
     base = llm.model
     prompts = ["The", "Once upon a", "In the", "A B C", "Hello world", "To be"]
@@ -685,14 +685,14 @@ def test_batched_multiview_burst_unbiased(llm):
     )
 
     _seed(SEED)
-    samplers = [make_group(p) for p in prompts]
+    smcs = [SMC(make_group(p)) for p in prompts]
     seqs = asyncio.run(
-        batched_smc(
-            samplers, [None] * B, n_particles=8, ess_threshold=0.0,
+        SMC.batched(
+            smcs, n_particles=8, ess_threshold=0.0,
             max_tokens=10, accelerate="require",
         )
     )
-    assert len(seqs) == B, f"batched_smc returned {len(seqs)} groups, expected {B}"
+    assert len(seqs) == B, f"SMC.batched returned {len(seqs)} groups, expected {B}"
 
     burst = np.array([s.log_ml for s in seqs])
     fb, fr = burst[np.isfinite(burst)], refs[np.isfinite(refs)]
@@ -855,9 +855,9 @@ def test_set_sampler_burst_vs_slow(llm):
         asyncio.run(set_sampler.cleanup())
 
 
-# ----- gate 2h: batched_smc (B groups, ONE batched engine burst) --------------
+# ----- gate 2h: SMC.batched (B groups, ONE batched engine burst) --------------
 #
-# batched_smc runs B examples as ONE population (B groups of n_particles), drawn
+# SMC.batched runs B examples as ONE population (B groups of n_particles), drawn
 # through a SINGLE engine forward over all B*N rows; ESS / resample / log_ml are
 # group-local. So each group must be statistically identical to running it alone --
 # which is exactly the cached single-run references. We therefore REUSE the
@@ -873,7 +873,7 @@ def test_batched_smc_burst_unbiased(llm):
     ``accelerate="require"`` forces the batched burst (raises if the batch isn't
     burst-homogeneous); each group crosses ESS independently (per-group resample).
     Per-group log_ml must be unbiased vs the REUSED cached single-run references."""
-    from genlm.control.sampler.sequence import batched_smc
+    from genlm.control.sampler.sequence import SMC
 
     llm.set_prompt_from_str(_PROMPT)
     target = _boolfsa_target(llm, r"[aeiou ]+")
@@ -882,16 +882,16 @@ def test_batched_smc_burst_unbiased(llm):
     refs = np.array([_ref("boolfsa[aeiou ]+", 16, 0.5, 10, s)["log_ml"] for s in seeds])
 
     _seed(SEED)
-    samplers = [DirectTokenSampler(target) for _ in range(B)]
+    smcs = [SMC(DirectTokenSampler(target)) for _ in range(B)]
     t0 = time.perf_counter()
     seqs = asyncio.run(
-        batched_smc(
-            samplers, [None] * B, n_particles=16, ess_threshold=0.5,
+        SMC.batched(
+            smcs, n_particles=16, ess_threshold=0.5,
             max_tokens=10, accelerate="require",
         )
     )
     dt = time.perf_counter() - t0
-    assert len(seqs) == B, f"batched_smc returned {len(seqs)} groups, expected {B}"
+    assert len(seqs) == B, f"SMC.batched returned {len(seqs)} groups, expected {B}"
 
     group_mls = np.array([s.log_ml for s in seqs])
     finite = group_mls[np.isfinite(group_mls)]
@@ -903,10 +903,10 @@ def test_batched_smc_burst_unbiased(llm):
         + refs.std() ** 2 / len(refs)
     )
     _log(
-        f"batched_smc B={B}: {dt:.1f}s  group log_ml mean={finite.mean():+.4f} "
+        f"SMC.batched B={B}: {dt:.1f}s  group log_ml mean={finite.mean():+.4f} "
         f"ref mean={refs[np.isfinite(refs)].mean():+.4f} diff={diff:+.4f} sem={sem:.4f}"
     )
     assert abs(diff) <= max(0.3, 3.0 * sem), (
-        f"batched_smc per-group log_ml biased vs cached singles: "
+        f"SMC.batched per-group log_ml biased vs cached singles: "
         f"diff {diff:+.4f} (sem {sem:.4f})"
     )
