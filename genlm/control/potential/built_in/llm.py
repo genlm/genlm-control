@@ -297,9 +297,11 @@ class PromptedLLM(Potential):
         self.model = llm
         self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
-        # Per-request LoRA adapter name for the burst (None = base model). The burst
-        # tags each view's substream with this; the backend resolves it to a LoRARequest.
+        # LoRA adapter this view forwards under (None = base model). The burst tags each
+        # substream with it; the slow lane forwards through ``_fwd`` (an adapter-bound
+        # view of the engine), so both lanes apply the adapter consistently.
         self.lora_name = lora_name
+        self._fwd = self.model.lora_view(lora_name)
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -520,7 +522,7 @@ class PromptedLLM(Potential):
     async def _log_probability(self, context_ids):
         prefixes = [self.prompt_ids + context_ids[:i] for i in range(len(context_ids))]
         log_ps = self._maybe_temper(
-            await self.model.batch_next_token_logprobs(prefixes)
+            await self._fwd.batch_next_token_logprobs(prefixes)
         )
         target_ids = torch.tensor(context_ids, device=log_ps.device)
         with torch.no_grad():
@@ -561,7 +563,7 @@ class PromptedLLM(Potential):
         context_ids = self.encode_tokens(context)
         logp_context = await self._log_probability(context_ids)
         logp_next = self._maybe_temper(
-            await self.model.next_token_logprobs(self.prompt_ids + context_ids)
+            await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
         )
         logp_eos = torch.logsumexp(logp_next[self.token_maps.eos_idxs], dim=0).item()
         return logp_context + logp_eos
@@ -716,7 +718,7 @@ class PromptedLLM(Potential):
             return override[self]  # burst: serve the engine's warm logits, no forward
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
-            await self.model.next_token_logprobs(self.prompt_ids + context_ids)
+            await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
         )
         return self._process_logw_next(logw_next)
 
@@ -731,7 +733,7 @@ class PromptedLLM(Potential):
         """
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
-            await self.model.batch_next_token_logprobs(
+            await self._fwd.batch_next_token_logprobs(
                 [self.prompt_ids + context_ids for context_ids in context_ids_batch]
             )
         )

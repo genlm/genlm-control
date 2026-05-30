@@ -678,36 +678,38 @@ class StepLoop:
         return await self.controller.run()
 
 
+def _views_of(sampler):
+    """The LM views a burst injects for ``sampler``: its target's engine leaf plus its
+    proposal's (if any). K=1 (no proposal) is the common case; K=2 is proposal + prior.
+    A view is ``None`` if its potential has no single engine-burst leaf."""
+    proposal = getattr(sampler, "proposal", None)
+    views = [find_engine_lm(sampler.target)]
+    if proposal is not None:
+        views.append(find_engine_lm(proposal))
+    return views
+
+
 def burst_blocker(controller):
     """Why this config can't run the engine burst, or ``None`` if it can. The burst
     needs a burst-capable sampler (``supports_burst()``) over a target with exactly
     one engine-burst LM leaf (:func:`find_engine_lm`), and must be **forward-free**:
-    every LM leaf in the per-step path (each group's target AND critic) must be that
-    injected view, else it would forward inside the burst (a non-injected leaf, or an
-    LM critic). A batched (B>1) population must be burst-homogeneous
-    (:func:`_batch_blocker`). ``auto`` falls back to ``StepLoop`` on a non-None reason;
-    ``require`` raises it."""
+    every LM leaf in each group's per-step path (target + proposal + critic) must be an
+    injected view (:func:`_views_of`), else it would forward inside the burst (a
+    non-injected leaf, or an LM critic). A batched (B>1) population must be
+    burst-homogeneous across views (:func:`_batch_blocker`); group and view are
+    orthogonal, so B>1 x K>1 is supported. ``auto`` falls back to ``StepLoop`` on a
+    non-None reason; ``require`` raises it."""
     s = controller.unit_sampler
     if not s.supports_burst():
         return f"{type(s).__name__} does not support the engine burst"
     if find_engine_lm(s.target) is None:
         return "sampler target has no single engine-burst LM leaf"
-    # Multi-view (a proposal adds a second injected view) is single-group only for now;
-    # batched multi-view (B>1 x K>1) isn't wired.
-    multiview = any(
-        getattr(samp, "proposal", None) is not None for samp in controller.samplers
-    )
-    if multiview and len(controller.samplers) > 1:
-        return "multi-view (proposal) burst is single-group only"
     # Forward-free invariant: every LM leaf in each group's per-step path (target +
     # proposal + critic) must be an injected view, else it would forward inside the
     # burst (with no hop, that suspends and raises). Route such configs to slow lane.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
-        proposal = getattr(samp, "proposal", None)
-        injected = {find_engine_lm(samp.target)}
-        if proposal is not None:
-            injected.add(find_engine_lm(proposal))
-        for pot in (samp.target, proposal, crit):
+        injected = set(_views_of(samp))
+        for pot in (samp.target, getattr(samp, "proposal", None), crit):
             if pot is None:
                 continue
             if any(lm not in injected for lm in lm_leaves(pot)):
@@ -723,25 +725,27 @@ def burst_blocker(controller):
 
 def _batch_blocker(samplers):
     """Why a batched burst can't draw every group through group 0's sampler, or
-    ``None`` if burst-homogeneous. The burst runs one engine forward over all B*N rows
-    and draws them with ``samplers[0]``, so groups must share sampler kind, engine
-    model, temperature, constraint, and LoRA -- they may differ only in prompt (the
-    warm logits carry it) and critic (scored per group)."""
+    ``None`` if burst-homogeneous. The burst draws all groups with ``samplers[0]`` over
+    one engine forward, so groups must share sampler kind, the same K views, and per
+    view the same engine model, temperature, and LoRA, plus the same constraint -- they
+    may differ only in prompt (the warm logits carry it) and critic (scored per group).
+    Group and view are orthogonal here, so B>1 with K>1 is allowed."""
     s0 = samplers[0]
-    lm0 = find_engine_lm(s0.target)
+    views0 = _views_of(s0)
     constraint0 = constraint_leaf_ids(s0.target)
     for g, s in enumerate(samplers[1:], start=1):
         if type(s) is not type(s0):
             return f"group {g} sampler is {type(s).__name__}, not {type(s0).__name__}"
-        lm = find_engine_lm(s.target)
-        if lm is None or lm.model is not lm0.model:
-            return f"group {g} uses a different engine"
-        if getattr(lm, "temperature", None) != getattr(lm0, "temperature", None):
-            return f"group {g} temperature differs from group 0"
-        # The K=1 batched burst tags every group's substream with group 0's lora, so
-        # groups must share the adapter (the per-group leaf's lora is otherwise ignored).
-        if lm.lora_name != lm0.lora_name:
-            return f"group {g} uses a different LoRA adapter from group 0"
+        views = _views_of(s)
+        if len(views) != len(views0):
+            return f"group {g} has {len(views)} views, not {len(views0)}"
+        for vi, (v, v0) in enumerate(zip(views, views0)):
+            if v is None or v.model is not v0.model:
+                return f"group {g} view {vi} uses a different engine"
+            if getattr(v, "temperature", None) != getattr(v0, "temperature", None):
+                return f"group {g} view {vi} temperature differs from group 0"
+            if v.lora_name != v0.lora_name:
+                return f"group {g} view {vi} uses a different LoRA adapter from group 0"
         if constraint_leaf_ids(s.target) != constraint0:
             return f"group {g} has a different constraint"
     return None
@@ -757,32 +761,24 @@ class BurstLoop:
         self.controller = controller
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         self.sampler = controller.unit_sampler
-        # The engine LM the burst drives (run_burst + the eos id). Views all share its
-        # ``.model``; any one drives the engine.
-        self.llm = find_engine_lm(self.sampler.target)
+        # Views: the LM leaves whose warm logits the burst injects per particle -- group
+        # 0's target leaf plus its proposal leaf (if any). K=1 (no proposal); K=2 for q
+        # (proposal) and p0 (prior). The batched burst draws every group through group
+        # 0's sampler, so these are the injection keys for all groups.
+        self.views = _views_of(self.sampler)
+        self.k = len(self.views)
+        # The engine LM the burst drives (run_burst + the eos id); views share its model.
+        self.llm = self.views[0]
         if self.llm is None:  # pragma: no cover - guarded by burst_blocker
             raise ValueError("sampler target has no single engine-burst LM leaf")
 
-        # Views: the LM leaves whose warm logits the burst injects per particle -- the
-        # target leaf plus the proposal leaf (if any). K=1 today; K=2 for q (proposal)
-        # and p0 (prior). Each carries its own ``prompt_ids`` and ``lora_name``.
-        proposal = getattr(self.sampler, "proposal", None)
-        self.views = [self.llm] + (
-            [find_engine_lm(proposal)] if proposal is not None else []
-        )
-        self.k = len(self.views)
-
         # Per-(group, view) prompt prefix, snapshotted on the main thread (``prompt_ids``
-        # is a ContextVar invisible on the ``run_burst`` worker thread). K=1: one entry
-        # per group (its own leaf, batched runs differ only by prefix). K>1 (multi-view):
-        # single group, one entry per view -- views may differ by prefix and/or lora.
-        if self.k == 1:
-            self.view_prefixes = [
-                [list(find_engine_lm(s.target).prompt_ids)]
-                for s in controller.samplers
-            ]
-        else:
-            self.view_prefixes = [[list(v.prompt_ids) for v in self.views]]
+        # is a ContextVar invisible on the ``run_burst`` worker thread). Group and view
+        # are orthogonal: each group's substreams carry that group's per-view prefixes,
+        # so batched (B>1) and multi-view (K>1) compose with no special case.
+        self.view_prefixes = [
+            [list(v.prompt_ids) for v in _views_of(s)] for s in controller.samplers
+        ]
 
         # Engine token id committed as the placeholder for an aborted/EOS row.
         eos_idxs = list(self.llm.token_maps.eos_idxs)

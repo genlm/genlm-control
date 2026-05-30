@@ -659,6 +659,54 @@ def test_multiview_proposal_burst_vs_steploop(llm):
     )
 
 
+def test_batched_multiview_burst_unbiased(llm):
+    """B>1 groups, each a K=2 multi-view (q proposal + p0 prior, group-specific prompts)
+    -> ONE batched burst over B x K substreams per particle. Per-group log_ml unbiased
+    vs a single-run StepLoop of each group: group and view are orthogonal, so there is
+    no cross-group coupling. ``accelerate="require"`` forces the batched multi-view
+    burst (raises if the B>1 x K>1 gate wrongly rejects it)."""
+    from genlm.control.sampler.sequence import batched_smc
+
+    base = llm.model
+    prompts = ["The", "Once upon a", "In the", "A B C", "Hello world", "To be"]
+    B = len(prompts)
+
+    def make_group(p):
+        q = PromptedLLM(
+            base, prompt_ids=base.tokenizer.encode(p + " then"), eos_byte_strings=_EOS_BYTES
+        )
+        p0 = PromptedLLM(
+            base, prompt_ids=base.tokenizer.encode(p), eos_byte_strings=_EOS_BYTES
+        )
+        return DirectTokenSampler(potential=p0, proposal=q)
+
+    refs = np.array(
+        [_run_steploop(lambda pp=p: make_group(pp), 8, 0.0, 10, SEED)["log_ml"] for p in prompts]
+    )
+
+    _seed(SEED)
+    samplers = [make_group(p) for p in prompts]
+    seqs = asyncio.run(
+        batched_smc(
+            samplers, [None] * B, n_particles=8, ess_threshold=0.0,
+            max_tokens=10, accelerate="require",
+        )
+    )
+    assert len(seqs) == B, f"batched_smc returned {len(seqs)} groups, expected {B}"
+
+    burst = np.array([s.log_ml for s in seqs])
+    fb, fr = burst[np.isfinite(burst)], refs[np.isfinite(refs)]
+    diff = fb.mean() - fr.mean()
+    sem = np.sqrt(fb.std() ** 2 / max(len(fb), 1) + fr.std() ** 2 / max(len(fr), 1))
+    print(
+        f"\nbatched multiview B={B} K=2: burst mean={fb.mean():+.4f} "
+        f"ref mean={fr.mean():+.4f} diff={diff:+.4f} sem={sem:.4f}"
+    )
+    assert abs(diff) <= max(0.3, 3.0 * sem), (
+        f"batched multiview log_ml biased vs single-run StepLoop: diff {diff:+.4f} (sem {sem:.4f})"
+    )
+
+
 # ----- gate 2f: MultiTokenUnitSampler (synchronized unit-grain burst) ---------
 #
 # The unit grain is the one NON-free-running burst: a unit spans a VARIABLE number
