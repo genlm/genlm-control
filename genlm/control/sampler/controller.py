@@ -214,44 +214,41 @@ def _run_pure_cpu(coro):
 
 
 class _Burst:
-    """Per-burst engine state, set on the Controller for one ``run_burst``: the live
-    row<->particle handle maps, the abort/re-add queues, the sampler scratch, and the
-    exit reason. Run config (the engine LM, eos) is borrowed from the ``BurstLoop``
-    ``d``. The sampler-facing surface is ``engine_lm``/``warm_logws`` (inject + draw)
-    and ``scratch`` (unit accumulation); ``draw``/``drain_*`` are the internal engine
-    seam."""
+    """Per-burst engine state, set on the Controller for one ``run_burst``: the K
+    substreams-per-particle handle maps (``handle_rv``/``row_handles``), the abort/
+    re-add queues, the sampler scratch, and the exit reason. Run config (views, eos)
+    is borrowed from the ``BurstLoop`` ``d``. ``draw``/``drain_*``/``context_ids`` are
+    the engine seam; ``scratch`` holds unit accumulation."""
 
     def __init__(self, d, live):
         self.d = d
         self.particles = live
+        self.views = d.views
+        self.k = d.k
         self.abort_rows = set()
         self.add_rows = []
-        # handle <-> population row. The engine hands ``draw`` the handle owning each
-        # row; ``next_handle`` issues a fresh one per mid-burst re-add.
-        self.handle_to_row = {i: p._i for i, p in enumerate(live)}
-        self.row_to_handle = {p._i: i for i, p in enumerate(live)}
-        self.next_handle = len(live)
+        # K substreams per particle: handle -> (row, view_idx) and row -> [handle/view].
+        # ``next_handle`` issues fresh handles per mid-burst re-add.
+        self.handle_rv = {}
+        self.row_handles = {}
+        h = 0
+        for p in live:
+            hs = []
+            for _vi in range(self.k):
+                self.handle_rv[h] = (p._i, _vi)
+                hs.append(h)
+                h += 1
+            self.row_handles[p._i] = hs
+        self.next_handle = h
         self.scratch = {}
         self.exit_reason = _EXIT_TERMINATED
 
-    @property
-    def engine_lm(self):
-        return self.d.llm
-
-    def warm_logws(self, logits):
-        """The engine's warm logits -> one per-row LazyWeights == the engine LM's
-        ``logw_next`` for each row's context (folded once on-device, transferred once).
-        The sampler injects these as the LM's ``logw_next`` and runs the real draw."""
-        llm = self.d.llm
-        batch = llm._process_logw_next_batch(llm._maybe_temper(logits.float()))
-        return [llm.make_lazy_weights(row) for row in batch.cpu().numpy()]
-
-    def particle_of(self, handle):
-        return self.d.controller.particles[self.handle_to_row[handle]]
-
-    def context_ids(self, p):
-        """Engine prompt: the row's group prefix + its drawn token ids (EOS dropped)."""
-        ids = list(self.d.group_prefixes[self.d.controller.particles.group[p._i]])
+    def context_ids(self, p, view_idx):
+        """Engine prompt for one (particle, view) substream: the view's prefix + the
+        particle's drawn token ids (EOS dropped; the drawn suffix is shared across
+        views, the prefix is per-view)."""
+        g = self.d.controller.particles.group[p._i]
+        ids = list(self.d.view_prefixes[g][view_idx])
 
         def _emit(item):
             if isinstance(item, EndOfSequence):
@@ -277,41 +274,68 @@ class _Burst:
         return rows
 
     def draw(self, logits, handles):
-        """The engine callback (``run_burst`` calls this), one token per live row: the
-        engine's warm logits become each row's engine-LM ``logw_next``, the sampler runs
-        its REAL ``burst_draw_batch`` (inject + ``transition``), and the Controller banks
-        the completed SMC steps. ``handles[i]`` owns row ``i``. Pop-out is out-of-band
-        (``drain_aborts``); a token-grain ESS crossing resamples in place (no exit)."""
+        """The engine callback (``run_burst`` calls this). ``handles`` are the live
+        substream ext_ids this step -- K per particle (one per view), lock-step. Each
+        view folds its own warm logits; the sampler runs its REAL ``burst_draw_batch``
+        (inject the K views + ``transition``) once per particle; the one drawn token
+        fans to that particle's K substreams. Pop-out is out-of-band (``drain_aborts``);
+        a token-grain ESS crossing resamples in place (no exit)."""
         c = self.d.controller
         sampler = self.d.sampler
-        # Every row here is live (aborted/terminated rows were dropped from the engine).
-        parts = [self.particle_of(h) for h in handles]
+        idx_of = {h: i for i, h in enumerate(handles)}
+
+        # Distinct particles present this step (first-seen order).
+        rows, seen = [], set()
+        for h in handles:
+            row = self.handle_rv[h][0]
+            if row not in seen:
+                seen.add(row)
+                rows.append(row)
+        parts = [c.particles[row] for row in rows]
 
         # Untwist last step's critic twist before this step's score (only the
         # twisting critic ever sets twist_amount; otherwise it's a no-op).
         if c.twist_with_critic:
             c.particles.untwist_subset([p._i for p in parts])
 
-        # Engine warm logits -> per-row LM logw_next; the sampler injects them and runs
-        # the real per-step draw, inline-driven on this worker thread (no hop).
-        warm = self.warm_logws(logits)
+        # Per-view warm logits: each view folds its own substream rows on-device.
+        warm = {}  # handle -> LazyWeights
+        for vi, view in enumerate(self.views):
+            vh = [h for h in handles if self.handle_rv[h][1] == vi]
+            if not vh:
+                continue
+            rowsidx = [idx_of[h] for h in vh]
+            batch = view._process_logw_next_batch(view._maybe_temper(logits[rowsidx].float()))
+            for h, row_w in zip(vh, batch.cpu().numpy()):
+                warm[h] = view.make_lazy_weights(row_w)
+
+        # Per-particle injection dict {view_lm: warm}; the sampler composes the K views.
+        injections = [
+            {view: warm[self.row_handles[row][vi]] for vi, view in enumerate(self.views)}
+            for row in rows
+        ]
         records = _run_pure_cpu(
-            sampler.burst_draw_batch(warm, [p.context for p in parts], handles, self)
+            sampler.burst_draw_batch(injections, [p.context for p in parts], rows, self)
         )
         # Bank steps before the token map: scoring sets p.done on termination.
         c._bank_burst_steps(parts, records)
         # Token grain records per step here; unit grain once per round in BurstLoop.run.
         if sampler.burst_free_running() and any(rec.step is not None for rec in records):
             c._record_step()
-        out = [0] * len(parts)
-        for k, p in enumerate(parts):
-            out[k] = self._burst_token_id(p, records[k])
-            if p.done or records[k].pop:
-                # Drop the row: terminated, or waiting at a unit boundary.
-                self.abort_rows.add(handles[k])
+
+        out = [0] * len(handles)
+        for k_i, (p, row) in enumerate(zip(parts, rows)):
+            tok_id = self._burst_token_id(p, records[k_i])
+            for h in self.row_handles[row]:  # fan the drawn token to the K substreams
+                if h in idx_of:
+                    out[idx_of[h]] = tok_id
+            if p.done or records[k_i].pop:
+                # Drop all K substreams: terminated, or waiting at a unit boundary.
+                for h in self.row_handles[row]:
+                    self.abort_rows.add(h)
                 if p.done:
-                    self.handle_to_row.pop(handles[k], None)
-                    self.row_to_handle.pop(p._i, None)
+                    for h in self.row_handles.pop(row, []):
+                        self.handle_rv.pop(h, None)
 
         if sampler.burst_free_running():
             self.resample_realize()  # resamples in place on an ESS crossing, else no-op
@@ -338,21 +362,23 @@ class _Burst:
             for row in c._group_rows[g]:
                 row = int(row)
                 if ancestors[row] == row:
-                    continue  # unchanged context -> engine row still valid, leave it
-                h = self.row_to_handle.pop(row, None)
-                if h is not None:
+                    continue  # unchanged context -> engine rows still valid, leave them
+                for h in self.row_handles.pop(row, []):  # drop all K substreams
                     self.abort_rows.add(h)
-                    self.handle_to_row.pop(h, None)
+                    self.handle_rv.pop(h, None)
             for row in c._group_rows[g]:
                 row = int(row)
                 p = c.particles[row]
                 if p.done or ancestors[row] == row:
                     continue
-                h = self.next_handle
-                self.next_handle += 1
-                self.handle_to_row[h] = row
-                self.row_to_handle[row] = h
-                self.add_rows.append((h, self.context_ids(p), None))
+                hs = []  # re-add all K substreams (per-view prefix + lora)
+                for vi, view in enumerate(self.views):
+                    h = self.next_handle
+                    self.next_handle += 1
+                    self.handle_rv[h] = (row, vi)
+                    hs.append(h)
+                    self.add_rows.append((h, self.context_ids(p, vi), view.lora_name))
+                self.row_handles[row] = hs
 
 
 # ---------------------------------------------------------------------------
@@ -666,15 +692,25 @@ def burst_blocker(controller):
         return f"{type(s).__name__} does not support the engine burst"
     if find_engine_lm(s.target) is None:
         return "sampler target has no single engine-burst LM leaf"
-    # Forward-free invariant: any LM leaf that isn't the injected engine view would
-    # forward inside the burst (with no hop, that suspends and raises). Route such
-    # configs to the slow lane here.
+    # Multi-view (a proposal adds a second injected view) is single-group only for now;
+    # batched multi-view (B>1 x K>1) isn't wired.
+    multiview = any(
+        getattr(samp, "proposal", None) is not None for samp in controller.samplers
+    )
+    if multiview and len(controller.samplers) > 1:
+        return "multi-view (proposal) burst is single-group only"
+    # Forward-free invariant: every LM leaf in each group's per-step path (target +
+    # proposal + critic) must be an injected view, else it would forward inside the
+    # burst (with no hop, that suspends and raises). Route such configs to slow lane.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
-        injected = find_engine_lm(samp.target)
-        for pot in (samp.target, crit):
+        proposal = getattr(samp, "proposal", None)
+        injected = {find_engine_lm(samp.target)}
+        if proposal is not None:
+            injected.add(find_engine_lm(proposal))
+        for pot in (samp.target, proposal, crit):
             if pot is None:
                 continue
-            if any(lm is not injected for lm in lm_leaves(pot)):
+            if any(lm not in injected for lm in lm_leaves(pot)):
                 return (
                     f"group {g}: an LM leaf can't be assembled into the burst as an "
                     "injected view (it would forward) -- e.g. an LM critic or a "
@@ -689,8 +725,8 @@ def _batch_blocker(samplers):
     """Why a batched burst can't draw every group through group 0's sampler, or
     ``None`` if burst-homogeneous. The burst runs one engine forward over all B*N rows
     and draws them with ``samplers[0]``, so groups must share sampler kind, engine
-    model, temperature, and constraint -- they may differ only in prompt (the warm
-    logits carry it) and critic (scored per group)."""
+    model, temperature, constraint, and LoRA -- they may differ only in prompt (the
+    warm logits carry it) and critic (scored per group)."""
     s0 = samplers[0]
     lm0 = find_engine_lm(s0.target)
     constraint0 = constraint_leaf_ids(s0.target)
@@ -702,6 +738,10 @@ def _batch_blocker(samplers):
             return f"group {g} uses a different engine"
         if getattr(lm, "temperature", None) != getattr(lm0, "temperature", None):
             return f"group {g} temperature differs from group 0"
+        # The K=1 batched burst tags every group's substream with group 0's lora, so
+        # groups must share the adapter (the per-group leaf's lora is otherwise ignored).
+        if lm.lora_name != lm0.lora_name:
+            return f"group {g} uses a different LoRA adapter from group 0"
         if constraint_leaf_ids(s.target) != constraint0:
             return f"group {g} has a different constraint"
     return None
@@ -717,16 +757,32 @@ class BurstLoop:
         self.controller = controller
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         self.sampler = controller.unit_sampler
-        # The single engine LM the burst drives (run_burst + warm-logits injection).
+        # The engine LM the burst drives (run_burst + the eos id). Views all share its
+        # ``.model``; any one drives the engine.
         self.llm = find_engine_lm(self.sampler.target)
         if self.llm is None:  # pragma: no cover - guarded by burst_blocker
             raise ValueError("sampler target has no single engine-burst LM leaf")
 
-        # Groups share one engine, differing only in ``prompt_ids``. Snapshot each
-        # prefix on the main thread: ``prompt_ids`` is a ContextVar, invisible on the
-        # ``run_burst`` worker thread where the mid-burst re-add runs.
-        llms = [find_engine_lm(s.target) for s in controller.samplers]
-        self.group_prefixes = [list(lm.prompt_ids) for lm in llms]
+        # Views: the LM leaves whose warm logits the burst injects per particle -- the
+        # target leaf plus the proposal leaf (if any). K=1 today; K=2 for q (proposal)
+        # and p0 (prior). Each carries its own ``prompt_ids`` and ``lora_name``.
+        proposal = getattr(self.sampler, "proposal", None)
+        self.views = [self.llm] + (
+            [find_engine_lm(proposal)] if proposal is not None else []
+        )
+        self.k = len(self.views)
+
+        # Per-(group, view) prompt prefix, snapshotted on the main thread (``prompt_ids``
+        # is a ContextVar invisible on the ``run_burst`` worker thread). K=1: one entry
+        # per group (its own leaf, batched runs differ only by prefix). K>1 (multi-view):
+        # single group, one entry per view -- views may differ by prefix and/or lora.
+        if self.k == 1:
+            self.view_prefixes = [
+                [list(find_engine_lm(s.target).prompt_ids)]
+                for s in controller.samplers
+            ]
+        else:
+            self.view_prefixes = [[list(v.prompt_ids) for v in self.views]]
 
         # Engine token id committed as the placeholder for an aborted/EOS row.
         eos_idxs = list(self.llm.token_maps.eos_idxs)
@@ -747,10 +803,13 @@ class BurstLoop:
         b.exit_reason = (
             _EXIT_TERMINATED if self.sampler.burst_free_running() else _EXIT_UNIT_SYNC
         )
-        # One substream per live particle (K=1): (handle, prompt_ids, lora_name=None).
-        # Handle ``i`` matches ``_Burst``'s handle_to_row for live[i]. Multi-view (K>1)
-        # extends this to K substreams per particle.
-        requests = [(i, b.context_ids(p), None) for i, p in enumerate(live)]
+        # K substreams per live particle: (handle, view-prefix+drawn, view.lora_name).
+        # Handles match ``_Burst``'s row_handles; views carry their own prefix + lora.
+        requests = [
+            (b.row_handles[p._i][vi], b.context_ids(p, vi), view.lora_name)
+            for p in live
+            for vi, view in enumerate(self.views)
+        ]
         # Decode budget for one burst (token grain: longest token budget; unit grain:
         # one unit's subunits).
         max_steps = self.sampler.burst_max_steps(live)

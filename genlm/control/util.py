@@ -1,3 +1,4 @@
+import asyncio
 import contextvars
 import warnings
 
@@ -13,6 +14,14 @@ from genlm.backend.tokenization import Token
 inline_drive: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_inline_drive", default=False
 )
+
+
+async def gather_or_inline(*coros):
+    """Await ``coros`` concurrently under a running loop (StepLoop), sequentially when
+    inline-driven in a burst (``inline_drive`` set, no loop to gather on)."""
+    if inline_drive.get():
+        return [await c for c in coros]
+    return list(await asyncio.gather(*coros))
 
 
 def logsumexp(x):

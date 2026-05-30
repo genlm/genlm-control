@@ -1,11 +1,10 @@
-import asyncio
 import numpy as np
 from arsenal import colors
 from arsenal.maths import log1mexp
 from genlm.control.util import logsumexp
 import warnings
 
-from genlm.control.util import select, inline_drive
+from genlm.control.util import select, gather_or_inline
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 from genlm.control.sampler.controller import BurstDraw
@@ -54,22 +53,19 @@ class TokenSampler:
         particle's remaining budget (+1). The unit sampler overrides it."""
         return max(p.max_tokens_left for p in live) + 1
 
-    async def burst_draw_batch(self, warm_logws, contexts, handles, burst):
-        """Engine-burst draw, one BurstDraw per row (token grain). Per row, inject the
-        engine's warm logits as the LM's ``logw_next`` and run the REAL per-step
-        ``transition`` -- the target composes itself, no proposal reconstruction. One
-        SMC step per decode step. The unit sampler overrides for subunit accumulation."""
-        llm = burst.engine_lm
+    async def burst_draw_batch(self, injections, contexts, handles, burst):
+        """Engine-burst draw, one BurstDraw per particle (token grain). ``injections[i]``
+        maps each view-LM to its warm logits for particle ``i``; inject them and run the
+        REAL per-step ``transition`` -- the target composes itself over the K views
+        (proposal/prior/...), no proposal reconstruction. One SMC step per decode step.
+        The unit sampler overrides for subunit accumulation."""
 
-        async def one(context, warm):
-            with burst_logw_next(llm, warm):
+        async def one(context, injection):
+            with burst_logw_next(injection):
                 to_append, logw, logp = await self.transition(context)
             return BurstDraw(token=to_append[-1], step=(to_append, logw, logp))
 
-        if not inline_drive.get():
-            return await asyncio.gather(*(one(c, w) for c, w in zip(contexts, warm_logws)))
-        # Burst inline-drive (no loop): drive sequentially.
-        return [await one(c, w) for c, w in zip(contexts, warm_logws)]
+        return await gather_or_inline(*(one(c, j) for c, j in zip(contexts, injections)))
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
@@ -178,9 +174,9 @@ class DirectTokenSampler(TokenSampler):
         self.proposal = proposal
 
     def supports_burst(self) -> bool:
-        # No proposal: draws exactly from the target's normalized logw_next (which the
-        # engine reproduces). A proposal makes the weight non-engine-expressible.
-        return self.proposal is None
+        # The engine reproduces the target's logw_next, and (with a proposal) the
+        # proposal's, as injected views; burst_blocker checks every leaf is a view.
+        return True
 
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
@@ -208,9 +204,8 @@ class DirectTokenSampler(TokenSampler):
             token = select(logps) if draw is None else draw(logps.exp().materialize())
             return token, logZ, logps[token]
 
-        proposal_logws, target_logws = await asyncio.gather(
-            self.proposal.logw_next(context),
-            self.potential.logw_next(context),
+        proposal_logws, target_logws = await gather_or_inline(
+            self.proposal.logw_next(context), self.potential.logw_next(context)
         )
         proposal_logZ = proposal_logws.sum()  # one logsumexp, reused below
         proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_logZ)
@@ -358,9 +353,9 @@ class AWRS(TokenSampler):
         self.rng = np.random.default_rng(seed=seed)
 
     def supports_burst(self) -> bool:
-        # No proposal: rejection runs over the engine LM logits, condition checked per
-        # probed token (same as the slow ``sample``).
-        return self.proposal is None
+        # Rejection runs over the engine LM logits (injected), condition checked per
+        # probed token (CPU). With a proposal, both LM reads are injected views.
+        return True
 
     def _prune_logws(self, logws):
         # Prune the logws to only include the tokens in the
@@ -408,9 +403,8 @@ class AWRS(TokenSampler):
             logws = await self.potential.logw_next(context)
             target_logws = None
         else:
-            target_logws, logws = await asyncio.gather(
-                self.potential.logw_next(context),
-                self.proposal.logw_next(context),
+            target_logws, logws = await gather_or_inline(
+                self.potential.logw_next(context), self.proposal.logw_next(context)
             )
 
         async def accept(tok):

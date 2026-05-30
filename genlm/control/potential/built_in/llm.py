@@ -21,11 +21,13 @@ _burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
 
 
 @contextlib.contextmanager
-def burst_logw_next(llm, logws):
-    """Make ``llm.logw_next`` return ``logws`` (the engine's warm logits for this
-    step) instead of forwarding, for the duration of the context. Set inside each
-    per-row burst task, so concurrent rows each inject their own warm logits."""
-    token = _burst_logw_next_overrides.set({llm: logws})
+def burst_logw_next(overrides):
+    """Inject the engine's warm logits per view: ``overrides`` maps each
+    ``PromptedLLM`` to the ``LazyWeights`` its ``logw_next`` should return this step
+    instead of forwarding. One entry = single-view (today's burst); K entries = K
+    views (e.g. proposal + prior) on the shared engine. Set inside each per-particle
+    burst task."""
+    token = _burst_logw_next_overrides.set(overrides)
     try:
         yield
     finally:
@@ -275,6 +277,7 @@ class PromptedLLM(Potential):
         eos_byte_strings=None,
         temperature=1.0,
         token_maps=None,
+        lora_name=None,
         **kwargs,
     ):
         """`
@@ -294,6 +297,9 @@ class PromptedLLM(Potential):
         self.model = llm
         self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
+        # Per-request LoRA adapter name for the burst (None = base model). The burst
+        # tags each view's substream with this; the backend resolves it to a LoRARequest.
+        self.lora_name = lora_name
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -763,6 +769,7 @@ class PromptedLLM(Potential):
                 prompt_ids=prompt_ids,
                 temperature=temperature,
                 token_maps=self.token_maps,
+                lora_name=self.lora_name,
             )
 
         return PromptedLLM(
@@ -770,6 +777,7 @@ class PromptedLLM(Potential):
             prompt_ids=prompt_ids,
             eos_byte_strings=eos_byte_strings,
             temperature=temperature,
+            lora_name=self.lora_name,
         )
 
     def spawn_new_eos(self, eos_byte_strings=None, **kwargs):

@@ -1,10 +1,9 @@
-import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import inline_drive
+from genlm.control.util import gather_or_inline
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.controller import BurstDraw
 from genlm.control.potential.built_in.llm import burst_logw_next
@@ -129,27 +128,26 @@ class MultiTokenUnitSampler(TokenSampler):
         # before this engine cap, so the engine never length-caps a row mid-unit.
         return self.max_subunits_per_unit + 1
 
-    async def burst_draw_batch(self, warm_logws, contexts, handles, burst):
+    async def burst_draw_batch(self, injections, contexts, handles, burst):
         """Burst draw for one unit round: one subunit per decode step, completing an
-        SMC step only at the unit boundary. Per row, inject the engine's warm logits
-        and run the subunit sampler's REAL ``sample`` (one subunit); accumulate it in
-        ``burst.scratch`` (keyed by ``handle``); then apply the SAME EOS-split /
-        boundary / max-subunit logic as the slow ``sample``/``transition``:
+        SMC step only at the unit boundary. Per particle, inject the views' warm logits
+        (``injections[i]``) and run the subunit sampler's REAL ``sample`` (one subunit);
+        accumulate it in ``burst.scratch`` (keyed by particle ``handle``); then apply the
+        SAME EOS-split / boundary / max-subunit logic as the slow ``sample``/``transition``:
 
         * EOS subunit -> split the content off so ``context[-1]`` is EOS (terminate).
         * boundary fires -> finalize the unit; the row pops out at the synced boundary.
         * max subunits without a boundary -> reject (``-inf`` weight, finishes).
         * otherwise -> mid-unit: emit the subunit, bank nothing (``step=None``)."""
         accums = burst.scratch  # handle -> _UnitAccum, fresh each burst
-        llm = burst.engine_lm
 
-        async def one(context, warm, handle):
+        async def one(context, injection, handle):
             accum = accums.get(handle)
             buf = accum.buffer if accum is not None else []
             # Subunit context: completed units flattened to subunits + in-progress
             # subunits this unit, so the subunit sampler's factor scores statelessly.
             sub_context = flatten_units(context) + list(buf)
-            with burst_logw_next(llm, warm):
+            with burst_logw_next(injection):
                 subunit, sub_logw, sub_logp = await self.subunit_sampler.sample(sub_context)
 
             if accum is None:
@@ -162,12 +160,9 @@ class MultiTokenUnitSampler(TokenSampler):
             step = (self._to_append(unit), weight, accum.logp)
             return BurstDraw(token=subunit, step=step, pop=status == "boundary")
 
-        if not inline_drive.get():
-            return await asyncio.gather(
-                *(one(c, w, h) for c, w, h in zip(contexts, warm_logws, handles))
-            )
-        # Burst inline-drive (no loop): drive sequentially.
-        return [await one(c, w, h) for c, w, h in zip(contexts, warm_logws, handles)]
+        return await gather_or_inline(
+            *(one(c, j, h) for c, j, h in zip(contexts, injections, handles))
+        )
 
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""

@@ -50,6 +50,7 @@ from genlm.control.sampler.unit import BoundaryPredicate  # noqa: E402
 from genlm.control.sampler.controller import (  # noqa: E402
     Controller,
     BurstLoop,
+    StepLoop,
     burst_blocker,
 )
 
@@ -177,6 +178,30 @@ def _run_burst(
         "log_ml": float(seq.log_ml),
         "wall": dt,
         "n_bursts": driver.n_bursts,
+        "n_resamples": controller.n_resamples,
+    }
+
+
+def _run_steploop(
+    make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
+):
+    """Same as ``_run_burst`` but the byte-exact StepLoop (``accelerate="off"``
+    ground truth, gate-1-pinned == original) -- the reference for configs with no
+    cached original snapshot (e.g. multi-view proposal)."""
+    from genlm.control.sampler.sequence import Sequences, _unpack_particles
+
+    _seed(seed)
+    controller = _controller(
+        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
+    )
+    parts = asyncio.run(StepLoop(controller).run())
+    seq = Sequences(*_unpack_particles(parts))
+    return {
+        "contexts": [_ctx_ids(p.context) for p in parts],
+        "logw": [float(p.logw) for p in parts],
+        "log_ml": float(seq.log_ml),
+        "wall": 0.0,
+        "n_bursts": 0,
         "n_resamples": controller.n_resamples,
     }
 
@@ -587,6 +612,51 @@ def test_lm_critic_routed_to_slow_lane(llm):
     _seed(SEED)
     with pytest.raises(NotAcceleratable):
         asyncio.run(make().smc(8, 0.0, 8, critic=lm_critic, accelerate="require"))
+
+
+# ----- gate 2g: multi-view (proposal q + prior p0, two views on one engine) -------
+#
+# K=2 multi-view: DirectTokenSampler(potential=p0, proposal=q) where q and p0 are two
+# PromptedLLMs on the SAME engine (here differing by prompt; the LoRA case differs by
+# adapter -- same control path). The burst submits 2 substreams/particle, injects both
+# warm logit views, draws from q and reweights by p0/q, fans the one drawn token to both
+# substreams (lock-step). No cached original reference (and no main checkout) for this
+# config, so compare against StepLoop (gate-1-pinned == original).
+
+
+def test_multiview_proposal_burst_vs_steploop(llm):
+    """Two prompt-views q/p0 on one engine -> K=2 multi-view burst; unbiased log_ml vs
+    StepLoop across seeds (warm-KV residual only). Exercises the multi-view machinery:
+    K substreams, K injected views, p0/q reweight, lock-step token fan-out."""
+    base = llm.model
+    q_ids = base.tokenizer.encode("Once upon a")
+    p0_ids = base.tokenizer.encode(_PROMPT)
+
+    def make():
+        q = PromptedLLM(base, prompt_ids=q_ids, eos_byte_strings=_EOS_BYTES)
+        p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=_EOS_BYTES)
+        return DirectTokenSampler(potential=p0, proposal=q)
+
+    assert can_burst(_controller(make, 8, 0.0, 10))  # K=2 multi-view rides the fast lane
+
+    seeds = (1234, 7, 99, 2024, 555, 31)
+    diffs, n_bursts = [], 0
+    for seed in seeds:
+        slow = _run_steploop(make, 8, 0.0, 10, seed)
+        burst = _run_burst(make, 8, 0.0, 10, seed)
+        s = _compare("multiview-q/p0", 0.0, 8, slow, burst)
+        diffs.append(s["log_ml_diff"])
+        n_bursts = max(n_bursts, s["n_bursts"])
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nmultiview q/p0 over {len(seeds)} seeds: "
+        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
+    )
+    assert n_bursts > 0, "multi-view config did not burst (n_bursts == 0)"
+    assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
+        f"multiview burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+    )
 
 
 # ----- gate 2f: MultiTokenUnitSampler (synchronized unit-grain burst) ---------
