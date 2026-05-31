@@ -746,7 +746,7 @@ def _views_of(sampler):
     proposal) is the common case; K=2 is proposal + prior. A view is ``None`` if its
     potential has no single engine-burst leaf."""
     s = sampler.burst_draw_sampler()
-    proposal = getattr(s, "proposal", None)
+    proposal = s.proposal
     views = [find_engine_lm(s.target)]
     if proposal is not None:
         views.append(find_engine_lm(proposal))
@@ -759,7 +759,7 @@ def _factor_leaves_of(sampler):
     unconstrained target; pre-computing them overlaps the engine forward."""
     s = sampler.burst_draw_sampler()
     leaves, seen = [], set()
-    for pot in (s.target, getattr(s, "proposal", None)):
+    for pot in (s.target, s.proposal):
         if pot is None:
             continue
         for leaf in factor_leaves(pot):
@@ -790,7 +790,7 @@ def burst_blocker(controller):
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
         draw = samp.burst_draw_sampler()
-        for pot in (draw.target, getattr(draw, "proposal", None), crit):
+        for pot in (draw.target, draw.proposal, crit):
             if pot is None:
                 continue
             if any(lm not in injected for lm in lm_leaves(pot)):

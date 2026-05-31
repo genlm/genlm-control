@@ -1,7 +1,6 @@
 import asyncio
 import warnings
-from genlm.control.potential.base import Potential
-from genlm.control.potential.built_in.llm import _burst_logw_next_overrides
+from genlm.control.potential.base import Potential, _burst_logw_next_overrides
 
 
 class Product(Potential):
@@ -84,6 +83,10 @@ class Product(Potential):
                     "This Product potential only operates on this relatively small subset of tokens.",
                     RuntimeWarning,
                 )
+
+    @property
+    def children(self):
+        return [self.p1, self.p2]
 
     @property
     def v1_idxs(self):

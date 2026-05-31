@@ -6,7 +6,7 @@ from typing import Any, Iterable, Optional
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.controller import BurstDraw
-from genlm.control.potential.built_in.llm import burst_logw_next
+from genlm.control.potential.base import burst_logw_next
 from lark import Lark
 from lark.exceptions import LarkError
 
@@ -25,21 +25,19 @@ class _UnitAccum:
 
 
 def flatten_units(context):
-    """
-    Flatten nested unit context to a flat token list. When using MultiTokenUnitSampler, token_ctx becomes nested [[...], [...], ...].
-    This helper flattens it for use with coercion functions like b"".join.
+    """Flatten a (possibly nested) unit context to a flat token list. A
+    MultiTokenUnitSampler nests units as sub-lists, and a nested unit sampler nests
+    deeper -- so this recurses (matching the engine-prompt flatten in
+    ``_Burst.context_ids``); a one-level flatten would leave deeper nesting for the
+    subunit sampler / coercion to choke on.
 
     Usage:
         potential.coerce(LLM, f=lambda ctx: b"".join(flatten_units(ctx)))
-    Args:
-        context: Either a flat list [token1, token2, ...] or nested [[token1, token2], [token3], ...]
-    Returns:
-        list: Flattened list of tokens
     """
     flattened = []
     for item in context:
         if isinstance(item, list):
-            flattened.extend(item)
+            flattened.extend(flatten_units(item))
         else:
             flattened.append(item)
     return flattened
@@ -94,6 +92,10 @@ class MultiTokenUnitSampler(TokenSampler):
         if not isinstance(subunit_sampler, TokenSampler):
             raise TypeError(
                 f"subunit_sampler must be a TokenSampler, got {type(subunit_sampler)}"
+            )
+        if max_subunits_per_unit < 1:
+            raise ValueError(
+                f"max_subunits_per_unit must be >= 1, got {max_subunits_per_unit}"
             )
 
         # Initialized with subunit sampler's target
@@ -272,8 +274,8 @@ class MultiTokenUnitSampler(TokenSampler):
                 continue
             weight = float("-inf") if status == "max" else accum.logw
             return unit, weight, accum.logp
-
-        return accum.buffer, float("-inf"), accum.logp  # max caught in _feed; safety net
+        # No fall-through: max_subunits_per_unit >= 1 (checked in __init__), so the last
+        # iteration always returns via _feed's "max" branch.
 
     async def cleanup(self):
         """Clean up resources."""

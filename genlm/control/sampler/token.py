@@ -9,7 +9,7 @@ from genlm.control.util import select
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 from genlm.control.sampler.controller import BurstDraw
-from genlm.control.potential.built_in.llm import burst_logw_next
+from genlm.control.potential.base import burst_logw_next
 
 
 class TokenSampler:
@@ -33,6 +33,10 @@ class TokenSampler:
     Args:
         target (Potential): The potential that samples are properly weighted with respect to.
     """
+
+    # Set by samplers that draw from a separate proposal (Direct/AWRS/Set); ``None`` for
+    # the rest, so callers read ``s.proposal`` instead of probing for the attribute.
+    proposal = None
 
     def __init__(self, target):
         self.target = target

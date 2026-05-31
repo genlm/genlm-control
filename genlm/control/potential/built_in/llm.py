@@ -4,7 +4,7 @@ import weakref
 import torch
 import warnings
 from typing import NamedTuple
-from genlm.control.potential.base import Potential
+from genlm.control.potential.base import Potential, _burst_logw_next_overrides
 from genlm.backend.tokenization import Token
 
 
@@ -12,104 +12,49 @@ _prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_prompt_ids_overrides", default=None
 )
 
-# Per-task override: within ``burst_logw_next``, a PromptedLLM's ``logw_next``
-# returns the injected warm logits (the engine's forward for this decode step)
-# instead of forwarding -- the one seam between the slow and burst lanes.
-_burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_logw_next", default=None
-)
+
+def _walk_leaves(potential):
+    """Yield the leaf potentials (those with no ``children``), recursing composites'
+    ``children``. The one tree walk the burst's leaf queries share -- via the
+    ``Potential.children`` abstraction, not duck-typing ``Product``'s ``p1``/``p2``."""
+    children = potential.children
+    if not children:
+        yield potential
+        return
+    for child in children:
+        yield from _walk_leaves(child)
 
 
-@contextlib.contextmanager
-def burst_logw_next(overrides):
-    """Inject the engine's warm logits per view: ``overrides`` maps each
-    ``PromptedLLM`` to the ``LazyWeights`` its ``logw_next`` should return this step
-    instead of forwarding. One entry = single-view (today's burst); K entries = K
-    views (e.g. proposal + prior) on the shared engine. Set inside each per-particle
-    burst task."""
-    token = _burst_logw_next_overrides.set(overrides)
-    try:
-        yield
-    finally:
-        _burst_logw_next_overrides.reset(token)
+def _is_burst_lm(p):
+    return isinstance(p, PromptedLLM) and p.model.supports_burst
 
 
 def find_engine_lm(potential):
-    """The single burst-capable engine LM leaf in ``potential``, recursing through
-    ``Product`` (``p1``/``p2``); ``None`` if not exactly one. A ``Coerced`` LM is
-    intentionally not found -> declines to the slow path: ``Coerced`` scores via
-    ``prefix``/``complete``, not ``logw_next``, so the warm-logit injection wouldn't
-    apply (the common case coerces the constraint, not the LM, and is unaffected)."""
-    found = []
-
-    def walk(p):
-        if isinstance(p, PromptedLLM) and p.model.supports_burst:
-            found.append(p)
-            return
-        for child in (getattr(p, "p1", None), getattr(p, "p2", None)):
-            if child is not None:
-                walk(child)
-
-    walk(potential)
-    return found[0] if len(found) == 1 else None
+    """The single burst-capable engine LM leaf, or ``None`` if not exactly one. (A
+    ``Coerced`` LM is a leaf here, not a ``PromptedLLM``, so it declines to the slow
+    path -- it scores via ``prefix``/``complete``, not the warm-logit seam.)"""
+    lms = [lf for lf in _walk_leaves(potential) if _is_burst_lm(lf)]
+    return lms[0] if len(lms) == 1 else None
 
 
 def lm_leaves(potential):
-    """All ``PromptedLLM`` leaves in ``potential`` (recursing ``Product`` ``p1``/``p2``).
-    The burst gate uses this: every LM leaf must be an injected view, else it forwards."""
-    found = []
-
-    def walk(p):
-        if isinstance(p, PromptedLLM):
-            found.append(p)
-            return
-        for child in (getattr(p, "p1", None), getattr(p, "p2", None)):
-            if child is not None:
-                walk(child)
-
-    walk(potential)
-    return found
+    """All ``PromptedLLM`` leaves. The burst gate uses this: every LM leaf must be an
+    injected view, else it would forward inside the burst."""
+    return [lf for lf in _walk_leaves(potential) if isinstance(lf, PromptedLLM)]
 
 
 def factor_leaves(potential):
-    """The non-LM leaves of ``potential`` (recursing ``Product`` ``p1``/``p2``) -- the
-    constraint potentials a burst can pre-compute during the forward (vs the engine-LM
-    leaves it injects warm). Empty for a bare LM target."""
-    found = []
-
-    def walk(p):
-        children = (getattr(p, "p1", None), getattr(p, "p2", None))
-        if all(c is None for c in children):
-            if not isinstance(p, PromptedLLM):
-                found.append(p)
-            return
-        for child in children:
-            if child is not None:
-                walk(child)
-
-    walk(potential)
-    return found
+    """The non-LM leaves -- the constraint potentials a burst can pre-compute during the
+    forward (vs the engine-LM leaves it injects warm). Empty for a bare LM target."""
+    return [lf for lf in _walk_leaves(potential) if not isinstance(lf, PromptedLLM)]
 
 
 def constraint_leaf_ids(potential):
-    """``id``s of the non-engine-LM leaves of ``potential`` (recursing ``Product``).
-    Two targets share a constraint iff these match -- the burst homogeneity check for
-    a batched run, where all groups draw through group 0's sampler."""
-    ids = set()
-
-    def walk(p):
-        if isinstance(p, PromptedLLM) and p.model.supports_burst:
-            return
-        children = [getattr(p, "p1", None), getattr(p, "p2", None)]
-        if all(c is None for c in children):
-            ids.add(id(p))
-            return
-        for c in children:
-            if c is not None:
-                walk(c)
-
-    walk(potential)
-    return frozenset(ids)
+    """``id``s of the non-(burst-LM) leaves -- the constraint identity two targets must
+    share for a batched burst (all groups draw through group 0's sampler). A non-burst
+    ``PromptedLLM`` counts as a constraint leaf here (it is not an injected view), unlike
+    in ``factor_leaves`` -- now an explicit per-query filter, not copy drift."""
+    return frozenset(id(lf) for lf in _walk_leaves(potential) if not _is_burst_lm(lf))
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):
@@ -682,47 +627,10 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Processed log probabilities for the next tokens.
         """
-        # This is ugly, but it's useful for all potentials to adhere to the convention
-        # of keeping the EOS token at the end of the weights array.
-
-        # EOS / non-EOS column-index tensors (cached, shared with the batched path).
-        self._eos_index_tensors(logw_next.device)
-
-        # The model may produce fewer logits than len(token_maps.decode) when
-        # the tokenizer has added tokens beyond the model's embedding matrix
-        # (e.g. Gemma's <image_soft_token>). Pad with -inf so these tokens
-        # are unscorable but still present in the vocabulary.
-        # We assert that HF models always produce logits for token indices
-        # 0..vocab_size-1, and added tokens are at indices >= vocab_size.
-        n_decode = len(self.token_maps.decode)
-        n_logits = len(logw_next)
-        if n_logits < n_decode:
-            self._verify_logit_padding(n_logits)
-            pad = torch.full(
-                (n_decode - n_logits,),
-                float("-inf"),
-                dtype=logw_next.dtype,
-                device=logw_next.device,
-            )
-            logw_next = torch.cat([logw_next, pad])
-
-        logw_next = logw_next[:n_decode]
-        logw_next = logw_next.log_softmax(dim=0)
-        _logw_next = torch.full(
-            (len(self.vocab) + 1,),
-            float("-inf"),
-            dtype=logw_next.dtype,
-            device=logw_next.device,
-        )
-        _logw_next[: len(self.vocab)] = logw_next[self._non_eos_indices]
-
-        # Special case: if only one EOS idx, just assign directly (avoids cost of logsumexp)
-        if self._eos_idxs_tensor.numel() == 1:
-            _logw_next[-1] = logw_next[self._eos_idxs_tensor]
-        else:
-            _logw_next[-1] = torch.logsumexp(logw_next[self._eos_idxs_tensor], dim=0)
-
-        return self.make_lazy_weights(_logw_next.float().cpu().numpy())
+        # N=1 adapter over the batched on-device fold: same pad / slice / log_softmax /
+        # EOS fold, then downgrade the single row to numpy for the slow lane's LazyWeights.
+        out = self._process_logw_next_batch(logw_next.unsqueeze(0))
+        return self.make_lazy_weights(out[0].float().cpu().numpy())
 
     async def logw_next(self, context):
         """Get log probabilities for next tokens given the prompt and `context`.
