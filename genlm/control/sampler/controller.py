@@ -213,18 +213,16 @@ class _Burst:
         self.abort_rows = set()
         self.add_rows = []
         # K substreams per particle: handle -> (row, view_idx) and row -> [handle/view].
-        # ``next_handle`` issues fresh handles per mid-burst re-add.
+        # The initial population and every mid-burst re-add go through _add_substream,
+        # which mints a fresh handle and queues the engine add (drained by run_burst) --
+        # one add path, no special-cased "initial requests".
         self.handle_rv = {}
         self.row_handles = {}
-        h = 0
+        self.next_handle = 0
         for p in live:
-            hs = []
-            for _vi in range(self.k):
-                self.handle_rv[h] = (p._i, _vi)
-                hs.append(h)
-                h += 1
-            self.row_handles[p._i] = hs
-        self.next_handle = h
+            self.row_handles[p._i] = [
+                self._add_substream(p, vi, view) for vi, view in enumerate(self.views)
+            ]
         self.scratch = {}
         self.exit_reason = _EXIT_TERMINATED
         self._pending_bank = None  # Future of the last step's deferred bank (overlaps next forward)
@@ -249,6 +247,16 @@ class _Burst:
         for item in p.context:
             _emit(item)
         return ids
+
+    def _add_substream(self, p, vi, view):
+        """Mint a fresh handle for one (particle, view) substream, register it in the
+        maps, and queue its engine add. The sole add path -- initial population
+        (``__init__``) and mid-burst re-add (``resample_realize``) both call it."""
+        h = self.next_handle
+        self.next_handle += 1
+        self.handle_rv[h] = (p._i, vi)
+        self.add_rows.append((h, self.context_ids(p, vi), view.lora_name))
+        return h
 
     def drain_aborts(self):
         rows = self.abort_rows
@@ -343,9 +351,10 @@ class _Burst:
         out = self._on_main(_step())
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
-    def flush_bank(self):
-        """Join the last kicked bank + resample it -- no next ``draw`` to do so (burst end /
-        unit-sync boundary). No-op if none pending."""
+    def on_burst_end(self):
+        """Engine lifecycle hook: the decode loop has drained, so settle work deferred
+        past the last step -- join the final kicked bank + resample (no next ``draw`` to do
+        it). No-op if none pending; ``run_burst`` drains what it flags."""
         self._on_main(self._join_pending_bank())
 
     async def _join_pending_bank(self):
@@ -432,14 +441,9 @@ class _Burst:
                 p = c.particles[row]
                 if p.done:
                     continue
-                hs = []  # re-add all K substreams (per-view prefix + lora)
-                for vi, view in enumerate(self.views):
-                    h = self.next_handle
-                    self.next_handle += 1
-                    self.handle_rv[h] = (row, vi)
-                    hs.append(h)
-                    self.add_rows.append((h, self.context_ids(p, vi), view.lora_name))
-                self.row_handles[row] = hs
+                self.row_handles[row] = [  # re-add all K substreams (per-view prefix + lora)
+                    self._add_substream(p, vi, view) for vi, view in enumerate(self.views)
+                ]
         return bool(groups)
 
 
@@ -608,7 +612,8 @@ class Controller:
             + colors.magenta % "]"
         )
 
-    # -- the controller-owned loop --------------------------------------------------
+    # -- controller-owned SMC primitives the drivers turn (start, per-step banking,
+    #    ESS+resample, record); the per-step loop itself lives in the drivers ----------
 
     async def start(self):
         """Score every particle by its group's empty-sequence prefix weight."""
@@ -622,21 +627,6 @@ class Controller:
                 )
         for p in self.particles:
             p.score(start_ws[self.particles.group[p._i]])
-
-    async def run(self):
-        """Run the slow (ground-truth) SMC loop to completion."""
-        while any(not p.done for p in self.particles):
-            if self.twist_with_critic:
-                self.particles.untwist_all()
-
-            await asyncio.gather(
-                *[self._draw_and_score(p) for p in self.particles if not p.done]
-            )
-
-            self._record_step()
-            self._maybe_resample()
-
-        return self.particles
 
     def _maybe_resample(self):
         """Per-group ESS test + resample (the only ESS/resample impl; both lanes call
@@ -725,15 +715,28 @@ class Controller:
 
 
 class StepLoop:
-    """Per-token round-trip driver (the ground-truth path); recomputes logprobs from
-    the full context every step."""
+    """Per-token round-trip driver (the byte-exact ground truth); recomputes logprobs
+    from the full context every step."""
 
     def __init__(self, controller):
         self.controller = controller
 
     async def run(self):
-        await self.controller.start()
-        return await self.controller.run()
+        """Turn the population per-token to completion: each step draws + scores every
+        live particle (concurrently), records the step, then runs the controller-owned
+        ESS/resample. Symmetric with ``BurstLoop.run`` -- the controller owns the SMC
+        math, the driver owns the loop."""
+        c = self.controller
+        await c.start()
+        while any(not p.done for p in c.particles):
+            if c.twist_with_critic:
+                c.particles.untwist_all()
+            await asyncio.gather(
+                *[c._draw_and_score(p) for p in c.particles if not p.done]
+            )
+            c._record_step()
+            c._maybe_resample()
+        return c.particles
 
 
 def _views_of(sampler):
@@ -880,13 +883,8 @@ class BurstLoop:
         b.exit_reason = (
             _EXIT_TERMINATED if self.sampler.burst_free_running() else _EXIT_UNIT_SYNC
         )
-        # K substreams per live particle: (handle, view-prefix+drawn, view.lora_name).
-        # Handles match ``_Burst``'s row_handles; views carry their own prefix + lora.
-        requests = [
-            (b.row_handles[p._i][vi], b.context_ids(p, vi), view.lora_name)
-            for p in live
-            for vi, view in enumerate(self.views)
-        ]
+        # The _Burst seeded its add-queue with the initial K substreams per particle;
+        # run_burst drains it (and every mid-burst re-add) uniformly -- no requests= arg.
         # Decode budget for one burst (token grain: longest token budget; unit grain:
         # one unit's subunits).
         max_steps = self.sampler.burst_max_steps(live)
@@ -894,11 +892,7 @@ class BurstLoop:
         # the Controller stays pure SMC math that the seam banks into.
         await loop.run_in_executor(
             None,
-            lambda: self.llm.model.run_burst(
-                requests=requests,
-                control=b,
-                max_steps=max_steps,
-            ),
+            lambda: self.llm.model.run_burst(control=b, max_steps=max_steps),
         )
         return b.exit_reason
 
