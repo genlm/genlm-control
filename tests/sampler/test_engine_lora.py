@@ -27,6 +27,7 @@ from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
 from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
 from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
 from genlm.control.sampler.sequence import Sequences, _unpack_particles  # noqa: E402
+from _harness import seed_all  # noqa: E402
 
 ADAPTER = "farpluto/SmolLM-135M-Instruct-Finetune-LoRA"
 EOS = [b"\n"]
@@ -54,8 +55,7 @@ def lora_model():
 
 
 def _run(model, q_lora_name, seed, driver_cls):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    seed_all(seed)
     prompt_ids = model.tokenizer.encode("The capital of France is")
     p0 = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS)
     q = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS, lora_name=q_lora_name)

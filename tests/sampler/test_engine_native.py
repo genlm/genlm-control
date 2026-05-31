@@ -1,36 +1,35 @@
-"""Gate-2 parity: the engine-accelerated BurstLoop vs the ORIGINAL genlm-control.
+"""Gate-2 parity: the engine-accelerated BurstLoop is UNBIASED vs the exact per-token path.
 
-The reference is the genuine original genlm-control (main + llamppl ``smc_standard``)
--- the released per-token SMC the downstream (lvar) actually uses -- generated once
-by ``gen_original_reference.py`` and cached in ``gate2_snapshot.json``. This test only
-LOADS that cache and compares the engine-native ``BurstLoop`` against it. StepLoop is
-NOT the reference here (it is the production fallback for non-burstable configs and
-the ``accelerate="off"`` path, pinned == the original by gate-1's
-``parity_snapshot.json``); disentangling the two is deliberate.
+Byte-exactness is impossible here -- the burst reads warm-KV decode logits inside vLLM
+instead of re-prefilling every step, a ~1e-2/logit residual that may flip a Gumbel-max
+draw -- so each test averages the burst-vs-reference log_ml (and length) diff across seeds
+and asserts the MEAN sits within sampling noise of 0 (``_harness.assert_unbiased``). A
+consistent same-sign gap is a BUG, not a tolerance.
 
-The burst and the original differ only in the source of next-token logits -- the
-burst reads warm-KV decode logits inside vLLM rather than re-prefilling every step --
-so they agree up to the warm-KV-vs-reprefill numerical residual (~1e-2/logit), which
-may flip a single Gumbel-max draw but is small and unbiased. A consistent ``log_ml``
-bias or systematically longer sequences in the burst is a BUG, not a tolerance.
+Two references, chosen per case (the ``reference`` field of ``gate2_cases.CASES``):
+- ``"ref"`` -- the genuine ORIGINAL genlm-control (main + llamppl ``smc_standard``), cached
+  in ``gate2_snapshot.json`` by ``gen_original_reference.py`` and loaded via ``_ref``. The
+  strongest anchor (independent of our StepLoop); used wherever a cached key exists.
+- ``"steploop"`` -- a live ``accelerate="off"`` StepLoop at the same seed (``_run_steploop``),
+  for configs with no cached original (multi-view, multitoken-multiview, batched). This is
+  RNG-matched, so the paired diff is tight.
 
-**Reference cache.** The original reference is deterministic per
-(target, N, ess, max_tokens, seed) and is the expensive half (per-token re-prefill).
-Regenerate it (e.g. after changing configs / model) by running the ORIGINAL on the
-box, shadowing our genlm.control with main's::
+Config (seeds/N/ess/critics/samplers) and the shared critics live in ``gate2_cases.py``,
+imported by BOTH this gate and the generator so they cannot drift; the seed/serialization/
+no-bias-assert harness is ``_harness.py`` (shared with gate-1).
+
+**Regenerate the cached original** (after changing a ``"ref"`` config) on the box, shadowing
+our genlm.control with main's::
 
     PYTHONPATH=/root/genlm/genlm-control-main VLLM_USE_FLASHINFER_SAMPLER=0 \\
-        /root/genlm-venv/bin/python \\
-        tests/sampler/gen_original_reference.py
+        /root/genlm-venv/bin/python tests/sampler/gen_original_reference.py
 
 A missing key is a hard error (run the generator) -- never a silent self-comparison.
 
-Requires CUDA + vLLM; uses gpt2. Run on the box with
-``VLLM_USE_FLASHINFER_SAMPLER=0``.
+Requires CUDA + vLLM; uses gpt2. Run on the box with ``VLLM_USE_FLASHINFER_SAMPLER=0``.
 """
 
 import asyncio
-import json
 import os
 import time
 
@@ -41,14 +40,22 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():  # pragma: no cover
     pytest.skip("engine-native parity needs CUDA + vLLM", allow_module_level=True)
 
-from genlm.control.constant import EndOfSequence  # noqa: E402
-from genlm.control.potential import Potential  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
-from genlm.control.potential.built_in.wfsa import BoolFSA  # noqa: E402
-from genlm.control.sampler.token import DirectTokenSampler, AWRS  # noqa: E402
-from genlm.control.sampler.unit import BoundaryPredicate  # noqa: E402
+from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
+from genlm.control.sampler.unit import MultiTokenUnitSampler  # noqa: E402
 from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
 from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
+
+from _harness import seed_all, ctx_ids, load_snapshot, assert_unbiased  # noqa: E402
+from gate2_cases import (  # noqa: E402
+    CASES,
+    MODEL,
+    PROMPT,
+    EOS_BYTES,
+    CONFIG,
+    ByteLengthBoundary,
+    boolfsa,
+)
 
 
 _T0 = time.perf_counter()
@@ -65,67 +72,21 @@ def can_burst(controller):
     return burst_blocker(controller) is None
 
 
-MODEL = "gpt2"
-SEED = 1234
-# Result-affecting global config shared by every gate-2 case (the constraint
-# that DOES vary per case is encoded in each `label`). Recorded in the snapshot
-# so a load against a mismatched reference fails loudly instead of silently
-# comparing the burst against a stale slow run.
-_EOS_BYTES = [b"\n"]
-_PROMPT = "The"
-_CONFIG = {"model": MODEL, "prompt": _PROMPT, "eos_hex": [b.hex() for b in _EOS_BYTES]}
+SEED = 1234  # single-seed default (unconstrained); per-case seeds come from CASES
 
-# Original-reference snapshot (see module docstring): generated by
-# ``gen_original_reference.py`` from the ORIGINAL genlm-control. This test only
-# LOADS it; it never recomputes a slow run (no StepLoop reference here).
+# Original-reference snapshot (model/prompt/eos in CONFIG, enforced on load). Generated by
+# ``gen_original_reference.py`` from the ORIGINAL genlm-control; this gate only LOADS it.
 _SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "gate2_snapshot.json")
 try:
-    with open(_SNAPSHOT_PATH) as _f:
-        _SNAPSHOT = json.load(_f)
+    _SNAPSHOT = load_snapshot(_SNAPSHOT_PATH, CONFIG)
 except FileNotFoundError:  # pragma: no cover
     _SNAPSHOT = {}
-
-# `__config__` is metadata, not a reference entry -- pop it so it never collides
-# with a data key lookup. A config mismatch means the reference was generated for a
-# different model/prompt/eos, so the comparison would be meaningless.
-_snap_config = _SNAPSHOT.pop("__config__", None)
-if _snap_config is not None and _snap_config != _CONFIG:  # pragma: no cover
-    raise RuntimeError(
-        f"gate2_snapshot.json was generated under {_snap_config} but the tests "
-        f"now run under {_CONFIG}; regenerate it with gen_original_reference.py."
-    )
-
-
-def _seed(s=SEED):
-    np.random.seed(s)
-    torch.manual_seed(s)
-
-
-def _ctx_ids(ctx):
-    """Token-id view of a particle context (EOS -> the sentinel string).
-
-    A multi-token unit context nests units as sub-lists; flatten them so a unit
-    run and a token run with the same tokens compare equal."""
-    out = []
-
-    def emit(t):
-        if isinstance(t, EndOfSequence):
-            out.append("EOS")
-        elif isinstance(t, list):
-            for s in t:
-                emit(s)
-        else:
-            out.append(t.token_id)
-
-    for t in ctx:
-        emit(t)
-    return out
 
 
 def _controller(make_sampler, n_particles, ess_threshold, max_tokens, make_critic=None):
     # `make_sampler`/`make_critic` are factories so each burst run gets a fresh
     # sampler/critic (an AWRS carries its own RNG; a fresh one per run keeps it
-    # seeded by `_seed` + its own seed). `twist_with_critic` mirrors SMC.__call__
+    # seeded by `seed_all` + its own seed). `twist_with_critic` mirrors SMC.__call__
     # exactly (per-step twist iff ess_threshold > 0).
     return Controller(
         unit_sampler=make_sampler(),
@@ -159,7 +120,7 @@ def _run_burst(
 ):
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
-    _seed(seed)
+    seed_all(seed)
     controller = _controller(
         make_sampler, n_particles, ess_threshold, max_tokens, make_critic
     )
@@ -169,7 +130,7 @@ def _run_burst(
     dt = time.perf_counter() - t0
     seq = Sequences(*_unpack_particles(parts))
     return {
-        "contexts": [_ctx_ids(p.context) for p in parts],
+        "contexts": [ctx_ids(p.context) for p in parts],
         "logw": [float(p.logw) for p in parts],
         "log_ml": float(seq.log_ml),
         "wall": dt,
@@ -186,14 +147,14 @@ def _run_steploop(
     cached original snapshot (e.g. multi-view proposal)."""
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
-    _seed(seed)
+    seed_all(seed)
     controller = _controller(
         make_sampler, n_particles, ess_threshold, max_tokens, make_critic
     )
     parts = asyncio.run(StepLoop(controller).run())
     seq = Sequences(*_unpack_particles(parts))
     return {
-        "contexts": [_ctx_ids(p.context) for p in parts],
+        "contexts": [ctx_ids(p.context) for p in parts],
         "logw": [float(p.logw) for p in parts],
         "log_ml": float(seq.log_ml),
         "wall": 0.0,
@@ -281,29 +242,70 @@ def llm():
         },
     )
     _log(f"engine ready in {time.perf_counter() - t0:.1f}s")
-    return PromptedLLM(model, eos_byte_strings=_EOS_BYTES)
+    return PromptedLLM(model, eos_byte_strings=EOS_BYTES)
 
 
-def _boolfsa_target(llm, regex):
-    return llm * BoolFSA.from_regex(regex).coerce(llm, f=b"".join)
+def _nobias(label, llm, *, ml_floor=0.3, ml_k=2.5, len_bound=None, len_k=None,
+            need_resample=False, need_rounds=False):
+    """Drive a homogeneous CASES no-bias case and assert the burst is unbiased.
+
+    Per seed: burst vs reference (cached original ``_ref`` or live StepLoop, per
+    ``case.reference``), accumulate the log_ml + length diffs, then assert the MEAN
+    log_ml diff is within sampling noise of 0 (``assert_unbiased``). ``len_bound``
+    bounds the mean length gap (sem-aware if ``len_k`` given, else absolute).
+    ``need_resample`` / ``need_rounds`` guard that the resample / per-unit-round path
+    actually fired (no vacuous pass); a ``n_bursts>0`` guard always runs."""
+    c = CASES[label]
+    llm.set_prompt_from_str(PROMPT)
+    mkc = (lambda: c.critic(llm)) if c.make_critic is not None else None
+    assert can_burst(
+        _controller(lambda: c.sampler(llm, c.seeds[0]), c.n_particles, c.ess, c.max_tokens, mkc)
+    )
+    diffs, len_gaps = [], []
+    any_resample, max_bursts = False, 0
+    for seed in c.seeds:
+        make = lambda s=seed: c.sampler(llm, s)  # noqa: E731
+        if c.reference == "ref":
+            slow = _ref(c.label, c.n_particles, c.ess, c.max_tokens, seed)
+        else:
+            slow = _run_steploop(make, c.n_particles, c.ess, c.max_tokens, seed, mkc)
+        burst = _run_burst(make, c.n_particles, c.ess, c.max_tokens, seed, mkc)
+        s = _compare(c.label, c.ess, c.n_particles, slow, burst)
+        diffs.append(s["log_ml_diff"])
+        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
+        any_resample = any_resample or s["n_resamples"] > 0
+        max_bursts = max(max_bursts, s["n_bursts"])
+    assert max_bursts > 0, f"{c.label}: burst never opened (n_bursts==0)"
+    if need_resample:
+        assert any_resample, f"{c.label}: ESS never crossed -- resample path unexercised"
+    if need_rounds:
+        assert max_bursts > 1, f"{c.label}: single unit round -- per-unit loop unexercised"
+    m, sem = assert_unbiased(diffs, floor=ml_floor, k=ml_k, label=f"{c.label} log_ml")
+    _log(f"{c.label}: log_ml diff mean={m:+.4f} sem={sem:.4f}")
+    if len_bound is not None:
+        if len_k is None:
+            lg = np.asarray(len_gaps, float)
+            assert abs(lg.mean()) <= len_bound, (
+                f"{c.label}: length biased -- mean gap {lg.mean():+.3f} > {len_bound}"
+            )
+        else:
+            assert_unbiased(len_gaps, floor=len_bound, k=len_k, label=f"{c.label} length")
+    return np.array(diffs), np.array(len_gaps)
 
 
-# ----- gate 2a: unconstrained ----------------------------------------------
+# ----- gate 2a: unconstrained (single seed, ABSOLUTE thresholds -- pure warm-KV,
+#       no factor, so length + log_ml track tightly; not a sem-based no-bias case) --
 
 
-@pytest.mark.parametrize("ess_threshold", [0.0])  # ess=0.5 dropped: no factor -> ESS never crosses, == ess=0.0
-def test_unconstrained_burst_vs_slow(llm, ess_threshold):
-    llm.set_prompt_from_str(_PROMPT)
-
-    def make():
-        return DirectTokenSampler(llm)
-
-    assert can_burst(_controller(make, 8, ess_threshold, 12))
-    slow = _ref("unconstrained", 8, ess_threshold, 12, SEED)
-    burst = _run_burst(make, 8, ess_threshold, 12, SEED)
-    stats = _compare("unconstrained", ess_threshold, 8, slow, burst)
-    # Pure warm-KV residual (no factor): the burst draws from the same normalized
-    # LM logw_next as the slow path, so length and log_ml track tightly.
+def test_unconstrained_burst_vs_slow(llm):
+    c = CASES["unconstrained"]
+    llm.set_prompt_from_str(PROMPT)
+    make = lambda: c.sampler(llm, SEED)  # noqa: E731
+    assert can_burst(_controller(make, c.n_particles, c.ess, c.max_tokens))
+    slow = _ref(c.label, c.n_particles, c.ess, c.max_tokens, SEED)
+    burst = _run_burst(make, c.n_particles, c.ess, c.max_tokens, SEED)
+    stats = _compare(c.label, c.ess, c.n_particles, slow, burst)
+    assert burst["n_bursts"] > 0, "unconstrained: burst never opened"
     assert abs(stats["mean_len_burst"] - stats["mean_len_slow"]) <= 2.0, (
         f"length diverged (slow {stats['mean_len_slow']:.2f} vs "
         f"burst {stats['mean_len_burst']:.2f})"
@@ -314,139 +316,24 @@ def test_unconstrained_burst_vs_slow(llm, ess_threshold):
     )
 
 
-# ----- gate 2b: constrained (additive factor folded into target) -----------
+# ----- gate 2b: constrained Direct (llm * boolfsa). Looser [a-z ]+ at ess=0 (no
+#       resample, vs StepLoop); tighter [aeiou ]+ at ess=0.5 FORCES the pop-out /
+#       relaunch resample path (vs cached original). --
 
 
-@pytest.mark.parametrize("ess_threshold", [0.0])  # ess=0.5 covered by forces_resample + twist_critic
-def test_constrained_boolfsa_burst_vs_slow(llm, ess_threshold):
-    """Constrained Direct (llm * boolfsa) at ess=0.0: burst vs StepLoop, log_ml unbiased.
-    ess=0.0 (no resample) is high-variance, so a single seed is too noisy to gate --
-    average a couple. The mean is the no-bias check; length stays tight."""
-    llm.set_prompt_from_str(_PROMPT)
-    target = _boolfsa_target(llm, r"[a-z ]+")
-
-    def make():
-        return DirectTokenSampler(target)
-
-    assert can_burst(_controller(make, 16, ess_threshold, 12))
-    seeds = (1234, 7)
-    diffs, len_gaps = [], []
-    for s in seeds:
-        slow = _run_steploop(make, 16, ess_threshold, 12, s)
-        burst = _run_burst(make, 16, ess_threshold, 12, s)
-        diffs.append(burst["log_ml"] - slow["log_ml"])
-        len_gaps.append(
-            float(np.mean([len(c) for c in burst["contexts"]]))
-            - float(np.mean([len(c) for c in slow["contexts"]]))
-        )
-        _log(f"boolfsa[a-z ]+ seed={s}: diff={diffs[-1]:+.4f}")
-    diffs, len_gaps = np.array(diffs), np.array(len_gaps)
-    sem = diffs.std() / np.sqrt(len(diffs))
-    assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
-        f"burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
-    )
-    assert abs(len_gaps.mean()) <= 1.5, f"length biased: mean gap {len_gaps.mean():+.3f}"
-
-
-# ----- gate 2b': a tighter constraint that FORCES resampling (exercises the
-#       burst pop-out / relaunch path, which the looser constraint does not) ---
+def test_constrained_boolfsa_burst_vs_slow(llm):
+    _nobias("constrained-boolfsa[a-z ]+", llm, ml_floor=0.3, ml_k=2.5, len_bound=1.5)
 
 
 def test_constrained_forces_resample_burst_vs_slow(llm):
-    """Vowels+space only: sharply disagrees with the LLM, so per-step weights
-    spread and ESS crosses 0.5 -> the burst must pop out, resample, and relaunch.
-
-    This constraint narrows the proposal to ~53 tokens and produces very short
-    sequences (~2-3 tokens), so a single run is high-variance Monte Carlo. We
-    therefore (1) assert the pop-out/relaunch path actually ran (n_bursts > 1),
-    and (2) check that the burst log_ml is UNBIASED by averaging the burst-vs-
-    slow log_ml difference across several seeds -- the mean should sit near 0
-    even though any single seed is noisy.
-    """
-    llm.set_prompt_from_str(_PROMPT)
-    target = _boolfsa_target(llm, r"[aeiou ]+")
-
-    def make():
-        return DirectTokenSampler(target)
-
-    seeds = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)  # enough to cross ESS
-    diffs, len_gaps = [], []
-    any_resample = False
-    for seed in seeds:
-        slow = _ref("boolfsa[aeiou ]+", 16, 0.5, 10, seed)
-        burst = _run_burst(make, 16, 0.5, 10, seed)
-        s = _compare("boolfsa[aeiou ]+", 0.5, 16, slow, burst)
-        diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        any_resample = any_resample or s["n_resamples"] > 0
-    diffs = np.array(diffs)
-    len_gaps = np.array(len_gaps)
-    sem = diffs.std() / np.sqrt(len(diffs))
-    print(f"\n[aeiou ]+ over {len(seeds)} seeds:")
-    print(f"  log_ml diff mean={diffs.mean():+.4f} std={diffs.std():.4f} sem={sem:.4f}")
-    print(f"  len gap mean={len_gaps.mean():+.3f}")
-
-    assert any_resample, (
-        "ESS never crossed across any seed -> the resample path was not "
-        "exercised; pick a tighter constraint"
-    )
-    # Unbiasedness is the testable claim: the MEAN log_ml diff and MEAN length gap
-    # across seeds sit near 0. A persistent same-sign gap would be a real bias bug.
-    assert abs(diffs.mean()) <= max(0.3, 2.0 * sem), (
-        f"burst log_ml is biased across seeds: mean diff {diffs.mean():+.4f} "
-        f"(sem {sem:.4f})"
-    )
-    assert abs(len_gaps.mean()) <= 1.5, (
-        f"burst length is systematically biased: mean gap {len_gaps.mean():+.3f}"
-    )
+    _nobias("boolfsa[aeiou ]+", llm, ml_floor=0.3, ml_k=2.0, len_bound=1.5, need_resample=True)
 
 
-# ----- gate 2c: AWRS (rejection over engine logits + stateful condition) ------
+# ----- gate 2c: AWRS (rejection over engine logits + stateful condition; per-seed rng) --
 
 
 def test_awrs_burst_vs_slow(llm):
-    """AWRS over an engine LM + a boolean condition, in the burst: the rejection
-    runs over the engine LM logits with the condition checked from its carried
-    state (no per-step gather over the vocab). AWRS's weight is a Monte-Carlo
-    estimate, so -- like the resample test -- check the burst-vs-slow log_ml is
-    UNBIASED across seeds (mean near 0); a persistent same-sign gap would be a bug.
-    """
-    llm.set_prompt_from_str(_PROMPT)
-    condition = BoolFSA.from_regex(r"[a-z ]+").coerce(llm, f=b"".join)
-
-    def make_seed(s):
-        # A fresh AWRS seeded per run so slow and burst share the rejection RNG,
-        # and the seed varies the draws across the loop (AWRS uses its own RNG).
-        def make():
-            return AWRS(llm, condition, seed=s)
-
-        return make
-
-    assert can_burst(_controller(make_seed(SEED), 16, 0.0, 12))
-
-    seeds = (1234, 7, 99, 2024, 555, 31)
-    diffs, len_gaps = [], []
-    for seed in seeds:
-        make = make_seed(seed)
-        slow = _ref("awrs[a-z ]+", 16, 0.0, 12, seed)
-        burst = _run_burst(make, 16, 0.0, 12, seed)
-        s = _compare("awrs[a-z ]+", 0.0, 16, slow, burst)
-        diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-    diffs = np.array(diffs)
-    len_gaps = np.array(len_gaps)
-    sem = diffs.std() / np.sqrt(len(diffs))
-    print(
-        f"\nAWRS [a-z ]+ over {len(seeds)} seeds: "
-        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f} "
-        f"len gap mean={len_gaps.mean():+.3f}"
-    )
-    assert abs(diffs.mean()) <= max(0.3, 2.0 * sem), (
-        f"AWRS burst log_ml biased: mean diff {diffs.mean():+.4f} (sem {sem:.4f})"
-    )
-    assert abs(len_gaps.mean()) <= 1.5, (
-        f"AWRS burst length biased: mean gap {len_gaps.mean():+.3f}"
-    )
+    _nobias("awrs[a-z ]+", llm, ml_floor=0.3, ml_k=2.0, len_bound=1.5)
 
 
 # ----- gate 2d: critic (terminal reweight + per-step twist) -------------------
@@ -460,138 +347,19 @@ def test_awrs_burst_vs_slow(llm):
 # same way regardless of where the rollout logits came from.
 
 
-class _TerminalContainsCritic(Potential):
-    """Terminal 0/-inf indicator critic (the genlm-latent CoTCritic shape): the
-    completed text must contain a space. ``prefix`` is 0 throughout; ``score``
-    returns the indicator on any termination (EOS or budget cutoff)."""
-
-    def __init__(self, vocab):
-        super().__init__(vocabulary=vocab)
-
-    async def _indicator(self, context):
-        bs = [t for t in context if not isinstance(t, EndOfSequence)]
-        try:
-            text = b"".join(bs).decode("utf-8")
-        except UnicodeDecodeError:
-            return float("-inf")
-        return 0.0 if " " in text else float("-inf")
-
-    async def complete(self, context):
-        return await self._indicator(context)
-
-    async def prefix(self, context):
-        return 0.0
-
-    async def score(self, context):
-        return await self._indicator(context)
-
-
-class _SoftVowelCritic(Potential):
-    """Soft, content-dependent critic: a -0.5 penalty per vowel in the decoded
-    text. Finite and non-trivial (so a per-step twist accumulates real weight),
-    and content-dependent (so particle weights diverge -> ESS drops -> the burst
-    actually resamples, exercising the twist + pop-out interaction). The penalty
-    is deliberately MODERATE: a stronger one (e.g. -1.0/vowel) collapses ESS to ~1
-    effective particle every step, which maximizes variance without testing
-    anything more and leaves the parity check unable to distinguish bias from
-    noise. Deterministic in the context."""
-
-    def __init__(self, vocab):
-        super().__init__(vocabulary=vocab)
-
-    def _pen(self, context):
-        bs = [t for t in context if not isinstance(t, EndOfSequence)]
-        try:
-            text = b"".join(bs).decode("utf-8")
-        except UnicodeDecodeError:
-            return float("-inf")
-        return -0.5 * sum(c in "aeiouAEIOU" for c in text)
-
-    async def complete(self, context):
-        return self._pen(context)
-
-    async def prefix(self, context):
-        return self._pen(context)
-
-
 def test_terminal_critic_burst_vs_slow(llm):
-    """DirectTokenSampler(llm) + a terminal indicator critic at ess=0 -- the
-    genlm-latent production regime: rollouts drawn from the backend, the indicator
-    applied once at termination (run_sync). No resampling (ess=0); the burst-vs-
-    slow log_ml must be unbiased across seeds."""
-    llm.set_prompt_from_str(_PROMPT)
-
-    def make():
-        return DirectTokenSampler(llm)
-
-    def make_critic():
-        return _TerminalContainsCritic(llm.vocab)
-
-    assert can_burst(_controller(make, 16, 0.0, 12, make_critic))
-
-    seeds = (1234, 7, 99, 2024, 555, 31)
-    diffs = []
-    for seed in seeds:
-        slow = _ref("terminal-critic", 16, 0.0, 12, seed)
-        burst = _run_burst(make, 16, 0.0, 12, seed, make_critic)
-        s = _compare("terminal-critic", 0.0, 16, slow, burst)
-        diffs.append(s["log_ml_diff"])
-    diffs = np.array(diffs)
-    sem = diffs.std() / np.sqrt(len(diffs))
-    print(
-        f"\nterminal critic over {len(seeds)} seeds: "
-        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
-    )
-    assert abs(diffs.mean()) <= max(0.3, 2.0 * sem), (
-        f"terminal-critic burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
-    )
+    """DirectTokenSampler(llm) + a terminal indicator critic at ess=0 -- the genlm-latent
+    production regime: rollouts drawn from the backend, indicator applied once at
+    termination. No resampling; burst-vs-original log_ml unbiased across seeds."""
+    _nobias("terminal-critic", llm, ml_floor=0.3, ml_k=2.0)
 
 
 def test_twisting_critic_burst_vs_slow(llm):
-    """DirectTokenSampler(llm) + a soft content-dependent critic at ess=0.5 -- the
-    per-step twist regime. Exercises untwist/twist accumulation and ESS resampling
-    on TWISTED weights inside the burst. Asserts the resample path ran (n_bursts>1)
-    and the burst-vs-slow log_ml + length are unbiased across seeds."""
-    llm.set_prompt_from_str(_PROMPT)
-
-    def make():
-        return DirectTokenSampler(llm)
-
-    def make_critic():
-        return _SoftVowelCritic(llm.vocab)
-
-    assert can_burst(_controller(make, 16, 0.5, 12, make_critic))
-
-    # Many seeds so the unbiasedness check has discriminating power (the warm-KV
-    # residual makes each run noisy; bias must show as a mean many sem from 0).
-    seeds = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)  # enough to resample
-    diffs, len_gaps, any_resample = [], [], False
-    for seed in seeds:
-        slow = _ref("twist-critic", 16, 0.5, 12, seed)
-        burst = _run_burst(make, 16, 0.5, 12, seed, make_critic)
-        s = _compare("twist-critic", 0.5, 16, slow, burst)
-        diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        any_resample = any_resample or s["n_resamples"] > 0
-    diffs = np.array(diffs)
-    len_gaps = np.array(len_gaps)
-    ml_sem = diffs.std() / np.sqrt(len(diffs))
-    len_sem = len_gaps.std() / np.sqrt(len(len_gaps))
-    print(
-        f"\ntwist critic over {len(seeds)} seeds: "
-        f"log_ml diff mean={diffs.mean():+.4f} sem={ml_sem:.4f} | "
-        f"len gap mean={len_gaps.mean():+.3f} sem={len_sem:.3f}"
-    )
-    assert any_resample, "twist-critic ess=0.5 never resampled; resample path unexercised"
-    # Both checks are sem-aware: unbiased means the mean sits within sampling
-    # noise of 0. A persistent same-sign gap many sem from 0 is the bug.
-    assert abs(diffs.mean()) <= max(0.3, 2.5 * ml_sem), (
-        f"twist-critic burst log_ml biased: mean {diffs.mean():+.4f} (sem {ml_sem:.4f})"
-    )
-    assert abs(len_gaps.mean()) <= max(0.5, 2.5 * len_sem), (
-        f"twist-critic burst length biased: mean gap {len_gaps.mean():+.3f} "
-        f"(sem {len_sem:.3f})"
-    )
+    """DirectTokenSampler(llm) + a soft content-dependent critic at ess=0.5 -- the per-step
+    twist regime. Exercises untwist/twist accumulation + ESS resampling on TWISTED weights;
+    asserts the resample path fired and burst-vs-original log_ml + length are unbiased."""
+    _nobias("twist-critic", llm, ml_floor=0.3, ml_k=2.5,
+            len_bound=0.5, len_k=2.5, need_resample=True)
 
 
 # ----- gate 2e: forward-free gate (an LM critic must NOT burst) ---------------
@@ -611,12 +379,12 @@ def test_lm_critic_routed_to_slow_lane(llm):
     def make():
         return DirectTokenSampler(llm)
 
-    lm_critic = PromptedLLM(llm.model, eos_byte_strings=_EOS_BYTES)
+    lm_critic = PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
     reason = burst_blocker(_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic))
     assert reason is not None and reason.reason is BlockReason.FORWARD_NOT_INJECTABLE, reason
 
-    llm.set_prompt_from_str(_PROMPT)
-    _seed(SEED)
+    llm.set_prompt_from_str(PROMPT)
+    seed_all(SEED)
     with pytest.raises(NotAcceleratable):
         asyncio.run(make().smc(8, 0.0, 8, critic=lm_critic, accelerate="require"))
 
@@ -637,11 +405,11 @@ def test_multiview_proposal_burst_vs_steploop(llm):
     K substreams, K injected views, p0/q reweight, lock-step token fan-out."""
     base = llm.model
     q_ids = base.tokenizer.encode("Once upon a")
-    p0_ids = base.tokenizer.encode(_PROMPT)
+    p0_ids = base.tokenizer.encode(PROMPT)
 
     def make():
-        q = PromptedLLM(base, prompt_ids=q_ids, eos_byte_strings=_EOS_BYTES)
-        p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=_EOS_BYTES)
+        q = PromptedLLM(base, prompt_ids=q_ids, eos_byte_strings=EOS_BYTES)
+        p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=EOS_BYTES)
         return DirectTokenSampler(potential=p0, proposal=q)
 
     assert can_burst(_controller(make, 8, 0.0, 10))  # K=2 multi-view rides the fast lane
@@ -680,10 +448,10 @@ def test_batched_multiview_burst_unbiased(llm):
 
     def make_group(p):
         q = PromptedLLM(
-            base, prompt_ids=base.tokenizer.encode(p + " then"), eos_byte_strings=_EOS_BYTES
+            base, prompt_ids=base.tokenizer.encode(p + " then"), eos_byte_strings=EOS_BYTES
         )
         p0 = PromptedLLM(
-            base, prompt_ids=base.tokenizer.encode(p), eos_byte_strings=_EOS_BYTES
+            base, prompt_ids=base.tokenizer.encode(p), eos_byte_strings=EOS_BYTES
         )
         return DirectTokenSampler(potential=p0, proposal=q)
 
@@ -691,7 +459,7 @@ def test_batched_multiview_burst_unbiased(llm):
         [_run_steploop(lambda pp=p: make_group(pp), 8, 0.0, 10, SEED)["log_ml"] for p in prompts]
     )
 
-    _seed(SEED)
+    seed_all(SEED)
     smcs = [SMC(make_group(p)) for p in prompts]
     seqs = asyncio.run(
         SMC.batched(
@@ -725,85 +493,15 @@ def test_batched_multiview_burst_unbiased(llm):
 # (a fixed-length boundary would complete every row at the same step and hide it).
 
 
-class _ByteLengthBoundary(BoundaryPredicate):
-    """A unit completes once its subunits span >= ``min_bytes`` bytes. Content-
-    dependent and variable-length -> rows reach the boundary at different engine
-    steps -> the staggered per-unit pop-out the burst must sync."""
-
-    def __init__(self, min_bytes):
-        self.min_bytes = min_bytes
-
-    def __call__(self, unit_context, subunit_buffer):
-        return (
-            sum(len(t) for t in subunit_buffer if not isinstance(t, EndOfSequence))
-            >= self.min_bytes
-        )
-
-
 def test_multitoken_burst_vs_slow(llm):
-    """MultiToken with a CONSTRAINED Direct subunit (``llm * coerced BoolFSA``) in
-    the burst at ess=0.5: subunits ride the warm-KV fast lane with the boolfsa
-    factor advancing per subunit; a unit completes at a byte-length boundary
-    (variable length -> staggered pop-out, rows finishing their unit at different
-    engine steps); and ESS fires once per unit round at the synced boundary -- the
-    slow per-unit loop's timing.
-
-    The constraint makes per-step weights NON-TRIVIAL (log_ml != 0, unlike the
-    unconstrained Direct whose proposal is its own target and whose weights are all
-    ~0), so the burst-vs-slow log_ml comparison actually tests the per-unit weight
-    accumulation + ESS + resample. This is a NO-BIAS check, not byte-parity: the slow
-    ``asyncio.gather`` consumes the numpy RNG in a different order than the burst's
-    sequential per-row loop, so the draws diverge from the first subunit (contexts
-    match ~0) -- a mis-timed ESS / double-counted unit weight would show as a
-    SYSTEMATIC log_ml shift across seeds, which the many-seed mean catches.
-    ``n_bursts`` counts unit ROUNDS (one burst each), confirming the synchronized
-    per-unit loop ran."""
-    from genlm.control.sampler.unit import MultiTokenUnitSampler
-
-    llm.set_prompt_from_str(_PROMPT)
-    target = _boolfsa_target(llm, r"[a-z ]+")
-
-    def make():
-        return MultiTokenUnitSampler(
-            DirectTokenSampler(target),
-            _ByteLengthBoundary(5),
-            max_subunits_per_unit=6,
-        )
-
-    assert can_burst(_controller(make, 8, 0.5, 6))  # rides the fast lane
-
-    # Many seeds: the no-bias check needs discriminating power (each run is noisy;
-    # a real bias must show as a mean many sem from 0).
-    seeds = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)
-    diffs, len_gaps = [], []
-    n_rounds = 0
-    for seed in seeds:
-        slow = _ref("multitoken-boolfsa[a-z ]+", 8, 0.5, 6, seed)
-        burst = _run_burst(make, 8, 0.5, 6, seed)
-        s = _compare("multitoken-boolfsa[a-z ]+", 0.5, 8, slow, burst)
-        diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        n_rounds = max(n_rounds, s["n_bursts"])
-    diffs = np.array(diffs)
-    len_gaps = np.array(len_gaps)
-    ml_sem = diffs.std() / np.sqrt(len(diffs))
-    len_sem = len_gaps.std() / np.sqrt(len(len_gaps))
-    print(
-        f"\nmultitoken boolfsa[a-z ]+ over {len(seeds)} seeds: "
-        f"log_ml diff mean={diffs.mean():+.4f} sem={ml_sem:.4f} | "
-        f"len gap mean={len_gaps.mean():+.3f} sem={len_sem:.3f}"
-    )
-    assert n_rounds > 1, (
-        "multitoken burst ran a single unit round -> the synchronized per-unit "
-        "loop (one burst per unit) was not exercised"
-    )
-    assert abs(diffs.mean()) <= max(0.3, 2.5 * ml_sem), (
-        f"multitoken burst log_ml biased: mean {diffs.mean():+.4f} (sem {ml_sem:.4f})"
-    )
-    assert abs(len_gaps.mean()) <= max(0.5, 2.5 * len_sem), (
-        f"multitoken burst length biased: mean gap {len_gaps.mean():+.3f} "
-        f"(sem {len_sem:.3f})"
-    )
+    """MultiToken with a CONSTRAINED Direct subunit (``llm * coerced BoolFSA``) at ess=0.5:
+    subunits ride the warm-KV fast lane with the boolfsa factor advancing per subunit; a
+    unit completes at a byte-length boundary (variable length -> staggered pop-out); ESS
+    fires once per unit round at the synced boundary. The constraint makes per-step weights
+    NON-TRIVIAL, so the no-bias log_ml + length checks exercise per-unit weight accumulation
+    + ESS + resample; ``need_rounds`` confirms the per-unit loop ran (>1 unit round)."""
+    _nobias("multitoken-boolfsa[a-z ]+", llm, ml_floor=0.3, ml_k=2.5,
+            len_bound=0.5, len_k=2.5, need_rounds=True)
 
 
 def test_multitoken_multiview_burst_vs_steploop(llm):
@@ -812,18 +510,16 @@ def test_multitoken_multiview_burst_vs_steploop(llm):
     subunit's two views, so the synchronized unit burst injects both per particle and
     draws subunits from q reweighted by p0/q. Unbiased log_ml vs StepLoop across seeds
     -- group/view/grain all compose."""
-    from genlm.control.sampler.unit import MultiTokenUnitSampler
-
     base = llm.model
     q_ids = base.tokenizer.encode("Once upon a")
-    p0_ids = base.tokenizer.encode(_PROMPT)
+    p0_ids = base.tokenizer.encode(PROMPT)
 
     def make():
-        q = PromptedLLM(base, prompt_ids=q_ids, eos_byte_strings=_EOS_BYTES)
-        p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=_EOS_BYTES)
+        q = PromptedLLM(base, prompt_ids=q_ids, eos_byte_strings=EOS_BYTES)
+        p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=EOS_BYTES)
         return MultiTokenUnitSampler(
             subunit_sampler=DirectTokenSampler(potential=p0, proposal=q),
-            boundary_predicate=_ByteLengthBoundary(3),
+            boundary_predicate=ByteLengthBoundary(3),
         )
 
     assert can_burst(_controller(make, 8, 0.5, 6))  # unit-grain multi-view fast lane
@@ -852,38 +548,12 @@ def test_multitoken_multiview_burst_vs_steploop(llm):
 
 
 def test_set_sampler_burst_vs_slow(llm):
-    """SetTokenSampler burst vs StepLoop: unbiased log_ml across seeds (the async-trie
-    set draw over the hop). Fresh EagerSetSampler per run -- its trie task binds to that
-    run's loop."""
-    from genlm.control.sampler import EagerSetSampler
-    from genlm.control.sampler.token import SetTokenSampler
-
-    llm.set_prompt_from_str(_PROMPT)
-    item = BoolFSA.from_regex(r"[a-z ]+")
-
-    def make():
-        return SetTokenSampler(EagerSetSampler(iter_potential=llm, item_potential=item))
-
-    assert can_burst(_controller(make, 8, 0.0, 8))  # re-enabled -> rides the fast lane
-    seeds = (1234, 7, 99, 2024)
-    diffs = []
-    for s in seeds:
-        slow = _run_steploop(make, 8, 0.0, 8, s)
-        burst = _run_burst(make, 8, 0.0, 8, s)
-        diffs.append(burst["log_ml"] - slow["log_ml"])
-        _log(
-            f"set seed={s}: burst={burst['log_ml']:.4f} slow={slow['log_ml']:.4f} "
-            f"diff={diffs[-1]:+.4f}"
-        )
-    diffs = np.array(diffs)
-    sem = diffs.std() / np.sqrt(len(diffs))
-    print(
-        f"\nset_sampler boolfsa[a-z ]+ over {len(seeds)} seeds: "
-        f"mean={diffs.mean():+.4f} sem={sem:.4f}"
-    )
-    assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
-        f"set burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
-    )
+    """SetTokenSampler burst vs the cached ORIGINAL (the async-trie set draw over the hop),
+    unbiased log_ml across seeds. Comparing to the original (not our StepLoop) is the
+    stronger anchor here -- SetTokenSampler has no byte-exact gate-1 pinning, so a Set-draw
+    bug shared by both lanes would be invisible against StepLoop. Fresh EagerSetSampler per
+    run (its trie task binds to that run's loop) is handled by the CASES factory."""
+    _nobias("set[a-z ]+", llm, ml_floor=0.3, ml_k=2.5)
 
 
 # ----- gate 2h: SMC.batched (B groups, ONE batched engine burst) --------------
@@ -911,13 +581,13 @@ def test_batched_smc_burst_unbiased(llm):
     unbiased (~0). A persistent same-sign gap is a burst bug."""
     from genlm.control.sampler.sequence import SMC
 
-    llm.set_prompt_from_str(_PROMPT)
-    target = _boolfsa_target(llm, r"[aeiou ]+")
+    llm.set_prompt_from_str(PROMPT)
+    target = boolfsa(llm, r"[aeiou ]+")
     pop_seeds = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
     B = len(pop_seeds)
 
     def group_mean(seed, accelerate):
-        _seed(seed)
+        seed_all(seed)
         smcs = [SMC(DirectTokenSampler(target)) for _ in range(B)]
         seqs = asyncio.run(
             SMC.batched(

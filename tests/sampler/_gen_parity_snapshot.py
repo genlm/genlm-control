@@ -33,14 +33,13 @@ from genlm.control.util import escape  # noqa: E402
 
 from llamppl import Model, smc_standard  # noqa: E402
 
+from _harness import seed_all, ctx_repr, num  # noqa: E402
 from parity_cases import (  # noqa: E402
     SAMPLER_BUILDERS,
-    MATRIX,
+    matrix_combos,
     N_PARTICLES,
     MAX_TOKENS,
     SEED,
-    _ctx_repr,
-    _num,
 )
 
 
@@ -159,10 +158,7 @@ def _gen_case(sampler_name, use_critic, ess):
     """
     import tempfile
 
-    import torch
-
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
+    seed_all(SEED)
     sampler, critic_pot = SAMPLER_BUILDERS[sampler_name]()
     critic = critic_pot if use_critic else None
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
@@ -173,24 +169,38 @@ def _gen_case(sampler_name, use_critic, ess):
     os.unlink(json_path)
 
     return {
-        "contexts": [_ctx_repr(c) for c, _ in seqs],
-        "logws": [_num(w) for _, w in seqs],
-        "log_ml": _num(seqs.log_ml),
+        "contexts": [ctx_repr(c) for c, _ in seqs],
+        "logws": [num(w) for _, w in seqs],
+        "log_ml": num(seqs.log_ml),
         "record": record,
     }
 
 
 def main():
-    out = {}
-    for sampler_name in SAMPLER_BUILDERS:
-        for use_critic in (False, True):
-            for ess in MATRIX:
-                key = f"{sampler_name}|critic={use_critic}|ess={ess}"
-                out[key] = _gen_case(sampler_name, use_critic, ess)
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--only", default=None, help="regen only this builder (exact sampler name)")
+    args = ap.parse_args()
+
     dst = os.path.join(os.path.dirname(__file__), "parity_snapshot.json")
+    # Merge into the existing snapshot so a partial regen (e.g. --only awrs) adds new keys
+    # without disturbing the frozen reference for the other samplers.
+    try:
+        with open(dst) as f:
+            out = json.load(f)
+    except FileNotFoundError:
+        out = {}
+    n_new = 0
+    for sampler_name, use_critic, ess in matrix_combos():
+        if args.only and sampler_name != args.only:
+            continue
+        key = f"{sampler_name}|critic={use_critic}|ess={ess}"
+        out[key] = _gen_case(sampler_name, use_critic, ess)
+        n_new += 1
     with open(dst, "w") as f:
         json.dump(out, f, indent=1)
-    print(f"Wrote {len(out)} snapshot cases to {dst}")
+    print(f"Wrote/updated {n_new} cases ({len(out)} total) to {dst}")
 
 
 if __name__ == "__main__":

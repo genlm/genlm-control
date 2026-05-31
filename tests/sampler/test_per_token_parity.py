@@ -25,14 +25,13 @@ import pytest
 
 from genlm.control.sampler.sequence import SMC
 
+from _harness import seed_all, ctx_repr, num, load_snapshot
 from parity_cases import (
     SAMPLER_BUILDERS,
-    MATRIX,
+    matrix_combos,
     N_PARTICLES,
     MAX_TOKENS,
     SEED,
-    _ctx_repr,
-    _num,
 )
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "parity_snapshot.json")
@@ -43,18 +42,10 @@ if not os.path.exists(SNAPSHOT_PATH):  # pragma: no cover
         allow_module_level=True,
     )
 
-with open(SNAPSHOT_PATH) as _f:
-    SNAPSHOT = json.load(_f)
+SNAPSHOT = load_snapshot(SNAPSHOT_PATH)
 
 
-def _seed(s=SEED):
-    np.random.seed(s)
-    import torch
-
-    torch.manual_seed(s)
-
-
-# _ctx_repr / _num are imported from parity_cases so the gate and the snapshot
+# seed_all / ctx_repr / num come from the shared harness so the gate and the snapshot
 # generator share one serialization -- drift here would be a silent false-green.
 
 
@@ -93,9 +84,7 @@ def _canonical_record(record_text):
     return out
 
 
-@pytest.mark.parametrize("sampler_name", list(SAMPLER_BUILDERS))
-@pytest.mark.parametrize("use_critic", [False, True])
-@pytest.mark.parametrize("ess_threshold", MATRIX)
+@pytest.mark.parametrize("sampler_name,use_critic,ess_threshold", list(matrix_combos()))
 def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
     # Synchronous test driving the controller with a fresh ``asyncio.run`` per case,
     # matching the snapshot generator.
@@ -116,7 +105,7 @@ def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
     key = f"{sampler_name}|critic={use_critic}|ess={ess_threshold}"
     snap = SNAPSHOT[key]
 
-    _seed()
+    seed_all(SEED)
     sampler, critic_pot = SAMPLER_BUILDERS[sampler_name]()
     critic = critic_pot if use_critic else None
     json_path = str(tmp_path / "got.json")
@@ -130,17 +119,17 @@ def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
     )
 
     # Per-particle contexts (exact) and log weights (atol 1e-9).
-    got_contexts = [_ctx_repr(c) for c, _ in got]
+    got_contexts = [ctx_repr(c) for c, _ in got]
     assert got_contexts == snap["contexts"], "context mismatch"
 
     for (_, gw), sw in zip(got, snap["logws"]):
         if sw in ("nan", "-inf", "inf"):
-            assert _num(gw) == sw
+            assert num(gw) == sw
         else:
             assert abs(gw - sw) <= 1e-9, f"logw mismatch: {gw} vs {sw}"
 
     # log_ml.
-    gml = _num(got.log_ml)
+    gml = num(got.log_ml)
     if snap["log_ml"] in ("nan", "-inf", "inf"):
         assert gml == snap["log_ml"]
     else:
