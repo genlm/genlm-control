@@ -71,6 +71,26 @@ def lm_leaves(potential):
     return found
 
 
+def factor_leaves(potential):
+    """The non-LM leaves of ``potential`` (recursing ``Product`` ``p1``/``p2``) -- the
+    constraint potentials a burst can pre-compute during the forward (vs the engine-LM
+    leaves it injects warm). Empty for a bare LM target."""
+    found = []
+
+    def walk(p):
+        children = (getattr(p, "p1", None), getattr(p, "p2", None))
+        if all(c is None for c in children):
+            if not isinstance(p, PromptedLLM):
+                found.append(p)
+            return
+        for child in children:
+            if child is not None:
+                walk(child)
+
+    walk(potential)
+    return found
+
+
 def constraint_leaf_ids(potential):
     """``id``s of the non-engine-LM leaves of ``potential`` (recursing ``Product``).
     Two targets share a constraint iff these match -- the burst homogeneity check for

@@ -1,6 +1,7 @@
 import asyncio
 import warnings
 from genlm.control.potential.base import Potential
+from genlm.control.potential.built_in.llm import _burst_logw_next_overrides
 
 
 class Product(Potential):
@@ -123,9 +124,17 @@ class Product(Potential):
         return W1 + W2
 
     async def logw_next(self, context):
-        W1, W2 = await asyncio.gather(
-            self.p1.logw_next(context), self.p2.logw_next(context)
-        )
+        # Inside a burst, a child whose logw_next is pre-supplied in the override (the LM
+        # view's warm logits, or a constraint factor pre-computed during the forward) is
+        # served from there instead of recomputed -- same value, off the critical path.
+        override = _burst_logw_next_overrides.get()
+
+        async def _child(p):
+            if override is not None and p in override:
+                return override[p]
+            return await p.logw_next(context)
+
+        W1, W2 = await asyncio.gather(_child(self.p1), _child(self.p2))
         return self.make_lazy_weights(
             W1.weights[self.v1_idxs] + W2.weights[self.v2_idxs]
         )
