@@ -1,6 +1,6 @@
 import asyncio
 import warnings
-from genlm.control.potential.base import Potential, _burst_logw_next_overrides
+from genlm.control.potential.base import Potential
 
 
 class Product(Potential):
@@ -127,15 +127,9 @@ class Product(Potential):
         return W1 + W2
 
     async def logw_next(self, context):
-        # A child whose logw_next is pre-supplied in the burst override is served from there.
-        override = _burst_logw_next_overrides.get()
-
-        async def _child(p):
-            if override is not None and p in override:
-                return override[p]
-            return await p.logw_next(context)
-
-        W1, W2 = await asyncio.gather(_child(self.p1), _child(self.p2))
+        W1, W2 = await asyncio.gather(
+            self.p1.logw_next(context), self.p2.logw_next(context)
+        )
         return self.make_lazy_weights(
             W1.weights[self.v1_idxs] + W2.weights[self.v2_idxs]
         )

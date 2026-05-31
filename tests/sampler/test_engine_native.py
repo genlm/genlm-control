@@ -447,7 +447,7 @@ def test_awrs_burst_vs_slow(llm):
 # ----- gate 2d: critic (terminal reweight + per-step twist) -------------------
 #
 # The critic is NOT a sampler -- it reweights the population. The burst scores it
-# via the SAME Controller._score_advance_terminate the slow loop uses (driven by
+# via the SAME Controller._bank_step the slow loop uses (driven by
 # run_sync from the engine-thread draw), so a terminal reweight (ess=0, the
 # genlm-latent production regime) and a per-step twist (ess>0) are handled
 # identically to the slow path. There is deliberately NO critic-category gate

@@ -38,14 +38,9 @@ def lm_leaves(potential):
     return [lf for lf in _walk_leaves(potential) if isinstance(lf, PromptedLLM)]
 
 
-def factor_leaves(potential):
-    """The non-LM (constraint) leaves; empty for a bare LM target."""
-    return [lf for lf in _walk_leaves(potential) if not isinstance(lf, PromptedLLM)]
-
-
 def constraint_leaf_ids(potential):
     """``id``s of the non-(burst-LM) leaves -- the constraint identity a batched burst's
-    groups must share. (Counts a non-burst ``PromptedLLM``, unlike ``factor_leaves``.)"""
+    groups must share (counts a non-burst ``PromptedLLM``)."""
     return frozenset(id(lf) for lf in _walk_leaves(potential) if not _is_burst_lm(lf))
 
 

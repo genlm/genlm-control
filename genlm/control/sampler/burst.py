@@ -13,7 +13,6 @@ from genlm.control.potential.built_in.llm import (
     find_engine_lm,
     constraint_leaf_ids,
     lm_leaves,
-    factor_leaves,
 )
 
 
@@ -90,7 +89,6 @@ class _Burst:
         self.scratch = {}
         self.exit_reason = _EXIT_TERMINATED
         self._pending_bank = None  # Future of the last step's deferred bank (overlaps next forward)
-        self._precomputed_factor = {}  # row -> {factor_leaf: LazyWeights}, pre-computed in the bank
 
     def context_ids(self, p, view_idx):
         """Engine prompt for one (particle, view) substream: the view's prefix + the
@@ -167,13 +165,7 @@ class _Burst:
             if c.twist_with_critic:
                 c.particles.untwist_subset([p._i for p in parts])
             injections = [
-                {
-                    **{
-                        view: warm[self.row_handles[row][vi]]
-                        for vi, view in enumerate(self.views)
-                    },
-                    **self._precomputed_factor.get(row, {}),  # factor pre-computed in the bank
-                }
+                {view: warm[self.row_handles[row][vi]] for vi, view in enumerate(self.views)}
                 for row in rows
             ]
             records = await sampler.burst_draw_batch(
@@ -242,32 +234,17 @@ class _Burst:
 
     async def _bank_pop(self, parts, records):
         """Bank one step's records into the population (score/extend/critic; sets
-        ``p.done``) and, for free running, pre-compute the next step's constraint factors."""
+        ``p.done``). Free running kicks this as a Future to overlap the next forward
+        (the deferred bank); unit grain awaits it inline."""
         c = self.d.controller
-        await c._bank_burst_steps(parts, records)
-        if not self.d.sampler.burst_free_running():
-            return  # unit grain banks inline; BurstLoop.run records, no overlap to prep
+        await c._bank_steps(parts, records)
         # Token grain records per step here; unit grain once per round in BurstLoop.run.
-        if any(r.step is not None for r in records):
+        if self.d.sampler.burst_free_running() and any(r.step is not None for r in records):
             c._record_step()
-        # Pre-compute the constraint factors at the live rows' new context so the next
-        # draw's Product.logw_next serves them from the injection (overlaps the next forward).
-        leaves = self.d.factor_leaves
-        live = [p for p in parts if not p.done]
-        if leaves and live:
-            results = await asyncio.gather(
-                *(leaf.logw_next(p.context) for p in live for leaf in leaves)
-            )
-            n = len(leaves)
-            for i, p in enumerate(live):
-                self._precomputed_factor[p._i] = dict(
-                    zip(leaves, results[i * n : (i + 1) * n])
-                )
 
     def _drop_row(self, row):
-        """Fully evict a row's K substreams: abort their engine requests, drop both handle
-        maps, and drop any pre-computed factor."""
-        self._precomputed_factor.pop(row, None)
+        """Fully evict a row's K substreams: abort their engine requests and drop both
+        handle maps."""
         for h in self.row_handles.pop(row, []):
             self.abort_rows.add(h)
             self.handle_rv.pop(h, None)
@@ -303,22 +280,6 @@ def _views_of(sampler):
     if proposal is not None:
         views.append(find_engine_lm(proposal))
     return views
-
-
-def _factor_leaves_of(sampler):
-    """The non-LM constraint leaves a burst can pre-compute for ``sampler`` -- the
-    non-LM leaves of the draw sampler's target (+ proposal), deduped. Empty for an
-    unconstrained target; pre-computing them overlaps the engine forward."""
-    s = sampler.burst_draw_sampler()
-    leaves, seen = [], set()
-    for pot in (s.target, s.proposal):
-        if pot is None:
-            continue
-        for leaf in factor_leaves(pot):
-            if id(leaf) not in seen:
-                seen.add(id(leaf))
-                leaves.append(leaf)
-    return leaves
 
 
 def burst_blocker(controller):
@@ -400,8 +361,6 @@ class BurstLoop:
         # proposal). The batched burst draws every group through group 0's sampler.
         self.views = _views_of(self.sampler)
         self.k = len(self.views)
-        # Non-LM constraint leaves to pre-compute during the forward. Empty == unconstrained.
-        self.factor_leaves = _factor_leaves_of(self.sampler)
         # The engine LM the burst drives (run_burst + the eos id); views share its model.
         self.llm = self.views[0]
         if self.llm is None:  # pragma: no cover - guarded by burst_blocker

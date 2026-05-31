@@ -243,11 +243,11 @@ class Controller:
 
     # -- the per-step transition for ONE particle --
 
-    async def _draw_and_score(self, p):
+    async def _draw_and_bank(self, p):
         """Slow per-step transition: draw from the sampler, then apply the shared
         score/twist/terminate math."""
         to_append, logw, logp = await self._sampler_of(p).transition(p.context)
-        await self._score_advance_terminate(p, to_append, logw, logp)
+        await self._bank_step(p, to_append, logw, logp)
 
     def _sampler_of(self, p):
         """The sampler for particle ``p``'s group."""
@@ -257,7 +257,7 @@ class Controller:
         """The critic for particle ``p``'s group."""
         return self.critics[self.particles.group[p._i]]
 
-    def _advance_no_critic(self, p, to_append, logw, logp):
+    def _bank_step_no_critic(self, p, to_append, logw, logp):
         """Sync score + advance + terminate for the no-critic path (shared by the slow
         path and the burst)."""
         p.score(logw)
@@ -272,12 +272,12 @@ class Controller:
         if p.max_tokens_left == 0 or self._is_terminal(p):
             p.finish()
 
-    async def _score_advance_terminate(self, p, to_append, logw, logp):
+    async def _bank_step(self, p, to_append, logw, logp):
         """The post-draw SMC math (one implementation, shared by both lanes): score,
         advance the context, critic-twist per step, reweight + terminate. The caller
         untwists ``p`` before the draw."""
         if not self.critic:
-            self._advance_no_critic(p, to_append, logw, logp)
+            self._bank_step_no_critic(p, to_append, logw, logp)
             return
 
         p.score(logw)
@@ -403,7 +403,7 @@ class Controller:
     # The seam (draw / drain_* / token-id mapping) lives on _Burst; what stays here is
     # the SMC math it banks into: per-step banking + ESS/resample.
 
-    async def _bank_burst_steps(self, parts, records):
+    async def _bank_steps(self, parts, records):
         """Bank every row's completed SMC step (``rec.step``), same math as the slow
         loop. Runs on the main loop (hopped from the burst worker), so an awaiting
         critic composes as a normal gather."""
@@ -414,10 +414,10 @@ class Controller:
             return
         if self.critic is None:
             for p, (to_append, logw, logp) in steps:
-                self._advance_no_critic(p, to_append, logw, logp)
+                self._bank_step_no_critic(p, to_append, logw, logp)
             return
         for p, (to_append, logw, logp) in steps:
-            await self._score_advance_terminate(p, to_append, logw, logp)
+            await self._bank_step(p, to_append, logw, logp)
 
 
 
@@ -444,7 +444,7 @@ class StepLoop:
             if c.twist_with_critic:
                 c.particles.untwist_all()
             await asyncio.gather(
-                *[c._draw_and_score(p) for p in c.particles if not p.done]
+                *[c._draw_and_bank(p) for p in c.particles if not p.done]
             )
             c._record_step()
             c._maybe_resample()
