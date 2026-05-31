@@ -5,7 +5,7 @@ from typing import Any, Iterable, Optional
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.controller import BurstDraw
+from genlm.control.sampler.burst import BurstDraw
 from genlm.control.potential.base import burst_logw_next
 from lark import Lark
 from lark.exceptions import LarkError

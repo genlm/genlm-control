@@ -1,7 +1,7 @@
 from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
 from .sequence import SMC
-from .controller import (
+from .burst import (
     NotAcceleratable,
 )
 from .unit import (

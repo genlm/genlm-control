@@ -24,12 +24,8 @@ from huggingface_hub import snapshot_download  # noqa: E402
 from genlm.backend.llm.vllm import AsyncVirtualLM  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
-from genlm.control.sampler.controller import (  # noqa: E402
-    Controller,
-    BurstLoop,
-    StepLoop,
-    burst_blocker,
-)
+from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
+from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
 from genlm.control.sampler.sequence import Sequences, _unpack_particles  # noqa: E402
 
 ADAPTER = "farpluto/SmolLM-135M-Instruct-Finetune-LoRA"

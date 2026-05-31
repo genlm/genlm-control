@@ -4,7 +4,7 @@ import numpy as np
 
 from genlm.control.potential import Potential
 from genlm.control.sampler.sequence import SMC
-from genlm.control.sampler.controller import Controller
+from genlm.control.sampler.smc import Controller
 from genlm.control.sampler.smc_record import string_for_serialization
 from genlm.control.sampler.token import DirectTokenSampler
 

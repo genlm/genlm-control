@@ -8,13 +8,8 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.controller import (
-    Controller,
-    StepLoop,
-    BurstLoop,
-    burst_blocker,
-    NotAcceleratable,
-)
+from genlm.control.sampler.smc import Controller, StepLoop
+from genlm.control.sampler.burst import BurstLoop, burst_blocker, NotAcceleratable
 
 logger = logging.getLogger("genlm.control")
 
@@ -236,7 +231,7 @@ class SMC:
         Run params and ``accelerate`` carry the same meaning as
         :meth:`__call__`; the burst lane needs the batch to be burst-homogeneous
         (one shared forward over all B*N rows -- see
-        :func:`~genlm.control.sampler.controller._batch_blocker`), else it falls
+        :func:`~genlm.control.sampler.burst._batch_blocker`), else it falls
         back to the exact per-token loop.
         """
         samplers = [s.unit_sampler for s in smcs]

@@ -8,7 +8,7 @@ import warnings
 from genlm.control.util import select
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
-from genlm.control.sampler.controller import BurstDraw
+from genlm.control.sampler.burst import BurstDraw
 from genlm.control.potential.base import burst_logw_next
 
 
