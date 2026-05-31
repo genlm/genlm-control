@@ -3,6 +3,7 @@
 instance it is handed; resample/ESS/log_ml stay Controller-owned, never in the backend."""
 
 import asyncio
+import enum
 from dataclasses import dataclass
 
 import torch
@@ -18,7 +19,24 @@ from genlm.control.potential.built_in.llm import (
 
 class NotAcceleratable(Exception):
     """Engine acceleration was required but the config can't be driven by the burst.
-    Message is ``burst_blocker``'s reason."""
+    Message is ``burst_blocker``'s detail."""
+
+
+class BlockReason(enum.Enum):
+    """Why a config can't run the engine burst -- the matchable category."""
+
+    UNSUPPORTED_SAMPLER = "sampler"
+    NO_ENGINE_LEAF = "engine_leaf"
+    FORWARD_NOT_INJECTABLE = "forward"
+    BATCH_HETEROGENEOUS = "batch"
+
+
+@dataclass(frozen=True)
+class BurstBlock:
+    """``burst_blocker``'s verdict: a matchable :class:`BlockReason` + human ``detail``."""
+
+    reason: BlockReason
+    detail: str
 
 
 
@@ -311,9 +329,14 @@ def burst_blocker(controller):
     (:func:`_batch_blocker`)."""
     s = controller.unit_sampler
     if not s.supports_burst():
-        return f"{type(s).__name__} does not support the engine burst"
+        return BurstBlock(
+            BlockReason.UNSUPPORTED_SAMPLER,
+            f"{type(s).__name__} does not support the engine burst",
+        )
     if find_engine_lm(s.target) is None:
-        return "sampler target has no single engine-burst LM leaf"
+        return BurstBlock(
+            BlockReason.NO_ENGINE_LEAF, "sampler target has no single engine-burst LM leaf"
+        )
     # Forward-free invariant: every LM leaf in each group's per-step path (target +
     # proposal + critic) must be an injected view (warm logits), else it would do a real
     # engine forward inside the burst, which the burst can't supply. Route to slow lane.
@@ -324,10 +347,10 @@ def burst_blocker(controller):
             if pot is None:
                 continue
             if any(lm not in injected for lm in lm_leaves(pot)):
-                return (
-                    f"group {g}: an LM leaf can't be assembled into the burst as an "
-                    "injected view (it would forward) -- e.g. an LM critic or a "
-                    "second engine LM"
+                return BurstBlock(
+                    BlockReason.FORWARD_NOT_INJECTABLE,
+                    f"group {g}: an LM leaf would forward inside the burst (it is not an "
+                    "injected view) -- e.g. an LM critic or a second engine LM",
                 )
     if len(controller.samplers) > 1:
         return _batch_blocker(controller.samplers)
@@ -342,21 +365,25 @@ def _batch_blocker(samplers):
     s0 = samplers[0]
     views0 = _views_of(s0)
     constraint0 = constraint_leaf_ids(s0.target)
+
+    def blocked(detail):
+        return BurstBlock(BlockReason.BATCH_HETEROGENEOUS, f"group {g} {detail}")
+
     for g, s in enumerate(samplers[1:], start=1):
         if type(s) is not type(s0):
-            return f"group {g} sampler is {type(s).__name__}, not {type(s0).__name__}"
+            return blocked(f"sampler is {type(s).__name__}, not {type(s0).__name__}")
         views = _views_of(s)
         if len(views) != len(views0):
-            return f"group {g} has {len(views)} views, not {len(views0)}"
+            return blocked(f"has {len(views)} views, not {len(views0)}")
         for vi, (v, v0) in enumerate(zip(views, views0)):
             if v is None or v.model is not v0.model:
-                return f"group {g} view {vi} uses a different engine"
+                return blocked(f"view {vi} uses a different engine")
             if getattr(v, "temperature", None) != getattr(v0, "temperature", None):
-                return f"group {g} view {vi} temperature differs from group 0"
+                return blocked(f"view {vi} temperature differs from group 0")
             if v.lora_name != v0.lora_name:
-                return f"group {g} view {vi} uses a different LoRA adapter from group 0"
+                return blocked(f"view {vi} uses a different LoRA adapter from group 0")
         if constraint_leaf_ids(s.target) != constraint0:
-            return f"group {g} has a different constraint"
+            return blocked("has a different constraint")
     return None
 
 

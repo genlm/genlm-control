@@ -601,14 +601,14 @@ def test_lm_critic_routed_to_slow_lane(llm):
     """An LM critic (a second PromptedLLM on the SAME engine) would forward inside the
     burst. The forward-free gate must catch it: burst_blocker gives a reason, and
     accelerate="require" raises instead of bursting."""
-    from genlm.control.sampler.burst import NotAcceleratable
+    from genlm.control.sampler.burst import NotAcceleratable, BlockReason
 
     def make():
         return DirectTokenSampler(llm)
 
     lm_critic = PromptedLLM(llm.model, eos_byte_strings=_EOS_BYTES)
     reason = burst_blocker(_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic))
-    assert reason is not None and "forward" in reason.lower(), reason
+    assert reason is not None and reason.reason is BlockReason.FORWARD_NOT_INJECTABLE, reason
 
     llm.set_prompt_from_str(_PROMPT)
     _seed(SEED)

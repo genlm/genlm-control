@@ -42,7 +42,7 @@ async def _drive(controller, mode):
     if mode != "off":
         reason = burst_blocker(controller)
         if mode == "require" and reason is not None:
-            raise NotAcceleratable(reason)
+            raise NotAcceleratable(reason.detail)
         if reason is None:
             if mode == "auto":
                 logger.info("running the engine-accelerated burst path.")
@@ -52,7 +52,7 @@ async def _drive(controller, mode):
                 "running the exact per-token path -- acceleration unavailable: %s. "
                 'Pass accelerate="off" to silence, or accelerate="require" to make '
                 "this an error.",
-                reason,
+                reason.detail,
             )
     return await StepLoop(controller).run()
 
