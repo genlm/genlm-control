@@ -1,5 +1,6 @@
 import string
 import numpy as np
+import torch
 from collections import OrderedDict
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
@@ -276,8 +277,10 @@ class BoolFSA(WFSA):
         -inf elsewhere). The single definition shared by every BoolFSA next-token
         method so they cannot drift."""
         return logw_next.spawn(
-            new_weights=np.where(
-                logw_next.weights > float("-inf"), 0, logw_next.weights
+            new_weights=torch.where(
+                logw_next.weights > float("-inf"),
+                torch.zeros_like(logw_next.weights),
+                logw_next.weights,
             )
         )
 

@@ -604,9 +604,9 @@ class PromptedLLM(Potential):
             (LazyWeights): Processed log probabilities for the next tokens.
         """
         # N=1 adapter over the batched on-device fold: same pad / slice / log_softmax /
-        # EOS fold, then downgrade the single row to numpy for the slow lane's LazyWeights.
+        # EOS fold, kept as a CPU torch tensor for the slow lane's LazyWeights.
         out = self._process_logw_next_batch(logw_next.unsqueeze(0))
-        return self.make_lazy_weights(out[0].float().cpu().numpy())
+        return self.make_lazy_weights(out[0].float().cpu())
 
     async def logw_next(self, context):
         """Get log probabilities for next tokens given the prompt and `context`.

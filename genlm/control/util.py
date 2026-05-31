@@ -1,6 +1,7 @@
 import warnings
 
 import numpy as np
+import torch
 from genlm.grammar import Float, Log
 
 from genlm.control.constant import EndOfSequence
@@ -46,6 +47,7 @@ class LazyWeights:
         Raises:
             AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
+        weights = torch.as_tensor(weights)  # the invariant: .weights is always a tensor
         assert len(weights) == len(decode)
         assert len(encode) == len(decode)
 
@@ -66,7 +68,7 @@ class LazyWeights:
             (float): The weight of the token, or -inf/0 if the token is not found.
         """
         if token in self.encode:
-            return self.weights[self.encode[token]]
+            return self.weights[self.encode[token]].item()
 
         # Fallback: if token is plain bytes (not Token), look up by byte_string content.
         # This supports old code that indexes by bytes; returns the first match.
@@ -84,7 +86,7 @@ class LazyWeights:
                     DeprecationWarning,
                     stacklevel=2,
                 )
-                return self.weights[self.encode[match]]
+                return self.weights[self.encode[match]].item()
 
         return float("-inf") if self.is_log else 0
 
@@ -120,9 +122,9 @@ class LazyWeights:
             (LazyWeights): A new LazyWeights instance with normalized weights.
         """
         if self.is_log:
-            return self.spawn(self.weights - logsumexp(self.weights))
+            return self.spawn(self.weights - torch.logsumexp(self.weights, 0))
         else:
-            return self.spawn(self.weights / np.sum(self.weights))
+            return self.spawn(self.weights / self.weights.sum())
 
     def exp(self):
         """
@@ -135,7 +137,7 @@ class LazyWeights:
             AssertionError: If the weights are not in log space.
         """
         assert self.is_log, "Weights must be in log space to exponentiate"
-        return self.spawn(np.exp(self.weights), log=False)
+        return self.spawn(torch.exp(self.weights), log=False)
 
     def log(self):
         """
@@ -148,7 +150,7 @@ class LazyWeights:
             AssertionError: If the weights are already in log space.
         """
         assert not self.is_log, "Weights must be in regular space to take the logarithm"
-        return self.spawn(np.log(self.weights), log=True)
+        return self.spawn(torch.log(self.weights), log=True)
 
     def sum(self):
         """
@@ -161,9 +163,9 @@ class LazyWeights:
             (float): The sum of the weights, either in log space or regular space.
         """
         if self.is_log:
-            return logsumexp(self.weights)
+            return torch.logsumexp(self.weights, 0).item()
         else:
-            return np.sum(self.weights)
+            return self.weights.sum().item()
 
     def spawn(self, new_weights, log=None):
         """
@@ -193,16 +195,15 @@ class LazyWeights:
             (Chart): A chart representation of the weights.
         """
         weights = self.weights
+        order = weights.argsort()
         if top is not None:
-            top_ws = weights.argsort()[-int(top) :]
-        else:
-            top_ws = weights.argsort()
+            order = order[-int(top) :]
 
         semiring = Log if self.is_log else Float
 
         chart = semiring.chart()
-        for i in reversed(top_ws):
-            chart[self.decode[i]] = weights[i]
+        for i in reversed(order.tolist()):
+            chart[self.decode[i]] = weights[i].item()
 
         return chart
 
@@ -221,7 +222,9 @@ class LazyWeights:
             **kwargs (dict): Additional arguments for np.testing.assert_allclose (e.g., rtol, atol).
         """
         assert self.decode == other.decode
-        np.testing.assert_allclose(self.weights, other.weights, **kwargs)
+        np.testing.assert_allclose(
+            self.weights.cpu().numpy(), other.weights.cpu().numpy(), **kwargs
+        )
 
     def assert_equal_unordered(self, other, **kwargs):
         """
@@ -300,42 +303,37 @@ def load_async_trie(V, backend=None, **kwargs):
     return AsyncTokenCharacterTrie(load_trie(V, backend, **kwargs))
 
 
-def fast_sample_logprobs(logprobs: np.ndarray, size: int = 1) -> np.ndarray:
-    """Sample indices from an array of log probabilities using the Gumbel-max trick.
-
-    Args:
-        logprobs: Array of log probabilities
-        size (int): Number of samples to draw
-
-    Returns:
-        (np.ndarray): Array of sampled indices
-
-    Note:
-        This is much faster than np.random.choice for large arrays since it avoids
-        normalizing probabilities and uses vectorized operations.
-    """
-    noise = -np.log(-np.log(np.random.random((size, len(logprobs)))))
-    return (logprobs + noise).argmax(axis=1)
+# --- token-picker family ---
+# Each maps a log-weight tensor -> drawn index, reducing the last dim (so the same
+# function serves a 1-D slow-lane draw and a batched [N, V] on-device draw). The default
+# is Gumbel-max (the historical draw); swap by passing another member as ``select(.., m)``.
 
 
-def select(lazyweights):
-    """Select (sample) a token from a LazyWeights instance -- the default token
-    picker, Gumbel-max.
+def gumbel_max(logps):
+    """Argmax of ``logps + Gumbel noise`` -- the default picker."""
+    g = -torch.log(-torch.log(torch.rand_like(logps)))
+    return (logps + g).argmax(dim=-1)
 
-    Named so the picker is a single, swappable seam: samplers call ``select`` rather
-    than inlining the draw, so an alternative method (inverse-CDF, multinomial, a
-    test tracer) can plug in via a sampler's ``draw=`` override without touching the
-    sampler bodies.
 
-    Args:
-        lazyweights (LazyWeights): A LazyWeights instance (log weights).
+def multinomial(logps):
+    """Categorical draw from ``exp(logps)`` (1-D)."""
+    p = (logps - torch.logsumexp(logps, 0)).exp()
+    return torch.multinomial(p, 1)[0]
 
-    Returns:
-        (Any): the selected token.
-    """
+
+def inverse_cdf(logps):
+    """Single-uniform inverse-CDF draw (1-D)."""
+    cdf = (logps - torch.logsumexp(logps, 0)).exp().cumsum(0)
+    return torch.searchsorted(cdf, torch.rand((), dtype=cdf.dtype))
+
+
+def select(lazyweights, method=gumbel_max):
+    """Select (sample) a token from a log-space ``LazyWeights`` via ``method`` (default
+    Gumbel-max). The single, swappable picker seam: samplers call ``select`` rather than
+    inlining the draw, so an alternative member of the family (multinomial, inverse-CDF,
+    a test tracer) plugs in without touching the sampler bodies."""
     assert lazyweights.is_log
-    token_id = fast_sample_logprobs(lazyweights.weights, size=1)[0]
-    return lazyweights.decode[token_id]
+    return lazyweights.decode[int(method(lazyweights.weights))]
 
 
 def escape(x):

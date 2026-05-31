@@ -367,16 +367,13 @@ class AWRS(TokenSampler):
         # probed token (CPU). With a proposal, both LM reads are injected views.
         return True
 
-    def _prune_logws(self, logws):
-        # Prune the logws to only include the tokens in the
-        # target vocabulary. (This zeros-out tokens which we know a priori
-        # will be rejected.) Note: We need an additional correction term
-        # to account for the fact that we're throwing away some probability mass.
-        # This should be handled in `sample`.
+    def _prune_logws(self, w):
+        # Prune the numpy log-weights ``w`` to only the tokens in the target vocabulary
+        # (zeroing-out tokens we know a priori will be rejected). The mass thrown away is
+        # corrected via logZ in `_run_rejection`.
         pruned = self.potential.alloc_logws()
-        pruned[self.valid_idxs] = logws.weights[self.valid_idxs]
-        logws.weights = pruned
-        return logws
+        pruned[self.valid_idxs] = w[self.valid_idxs]
+        return pruned
 
     async def _accept(self, context, token, verbosity=0):
         if self.prune_logws or token in self.vocab_eos_set:
@@ -427,10 +424,13 @@ class AWRS(TokenSampler):
         coroutine (and an optional ``target_logws`` proposal correction). The slow
         ``sample`` and the engine burst both call this, so the algorithm and weight
         stay identical -- only the source of ``logws``/``accept`` differs."""
+        # AWRS rejection is CPU/numpy (seeded rng, argsort, data-dependent walk); convert
+        # the torch log-weights at this edge and operate in numpy throughout.
+        lw = logws.weights.cpu().numpy()
         if self.prune_logws:
-            logws = self._prune_logws(logws)
-        logZ = logsumexp(logws.weights)
-        logps = logws.weights - logZ
+            lw = self._prune_logws(lw)
+        logZ = logsumexp(lw)
+        logps = lw - logZ
         toks = logws.decode
 
         # Cache successful calls (geometric_awrs may revisit a token).
@@ -478,10 +478,10 @@ class AWRS(TokenSampler):
             return tok, w + logZ, np.nan
 
         # `tok` was drawn with finite sampling weight, so `_prune_logws` left
-        # `logws.weights[tok_idx]` untouched even when pruning is on. When
-        # `w == -inf` (rejection failure) the result stays -inf.
+        # `lw[tok_idx]` untouched even when pruning is on. When `w == -inf`
+        # (rejection failure) the result stays -inf.
         tok_idx = self.potential.lookup[tok]
-        log_ratio = target_logws.weights[tok_idx] - logws.weights[tok_idx]
+        log_ratio = target_logws.weights[tok_idx].item() - lw[tok_idx]
         return tok, w + logZ + log_ratio, np.nan
 
 
