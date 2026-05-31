@@ -1,9 +1,9 @@
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import gather_or_inline
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.controller import BurstDraw
 from genlm.control.potential.built_in.llm import burst_logw_next
@@ -165,7 +165,7 @@ class MultiTokenUnitSampler(TokenSampler):
             step = (self._to_append(unit), weight, accum.logp)
             return BurstDraw(token=subunit, step=step, pop=status == "boundary")
 
-        return await gather_or_inline(
+        return await asyncio.gather(
             *(one(c, j, h) for c, j, h in zip(contexts, injections, handles))
         )
 

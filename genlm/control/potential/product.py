@@ -1,7 +1,6 @@
 import asyncio
 import warnings
 from genlm.control.potential.base import Potential
-from genlm.control.util import gather_or_inline
 
 
 class Product(Potential):
@@ -124,7 +123,7 @@ class Product(Potential):
         return W1 + W2
 
     async def logw_next(self, context):
-        W1, W2 = await gather_or_inline(
+        W1, W2 = await asyncio.gather(
             self.p1.logw_next(context), self.p2.logw_next(context)
         )
         return self.make_lazy_weights(

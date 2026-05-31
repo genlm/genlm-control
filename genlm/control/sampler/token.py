@@ -1,10 +1,11 @@
+import asyncio
 import numpy as np
 from arsenal import colors
 from arsenal.maths import log1mexp
 from genlm.control.util import logsumexp
 import warnings
 
-from genlm.control.util import select, gather_or_inline
+from genlm.control.util import select
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 from genlm.control.sampler.controller import BurstDraw
@@ -71,7 +72,7 @@ class TokenSampler:
                 to_append, logw, logp = await self.transition(context)
             return BurstDraw(token=to_append[-1], step=(to_append, logw, logp))
 
-        return await gather_or_inline(*(one(c, j) for c, j in zip(contexts, injections)))
+        return await asyncio.gather(*(one(c, j) for c, j in zip(contexts, injections)))
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
@@ -210,7 +211,7 @@ class DirectTokenSampler(TokenSampler):
             token = select(logps) if draw is None else draw(logps.exp().materialize())
             return token, logZ, logps[token]
 
-        proposal_logws, target_logws = await gather_or_inline(
+        proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context), self.potential.logw_next(context)
         )
         proposal_logZ = proposal_logws.sum()  # one logsumexp, reused below
@@ -243,8 +244,8 @@ class SetTokenSampler(TokenSampler):
 
     def supports_burst(self) -> bool:
         # Slow lane: the set draw runs over an ASYNC trie (background asyncio task +
-        # per-node futures, backend/trie/async_impl.py) that needs a running event
-        # loop -- which the inline-driven burst (coro.send, no loop) doesn't have.
+        # per-node futures, backend/trie/async_impl.py) whose loop-bound machinery
+        # doesn't compose with the burst's per-step main-loop hop.
         # Re-enabling needs a loop-free (sync) set draw, not just flipping this.
         return False
 
@@ -411,7 +412,7 @@ class AWRS(TokenSampler):
             logws = await self.potential.logw_next(context)
             target_logws = None
         else:
-            target_logws, logws = await gather_or_inline(
+            target_logws, logws = await asyncio.gather(
                 self.potential.logw_next(context), self.proposal.logw_next(context)
             )
 
