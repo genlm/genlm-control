@@ -107,32 +107,21 @@ class MultiTokenUnitSampler(TokenSampler):
         self.max_subunits_per_unit = max_subunits_per_unit
 
     def supports_burst(self) -> bool:
-        # Rides the fast lane iff its subunit sampler can: the subunits ARE the
-        # burst draws (Direct/AWRS over the warm-KV logits). MultiToken adds only
-        # the unit accumulation + the synchronized per-unit pop-out on top, so its
-        # burst-capability is exactly the subunit sampler's.
+        # Rides the fast lane iff its subunit sampler can (the subunits ARE the burst draws).
         return self.subunit_sampler.supports_burst()
 
     def burst_draw_sampler(self):
-        # The subunit does the per-step draw, so its target/proposal are the injected
-        # views (recurse, in case of nested unit samplers).
+        # The subunit does the per-step draw, so recurse to its draw sampler.
         return self.subunit_sampler.burst_draw_sampler()
 
     def burst_free_running(self) -> bool:
-        # Synchronized (unit grain), NOT free-running: one SMC step is one whole
-        # unit, completed at a per-row boundary after a VARIABLE number of subunit
-        # decode steps. Because rows reach their boundary at different engine steps,
-        # each pops out and waits at its boundary; the controller runs exactly one
-        # unit round per burst and tests ESS once at the synced boundary -- identical
-        # timing to the slow per-unit loop (every particle advances one unit per
-        # transition). This is what made the per-step token-grain ESS wrong for
-        # units; the synchronized grain makes it exact.
+        # Synchronized (unit grain): one SMC step is one whole unit, with ESS tested once
+        # per unit round at the synced boundary (not per subunit decode step).
         return False
 
     def burst_max_steps(self, live) -> int:
-        # One unit's worth of subunit decode steps (+1 margin). The reject at
-        # ``max_subunits_per_unit`` subunits fires control-side (in burst_draw_batch)
-        # before this engine cap, so the engine never length-caps a row mid-unit.
+        # One unit's worth of subunit decode steps (+1 margin); the control-side reject at
+        # ``max_subunits_per_unit`` fires before this engine cap.
         return self.max_subunits_per_unit + 1
 
     async def burst_draw_batch(self, injections, contexts, handles, burst):
@@ -183,11 +172,8 @@ class MultiTokenUnitSampler(TokenSampler):
         log-probability of the random choices.
 
         The context passed by the controller is the structured (possibly nested) unit
-        context; it is flattened before sampling so the subunit sampler always
-        sees a flat token list. The trailing-EOS split logic mirrors the old
-        LLaMPPL ``forward``: when the sampled unit ends with EOS, the content
-        before EOS (if any) is appended as one unit and EOS is appended
-        separately so the controller's terminal check (``context[-1] is EOS``) fires.
+        context; it is flattened before sampling so the subunit sampler sees a flat token
+        list. The trailing-EOS split (when a unit ends with EOS) is done by ``_to_append``.
 
         Args:
             context (list): The particle's structured unit context.

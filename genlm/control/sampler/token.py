@@ -247,11 +247,8 @@ class SetTokenSampler(TokenSampler):
         self.set_sampler = set_sampler
 
     def supports_burst(self) -> bool:
-        # Slow lane: the set draw runs over an ASYNC trie (background asyncio task +
-        # per-node futures, backend/trie/async_impl.py) whose loop-bound machinery
-        # doesn't compose with the burst's per-step main-loop hop.
-        # Re-enabling needs a loop-free (sync) set draw, not just flipping this.
-        return False
+        # The async-trie set draw runs on the main loop via the per-step hop.
+        return True
 
     async def sample(self, context, draw=None):
         """Sample a token and weight by sampling a weighted set of tokens from the `set_sampler`

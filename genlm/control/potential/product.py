@@ -127,9 +127,7 @@ class Product(Potential):
         return W1 + W2
 
     async def logw_next(self, context):
-        # Inside a burst, a child whose logw_next is pre-supplied in the override (the LM
-        # view's warm logits, or a constraint factor pre-computed during the forward) is
-        # served from there instead of recomputed -- same value, off the critical path.
+        # A child whose logw_next is pre-supplied in the burst override is served from there.
         override = _burst_logw_next_overrides.get()
 
         async def _child(p):

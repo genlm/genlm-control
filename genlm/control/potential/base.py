@@ -11,11 +11,8 @@ from genlm.control.potential.operators import PotentialOps
 from genlm.control.potential.testing import PotentialTests
 
 
-# Per-task burst injection: within ``burst_logw_next``, a potential's ``logw_next``
-# returns the pre-supplied result for itself -- the engine's warm logits for an LM view,
-# or a constraint factor pre-computed during the forward -- instead of computing. Lives
-# here (not in a concrete potential) so any potential can read it without an upward
-# import; ``PromptedLLM`` and ``Product`` both check it.
+# Per-burst override: {potential: LazyWeights} a potential's ``logw_next`` returns for
+# itself instead of computing. Read by ``PromptedLLM`` and ``Product``.
 _burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_burst_logw_next", default=None
 )
@@ -23,9 +20,7 @@ _burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def burst_logw_next(overrides):
-    """Inject pre-computed ``logw_next`` results for one burst step: ``overrides`` maps a
-    potential to the ``LazyWeights`` its ``logw_next`` should return this step (an LM
-    view's warm logits, a constraint factor). Set inside each per-particle burst task."""
+    """Inject ``{potential: LazyWeights}`` for one burst step (set per particle task)."""
     token = _burst_logw_next_overrides.set(overrides)
     try:
         yield
@@ -165,10 +160,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
     @property
     def children(self):
-        """Sub-potentials this potential composes, for structural walks (finding LM vs
-        constraint leaves). ``[]`` for a leaf; combinators override it (``Product`` ->
-        ``[p1, p2]``) so the walks use this abstraction instead of duck-typing ``p1``/
-        ``p2`` attribute names."""
+        """Sub-potentials this composes (``[]`` for a leaf; ``Product`` -> ``[p1, p2]``)."""
         return []
 
     async def logw_next(self, context):

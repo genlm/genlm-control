@@ -14,9 +14,7 @@ _prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
 
 
 def _walk_leaves(potential):
-    """Yield the leaf potentials (those with no ``children``), recursing composites'
-    ``children``. The one tree walk the burst's leaf queries share -- via the
-    ``Potential.children`` abstraction, not duck-typing ``Product``'s ``p1``/``p2``."""
+    """Yield the leaf potentials (no ``children``), recursing composites' ``children``."""
     children = potential.children
     if not children:
         yield potential
@@ -30,30 +28,24 @@ def _is_burst_lm(p):
 
 
 def find_engine_lm(potential):
-    """The single burst-capable engine LM leaf, or ``None`` if not exactly one. (A
-    ``Coerced`` LM is a leaf here, not a ``PromptedLLM``, so it declines to the slow
-    path -- it scores via ``prefix``/``complete``, not the warm-logit seam.)"""
+    """The single burst-capable engine LM leaf, or ``None`` if not exactly one."""
     lms = [lf for lf in _walk_leaves(potential) if _is_burst_lm(lf)]
     return lms[0] if len(lms) == 1 else None
 
 
 def lm_leaves(potential):
-    """All ``PromptedLLM`` leaves. The burst gate uses this: every LM leaf must be an
-    injected view, else it would forward inside the burst."""
+    """All ``PromptedLLM`` leaves."""
     return [lf for lf in _walk_leaves(potential) if isinstance(lf, PromptedLLM)]
 
 
 def factor_leaves(potential):
-    """The non-LM leaves -- the constraint potentials a burst can pre-compute during the
-    forward (vs the engine-LM leaves it injects warm). Empty for a bare LM target."""
+    """The non-LM (constraint) leaves; empty for a bare LM target."""
     return [lf for lf in _walk_leaves(potential) if not isinstance(lf, PromptedLLM)]
 
 
 def constraint_leaf_ids(potential):
-    """``id``s of the non-(burst-LM) leaves -- the constraint identity two targets must
-    share for a batched burst (all groups draw through group 0's sampler). A non-burst
-    ``PromptedLLM`` counts as a constraint leaf here (it is not an injected view), unlike
-    in ``factor_leaves`` -- now an explicit per-query filter, not copy drift."""
+    """``id``s of the non-(burst-LM) leaves -- the constraint identity a batched burst's
+    groups must share. (Counts a non-burst ``PromptedLLM``, unlike ``factor_leaves``.)"""
     return frozenset(id(lf) for lf in _walk_leaves(potential) if not _is_burst_lm(lf))
 
 
@@ -571,18 +563,11 @@ class PromptedLLM(Potential):
             self._logit_padding_verified = True
 
     def _process_logw_next_batch(self, logits):
-        """Vectorized, on-device analog of :meth:`_process_logw_next`.
-
-        Maps a ``[N, n_logits]`` batch of raw engine logits to ``[N, V+1]``
-        control-vocab log-weights (EOS folded into the last column) ENTIRELY on
-        the device, with NO host transfer and NO Python per-row loop -- the engine
-        burst uses this so all N rows are processed and sampled in one GPU pass
-        instead of N separate 50k-vocab numpy passes (the per-row loop was ~19x
-        the engine's native decode cost).
-
-        Returns a ``torch.Tensor`` (NOT a ``LazyWeights``); the caller samples
-        from it on-device and transfers only the N drawn ids back.
-        """
+        """Vectorized, on-device analog of :meth:`_process_logw_next`: maps a
+        ``[N, n_logits]`` batch of raw engine logits to ``[N, V+1]`` control-vocab
+        log-weights (EOS folded into the last column) entirely on device, no host
+        transfer. Returns a ``torch.Tensor`` (not a ``LazyWeights``); the caller samples
+        on-device and transfers only the N drawn ids back."""
         eos_idxs, non_eos = self._eos_index_tensors(logits.device)
         n_decode = len(self.token_maps.decode)
         n_logits = logits.shape[1]
@@ -604,12 +589,8 @@ class PromptedLLM(Potential):
         )
         out[:, : len(self.vocab)] = logits[:, non_eos]
         if eos_idxs.numel() == 1:
-            # On-device single-EOS gather (mirrors the per-row `_process_logw_next`
-            # path, line ~609): index with the 0-dim tensor, NOT `eos_idxs.item()`,
-            # so the EOS column needs no host sync -- keeps this batch path fully on
-            # device as advertised. (The per-step forward-wait is inherent and lands
-            # at the drawn-token readback regardless; this only drops the redundant
-            # second sync, not the wait itself.)
+            # On-device single-EOS gather: index with the 0-dim tensor, NOT
+            # `eos_idxs.item()`, so the EOS column needs no host sync.
             out[:, -1] = logits[:, eos_idxs[0]]
         else:
             out[:, -1] = torch.logsumexp(logits[:, eos_idxs], dim=1)

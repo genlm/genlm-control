@@ -341,6 +341,41 @@ def test_constrained_boolfsa_burst_vs_slow(llm, ess_threshold):
     )
 
 
+def test_constrained_boolfsa_multiseed_diagnostic(llm):
+    """DIAGNOSTIC (not a gate): is the single-seed boolfsa[a-z ]+ ess=0.0 log_ml gap a
+    real bias or just variance? ess=0.0 (no resample) is the highest-variance setting,
+    so a single seed is noisy. Sweep many seeds vs the live StepLoop (gate-1 == original)
+    and look at the MEAN: ~0 (within sem) => variance, the single-seed assert is just
+    too tight; systematically off => a real bias to chase."""
+    llm.set_prompt_from_str(_PROMPT)
+    target = _boolfsa_target(llm, r"[a-z ]+")
+
+    def make():
+        return DirectTokenSampler(target)
+
+    seeds = (1234, 7, 99, 2024)
+    diffs, len_gaps = [], []
+    for s in seeds:
+        slow = _run_steploop(make, 16, 0.0, 12, s)
+        burst = _run_burst(make, 16, 0.0, 12, s)
+        d = burst["log_ml"] - slow["log_ml"]
+        lg = float(np.mean([len(c) for c in burst["contexts"]])) - float(
+            np.mean([len(c) for c in slow["contexts"]])
+        )
+        diffs.append(d)
+        len_gaps.append(lg)
+        _log(f"seed={s}: log_ml burst={burst['log_ml']:.4f} slow={slow['log_ml']:.4f} diff={d:+.4f}")
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nboolfsa[a-z ]+ ess=0.0 over {len(seeds)} seeds (burst vs StepLoop):\n"
+        f"  log_ml diff mean={diffs.mean():+.4f} std={diffs.std():.4f} sem={sem:.4f} "
+        f"max|diff|={np.abs(diffs).max():.4f} n>0.2={int((np.abs(diffs) > 0.2).sum())}\n"
+        f"  len gap mean={np.mean(len_gaps):+.3f}"
+    )
+    # No hard assert -- this run reports the mean for the bias-vs-variance call.
+
+
 # ----- gate 2b': a tighter constraint that FORCES resampling (exercises the
 #       burst pop-out / relaunch path, which the looser constraint does not) ---
 
@@ -844,21 +879,39 @@ def test_multitoken_multiview_burst_vs_steploop(llm):
 # ----- gate 2e: SetTokenSampler (trie set construction over warm-KV iter weights) ----
 
 
-def test_set_sampler_routed_to_slow_lane(llm):
-    """SetTokenSampler stays on StepLoop: its set draw runs over an ASYNC trie
-    (background asyncio task + per-node futures) that needs a running event loop, which
-    the inline-driven burst doesn't have. The gate must route it to the slow lane (a
-    loop-free set draw would be needed to burst it)."""
+def test_set_sampler_burst_vs_slow(llm):
+    """SetTokenSampler burst vs StepLoop: unbiased log_ml across seeds (the async-trie
+    set draw over the hop). Fresh EagerSetSampler per run -- its trie task binds to that
+    run's loop."""
     from genlm.control.sampler import EagerSetSampler
     from genlm.control.sampler.token import SetTokenSampler
 
+    llm.set_prompt_from_str(_PROMPT)
     item = BoolFSA.from_regex(r"[a-z ]+")
-    set_sampler = EagerSetSampler(iter_potential=llm, item_potential=item)
-    try:
-        reason = burst_blocker(_controller(lambda: SetTokenSampler(set_sampler), 8, 0.0, 8))
-        assert reason is not None and "does not support" in reason, reason
-    finally:
-        asyncio.run(set_sampler.cleanup())
+
+    def make():
+        return SetTokenSampler(EagerSetSampler(iter_potential=llm, item_potential=item))
+
+    assert can_burst(_controller(make, 8, 0.0, 8))  # re-enabled -> rides the fast lane
+    seeds = (1234, 7, 99, 2024)
+    diffs = []
+    for s in seeds:
+        slow = _run_steploop(make, 8, 0.0, 8, s)
+        burst = _run_burst(make, 8, 0.0, 8, s)
+        diffs.append(burst["log_ml"] - slow["log_ml"])
+        _log(
+            f"set seed={s}: burst={burst['log_ml']:.4f} slow={slow['log_ml']:.4f} "
+            f"diff={diffs[-1]:+.4f}"
+        )
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nset_sampler boolfsa[a-z ]+ over {len(seeds)} seeds: "
+        f"mean={diffs.mean():+.4f} sem={sem:.4f}"
+    )
+    assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
+        f"set burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+    )
 
 
 # ----- gate 2h: SMC.batched (B groups, ONE batched engine burst) --------------
