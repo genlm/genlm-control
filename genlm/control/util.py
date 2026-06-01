@@ -1,3 +1,4 @@
+import contextlib
 import warnings
 
 import numpy as np
@@ -327,13 +328,42 @@ def inverse_cdf(logps):
     return torch.searchsorted(cdf, torch.rand((), dtype=cdf.dtype))
 
 
-def select(lazyweights, method=gumbel_max):
-    """Select (sample) a token from a log-space ``LazyWeights`` via ``method`` (default
-    Gumbel-max). The single, swappable picker seam: samplers call ``select`` rather than
-    inlining the draw, so an alternative member of the family (multinomial, inverse-CDF,
-    a test tracer) plugs in without touching the sampler bodies."""
+DRAW_METHODS = {
+    "gumbel_max": gumbel_max,
+    "multinomial": multinomial,
+    "inverse_cdf": inverse_cdf,
+}
+# The picker ``select`` uses -- a process-wide SETTING (see ``set_draw_method``), not a
+# per-call argument, so samplers call ``select(logws)`` and the method swaps in one place.
+_picker = gumbel_max
+
+
+def set_draw_method(method):
+    """Set the token picker ``select`` uses: a name in ``DRAW_METHODS`` (``"gumbel_max"``
+    default, ``"multinomial"``, ``"inverse_cdf"``) or a custom ``(logps_tensor) -> index``
+    callable. Process-wide."""
+    global _picker
+    _picker = DRAW_METHODS[method] if isinstance(method, str) else method
+
+
+@contextlib.contextmanager
+def draw_method(method):
+    """Scope ``set_draw_method`` to a ``with`` block, restoring the prior picker after."""
+    global _picker
+    prev = _picker
+    set_draw_method(method)
+    try:
+        yield
+    finally:
+        _picker = prev
+
+
+def select(lazyweights):
+    """Select (sample) a token from a log-space ``LazyWeights`` using the configured draw
+    method (``set_draw_method``; default Gumbel-max). The single picker seam: samplers call
+    ``select``, never inlining the draw, so the method is swapped by setting, not per call."""
     assert lazyweights.is_log
-    return lazyweights.decode[int(method(lazyweights.weights))]
+    return lazyweights.decode[int(_picker(lazyweights.weights))]
 
 
 def escape(x):

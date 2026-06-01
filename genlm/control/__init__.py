@@ -17,12 +17,16 @@ from .sampler import (
     topk_token_sampler,
     AWRS,
 )
+from .util import set_draw_method, draw_method, DRAW_METHODS
 from .viz import InferenceVisualizer
 
 __all__ = [
     "EOS",
     "EOT",
     "SMC",
+    "set_draw_method",
+    "draw_method",
+    "DRAW_METHODS",
     "Potential",
     "PromptedLLM",
     "ByteLLM",
