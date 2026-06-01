@@ -126,24 +126,29 @@ class Product(Potential):
         )
         return W1 + W2
 
+    def _compose(self, W1, W2):
+        """Sum the operands' weights over the shared vocab. Device-reconciled: a burst
+        composes the engine-LM operand (on GPU) with a CPU factor mask -- move the factor
+        onto the LM's device (the inherent cross while grammar is CPU). Same-device (slow
+        lane, both CPU) -> no-op, byte-identical to the per-token path."""
+        w1 = W1.weights[self.v1_idxs]
+        w2 = W2.weights[self.v2_idxs]
+        if w1.device != w2.device:
+            dev = w1.device if w1.device.type != "cpu" else w2.device
+            w1, w2 = w1.to(dev), w2.to(dev)
+        return w1 + w2
+
     async def logw_next(self, context):
         W1, W2 = await asyncio.gather(
             self.p1.logw_next(context), self.p2.logw_next(context)
         )
-        return self.make_lazy_weights(
-            W1.weights[self.v1_idxs] + W2.weights[self.v2_idxs]
-        )
+        return self.make_lazy_weights(self._compose(W1, W2))
 
     async def batch_logw_next(self, contexts):
         Ws1, Ws2 = await asyncio.gather(
             self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
         )
-        return [
-            self.make_lazy_weights(
-                Ws1[n].weights[self.v1_idxs] + Ws2[n].weights[self.v2_idxs]
-            )
-            for n in range(len(contexts))
-        ]
+        return [self.make_lazy_weights(self._compose(Ws1[n], Ws2[n])) for n in range(len(contexts))]
 
     def spawn(self, p1_opts=None, p2_opts=None):
         return Product(

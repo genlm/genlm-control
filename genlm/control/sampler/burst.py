@@ -145,7 +145,7 @@ class _Burst:
                 continue
             rowsidx = [idx_of[h] for h in vh]
             batch = view._process_logw_next_batch(view._maybe_temper(logits[rowsidx].float()))
-            for h, row_w in zip(vh, batch.cpu().numpy()):
+            for h, row_w in zip(vh, batch):  # row_w: [V+1] device-tensor view, no host xfer
                 warm[h] = view.make_lazy_weights(row_w)
 
         async def _step():
