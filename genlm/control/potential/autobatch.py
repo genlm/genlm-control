@@ -3,6 +3,7 @@ from typing import NamedTuple, Callable
 from collections import defaultdict
 
 from genlm.control.potential.base import Potential
+from genlm.control.util import LazyWeights
 
 
 class Request(NamedTuple):
@@ -124,6 +125,14 @@ class AsyncBatchLoop:
                         results = await getattr(self.potential, method_name)(
                             *batch_args
                         )
+
+                        # batch_logw_next returns ONE batched LazyWeights [N, V+1]; split it
+                        # back into per-request rows (other batch methods return [N] arrays).
+                        if isinstance(results, LazyWeights):
+                            results = [
+                                results.spawn(results.weights[i])
+                                for i in range(len(requests))
+                            ]
 
                         assert len(results) == len(requests)
                         for i, req in enumerate(requests):

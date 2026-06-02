@@ -64,10 +64,10 @@ async def test_coerced_batch_operations():
     want = np.array([await coerced.score(sequence) for sequence in sequences])
     np.testing.assert_array_equal(have, want)
 
-    haves = await coerced.batch_logw_next(sequences)
+    haves = await coerced.batch_logw_next(sequences)  # one batched LazyWeights [N, V+1]
     wants = [await coerced.logw_next(sequence) for sequence in sequences]
-    for have, want in zip(haves, wants):
-        have.assert_equal(want)
+    for i, want in enumerate(wants):
+        haves.spawn(haves.weights[i]).assert_equal(want)
 
 
 @pytest.mark.asyncio

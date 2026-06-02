@@ -7,6 +7,7 @@ from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.burst import BurstDraw
 from genlm.control.potential.base import burst_logw_next
+from genlm.control.util import draw_key, draw_ordinal
 from lark import Lark
 from lark.exceptions import LarkError
 
@@ -124,12 +125,13 @@ class MultiTokenUnitSampler(TokenSampler):
         # ``max_subunits_per_unit`` fires before this engine cap.
         return self.max_subunits_per_unit + 1
 
-    async def burst_draw_batch(self, injections, contexts, handles, burst):
+    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
         """Burst draw for one unit round: one subunit per decode step, completing an
-        SMC step only at the unit boundary. Per particle, inject the views' warm logits
-        (``injections[i]``) and run the subunit sampler's REAL ``sample`` (one subunit);
-        accumulate it in ``burst.scratch`` (keyed by particle ``handle``); then apply the
-        SAME EOS-split / boundary / max-subunit logic as the slow ``sample``/``transition``:
+        SMC step only at the unit boundary. Per particle, slice the batched warm
+        (``{view: [N, V+1] LazyWeights}``) into a per-row injection and run the subunit
+        sampler's REAL ``sample`` (one subunit); accumulate it in ``burst.scratch`` (keyed by
+        particle ``handle``); then apply the SAME EOS-split / boundary / max-subunit logic as
+        the slow ``sample``/``transition``:
 
         * EOS subunit -> split the content off so ``context[-1]`` is EOS (terminate).
         * boundary fires -> finalize the unit; the row pops out at the synced boundary.
@@ -137,13 +139,16 @@ class MultiTokenUnitSampler(TokenSampler):
         * otherwise -> mid-unit: emit the subunit, bank nothing (``step=None``)."""
         accums = burst.scratch  # handle -> _UnitAccum, fresh each burst
 
-        async def one(context, injection, handle):
+        async def one(i, context, handle):
+            injection = self._row_injection(warm_batch, i)
             accum = accums.get(handle)
             buf = accum.buffer if accum is not None else []
             # Subunit context: completed units flattened to subunits + in-progress
             # subunits this unit, so the subunit sampler's factor scores statelessly.
             sub_context = flatten_units(context) + list(buf)
-            with burst_logw_next(injection):
+            # ordinal = subunits committed (leaf count) + those drawn this unit so far,
+            # matching the slow loop's per-subunit ordinal under one transition scope.
+            with burst_logw_next(injection), draw_key(handle, draw_ordinal(context) + len(buf)):
                 subunit, sub_logw, sub_logp = await self.subunit_sampler.sample(sub_context)
 
             if accum is None:
@@ -157,7 +162,7 @@ class MultiTokenUnitSampler(TokenSampler):
             return BurstDraw(token=subunit, step=step, pop=status == "boundary")
 
         return await asyncio.gather(
-            *(one(c, j, h) for c, j, h in zip(contexts, injections, handles))
+            *(one(i, c, h) for i, (c, h) in enumerate(zip(contexts, handles)))
         )
 
     async def start_weight(self):

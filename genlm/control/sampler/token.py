@@ -1,11 +1,12 @@
 import asyncio
 import numpy as np
+import torch
 from arsenal import colors
 from arsenal.maths import log1mexp
 from genlm.control.util import logsumexp
 import warnings
 
-from genlm.control.util import select
+from genlm.control.util import select, picker_indices, draw_key, draw_ordinal, to_numpy
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 from genlm.control.sampler.burst import BurstDraw
@@ -64,19 +65,30 @@ class TokenSampler:
         particle's remaining budget (+1). The unit sampler overrides it."""
         return max(p.max_tokens_left for p in live) + 1
 
-    async def burst_draw_batch(self, injections, contexts, handles, burst):
-        """Engine-burst draw, one BurstDraw per particle (token grain). ``injections[i]``
-        maps each view-LM to its warm logits for particle ``i``; inject them and run the
-        REAL per-step ``transition`` -- the target composes itself over the K views
-        (proposal/prior/...), no proposal reconstruction. One SMC step per decode step.
-        The unit sampler overrides for subunit accumulation."""
+    @staticmethod
+    def _row_injection(warm_batch, i):
+        """Slice the batched warm (``{view: [N, V+1] LazyWeights}``) into particle ``i``'s
+        per-row injection (``{view: [V+1] LazyWeights}``) -- the inverse of the burst's stack,
+        for the sequential per-particle draw (AWRS/Set/unit)."""
+        return {view: view.make_lazy_weights(W.weights[i]) for view, W in warm_batch.items()}
 
-        async def one(context, injection):
-            with burst_logw_next(injection):
+    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
+        """Engine-burst draw, one BurstDraw per particle (token grain). ``warm_batch`` maps
+        each view-LM to its batched ``[N, V+1]`` warm logits; slice row ``i`` into a per-row
+        injection and run the REAL per-step ``transition`` -- the target composes itself over
+        the K views (proposal/prior/...), no proposal reconstruction. One SMC step per decode
+        step. This is the sequential path (AWRS/Set, rejection/trie); `DirectTokenSampler`
+        overrides with a vectorized ``[N, V]`` draw, the unit sampler for subunit accumulation."""
+
+        async def one(i, context, handle):
+            injection = self._row_injection(warm_batch, i)
+            with burst_logw_next(injection), draw_key(handle, draw_ordinal(context)):
                 to_append, logw, logp = await self.transition(context)
             return BurstDraw(token=to_append[-1], step=(to_append, logw, logp))
 
-        return await asyncio.gather(*(one(c, j) for c, j in zip(contexts, injections)))
+        return await asyncio.gather(
+            *(one(i, c, h) for i, (c, h) in enumerate(zip(contexts, handles)))
+        )
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
@@ -226,6 +238,42 @@ class DirectTokenSampler(TokenSampler):
             token = draw(proposal_logps.exp().materialize())
         logw = target_logws[token] - proposal_logws[token] + proposal_logZ
         return token, logw, proposal_logps[token]
+
+    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
+        """Vectorized engine-burst draw over the whole population: compose the ``[N, V+1]``
+        proposal (injected warm batch + batched factors), one logsumexp + one keyed Gumbel
+        draw + one gather, instead of N per-particle ``sample`` calls. Byte-identical to the
+        per-particle path -- threefry keyed by ``(row, draw_ordinal)``, so batched ==
+        per-particle. Mirrors ``sample``: without a proposal the weight is the normalizer
+        ``logZ``; with one it's the importance weight ``target[x] - proposal[x] + logZ``."""
+        rows = torch.tensor(handles, dtype=torch.int64)
+        ordinals = torch.tensor([draw_ordinal(c) for c in contexts], dtype=torch.int64)
+        with burst_logw_next(warm_batch):
+            # Draw from the proposal (the target itself when there is no separate proposal).
+            if self.proposal is None:
+                proposal, target = await self.potential.batch_logw_next(contexts), None
+            else:
+                proposal, target = await asyncio.gather(
+                    self.proposal.batch_logw_next(contexts),
+                    self.potential.batch_logw_next(contexts),
+                )
+            pw = proposal.weights
+            pZ = torch.logsumexp(pw, dim=-1)  # [N], == per-row .sum()
+            plogps = pw - pZ[:, None]  # normalized proposal [N, V+1]
+            with draw_key(rows, ordinals):
+                idx = picker_indices(plogps)  # [N]
+            ar = torch.arange(len(handles), device=pw.device)
+            logp, decode = plogps[ar, idx], proposal.decode
+            if target is None:
+                weight = pZ  # the normalizer is the weight
+            else:
+                tw = target.weights.to(pw.device)
+                weight = tw[ar, idx] - pw[ar, idx] + pZ  # importance weight
+        idx_l, w_l, lp_l = idx.tolist(), weight.tolist(), logp.tolist()
+        return [
+            BurstDraw(token=decode[idx_l[i]], step=([decode[idx_l[i]]], w_l[i], lp_l[i]))
+            for i in range(len(handles))
+        ]
 
     async def cleanup(self):
         pass  # pragma: no cover
@@ -424,9 +472,10 @@ class AWRS(TokenSampler):
         coroutine (and an optional ``target_logws`` proposal correction). The slow
         ``sample`` and the engine burst both call this, so the algorithm and weight
         stay identical -- only the source of ``logws``/``accept`` differs."""
-        # AWRS rejection is CPU/numpy (seeded rng, argsort, data-dependent walk); convert
-        # the torch log-weights at this edge and operate in numpy throughout.
-        lw = logws.weights.cpu().numpy()
+        # AWRS rejection is CPU/numpy (seeded rng, argsort, data-dependent walk); pull the
+        # log-weights to numpy at this edge (no-op if the producer is already numpy) and
+        # operate in numpy throughout.
+        lw = to_numpy(logws.weights)
         if self.prune_logws:
             lw = self._prune_logws(lw)
         logZ = logsumexp(lw)

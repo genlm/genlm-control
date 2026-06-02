@@ -1,5 +1,6 @@
 import asyncio
 import warnings
+import torch
 from genlm.control.potential.base import Potential
 
 
@@ -126,29 +127,38 @@ class Product(Potential):
         )
         return W1 + W2
 
-    def _compose(self, W1, W2):
-        """Sum the operands' weights over the shared vocab. Device-reconciled: a burst
-        composes the engine-LM operand (on GPU) with a CPU factor mask -- move the factor
-        onto the LM's device (the inherent cross while grammar is CPU). Same-device (slow
-        lane, both CPU) -> no-op, byte-identical to the per-token path."""
-        w1 = W1.weights[self.v1_idxs]
-        w2 = W2.weights[self.v2_idxs]
-        if w1.device != w2.device:
-            dev = w1.device if w1.device.type != "cpu" else w2.device
-            w1, w2 = w1.to(dev), w2.to(dev)
+    def _compose(self, w1_full, w2_full):
+        """Sum the operands' weights over the shared vocab, slicing the vocab on the LAST
+        axis so the same code composes a single ``[V]`` draw and a batched ``[N, V]`` one
+        (``v*_idxs`` may be ``...`` when vocabs already match, so index the vocab axis
+        directly rather than prepend an ellipsis). The reconcile edge: a burst composes the
+        engine-LM operand (GPU torch) with a factor mask (numpy or CPU torch) -- lift the
+        numpy/CPU operand to the LM's backend + device. Both-numpy (slow lane) stays numpy,
+        byte-identical to the per-token path."""
+        w1 = w1_full[self.v1_idxs] if w1_full.ndim == 1 else w1_full[:, self.v1_idxs]
+        w2 = w2_full[self.v2_idxs] if w2_full.ndim == 1 else w2_full[:, self.v2_idxs]
+        t1, t2 = torch.is_tensor(w1), torch.is_tensor(w2)
+        if t1 and t2:
+            if w1.device != w2.device:
+                dev = w1.device if w1.device.type != "cpu" else w2.device
+                w1, w2 = w1.to(dev), w2.to(dev)
+        elif t1:  # numpy w2 -> lift to w1's device (dtype preserved -> same promotion)
+            w2 = torch.as_tensor(w2, device=w1.device)
+        elif t2:
+            w1 = torch.as_tensor(w1, device=w2.device)
         return w1 + w2
 
     async def logw_next(self, context):
         W1, W2 = await asyncio.gather(
             self.p1.logw_next(context), self.p2.logw_next(context)
         )
-        return self.make_lazy_weights(self._compose(W1, W2))
+        return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
 
     async def batch_logw_next(self, contexts):
-        Ws1, Ws2 = await asyncio.gather(
+        W1, W2 = await asyncio.gather(
             self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
-        )
-        return [self.make_lazy_weights(self._compose(Ws1[n], Ws2[n])) for n in range(len(contexts))]
+        )  # each is one batched LazyWeights [N, V_i]; compose over the vocab axis -> [N, V]
+        return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
 
     def spawn(self, p1_opts=None, p2_opts=None):
         return Product(

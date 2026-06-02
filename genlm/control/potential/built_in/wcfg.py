@@ -212,16 +212,15 @@ class BoolCFG(Potential):
             contexts (list): A list of sequences of tokens in the CFG's alphabet.
 
         Returns:
-            (list): A list of log-weights for next token, one per context.
+            (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
         """
-        Ws = []
+        rows = []
         for context in contexts:
             ws = self.model.next_token_weights(self.model.chart(context))
-            log_ws = np.array(
-                [0 if ws[x].score else float("-inf") for x in self.vocab_eos]
+            rows.append(
+                np.array([0 if ws[x].score else float("-inf") for x in self.vocab_eos])
             )
-            Ws.append(self.make_lazy_weights(log_ws))
-        return Ws
+        return self.make_lazy_weights(np.stack(rows))
 
     def spawn(self):
         """Spawn a new BoolCFG."""

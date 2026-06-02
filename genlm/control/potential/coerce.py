@@ -1,7 +1,6 @@
 from genlm.control.potential import Potential
 from genlm.backend.tokenization import Token
 from itertools import chain
-import asyncio
 
 
 class Coerced(Potential):
@@ -216,8 +215,7 @@ class Coerced(Potential):
     async def batch_prefix(self, contexts):
         return await self.potential.batch_prefix(contexts=self._batch_f(contexts))
 
-    async def batch_logw_next(self, contexts):
-        return await asyncio.gather(*[self.logw_next(context) for context in contexts])
+    # batch_logw_next inherited from Potential (stacks per-context logw_next -> [N, V+1]).
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.potential!r})"

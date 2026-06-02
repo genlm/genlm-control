@@ -1,6 +1,5 @@
 import string
 import numpy as np
-import torch
 from collections import OrderedDict
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
@@ -276,12 +275,9 @@ class BoolFSA(WFSA):
         """Map a weighted `LazyWeights` to its boolean indicator (0 where alive,
         -inf elsewhere). The single definition shared by every BoolFSA next-token
         method so they cannot drift."""
+        w = logw_next.weights  # BoolFSA produces numpy; stay numpy (lifted at _compose)
         return logw_next.spawn(
-            new_weights=torch.where(
-                logw_next.weights > float("-inf"),
-                torch.zeros_like(logw_next.weights),
-                logw_next.weights,
-            )
+            new_weights=np.where(w > float("-inf"), 0, w)
         )
 
     @staticmethod
@@ -317,9 +313,9 @@ class BoolFSA(WFSA):
             contexts (list): The list of contexts.
 
         Returns:
-            (list): List of log-weights for next token, one per context.
+            (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
         """
-        return [self._booleanize(lw) for lw in await super().batch_logw_next(contexts)]
+        return self._booleanize(await super().batch_logw_next(contexts))
 
     def __repr__(self):
         return f"BoolFSA(wfsa={self.wfsa!r})"

@@ -100,8 +100,13 @@ class ByteLengthBoundary(BoundaryPredicate):
 #
 # ``make_sampler(llm, seed)`` is two-arg so AWRS gets its per-seed rng (every other factory
 # ignores ``seed``); fresh per call (the async-trie Set sampler must bind to the run's loop).
-# ``reference`` is data: "ref" => the generator emits a cached original key the test loads
-# via ``_ref``; "steploop" => the test compares against a live StepLoop (no cached ref).
+# ``reference`` selects the gate-2 comparison (an OPTION; default is the tight one):
+#   "steploop_cached" => cached OUR-StepLoop+threefry, RNG-matched to the burst => a TIGHT
+#       paired check (warm-KV residual only). Cached by gen_steploop_reference.py in
+#       gate2_steploop_snapshot.json. THE DEFAULT from here on.
+#   "ref"      => cached ORIGINAL (main + llamppl) in gate2_snapshot.json -- the independent,
+#       un-RNG-matchable anchor (looser, statistical). Kept available, never overwritten.
+#   "steploop" => a live StepLoop run (no cache).
 
 
 @dataclass(frozen=True)
@@ -111,7 +116,7 @@ class Case:
     ess: float
     max_tokens: int
     seeds: tuple
-    reference: str  # "ref" | "steploop"
+    reference: str  # "steploop_cached" (tight, default) | "ref" (original anchor) | "steploop" (live)
     make_sampler: Callable  # (llm, seed) -> TokenSampler
     make_critic: Optional[Callable] = None  # (llm) -> Potential | None
 
@@ -148,25 +153,25 @@ S_AEIOU = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
 CASES = {
     c.label: c
     for c in [
-        Case("unconstrained", 8, 0.0, 12, (1234,), "ref",
+        Case("unconstrained", 8, 0.0, 12, (1234,), "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm)),
-        Case("constrained-boolfsa[a-z ]+", 16, 0.0, 12, (1234, 7), "steploop",
+        Case("constrained-boolfsa[a-z ]+", 16, 0.0, 12, (1234, 7), "steploop_cached",
              lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[a-z ]+"))),
-        Case("boolfsa[aeiou ]+", 16, 0.5, 10, S_AEIOU, "ref",
+        Case("boolfsa[aeiou ]+", 16, 0.5, 10, S_AEIOU, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[aeiou ]+"))),
-        Case("terminal-critic", 16, 0.0, 12, S6, "ref",
+        Case("terminal-critic", 16, 0.0, 12, S6, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: TerminalContainsCritic(llm.vocab)),
-        Case("twist-critic", 16, 0.5, 12, S12, "ref",
+        Case("twist-critic", 16, 0.5, 12, S12, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: SoftVowelCritic(llm.vocab)),
-        Case("multitoken-boolfsa[a-z ]+", 8, 0.5, 6, S12, "ref",
+        Case("multitoken-boolfsa[a-z ]+", 8, 0.5, 6, S12, "steploop_cached",
              lambda llm, seed: MultiTokenUnitSampler(
                  DirectTokenSampler(boolfsa(llm, r"[a-z ]+")),
                  ByteLengthBoundary(5), max_subunits_per_unit=6)),
-        Case("awrs[a-z ]+", 16, 0.0, 12, S6, "ref",
+        Case("awrs[a-z ]+", 16, 0.0, 12, S6, "steploop_cached",
              lambda llm, seed: AWRS(llm, _condition(llm, r"[a-z ]+"), seed=seed)),
-        Case("set[a-z ]+", 8, 0.0, 8, (1234, 7, 99, 2024), "ref",
+        Case("set[a-z ]+", 8, 0.0, 8, (1234, 7, 99, 2024), "steploop_cached",
              lambda llm, seed: SetTokenSampler(
                  EagerSetSampler(iter_potential=llm,
                                  item_potential=BoolFSA.from_regex(r"[a-z ]+")))),

@@ -138,7 +138,7 @@ class _Burst:
         idx_of = {h: i for i, h in enumerate(handles)}
 
         # Warm logits for every forwarded substream.
-        warm = {}  # handle -> LazyWeights
+        warm = {}  # handle -> [V+1] device tensor (wrapped into one batched LazyWeights below)
         for vi, view in enumerate(self.views):
             vh = [h for h in handles if (h in self.handle_rv and self.handle_rv[h][1] == vi)]
             if not vh:
@@ -146,7 +146,7 @@ class _Burst:
             rowsidx = [idx_of[h] for h in vh]
             batch = view._process_logw_next_batch(view._maybe_temper(logits[rowsidx].float()))
             for h, row_w in zip(vh, batch):  # row_w: [V+1] device-tensor view, no host xfer
-                warm[h] = view.make_lazy_weights(row_w)
+                warm[h] = row_w
 
         async def _step():
             # (1) Join the prior deferred bank so select draws over the resampled population.
@@ -164,13 +164,20 @@ class _Burst:
             parts = [c.particles[row] for row in rows]
             if c.twist_with_critic:
                 c.particles.untwist_subset([p._i for p in parts])
-            injections = [
-                {view: warm[self.row_handles[row][vi]] for vi, view in enumerate(self.views)}
-                for row in rows
-            ]
-            records = await sampler.burst_draw_batch(
-                injections, [p.context for p in parts], rows, self
-            )
+            if rows:
+                # One batched warm per view ([N, V+1], rows-order). The sampler consumes it
+                # whole (Direct: vectorized [N, V] draw) or slices it per row (AWRS/Set/unit).
+                warm_batch = {
+                    view: view.make_lazy_weights(
+                        torch.stack([warm[self.row_handles[row][vi]] for row in rows])
+                    )
+                    for vi, view in enumerate(self.views)
+                }
+                records = await sampler.burst_draw_batch(
+                    warm_batch, [p.context for p in parts], rows, self
+                )
+            else:  # no live rows this step (all drained/terminated) -- nothing to draw
+                records = []
             # (3) Bank the step. Free running defers it to overlap the next forward; unit
             # grain banks inline (its pop-out abort must take effect this step).
             if sampler.burst_free_running():

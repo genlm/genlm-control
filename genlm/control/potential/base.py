@@ -5,7 +5,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import LazyWeights
+from genlm.control.util import LazyWeights, stack_weights
 from genlm.control.typing import TokenType, infer_vocabulary_type
 from genlm.control.potential.operators import PotentialOps
 from genlm.control.potential.testing import PotentialTests
@@ -262,15 +262,16 @@ class Potential(ABC, PotentialOps, PotentialTests):
         return results
 
     async def batch_logw_next(self, contexts):
-        """Batched equivalent to `logw_next`.
-
-        Computes the next-token weights of each token in `self.vocab_eos` given each context in the batch.
+        """Batched equivalent to `logw_next`: the next-token weights for every context in the
+        batch, as ONE `LazyWeights` whose weights are `[N, V+1]` (the batch dim leads). Row
+        `i` is `result.weights[i]`. Default: stack the per-particle `logw_next` (preserving
+        backend); `Product` composes batched, `PromptedLLM` serves its injected warm batch.
 
         Args:
             contexts (list): List of sequences of tokens.
 
         Returns:
-            (list): List of LazyWeights objects, one for each context.
+            (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
 
         Raises:
             ValueError: If any context has zero weight (log weight of -inf) under `prefix`.
@@ -278,7 +279,8 @@ class Potential(ABC, PotentialOps, PotentialTests):
         if not contexts:
             raise ValueError("Contexts must be non-empty.")
 
-        return await asyncio.gather(*[self.logw_next(context) for context in contexts])
+        lws = await asyncio.gather(*[self.logw_next(context) for context in contexts])
+        return self.make_lazy_weights(stack_weights([lw.weights for lw in lws]))
 
     #############
     # Utilities #

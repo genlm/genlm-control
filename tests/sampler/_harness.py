@@ -19,11 +19,15 @@ from genlm.control.constant import EndOfSequence
 
 
 def seed_all(s):
-    """Seed numpy + torch (in that order) -- the per-case seed every gate uses."""
+    """Seed numpy + torch (in that order) -- the per-case seed every gate uses. Also
+    seeds the counter-based picker so a threefry draw is identical across lanes/devices."""
     np.random.seed(s)
     import torch
 
     torch.manual_seed(s)
+    from genlm.control.util import set_draw_seed
+
+    set_draw_seed(s)
 
 
 def ctx_repr(ctx):

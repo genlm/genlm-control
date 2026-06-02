@@ -627,21 +627,29 @@ class PromptedLLM(Potential):
         return self._process_logw_next(logw_next)
 
     async def batch_logw_next(self, contexts):
-        """Get log probabilities for next tokens given the prompt and `context`, for a batch of contexts.
+        """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
+        (`.weights` shape `[N, V+1]`). In a batched burst the engine's warm `[N, V+1]` batch
+        is injected via the `burst_logw_next` override (same ContextVar as the scalar path,
+        value batched) -- served directly, no forward.
 
         Args:
-            contexts (list[list[bytes]] | list[list[Token]]): A list of sequences of byte tokens or Token objects.
+            contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.
 
         Returns:
-            (list[LazyWeights]): Log probabilities for next tokens and EOS for each context. Keys are Token objects.
+            (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
+        override = _burst_logw_next_overrides.get()
+        if override is not None and self in override:
+            return override[self]  # burst: the engine's warm [N, V+1] batch, no forward
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
             await self._fwd.batch_next_token_logprobs(
                 [self.prompt_ids + context_ids for context_ids in context_ids_batch]
             )
         )
-        return [self._process_logw_next(logw_next) for logw_next in logw_nexts]
+        # One on-device fold over the [N, n_logits] batch -> [N, V+1] (== stacking the
+        # per-row `_process_logw_next`), wrapped as one batched LazyWeights.
+        return self.make_lazy_weights(self._process_logw_next_batch(logw_nexts).float().cpu())
 
     def __repr__(self):
         return f"PromptedLLM(prompt={self.prompt!r})"

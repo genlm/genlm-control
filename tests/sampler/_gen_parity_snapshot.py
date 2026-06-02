@@ -135,6 +135,8 @@ async def _run_reference(unit_sampler, critic, ess_threshold, json_path):
         n_particles=N_PARTICLES,
         ess_threshold=ess_threshold,
         json_file=json_path,
+        resampling_method="multinomial",  # match the Controller's default; llamppl's
+        # default flipped to "stratified" in newer versions -> silent ess>0 divergence
     )
     contexts, logws = map(
         list,

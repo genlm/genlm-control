@@ -1,20 +1,18 @@
-"""cProfile entry for ONE E-step config → .pstats (for gprof2dot call-graph SVG).
+"""cProfile a single scenario's SMC run -> merged .pstats -> gprof2dot call-graph SVG.
 
-Captures BOTH threads and merges them, because the burst decode loop runs in a
-worker thread that a plain ``python -m cProfile`` (main thread) would miss:
-  * main thread  — the SMC driver + the hop coroutines (AWRS rejection / critic /
-    factor eval run on the event loop, serviced while the main thread awaits the
-    executor future);
-  * worker thread — ``run_burst`` → ``ControlSampler.forward`` → ``Controller.draw``.
+Reuses bench.py's scenario builders (direct/awrs/set/lora/cot/ds1000), so the
+profiled path is exactly the benchmarked one. Captures BOTH threads and merges:
+the burst's vLLM decode loop runs in a worker thread (``run_burst``) that a plain
+main-thread cProfile would miss; the SMC driver + awaited critics run on the loop.
 
-CAVEAT (read the graph with this in mind): CUDA is async. The engine forward
-queues on the GPU stream and returns; its compute time is attributed to whichever
-CPU frame first *synchronizes* on the result (a ``.cpu()`` / ``.tolist()`` / a read).
-So a frame's cumulative time can include GPU waits, not just CPU work.
+CAVEAT: CUDA is async -- the engine forward queues on the GPU stream and returns;
+its time is attributed to whichever CPU frame first synchronizes on the result
+(.cpu()/.tolist()/a read). A frame's cumulative time can include GPU waits.
 
-Run on the box (writes <out>.pstats):
+Run on the box (writes <out>.pstats and, unless --no-svg, <out>.svg):
   VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-    python benchmarks/prof_entry.py --mode burst --model gpt2 --sampler direct --out /tmp/p_burst_direct
+    python benchmarks/prof_entry.py --scenario direct --mode burst \
+      --model Qwen/Qwen2.5-7B-Instruct --out results/prof__direct__burst
 """
 
 from __future__ import annotations
@@ -24,103 +22,75 @@ import asyncio
 import cProfile
 import pstats
 import shutil
+import subprocess
 
-import numpy as np
+import bench
+import bench_core as bc
 
 
-async def _run(sampler, critic, accelerate, args):
-    from genlm.control.sampler.sequence import SMC
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--scenario",
+                   choices=["direct", "awrs", "set", "lora", "cot", "ds1000"],
+                   default="direct")
+    p.add_argument("--mode", choices=["burst", "step"], default="burst")
+    p.add_argument("--out", required=True, help="output path stem (.pstats/.svg appended)")
+    p.add_argument("--no-svg", action="store_true", help="write .pstats only")
+    # scenario knobs (mirror bench.py; the sampler/critic LOGIC is reused from bench)
+    p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    p.add_argument("--n-particles", type=int, default=16)
+    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--ess-threshold", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--gpu-mem", type=float, default=0.6)
+    p.add_argument("--max-model-len", type=int, default=2048)
+    p.add_argument("--prompt", default="The")
+    p.add_argument("--eos", choices=["natural", "newline"], default="natural")
+    p.add_argument("--no-critic", action="store_true")
+    p.add_argument("--no-prefix-cache", action="store_true")
+    p.add_argument("--constraint", choices=["alpha", "json"], default="alpha")
+    p.add_argument("--lora-adapter", default=bench.LORA_ADAPTER)
+    p.add_argument("--question", default=(
+        "Natalia sold clips to 48 of her friends in April, and then she sold half "
+        "as many clips in May. How many clips did she sell altogether?"))
+    p.add_argument("--answer", default="72")
+    p.add_argument("--library", default="Pandas")
+    p.add_argument("--item", type=int, default=0)
+    p.add_argument("--timeout", type=float, default=6.0)
+    return p.parse_args()
 
-    np.random.seed(args.seed)
-    import torch
 
-    torch.manual_seed(args.seed)
-    await SMC(sampler, critic=critic)(
-        n_particles=args.n_particles,
-        ess_threshold=0.0,
-        max_tokens=args.max_tokens,
-        accelerate=accelerate,
-    )
+def _render_svg(pstats_path: str, svg_path: str) -> None:
+    """gprof2dot -f pstats <pstats> | dot -Tsvg -o <svg>  (default node format:
+    name:module / total-time-incl-subcalls % / (self %) / num self calls)."""
+    dot = subprocess.run(
+        ["gprof2dot", "-f", "pstats", pstats_path], check=True, capture_output=True)
+    subprocess.run(["dot", "-Tsvg", "-o", svg_path], check=True, input=dot.stdout)
+    print(f"wrote {svg_path}")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=["step", "burst"], required=True)
-    ap.add_argument("--model", default="gpt2")
-    ap.add_argument("--sampler", default="direct", choices=["direct", "awrs", "set"])
-    ap.add_argument("--constraint", default="alpha", choices=["alpha", "json"])
-    ap.add_argument("--critic", action="store_true")
-    ap.add_argument("--n-particles", type=int, default=16)
-    ap.add_argument("--max-tokens", type=int, default=256)
-    ap.add_argument("--max-model-len", type=int, default=2048)
-    ap.add_argument("--gpu-mem", type=float, default=0.7)
-    ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
+    args = parse_args()
+    from genlm.control.sampler.sequence import SMC
 
-    from genlm.backend.llm import AsyncVirtualLM
-    from genlm.control.constant import EndOfSequence
-    from genlm.control.potential import Potential
-    from genlm.control.potential.built_in.llm import PromptedLLM
-    from genlm.control.potential.built_in.wfsa import BoolFSA
-    from genlm.control.sampler import EagerSetSampler
-    from genlm.control.sampler.token import AWRS, DirectTokenSampler, SetTokenSampler
-
-    class TermCritic(Potential):
-        def __init__(self, vocab):
-            super().__init__(vocabulary=vocab)
-
-        async def _ind(self, c):
-            bs = [t for t in c if not isinstance(t, EndOfSequence)]
-            try:
-                return 0.0 if " " in b"".join(bs).decode("utf-8") else float("-inf")
-            except UnicodeDecodeError:
-                return float("-inf")
-
-        async def complete(self, c):
-            return await self._ind(c)
-
-        async def prefix(self, c):
-            return 0.0
-
-        async def score(self, c):
-            return await self._ind(c)
-
-    model = AsyncVirtualLM.from_name(
-        args.model,
-        engine_opts={
-            "max_model_len": args.max_model_len,
-            "gpu_memory_utilization": args.gpu_mem,
-            "enable_prefix_caching": True,
-        },
-    )
-    eid = model.tokenizer.eos_token_id
-    llm = PromptedLLM(model, eos_byte_strings=[model.byte_vocab[eid].byte_string])
-    llm.set_prompt_from_str("The")
-    critic = TermCritic(llm.vocab) if args.critic else None
-
-    regex = {
-        "alpha": r"[a-z ]+",
-        "json": r'\{("[a-z]+": ("[a-z ]*"|-?[0-9]+|true|false|null)(, "[a-z]+": ("[a-z ]*"|-?[0-9]+|true|false|null))*)?\}',
-    }[args.constraint]
-
-    set_sampler = None
-    if args.sampler == "direct":
-        sampler = DirectTokenSampler(llm)
-    elif args.sampler == "awrs":
-        sampler = AWRS(llm, BoolFSA.from_regex(regex).coerce(llm, f=b"".join))
-    else:
-        set_sampler = EagerSetSampler(
-            iter_potential=llm, item_potential=BoolFSA.from_regex(regex)
-        )
-        sampler = SetTokenSampler(set_sampler)
-
+    model_name, engine_opts, post_engine = bench.scenario_engine(args)
+    args.model = model_name
+    model = bc.build_engine(model_name, engine_opts)
+    if post_engine:
+        post_engine(model)
+    built = bench.scenario_build(args, model)
     accelerate = "require" if args.mode == "burst" else "off"
 
-    # warmup (untimed, unprofiled)
-    asyncio.run(_run(sampler, critic, accelerate, args))
+    async def run():
+        bc.seed_all(args.seed)
+        await SMC(built.sampler, critic=built.critic)(
+            n_particles=args.n_particles, ess_threshold=args.ess_threshold,
+            max_tokens=args.max_tokens, accelerate=accelerate)
 
-    # worker-thread profiler: wrap run_burst (the executor target)
+    asyncio.run(run())  # warmup (untimed, unprofiled): cold prefill / CUDA graphs
+
+    # worker-thread profiler: the burst decode loop runs in the run_burst executor target
     worker_prof = cProfile.Profile()
     if args.mode == "burst":
         _orig = model.run_burst
@@ -136,7 +106,7 @@ def main() -> None:
 
     main_prof = cProfile.Profile()
     main_prof.enable()
-    asyncio.run(_run(sampler, critic, accelerate, args))
+    asyncio.run(run())
     main_prof.disable()
 
     main_prof.dump_stats(args.out + ".main.pstats")
@@ -149,8 +119,10 @@ def main() -> None:
         shutil.copy(args.out + ".main.pstats", args.out + ".pstats")
     print(f"wrote {args.out}.pstats")
 
-    if set_sampler is not None:
-        asyncio.run(set_sampler.cleanup())
+    asyncio.run(built.sampler.cleanup())
+
+    if not args.no_svg:
+        _render_svg(args.out + ".pstats", args.out + ".svg")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import asyncio
 import numpy as np
 
+from genlm.control.util import to_numpy
+
 
 class PotentialTests:
     """A mixin class providing testing utilities for validating Potential implementations.
@@ -176,9 +178,11 @@ class PotentialTests:
 
         for i, context in enumerate(contexts):
             logw_next = await self.logw_next(context, *method_args)
+            # batch_logw_next now returns ONE batched LazyWeights ([N, V+1]); row i is .weights[i]
+            batch_row = to_numpy(batch_logw_nexts.weights[i])
             try:
                 np.testing.assert_allclose(
-                    batch_logw_nexts[i].weights, logw_next.weights, rtol=rtol, atol=atol
+                    batch_row, to_numpy(logw_next.weights), rtol=rtol, atol=atol
                 )
                 if verbosity > 0:
                     print(
@@ -186,13 +190,13 @@ class PotentialTests:
                     )
                     print(
                         f"{self.colors['green']}Non-batched: {logw_next.weights}\n"
-                        + f"{self.colors['green']}Batched:     {batch_logw_nexts[i].weights}{self.colors['reset']}\n"
+                        + f"{self.colors['green']}Batched:     {batch_row}{self.colors['reset']}\n"
                     )
             except AssertionError:
                 raise AssertionError(
                     f"{self.colors['red']}Batch logw_next mismatch for context {context}:{self.colors['reset']}\n"
                     + f"{self.colors['green']}Non-batched: {logw_next.weights}\n"
-                    + f"{self.colors['red']}Batched:     {batch_logw_nexts[i].weights}{self.colors['reset']}"
+                    + f"{self.colors['red']}Batched:     {batch_row}{self.colors['reset']}"
                 )
 
             score = await self.score(context, *method_args)

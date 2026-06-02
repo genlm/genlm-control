@@ -7,7 +7,7 @@ import asyncio
 import numpy as np
 
 from genlm.control.constant import EOS
-from genlm.control.util import logsumexp
+from genlm.control.util import logsumexp, draw_key, draw_ordinal
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
 
@@ -245,8 +245,10 @@ class Controller:
 
     async def _draw_and_bank(self, p):
         """Slow per-step transition: draw from the sampler, then apply the shared
-        score/twist/terminate math."""
-        to_append, logw, logp = await self._sampler_of(p).transition(p.context)
+        score/twist/terminate math. The (slot, ordinal) draw key lets the counter-based
+        picker match the burst draw (no-op for the default torch.rand picker)."""
+        with draw_key(p._i, draw_ordinal(p.context)):
+            to_append, logw, logp = await self._sampler_of(p).transition(p.context)
         await self._bank_step(p, to_append, logw, logp)
 
     def _sampler_of(self, p):
