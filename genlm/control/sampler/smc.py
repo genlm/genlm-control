@@ -355,7 +355,9 @@ class Controller:
             w_sum = logsumexp(Wg)
             nw = Wg - w_sum
             if -logsumexp(nw * 2) < self._log_ess_threshold + np.log(len(rows)):
-                local = np.asarray(self.resample_fn(np.exp(nw)))  # ancestors in 0..ng-1
+                probs = np.exp(nw)
+                probs /= probs.sum()  # multinomial's np.random.choice is strict on sum==1
+                local = np.asarray(self.resample_fn(probs))  # ancestors in 0..ng-1
                 if self.record is not None:
                     local = np.sort(local)  # only matters for a reproducible record
                 crossings.append((g, rows, local, w_sum - np.log(len(rows))))
