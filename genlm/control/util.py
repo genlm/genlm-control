@@ -347,15 +347,17 @@ def gumbel_max(logps):
 
 
 def multinomial(logps):
-    """Categorical draw from ``exp(logps)`` (1-D)."""
-    p = (logps - torch.logsumexp(logps, 0)).exp()
-    return torch.multinomial(p, 1)[0]
+    """Categorical draw over the last dim (scalar for ``[V]``, ``[N]`` for ``[N, V]``)."""
+    p = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp()
+    return torch.multinomial(p, 1).squeeze(-1)
 
 
 def inverse_cdf(logps):
-    """Single-uniform inverse-CDF draw (1-D)."""
-    cdf = (logps - torch.logsumexp(logps, 0)).exp().cumsum(0)
-    return torch.searchsorted(cdf, torch.rand((), dtype=cdf.dtype))
+    """Single-uniform inverse-CDF draw over the last dim (scalar for ``[V]``, ``[N]`` for
+    ``[N, V]``); one uniform per row, on ``logps``'s device."""
+    cdf = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp().cumsum(dim=-1)
+    u = torch.rand((*cdf.shape[:-1], 1), dtype=cdf.dtype, device=cdf.device)
+    return torch.searchsorted(cdf, u).squeeze(-1).clamp_(max=cdf.shape[-1] - 1)
 
 
 # --- counter-based (device/order-independent) noise ---
