@@ -205,14 +205,12 @@ class Controller:
 
         self.samplers = samplers
         self.critics = critics
-        self.group_sizes = group_sizes
         # Representatives for the capability check / BurstLoop (groups share structure).
         self.unit_sampler = samplers[0]
         self.critic = critics[0]
         self.n_particles = n_particles
         self.n_resamples = 0  # resample events (any lane); guards verify the resample path fired
         self.ess_threshold = ess_threshold
-        self.max_tokens = max_tokens
         self.twist_with_critic = twist_with_critic
         # A terminal-only critic carries no per-step signal, so reweight only at
         # termination (skips the per-step critic call; same result).

@@ -70,9 +70,7 @@ class _Burst:
 
     def __init__(self, d, live):
         self.d = d
-        self.particles = live
         self.views = d.views
-        self.k = d.k
         self.abort_rows = set()
         self.add_rows = []
         # K substreams per particle: handle -> (row, view_idx) and row -> [handle/view].
@@ -367,7 +365,6 @@ class BurstLoop:
         # Views: the LM leaves whose warm logits the burst injects (group 0's target +
         # proposal). The batched burst draws every group through group 0's sampler.
         self.views = _views_of(self.sampler)
-        self.k = len(self.views)
         # The engine LM the burst drives (run_burst + the eos id); views share its model.
         self.llm = self.views[0]
         if self.llm is None:  # pragma: no cover - guarded by burst_blocker

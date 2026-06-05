@@ -499,18 +499,6 @@ def set_draw_method(method):
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
 
 
-@contextlib.contextmanager
-def draw_method(method):
-    """Scope ``set_draw_method`` to a ``with`` block, restoring the prior picker after."""
-    global _picker
-    prev = _picker
-    set_draw_method(method)
-    try:
-        yield
-    finally:
-        _picker = prev
-
-
 def select(lazyweights):
     """Select (sample) a token from a log-space ``LazyWeights`` using the configured draw
     method (``set_draw_method``; default Gumbel-max). The single picker seam: samplers call
