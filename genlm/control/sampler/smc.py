@@ -1,27 +1,20 @@
-"""The SMC algorithm: the particle population and the ``Controller`` that owns it
-(per-step transition, ESS, resample/fork, log_ml). ``StepLoop`` is the byte-exact
-per-token driver. Engine acceleration lives in ``burst.py``."""
+"""SMC population, the ``Controller`` (algorithm owner), and ``StepLoop`` (per-token
+driver). Engine acceleration lives in ``burst.py``."""
 
 import asyncio
 
 import numpy as np
+from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.util import logsumexp, draw_key, draw_ordinal
+from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
 
 
-# ---------------------------------------------------------------------------
-# The population
-# ---------------------------------------------------------------------------
-
-
 class Population:
-    """The SMC particle population, stored columnar: bulk scalars (``logw``,
-    ``logp``, ``twist_amount``, ``done``, ``max_tokens_left``) are parallel numpy
-    arrays; ``contexts`` are Python lists. Indexing/iterating yields :class:`Particle`
-    views onto a row (no second copy to sync)."""
+    """Columnar SMC particle store: scalars are parallel numpy arrays, ``contexts``
+    are Python lists. Indexing yields :class:`Particle` row views."""
 
     __slots__ = (
         "n",
@@ -37,7 +30,7 @@ class Population:
 
     def __init__(self, n, max_tokens, group=None):
         self.n = n
-        # Sub-population id per row (batched runs); ESS/resample/log_ml are per-group.
+        # Per-row group id; ESS/resample/log_ml are per-group.
         self.group = (
             np.zeros(n, dtype=np.int64) if group is None
             else np.asarray(group, dtype=np.int64)
@@ -48,8 +41,7 @@ class Population:
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
         self.contexts = [[] for _ in range(n)]
-        # Row views built once and reused (a view is a stateless (pop, row) pointer;
-        # reindex mutates the arrays in place, so row i staying row i keeps them valid).
+        # Views reused: reindex mutates arrays in place so row i stays valid.
         self._views = [Particle(self, i) for i in range(n)]
 
     def __len__(self):
@@ -62,18 +54,17 @@ class Population:
         return iter(self._views)
 
     def untwist_all(self):
-        """Vectorized untwist over the whole population (done rows carry 0)."""
+        """Vectorized untwist over the whole population."""
         self.logw -= self.twist_amount
         self.twist_amount[:] = 0.0
 
     def untwist_subset(self, idx):
-        """Vectorized untwist of rows ``idx`` (the burst's live rows; ``idx`` distinct)."""
+        """Vectorized untwist of rows ``idx`` (must be distinct)."""
         self.logw[idx] -= self.twist_amount[idx]
         self.twist_amount[idx] = 0.0
 
     def reindex(self, ancestor_indices):
-        """Resample/fork: reindex every column by ``ancestor_indices`` (contexts
-        shallow-copied; their token elements are immutable)."""
+        """Reindex every column by ``ancestor_indices`` (resample/fork)."""
         idx = ancestor_indices
         self.logw = self.logw[idx]
         self.logp = self.logp[idx]
@@ -85,8 +76,8 @@ class Population:
 
 
 class Particle:
-    """A thin view onto one row of a :class:`Population`; scalar reads/writes go
-    through to the population arrays (no second copy to sync)."""
+    """A view onto one row of a :class:`Population`; reads/writes pass through to the
+    population arrays."""
 
     __slots__ = ("_pop", "_i")
 
@@ -130,8 +121,6 @@ class Particle:
     def context(self):
         return self._pop.contexts[self._i]
 
-    # -- weight bookkeeping --
-
     def score(self, amt):
         self._pop.logw[self._i] += amt
 
@@ -147,8 +136,7 @@ class Particle:
         self.untwist()
         self._pop.done[self._i] = True
 
-    # -- viz adapter (the record reads .weight + .string_for_serialization()) --
-
+    # record viz adapter
     @property
     def weight(self):
         return self._pop.logw[self._i]
@@ -158,14 +146,9 @@ class Particle:
 
 
 
-# ---------------------------------------------------------------------------
-# The controller
-# ---------------------------------------------------------------------------
-
-
 class Controller:
-    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. A
-    sampler collapses to one per-step ``transition``; no sampler reimplements the loop.
+    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. Every
+    sampler collapses to one per-step ``transition``.
 
     Args:
         unit_sampler (TokenSampler): produces ``(to_append, logw, logp)`` per step.
@@ -195,7 +178,7 @@ class Controller:
         critics=None,
     ):
         assert max_tokens > 0
-        # Batched runs: B groups in one population; default is a single group.
+        # B groups in one population; default is one group.
         if group_sizes is None:
             group_sizes = [n_particles]
             samplers = [unit_sampler]
@@ -209,11 +192,10 @@ class Controller:
         self.unit_sampler = samplers[0]
         self.critic = critics[0]
         self.n_particles = n_particles
-        self.n_resamples = 0  # resample events (any lane); guards verify the resample path fired
+        self.n_resamples = 0
         self.ess_threshold = ess_threshold
         self.twist_with_critic = twist_with_critic
-        # A terminal-only critic carries no per-step signal, so reweight only at
-        # termination (skips the per-step critic call; same result).
+        # A terminal-only critic has no per-step signal: reweight only at termination.
         if twist_with_critic and all(
             c is not None and c.is_terminal_only() for c in critics
         ):
@@ -230,8 +212,7 @@ class Controller:
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
         self.record = SMCRecord(n_particles) if record else None
-        # Resample tag: ``_maybe_resample`` sets it so the next ``_record_step`` is
-        # tagged ``add_resample`` (lazy tag-at-next-step).
+        # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
         self._pending_resample = False
         self._pending_ancestors = list(range(n_particles))
 
@@ -239,27 +220,21 @@ class Controller:
         with np.errstate(divide="ignore"):
             self._log_ess_threshold = np.log(ess_threshold)
 
-    # -- the per-step transition for ONE particle --
-
     async def _draw_and_bank(self, p):
-        """Slow per-step transition: draw from the sampler, then apply the shared
-        score/twist/terminate math. The (slot, ordinal) draw key lets the counter-based
-        picker match the burst draw (no-op for the default torch.rand picker)."""
+        """Per-step transition: draw, then bank. The (slot, ordinal) draw key lets a
+        counter-based picker match the burst draw."""
         with draw_key(p._i, draw_ordinal(p.context)):
             to_append, logw, logp = await self._sampler_of(p).transition(p.context)
         await self._bank_step(p, to_append, logw, logp)
 
     def _sampler_of(self, p):
-        """The sampler for particle ``p``'s group."""
         return self.samplers[self.particles.group[p._i]]
 
     def _critic_of(self, p):
-        """The critic for particle ``p``'s group."""
         return self.critics[self.particles.group[p._i]]
 
     def _bank_step_no_critic(self, p, to_append, logw, logp):
-        """Sync score + advance + terminate for the no-critic path (shared by the slow
-        path and the burst)."""
+        """Sync score + advance + terminate, no-critic path."""
         p.score(logw)
         p.logp += logp
         p.context.extend(to_append)
@@ -273,9 +248,8 @@ class Controller:
             p.finish()
 
     async def _bank_step(self, p, to_append, logw, logp):
-        """The post-draw SMC math (one implementation, shared by both lanes): score,
-        advance the context, critic-twist per step, reweight + terminate. The caller
-        untwists ``p`` before the draw."""
+        """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
+        Caller untwists ``p`` before the draw."""
         if not self.critic:
             self._bank_step_no_critic(p, to_append, logw, logp)
             return
@@ -313,9 +287,6 @@ class Controller:
         return bool(p.context) and p.context[-1] is EOS
 
     def _repr_particle(self, p):
-        from arsenal import colors
-        from genlm.control.util import escape
-
         return (
             f"{p.logw:.2f}:\t"
             + colors.magenta % "["
@@ -323,8 +294,7 @@ class Controller:
             + colors.magenta % "]"
         )
 
-    # -- controller-owned SMC primitives the drivers turn (start, per-step banking,
-    #    ESS+resample, record); the per-step loop itself lives in the drivers ----------
+    # controller-owned SMC primitives the drivers turn
 
     async def start(self):
         """Score every particle by its group's empty-sequence prefix weight."""
@@ -340,10 +310,8 @@ class Controller:
             p.score(start_ws[self.particles.group[p._i]])
 
     def _maybe_resample(self):
-        """Per-group ESS test + resample (the only ESS/resample impl; both lanes call
-        it). Group-local: each crossing group reindexes within its own rows. Mutates
-        ``self.particles`` on a resample. Returns ``(crossing_groups, ancestors)`` --
-        ``([], None)`` when nothing crossed (no global vector built)."""
+        """Per-group ESS test + group-local resample. Mutates ``self.particles`` on a
+        resample. Returns ``(crossing_groups, ancestors)`` or ``([], None)``."""
         W = self.particles.logw
         crossings = []  # (g, rows, local_ancestors, reset_logw) per crossing group
         for g, rows in enumerate(self._group_rows):
@@ -354,14 +322,14 @@ class Controller:
             nw = Wg - w_sum
             if -logsumexp(nw * 2) < self._log_ess_threshold + np.log(len(rows)):
                 probs = np.exp(nw)
-                probs /= probs.sum()  # multinomial's np.random.choice is strict on sum==1
+                probs /= probs.sum()  # np.random.choice is strict on sum==1
                 local = np.asarray(self.resample_fn(probs))  # ancestors in 0..ng-1
                 if self.record is not None:
-                    local = np.sort(local)  # only matters for a reproducible record
+                    local = np.sort(local)  # reproducible record
                 crossings.append((g, rows, local, w_sum - np.log(len(rows))))
 
         if not crossings:
-            return [], None  # no-cross early-out: no arange / reindex / tolist
+            return [], None
 
         ancestors = np.arange(self.n_particles)
         for _g, rows, local, _t in crossings:
@@ -372,14 +340,11 @@ class Controller:
             self.particles.logw[rows] = target
         ancestors = ancestors.tolist()
         if self.record is not None:
-            # Tag the NEXT recorded step as a resample (lazy tag-at-next-step,
-            # consumed by ``_record_step``).
             self._pending_resample = True
             self._pending_ancestors = ancestors
         return [c[0] for c in crossings], ancestors
 
     def save_record(self, json_path):
-        """Write the SMC record JSON."""
         if self.record is None:
             return
         with open(json_path, "w") as f:
@@ -387,9 +352,8 @@ class Controller:
         print(f"Saved record to {json_path}")
 
     def _record_step(self):
-        """Record one completed SMC step (lane-neutral): ``add_init`` first,
-        ``add_resample`` if a resample preceded it, else ``add_smc_step``. No-op
-        without a record."""
+        """Record one completed step: ``add_init`` first, ``add_resample`` if one
+        preceded it, else ``add_smc_step``."""
         if self.record is None:
             return
         if len(self.record.history) == 0:
@@ -400,15 +364,11 @@ class Controller:
             self.record.add_smc_step(self.particles)
         self._pending_resample = False
 
-    # -- burst-lane math the engine seam (_Burst) calls into --
-    #
-    # The seam (draw / drain_* / token-id mapping) lives on _Burst; what stays here is
-    # the SMC math it banks into: per-step banking + ESS/resample.
+    # burst-lane math the engine seam (_Burst) calls into
 
     async def _bank_steps(self, parts, records):
-        """Bank every row's completed SMC step (``rec.step``), same math as the slow
-        loop. Runs on the main loop (hopped from the burst worker), so an awaiting
-        critic composes as a normal gather."""
+        """Bank every row's completed step (``rec.step``), same math as the slow loop.
+        Runs on the main loop (hopped from the burst worker)."""
         steps = [
             (p, rec.step) for p, rec in zip(parts, records) if rec.step is not None
         ]
@@ -423,23 +383,17 @@ class Controller:
 
 
 
-# ---------------------------------------------------------------------------
-# Driver: StepLoop (per-token ground truth)
-# ---------------------------------------------------------------------------
-
-
 class StepLoop:
-    """Per-token round-trip driver (the byte-exact ground truth); recomputes logprobs
-    from the full context every step."""
+    """Per-token round-trip driver (byte-exact ground truth); recomputes logprobs from
+    the full context every step."""
 
     def __init__(self, controller):
         self.controller = controller
 
     async def run(self):
         """Turn the population per-token to completion: each step draws + scores every
-        live particle (concurrently), records the step, then runs the controller-owned
-        ESS/resample. Symmetric with ``BurstLoop.run`` -- the controller owns the SMC
-        math, the driver owns the loop."""
+        live particle concurrently, records, then runs the controller-owned
+        ESS/resample."""
         c = self.controller
         await c.start()
         while any(not p.done for p in c.particles):

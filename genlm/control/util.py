@@ -11,12 +11,8 @@ from genlm.backend.tokenization import Token
 
 
 def logsumexp(x):
-    """Numerically-stable log-sum-exp over a 1-D array, correct on the zero-mass
-    edge: returns ``-inf`` for an all-(-inf) input (log of zero total mass), where
-    the bare max-subtraction (and arsenal's ``logsumexp``) yields ``nan`` from
-    ``-inf - (-inf)``. This is THE CPU/numpy log-sum-exp for the SMC paths; for
-    weights already on the GPU as a torch tensor, use ``torch.logsumexp`` (the
-    on-device burst ops do). Bit-identical to the max-trick on finite inputs."""
+    """Numpy log-sum-exp over a 1-D array; returns ``-inf`` (not ``nan``) on all-(-inf)
+    input. CPU path; on-device weights use ``torch.logsumexp``."""
     x = np.asarray(x)
     if np.all(x == -np.inf):
         return -np.inf
@@ -70,13 +66,9 @@ class LazyWeights:
         Raises:
             AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
-        # Native storage: ``weights`` keeps the producer's backend (LM->torch,
-        # grammar/FSA/trie->numpy); a raw python sequence becomes numpy (its natural array
-        # form -- no backend to preserve). Conversion happens only at a genuine cross
-        # (``_compose`` lifts to torch+device; CPU-sequential consumers pull numpy).
-        # ``weights`` is over the vocab on the LAST axis: ``[V]`` for one context, or
-        # ``[N, V]`` for a whole population (the batch dim leads). Bulk ops reduce dim=-1,
-        # so the same object serves a single draw and a batched [N, V] burst draw.
+        # ``weights`` keeps the producer's backend (LM->torch, grammar/FSA/trie->numpy; a
+        # raw python sequence becomes numpy). Vocab is the LAST axis: ``[V]`` (one context)
+        # or ``[N, V]`` (population); bulk ops reduce dim=-1, so one object serves both.
         if not (torch.is_tensor(weights) or isinstance(weights, np.ndarray)):
             weights = np.asarray(weights)
         assert weights.shape[-1] == len(decode)
@@ -284,8 +276,7 @@ def load_trie(V, backend=None, **kwargs):
     Returns:
         (TokenCharacterTrie): A trie instance.
     """
-    import torch
-    from genlm.backend.tokenization import Token
+    from genlm.backend.tokenization import Token  # lazy: backend absent on mac
 
     # Convert pure bytes/strings vocabularies to Token objects.
     # Skip if V already contains Token objects (Token subclasses bytes,
@@ -335,9 +326,7 @@ def load_async_trie(V, backend=None, **kwargs):
 
 
 # --- token-picker family ---
-# Each maps a log-weight tensor -> drawn index, reducing the last dim (so the same
-# function serves a 1-D slow-lane draw and a batched [N, V] on-device draw). The default
-# is Gumbel-max (the historical draw); swap by passing another member as ``select(.., m)``.
+# Each maps a log-weight tensor -> drawn index over dim=-1 (1-D draw or batched [N, V]).
 
 
 def gumbel_max(logps):
@@ -361,11 +350,9 @@ def inverse_cdf(logps):
 
 
 # --- counter-based (device/order-independent) noise ---
-# The picker noise is a pure function of an explicit (seed, slot, step) key, NOT of a
-# shared mutable RNG stream. Threefry-2x32 (Random123 constants) in torch int64 + 32-bit
-# masking is bit-identical on CPU and CUDA, so the burst (GPU) and StepLoop (CPU) draw the
-# SAME noise -- the gate's RNG-pairing survives the on-device move. The key is in scope via
-# the ``draw_key`` ContextVar (set per draw by the SMC loops); unkeyed -> torch.rand fallback.
+# Picker noise is a pure function of an explicit (seed, slot, step) key, not a shared RNG
+# stream: threefry-2x32 in torch int64 is bit-identical CPU/CUDA, so burst (GPU) and StepLoop
+# (CPU) draw the SAME noise. Key in scope via the ``draw_key`` ContextVar; unkeyed -> torch.rand.
 
 _DRAW_KEY = contextvars.ContextVar("draw_key", default=None)  # (slot, [next_ordinal]) | None
 _DRAW_SEED = 0  # base seed; set by set_draw_seed (mirror of seed_all's seed)
@@ -381,9 +368,8 @@ def _rotl32(x, r):
 
 
 def threefry_2x32(c0, c1, k0, k1):
-    """Threefry-2x32 keyed hash. ``c*``/``k*`` are int64 tensors (or ints) in [0, 2^32).
-    Returns the first 32-bit output word: one pseudo-random uint32 per element. Pure int
-    arithmetic -> bit-identical across devices."""
+    """Threefry-2x32 keyed hash (``c*``/``k*`` int64 tensors/ints in [0, 2^32)); returns
+    the first 32-bit output word. Pure int arithmetic -> bit-identical across devices."""
     ks0, ks1 = k0 & _TF_MASK, k1 & _TF_MASK
     ks2 = (_TF_PARITY ^ ks0 ^ ks1) & _TF_MASK
     ks = (ks0, ks1, ks2)
@@ -401,10 +387,8 @@ def threefry_2x32(c0, c1, k0, k1):
 
 
 def threefry_uniform(n, seed, slot, step, device, dtype):
-    """``n`` device-independent uniforms in (0,1) keyed by (seed, slot, step): key=(seed,
-    slot), counter=(index, step), so (seed, slot, step, index) is a unique address.
-    ``slot``/``step`` may be scalars (-> ``[n]``) or ``[N]`` tensors (-> ``[N, n]``, one
-    keyed row each) -- the hash is elementwise, so the batched draw is just broadcasting."""
+    """``n`` device-independent uniforms in (0,1) keyed by (seed, slot, step). ``slot``/
+    ``step`` may be scalars (-> ``[n]``) or ``[N]`` tensors (-> ``[N, n]``, one keyed row each)."""
     i = torch.arange(n, device=device, dtype=torch.int64)  # counter word 0 (index)
     slot = torch.as_tensor(slot, device=device, dtype=torch.int64)
     step = torch.as_tensor(step, device=device, dtype=torch.int64)
@@ -417,10 +401,8 @@ def threefry_uniform(n, seed, slot, step, device, dtype):
 def threefry_gumbel(logps):
     """Gumbel-max over counter-based noise when a ``draw_key`` is in scope (device/order-
     independent); torch.rand Gumbel fallback when unkeyed. A scalar key advances its ordinal
-    per draw (so a multi-subunit unit drawn under one scope gets a distinct key per subunit);
-    a batched key (per-row ``slot``/``step`` tensors) draws every row of ``logps`` ``[N, V]``
-    at once -- byte-identical to the per-row scalar draws, since the noise is keyed not
-    streamed (so a batched draw == per-particle, order-independent)."""
+    per draw; a batched key (per-row ``slot``/``step`` tensors) draws every row of ``[N, V]``
+    at once, byte-identical to the per-row scalar draws (noise is keyed, not streamed)."""
     key = _DRAW_KEY.get()
     if key is None:
         u = torch.rand_like(logps)
@@ -443,15 +425,13 @@ def set_draw_seed(s):
 
 
 def get_draw_seed():
-    """Current base seed for the counter-based streams (set by ``set_draw_seed``/seed_all).
-    AWRS uses it as the default seed for its per-instance stream when none is given."""
+    """Current base seed for the counter-based streams (AWRS's default per-instance seed)."""
     return _DRAW_SEED
 
 
 def awrs_gumbel_keys(logps, seed, step):
     """``logps + Gumbel`` over the threefry stream keyed by ``(seed, step)`` -- AWRS's OWN
-    per-instance (seed, counter), so it is driver-independent (the original smc_standard sets
-    no ``draw_key``) yet device-identical + on-device. Returns keys on ``logps``'s device."""
+    per-instance (seed, counter), so it is driver-independent yet device-identical."""
     u = threefry_uniform(logps.shape[-1], int(seed) & _TF_MASK, 0, int(step) & _TF_MASK,
                          logps.device, logps.dtype)
     return logps + (-torch.log(-torch.log(u)))
@@ -459,8 +439,7 @@ def awrs_gumbel_keys(logps, seed, step):
 
 def draw_ordinal(context):
     """Flattened leaf count of a (possibly unit-nested) particle context -- the base draw
-    ordinal. Token grain: ``len(context)``; unit grain: total subunits drawn. Counts
-    leaves without importing ``flatten_units`` (keeps util import-light)."""
+    ordinal. Token grain: ``len(context)``; unit grain: total subunits drawn."""
     n = 0
     for item in context:
         n += draw_ordinal(item) if isinstance(item, list) else 1
@@ -469,11 +448,9 @@ def draw_ordinal(context):
 
 @contextlib.contextmanager
 def draw_key(slot, base=0):
-    """Scope the counter-based picker's key. Scalar ``slot``/``base`` (one particle):
-    ``slot`` = the particle row, ``base`` = its draw ordinal so far; the picker advances the
-    ordinal per draw, so a unit's subunits get distinct keys. Tensor ``slot``/``base``
-    (``[N]`` per-row): one batched draw over the whole population, ordinals fixed. Set by the
-    SMC loops so the burst (GPU) and StepLoop (CPU) compute identical noise."""
+    """Scope the counter-based picker's key. Scalar ``slot``/``base`` (one particle): ``slot``
+    = particle row, ``base`` = draw ordinal so far (advanced per draw). Tensor ``slot``/``base``
+    (``[N]`` per-row): one batched draw over the population, ordinals fixed."""
     key = (slot, base) if torch.is_tensor(slot) else (int(slot), [int(base)])
     tok = _DRAW_KEY.set(key)
     try:
@@ -488,8 +465,7 @@ DRAW_METHODS = {
     "inverse_cdf": inverse_cdf,
     "threefry_gumbel": threefry_gumbel,
 }
-# The picker ``select`` uses -- a process-wide SETTING (see ``set_draw_method``), not a
-# per-call argument, so samplers call ``select(logws)`` and the method swaps in one place.
+# The picker ``select`` uses -- a process-wide setting (see ``set_draw_method``).
 _picker = gumbel_max
 
 
@@ -502,19 +478,16 @@ def set_draw_method(method):
 
 
 def select(lazyweights):
-    """Select (sample) a token from a log-space ``LazyWeights`` using the configured draw
-    method (``set_draw_method``; default Gumbel-max). The single picker seam: samplers call
-    ``select``, never inlining the draw, so the method is swapped by setting, not per call."""
+    """Select a token from a log-space ``LazyWeights`` using the configured draw method
+    (``set_draw_method``; default Gumbel-max). The single scalar-draw picker seam."""
     assert lazyweights.is_log
     return lazyweights.decode[int(picker_indices(lazyweights.weights))]
 
 
 def picker_indices(weights):
     """Apply the configured picker to a (possibly batched) log-weight array, returning the
-    drawn index/indices over dim=-1 (scalar for ``[V]``, ``[N]`` for ``[N, V]``). The draw is
-    defined in torch (the picker family is pure-torch, device-independent); lift here -- a
-    no-op on the common torch path, one cross for a numpy producer. ``select`` is the scalar-
-    token wrapper; the batched burst draw uses this directly to gather per-row logp."""
+    drawn index/indices over dim=-1 (scalar for ``[V]``, ``[N]`` for ``[N, V]``). Lifts to
+    torch (the picker family is pure-torch); a no-op on the common torch path."""
     return _picker(torch.as_tensor(weights))
 
 

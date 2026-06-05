@@ -32,17 +32,14 @@ class TokenSampler:
     \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})
     $$
 
-    A `TokenSampler` collapses to a single per-step transition that the SMC controller
-    calls: :meth:`transition` maps a particle context to
-    ``(to_append, logw, logp)``. The controller owns the population, ESS test,
-    resampling and log marginal likelihood; samplers never reimplement the loop.
+    Collapses to a single per-step :meth:`transition` the controller calls,
+    mapping a particle context to ``(to_append, logw, logp)``.
 
     Args:
         target (Potential): The potential that samples are properly weighted with respect to.
     """
 
-    # Set by samplers that draw from a separate proposal (Direct/AWRS/Set); ``None`` for
-    # the rest, so callers read ``s.proposal`` instead of probing for the attribute.
+    # ``None`` unless the sampler draws from a separate proposal (Direct/AWRS/Set).
     proposal = None
 
     def __init__(self, target):
@@ -50,41 +47,34 @@ class TokenSampler:
         self.token_type = self.target.token_type
 
     def supports_burst(self) -> bool:
-        """Whether this sampler can be driven inside the engine burst (implements
+        """Whether this sampler can run inside the engine burst (implements
         :meth:`burst_draw_batch`). Default ``False`` (stays on ``StepLoop``)."""
         return False
 
     def burst_draw_sampler(self):
-        """The sampler whose per-step ``sample`` the burst actually injects logits for
-        -- i.e. whose ``target``/``proposal`` are the injected views. ``self`` for a
-        token-grain sampler; a unit sampler delegates to its subunit."""
+        """The sampler whose ``target``/``proposal`` are the injected views: ``self``
+        at token grain; a unit sampler delegates to its subunit."""
         return self
 
     def burst_free_running(self) -> bool:
-        """Whether the burst is free-running (token grain): one SMC step per decode
-        step, ESS tested every step. ``False`` = synchronized (unit grain): one SMC
-        step per unit, ESS once per round."""
+        """``True`` = free-running (token grain): one SMC step per decode step, ESS
+        every step. ``False`` = synchronized (unit grain): one step per unit."""
         return True
 
     def burst_max_steps(self, live) -> int:
-        """Engine decode-step budget for one burst. Token grain: the longest
-        particle's remaining budget (+1). The unit sampler overrides it."""
+        """Engine decode-step budget for one burst (token grain). The unit sampler overrides."""
         return max(p.max_tokens_left for p in live) + 1
 
     @staticmethod
     def _row_injection(warm_batch, i):
-        """Slice the batched warm (``{view: [N, V+1] LazyWeights}``) into particle ``i``'s
-        per-row injection (``{view: [V+1] LazyWeights}``) -- the inverse of the burst's stack,
-        for the sequential per-particle draw (AWRS/Set/unit)."""
+        """Slice batched warm ``{view: [N, V+1]}`` into particle ``i``'s per-row
+        injection ``{view: [V+1]}`` for the sequential draw."""
         return {view: view.make_lazy_weights(W.weights[i]) for view, W in warm_batch.items()}
 
     async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
-        """Engine-burst draw, one BurstDraw per particle (token grain). ``warm_batch`` maps
-        each view-LM to its batched ``[N, V+1]`` warm logits; slice row ``i`` into a per-row
-        injection and run the REAL per-step ``transition`` -- the target composes itself over
-        the K views (proposal/prior/...), no proposal reconstruction. One SMC step per decode
-        step. This is the sequential path (AWRS/Set, rejection/trie); `DirectTokenSampler`
-        overrides with a vectorized ``[N, V]`` draw, the unit sampler for subunit accumulation."""
+        """Sequential engine-burst draw, one BurstDraw per particle (token grain): slice
+        each row's warm logits and run the real per-step ``transition``. `DirectTokenSampler`
+        overrides with a vectorized draw, the unit sampler for subunit accumulation."""
 
         async def one(i, context, handle):
             injection = self._row_injection(warm_batch, i)
@@ -101,20 +91,14 @@ class TokenSampler:
         return await self.target.prefix([])
 
     async def transition(self, context):
-        """The controller-facing per-step transition.
-
-        Draws a single token, returning the list of items to append to the
-        particle context together with the importance-weight increment and the
-        log-probability of the random choices.
+        """Controller-facing per-step transition.
 
         Args:
             context (list): The particle's current token context.
 
         Returns:
-            (to_append, logw, logp): ``to_append`` is ``[token]`` (subclasses
-                that produce multi-token units may return more than one item),
-                ``logw`` is the importance-weight increment, ``logp`` the
-                log-probability of the sampler's random choices.
+            (to_append, logw, logp): items to append (``[token]``, or more for a
+                multi-token unit), the weight increment, and the choice log-prob.
         """
         token, logw, logp = await self.sample(context)
         return [token], logw, logp
@@ -156,12 +140,10 @@ class TokenSampler:
             max_tokens (int): The maximum number of tokens to generate.
             critic (Potential, optional): A potential function that guides the generation process
                 by scoring candidate sequences. Must have the same token type as the token sampler.
-            accelerate (str | bool, optional): Engine-acceleration knob, forwarded to
-                `SMC.__call__`. One of ``"auto"`` (default; engine path when
-                burst-capable, else the exact per-token path), ``"off"`` (force the
-                exact per-token path), or ``"require"`` (engine path or raise
-                `NotAcceleratable`). ``True``/``False`` alias ``"auto"``/``"off"``.
-                See `SMC.__call__` for the full contract.
+            accelerate (str | bool, optional): Engine-acceleration knob forwarded to
+                `SMC.__call__`: ``"auto"`` (default), ``"off"`` (force per-token), or
+                ``"require"`` (engine or raise `NotAcceleratable`). ``True``/``False``
+                alias ``"auto"``/``"off"``.
             **kwargs (dict): Additional keyword arguments to pass to `SMC`'s `__call__` method.
         """
         from genlm.control.sampler.sequence import SMC
@@ -203,8 +185,7 @@ class DirectTokenSampler(TokenSampler):
         self.proposal = proposal
 
     def supports_burst(self) -> bool:
-        # The engine reproduces the target's logw_next, and (with a proposal) the
-        # proposal's, as injected views; burst_blocker checks every leaf is a view.
+        # Target (and proposal) logw_next are reproduced as injected views.
         return True
 
     async def sample(self, context, draw=None):
@@ -228,15 +209,15 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            logZ = logws.sum()  # normalizer == the returned weight; compute logsumexp once
-            logps = logws.spawn(logws.weights - logZ)  # == logws.normalize()
+            logZ = logws.sum()  # normalizer == the weight
+            logps = logws.spawn(logws.weights - logZ)  # logws.normalize()
             token = select(logps) if draw is None else draw(logps.exp().materialize())
             return token, logZ, logps[token]
 
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context), self.potential.logw_next(context)
         )
-        proposal_logZ = proposal_logws.sum()  # one logsumexp, reused below
+        proposal_logZ = proposal_logws.sum()
         proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_logZ)
         if draw is None:
             token = select(proposal_logps)
@@ -246,16 +227,12 @@ class DirectTokenSampler(TokenSampler):
         return token, logw, proposal_logps[token]
 
     async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
-        """Vectorized engine-burst draw over the whole population: compose the ``[N, V+1]``
-        proposal (injected warm batch + batched factors), one logsumexp + one keyed Gumbel
-        draw + one gather, instead of N per-particle ``sample`` calls. Byte-identical to the
-        per-particle path -- threefry keyed by ``(row, draw_ordinal)``, so batched ==
-        per-particle. Mirrors ``sample``: without a proposal the weight is the normalizer
-        ``logZ``; with one it's the importance weight ``target[x] - proposal[x] + logZ``."""
+        """Vectorized engine-burst draw over the population: one logsumexp + one keyed
+        Gumbel draw + one gather over the ``[N, V+1]`` proposal. Threefry keyed by
+        ``(row, draw_ordinal)``, so byte-identical to the per-particle path."""
         rows = torch.tensor(handles, dtype=torch.int64)
         ordinals = torch.tensor([draw_ordinal(c) for c in contexts], dtype=torch.int64)
         with burst_logw_next(warm_batch):
-            # Draw from the proposal (the target itself when there is no separate proposal).
             if self.proposal is None:
                 proposal, target = await self.potential.batch_logw_next(contexts), None
             else:
@@ -492,12 +469,10 @@ class AWRS(TokenSampler):
 
     async def _run_rejection(self, logws, accept, target_logws=None):
         """Shared AWRS rejection over next-token ``logws`` with a boolean ``accept``
-        coroutine (and an optional ``target_logws`` proposal correction). The slow
-        ``sample`` and the engine burst both call this, so the algorithm and weight
-        stay identical -- only the source of ``logws``/``accept`` differs."""
-        # Keep the log-weights on their native device (GPU in the burst): prune/normalize/
-        # top-k on device, only the walked slice crosses to the CPU condition checks.
-        lw = torch.as_tensor(logws.weights)  # no-op when already a (device) tensor
+        coroutine (optional ``target_logws`` proposal correction)."""
+        # On-device: prune/normalize/top-k stay on the native device, only the walked
+        # slice crosses to the CPU condition checks.
+        lw = torch.as_tensor(logws.weights)  # no-op when already a device tensor
         if self.prune_logws:
             lw = self._prune_logws(lw)
         logZ = float(torch.logsumexp(lw, 0))
@@ -571,11 +546,10 @@ GEOMETRIC_THRESHOLD = np.log(2 / 3)
 
 
 class _AwrsOrder:
-    """Descending Gumbel-perturbed order over a device ``logps``, materialized lazily via
-    ``torch.topk`` (on a GPU tensor only the walked top-k slice crosses to the CPU checks; a
-    deep walk triggers one full sort). ``order[i]`` -> ``(vocab_id, logp)`` of the i-th best
-    (``logp == -inf`` for a pruned token, the Gumbel noise being finite). ``reject(vid)``
-    scatters -inf into the logps for geometric's next-round re-perturbation."""
+    """Descending Gumbel-perturbed order over device ``logps``, materialized lazily via
+    ``torch.topk`` (only the walked top-k slice crosses to the CPU checks; a deep walk
+    triggers one full sort). ``order[i]`` -> ``(vocab_id, logp)`` of the i-th best
+    (``logp == -inf`` for a pruned token). ``reject(vid)`` scatters -inf for the next round."""
 
     __slots__ = ("_logps", "_keys", "_n", "_ids", "_lvals", "_k")
 
@@ -718,8 +692,7 @@ async def geometric_awrs(*, logps, toks, accept, make_keys, rng, max_rejects, ma
     for _ in range(max_accepts):
         if n_rejects >= max_rejects:
             break
-        # Re-perturb the (mutated) device logps and take the top-k on device; rejected
-        # tokens from prior rounds are -inf (scattered by reject()) so they fall out.
+        # Re-perturb the (mutated) device logps; prior-round rejects are -inf and fall out.
         cur_order = _AwrsOrder(logps, make_keys)
         for pos in range(len(cur_order)):
             vid, lp = cur_order[pos]
