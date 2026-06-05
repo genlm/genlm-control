@@ -3,10 +3,16 @@ import numpy as np
 import torch
 from arsenal import colors
 from arsenal.maths import log1mexp
-from genlm.control.util import logsumexp
 import warnings
 
-from genlm.control.util import select, picker_indices, draw_key, draw_ordinal, to_numpy
+from genlm.control.util import (
+    select,
+    picker_indices,
+    draw_key,
+    draw_ordinal,
+    awrs_gumbel_keys,
+    get_draw_seed,
+)
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 from genlm.control.sampler.burst import BurstDraw
@@ -408,7 +414,11 @@ class AWRS(TokenSampler):
 
         self.vocab_eos_set = set(self.target.vocab_eos)
         self.V = len(self.potential.vocab_eos)
-        self.rng = np.random.default_rng(seed=seed)
+        self.rng = np.random.default_rng(seed=seed)  # phantom-geometric (CPU scalar)
+        # Gumbel keys: per-instance threefry stream (driver-independent, on-device).
+        self._draw_seed = (seed if seed is not None else get_draw_seed()) & 0xFFFFFFFF
+        self._draw_ctr = 0
+        self._valid_idxs_cache = None
 
     def supports_burst(self) -> bool:
         # Rejection runs over the engine LM logits (injected), condition checked per
@@ -416,12 +426,25 @@ class AWRS(TokenSampler):
         return True
 
     def _prune_logws(self, w):
-        # Prune the numpy log-weights ``w`` to only the tokens in the target vocabulary
-        # (zeroing-out tokens we know a priori will be rejected). The mass thrown away is
-        # corrected via logZ in `_run_rejection`.
-        pruned = self.potential.alloc_logws()
-        pruned[self.valid_idxs] = w[self.valid_idxs]
+        # Keep only target-vocab tokens (-inf elsewhere; mass corrected via logZ). On-device.
+        pruned = torch.full_like(w, float("-inf"))
+        idx = self._valid_idxs_t(w.device)
+        pruned[idx] = w[idx]
         return pruned
+
+    def _valid_idxs_t(self, device):
+        c = self._valid_idxs_cache
+        if c is None or c.device != device:
+            c = self._valid_idxs_cache = torch.as_tensor(
+                self.valid_idxs, dtype=torch.int64, device=device
+            )
+        return c
+
+    def _make_keys(self, logps):
+        """Fresh Gumbel keys for one round; advance the counter so each round is independent."""
+        keys = awrs_gumbel_keys(logps, self._draw_seed, self._draw_ctr)
+        self._draw_ctr += 1
+        return keys
 
     async def _accept(self, context, token, verbosity=0):
         if self.prune_logws or token in self.vocab_eos_set:
@@ -472,14 +495,13 @@ class AWRS(TokenSampler):
         coroutine (and an optional ``target_logws`` proposal correction). The slow
         ``sample`` and the engine burst both call this, so the algorithm and weight
         stay identical -- only the source of ``logws``/``accept`` differs."""
-        # AWRS rejection is CPU/numpy (seeded rng, argsort, data-dependent walk); pull the
-        # log-weights to numpy at this edge (no-op if the producer is already numpy) and
-        # operate in numpy throughout.
-        lw = to_numpy(logws.weights)
+        # Keep the log-weights on their native device (GPU in the burst): prune/normalize/
+        # top-k on device, only the walked slice crosses to the CPU condition checks.
+        lw = torch.as_tensor(logws.weights)  # no-op when already a (device) tensor
         if self.prune_logws:
             lw = self._prune_logws(lw)
-        logZ = logsumexp(lw)
-        logps = lw - logZ
+        logZ = float(torch.logsumexp(lw, 0))
+        logps = lw - logZ  # device [V]
         toks = logws.decode
 
         # Cache successful calls (geometric_awrs may revisit a token).
@@ -500,16 +522,17 @@ class AWRS(TokenSampler):
                 logps=logps,
                 toks=toks,
                 accept=cached_accept,
-                rng=self.rng,
+                make_keys=self._make_keys,
                 max_rejects=self.max_rejects,
             )
         # geometric_awrs when max_accepts>2 (recursive_awrs ignores it) or when
         # the distribution is peaked (then geometric is more efficient).
-        elif self.max_accepts > 2 or logps.max() >= GEOMETRIC_THRESHOLD:
+        elif self.max_accepts > 2 or float(logps.max()) >= GEOMETRIC_THRESHOLD:
             tok, w, _ = await geometric_awrs(
                 logps=logps,
                 toks=toks,
                 accept=cached_accept,
+                make_keys=self._make_keys,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
                 max_accepts=self.max_accepts,
@@ -519,7 +542,7 @@ class AWRS(TokenSampler):
                 logps=logps,
                 toks=toks,
                 accept=cached_accept,
-                rng=self.rng,
+                make_keys=self._make_keys,
                 max_rejects=self.max_rejects,
             )
 
@@ -530,7 +553,8 @@ class AWRS(TokenSampler):
         # `lw[tok_idx]` untouched even when pruning is on. When `w == -inf`
         # (rejection failure) the result stays -inf.
         tok_idx = self.potential.lookup[tok]
-        log_ratio = target_logws.weights[tok_idx].item() - lw[tok_idx]
+        tw = torch.as_tensor(target_logws.weights)
+        log_ratio = float(tw[tok_idx]) - float(lw[tok_idx])
         return tok, w + logZ + log_ratio, np.nan
 
 
@@ -546,55 +570,57 @@ class AWRS(TokenSampler):
 GEOMETRIC_THRESHOLD = np.log(2 / 3)
 
 
-class _TopK:
-    """Descending-key order as a lazy top-K ``argpartition`` instead of a full
-    ``argsort``. The AWRS walk almost always stops within the first few, so sorting
-    the whole ~50k vocab is wasted; this materializes only the top ``k`` and falls
-    back once to a full sort if a walk goes past it. Indexable/``len``-able like
-    ``np.argsort(-keys)``; for distinct keys it yields the identical sequence."""
+class _AwrsOrder:
+    """Descending Gumbel-perturbed order over a device ``logps``, materialized lazily via
+    ``torch.topk`` (on a GPU tensor only the walked top-k slice crosses to the CPU checks; a
+    deep walk triggers one full sort). ``order[i]`` -> ``(vocab_id, logp)`` of the i-th best
+    (``logp == -inf`` for a pruned token, the Gumbel noise being finite). ``reject(vid)``
+    scatters -inf into the logps for geometric's next-round re-perturbation."""
 
-    __slots__ = ("_keys", "_n", "_order", "_full")
+    __slots__ = ("_logps", "_keys", "_n", "_ids", "_lvals", "_k")
 
-    def __init__(self, keys, k=256):
-        # Negate only the k-element top slice; sort that small slice descending.
-        self._keys = keys
-        self._n = len(keys)
-        k = min(k, self._n)
-        top = np.argpartition(keys, self._n - k)[self._n - k :]
-        self._order = top[np.argsort(-keys[top])]
-        self._full = self._n <= k
+    def __init__(self, logps, make_keys, k=256):
+        self._logps = logps  # device [V]; geometric mutates it via reject()
+        self._keys = make_keys(logps)  # device [V]; advances AWRS's per-instance counter
+        self._n = logps.shape[-1]
+        self._materialize(min(k, self._n))
+
+    def _materialize(self, k):
+        _, idx = torch.topk(self._keys, k)  # descending order; the key VALUES aren't needed
+        self._ids = idx.cpu().numpy()
+        self._lvals = self._logps[idx].cpu().numpy()  # logps at materialization
+        self._k = k
 
     def __len__(self):
         return self._n
 
-    def _ensure_full(self):
-        if not self._full:  # rare deep walk: one full sort
-            self._order = np.argsort(-self._keys)
-            self._full = True
-
     def __getitem__(self, i):
         if i < 0 or i >= self._n:
             raise IndexError(i)
-        if i >= len(self._order):  # walked past the top-k -> one full-sort fallback
-            self._ensure_full()
-        return self._order[i]
+        if i >= self._k:  # walked past the materialized top-k -> one full sort
+            self._materialize(self._n)
+        return int(self._ids[i]), float(self._lvals[i])
+
+    def reject(self, vid):
+        self._logps[vid] = float("-inf")  # device scatter; next round re-reads it
 
 
-async def improper_sample(*, logps, toks, accept, rng, max_rejects):
+async def improper_sample(*, logps, toks, accept, make_keys, max_rejects):
     """Single rejection loop returning the first accepted value, no proper weight.
-    The walk stops at the first ``logps == -inf`` (pruned token)."""
-    keys = logps - np.log(-np.log(rng.random((len(logps),))))
-    order = _TopK(keys)
-    for count, item in enumerate(order):
-        if count >= max_rejects or keys[item] == -np.inf:
+    The walk stops at the first ``key == -inf`` (pruned token)."""
+    order = _AwrsOrder(logps, make_keys)
+    tok = None
+    for count in range(len(order)):
+        vid, lp = order[count]
+        if count >= max_rejects or lp == -np.inf:
             break
-        tok = toks[item]
+        tok = toks[vid]
         if await accept(tok):
             return tok, 0.0, np.nan
     return tok, -float("inf"), np.nan
 
 
-async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
+async def recursive_awrs(*, logps, toks, accept, make_keys, max_rejects):
     """Implements Recursive AWRS.
 
     This uses the observation that
@@ -616,22 +642,21 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     # cases are all ones where the remaining weight is very bad.
     error_tolerance = 10e-6
 
-    keys = logps - np.log(-np.log(rng.random((len(logps),))))
-    order = _TopK(keys)
-    for index_into_list, item in enumerate(order):
+    order = _AwrsOrder(logps, make_keys)
+    n = len(order)
+    for index_into_list in range(n):
+        vid, lp = order[index_into_list]
         assert n_accepts == 0
-        tok = toks[item]
-        last = (
-            index_into_list + 1 == len(order)
-            or keys[order[index_into_list + 1]] == -np.inf
-        )
+        tok = toks[vid]
+        nxt = order[index_into_list + 1] if index_into_list + 1 < n else None
+        last = nxt is None or nxt[1] == -np.inf  # nxt is (vid, logp)
 
-        log_q = logps[item] - np.log1p(-rejected_mass)
+        log_q = lp - np.log1p(-rejected_mass)
 
         # The last check is because in the case where there is a single
         # accepted token with very low log probability, numerical stability
         # issues make it very hard to get this calculation right.
-        assert not last or log_q >= -error_tolerance or logps[item] < -32
+        assert not last or log_q >= -error_tolerance or lp < -32
         assert log_q <= error_tolerance
         assert log_multiplier <= error_tolerance
         assert rejected_mass <= 1
@@ -642,14 +667,14 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
         log_q = min(log_q, 0)
         log_multiplier = min(log_multiplier, 0)
 
-        if await accept(toks[item]):
+        if await accept(tok):
             n_accepts += 1
             if n_rejects == max_rejects - 1:
                 return tok, log_multiplier, np.nan
             elif last:
                 final_estimator = 0.0
             else:
-                next_token = toks[order[index_into_list + 1]]
+                next_token = toks[nxt[0]]
                 if await accept(next_token):
                     final_estimator = 0
                 else:
@@ -661,7 +686,7 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
             return tok, float("-inf"), np.nan
         else:
             n_rejects += 1
-            rejected_mass += np.exp(logps[item])
+            rejected_mass += np.exp(lp)
             if rejected_mass >= 1 - error_tolerance:
                 # We've explored all the probability mass and still found no
                 # accepted token.
@@ -674,7 +699,7 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     raise AssertionError("Unreachable")
 
 
-async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
+async def geometric_awrs(*, logps, toks, accept, make_keys, rng, max_rejects, max_accepts):
     """Implements Geometric AWRS.
 
     This simulates a single run of sampling with replacement from a sampling
@@ -693,13 +718,15 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
     for _ in range(max_accepts):
         if n_rejects >= max_rejects:
             break
-        cur_keys = logps - np.log(-np.log(rng.random((len(logps),))))
-        cur_order = _TopK(cur_keys)
-        for item in cur_order:
-            if cur_keys[item] == -np.inf:
+        # Re-perturb the (mutated) device logps and take the top-k on device; rejected
+        # tokens from prior rounds are -inf (scattered by reject()) so they fall out.
+        cur_order = _AwrsOrder(logps, make_keys)
+        for pos in range(len(cur_order)):
+            vid, lp = cur_order[pos]
+            if lp == -np.inf:
                 break
 
-            tok = toks[item]
+            tok = toks[vid]
 
             if rejected_mass >= 1:
                 # If rejected mass is >= 1 but we have a non-zero probability
@@ -733,8 +760,8 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
                 if rejected_token is None:
                     rejected_token = tok
                 n_rejects += 1
-                rejected_mass += np.exp(logps[item])
-                logps[item] = -float("inf")
+                rejected_mass += np.exp(lp)
+                cur_order.reject(vid)
 
     if n_accepts == 0:
         assert rejected_token is not None

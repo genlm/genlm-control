@@ -440,6 +440,21 @@ def set_draw_seed(s):
     _DRAW_SEED = int(s) & _TF_MASK
 
 
+def get_draw_seed():
+    """Current base seed for the counter-based streams (set by ``set_draw_seed``/seed_all).
+    AWRS uses it as the default seed for its per-instance stream when none is given."""
+    return _DRAW_SEED
+
+
+def awrs_gumbel_keys(logps, seed, step):
+    """``logps + Gumbel`` over the threefry stream keyed by ``(seed, step)`` -- AWRS's OWN
+    per-instance (seed, counter), so it is driver-independent (the original smc_standard sets
+    no ``draw_key``) yet device-identical + on-device. Returns keys on ``logps``'s device."""
+    u = threefry_uniform(logps.shape[-1], int(seed) & _TF_MASK, 0, int(step) & _TF_MASK,
+                         logps.device, logps.dtype)
+    return logps + (-torch.log(-torch.log(u)))
+
+
 def draw_ordinal(context):
     """Flattened leaf count of a (possibly unit-nested) particle context -- the base draw
     ordinal. Token grain: ``len(context)``; unit grain: total subunits drawn. Counts
