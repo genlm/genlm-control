@@ -1,4 +1,3 @@
-import contextlib
 import contextvars
 import weakref
 import torch
@@ -249,11 +248,7 @@ class PromptedLLM(Potential):
         self.model = llm
         self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
-        # LoRA adapter this view forwards under (None = base model). The burst tags each
-        # substream with it; the slow lane forwards through ``_fwd`` (an adapter-bound
-        # view of the engine), so both lanes apply the adapter consistently.
-        self.lora_name = lora_name
-        self._fwd = self.model.lora_view(lora_name)
+        self.lora_name = lora_name  # property setter derives self._fwd
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -318,6 +313,20 @@ class PromptedLLM(Potential):
             "Cannot reset eos_byte_strings after initialization. "
             "Use spawn_new_eos(new_eos_byte_strings) instead."
         )
+
+    @property
+    def lora_name(self):
+        """LoRA adapter this view forwards under (``None`` = base model). The burst
+        tags each substream with it; the slow lane forwards through ``_fwd`` (an
+        adapter-bound view of the engine), so both lanes apply the adapter
+        consistently. Assigning rebinds the forward handle — rebind between SMC
+        runs, never mid-burst (the burst snapshots adapter names at start)."""
+        return self._lora_name
+
+    @lora_name.setter
+    def lora_name(self, lora_name):
+        self._lora_name = lora_name
+        self._fwd = self.model.lora_view(lora_name)
 
     @property
     def prompt_ids(self):

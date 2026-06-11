@@ -62,6 +62,9 @@ class _Burst:
     def __init__(self, d, live):
         self.d = d
         self.views = d.views
+        # Adapter names snapshotted at burst start (like view_prefixes): a rebind
+        # of a view's lora_name mid-run must not split this burst across adapters.
+        self.view_loras = [v.lora_name for v in d.views]
         self.abort_rows = set()
         self.add_rows = []
         # K substreams per particle: handle -> (row, view_idx); row -> [handle/view].
@@ -70,7 +73,7 @@ class _Burst:
         self.next_handle = 0
         for p in live:
             self.row_handles[p._i] = [
-                self._add_substream(p, vi, view) for vi, view in enumerate(self.views)
+                self._add_substream(p, vi) for vi in range(len(self.views))
             ]
         self.scratch = {}
         self.exit_reason = _EXIT_TERMINATED
@@ -95,13 +98,13 @@ class _Burst:
             _emit(item)
         return ids
 
-    def _add_substream(self, p, vi, view):
+    def _add_substream(self, p, vi):
         """Mint+register a handle for one (particle, view) substream, queue its engine add.
         Sole add path (initial population + mid-burst re-add)."""
         h = self.next_handle
         self.next_handle += 1
         self.handle_rv[h] = (p._i, vi)
-        self.add_rows.append((h, self.context_ids(p, vi), view.lora_name))
+        self.add_rows.append((h, self.context_ids(p, vi), self.view_loras[vi]))
         return h
 
     def drain_aborts(self):
@@ -249,7 +252,7 @@ class _Burst:
                 if p.done:
                     continue
                 self.row_handles[row] = [  # re-add all K substreams
-                    self._add_substream(p, vi, view) for vi, view in enumerate(self.views)
+                    self._add_substream(p, vi) for vi in range(len(self.views))
                 ]
         return bool(groups)
 
