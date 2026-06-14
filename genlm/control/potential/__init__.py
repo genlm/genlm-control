@@ -15,6 +15,7 @@ from .built_in import (
     BoolFSA,
     JsonSchema,
     CanonicalTokenization,
+    PythonParser,
 )
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "WFSA",
     "BoolFSA",
     "CanonicalTokenization",
+    "PythonParser",
     "AutoBatchedPotential",
     "MultiProcPotential",
     "Coerced",

@@ -4,6 +4,7 @@ from .wfsa import WFSA, BoolFSA
 from .json import JsonSchema
 from .canonical import CanonicalTokenization
 from .bytellm import ByteLLM
+from .python_parser import PythonParser
 
 __all__ = [
     "PromptedLLM",
@@ -14,4 +15,5 @@ __all__ = [
     "WFSA",
     "BoolFSA",
     "CanonicalTokenization",
+    "PythonParser",
 ]
