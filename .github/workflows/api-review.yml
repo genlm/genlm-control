@@ -36,6 +36,7 @@ jobs:
         if: ${{ env.ANTHROPIC_API_KEY != '' }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}  # use the built-in token (no Claude GitHub App needed)
           prompt: |
             Review this PR for changes to the PUBLIC API surface of the Python package
             `genlm.control`. You are on the runner with the checked-out repo.
