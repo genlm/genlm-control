@@ -1,0 +1,45 @@
+name: API surface check
+
+# Layer 1 — deterministic public-API-surface diff. Flags signature-level breaks
+# (removed/renamed symbols, changed/removed params) vs the PR's base branch using
+# griffe (already a transitive docs dependency). Always succeeds (stays green);
+# breaking changes surface as a PR warning annotation + job summary, never blocking.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  griffe-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # griffe needs history to extract the base ref
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.11.5
+      - name: Install griffe
+        run: pip install griffe
+      - name: Check public API surface vs ${{ github.base_ref }}
+        # Report-only: the `|| true` guarantees the step (and the check) stay green
+        # even when griffe finds breaks. The signal is the warning annotation + summary.
+        run: |
+          git fetch -q origin "${{ github.base_ref }}"
+          echo "## Public API surface vs \`${{ github.base_ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          python -m griffe check genlm.control -s . -a "origin/${{ github.base_ref }}" > /tmp/griffe.txt 2>&1 || true
+          if [ -s /tmp/griffe.txt ]; then
+            {
+              echo "Breaking public-API changes detected — confirm they are intentional and that"
+              echo "downstream consumers (genlm-latent, smc_learning) are migrated:"
+              echo '```'
+              cat /tmp/griffe.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Breaking public-API changes detected (see job summary)."
+          else
+            echo "No breaking public-API changes detected. ✅" >> "$GITHUB_STEP_SUMMARY"
+          fi
