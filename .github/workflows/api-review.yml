@@ -56,11 +56,11 @@ jobs:
                - safe: additive — new optional param with a default, new method/attribute.
                Name the likely-affected downstream consumers: genlm-latent, smc_learning.
                Omit a consumer if not plausibly affected.
-            4. Post ONE top-level PR comment via `gh pr comment` — a short markdown table
-               (severity | symbol | change | affected), led by a one-line count
-               (N breaking / N behavioral / N safe). If there are no public-API changes,
-               post a one-line "No public-API changes." End with a note that this is advisory.
-               Only post the GitHub comment — do not submit review text as chat messages.
+            4. If there are NO public-API changes, do not post anything — finish without
+               commenting. Otherwise post ONE top-level PR comment via `gh pr comment`: a short
+               markdown table (severity | symbol | change | affected), led by a one-line count
+               (N breaking / N behavioral / N safe). No footer or disclaimer. Only post the
+               GitHub comment — do not submit review text as chat messages.
           claude_args: |
             --model claude-opus-4-8
             --allowedTools "Bash(git fetch:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(python -m griffe:*)"
