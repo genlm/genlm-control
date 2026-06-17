@@ -749,7 +749,10 @@ async def geometric_awrs(*, logps, toks, accept, make_keys, rng, max_rejects, ma
     # 1 if the first sample was accepted and 0 if it was rejected
     # to the sufficient statistic (n_accepts, n_rejects). Some
     # straightforward sequence counting gives you this estimator.
-    estimator = min(max_accepts - 1, n_accepts) / (n_accepts + n_rejects - 1)
+    # denom == 0 means a single accepted draw with no rejects (peaked target,
+    # accepted immediately); the acceptance-prob estimate is 1 -- avoid 0/0.
+    denom = n_accepts + n_rejects - 1
+    estimator = min(max_accepts - 1, n_accepts) / denom if denom > 0 else 1.0
 
     assert estimator > 0 or result is None
 

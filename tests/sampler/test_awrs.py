@@ -1012,3 +1012,21 @@ async def test_geometric_awrs_validity(logps, accept, rng, max_rejects, max_acce
         assert logp > -np.inf
     else:
         assert logp == -np.inf
+
+
+@pytest.mark.asyncio
+async def test_geometric_awrs_max_accepts_one_no_zerodiv():
+    """Regression: max_accepts=1 gives a single accepted draw (n_accepts+n_rejects==1),
+    so the estimator denominator is 0. Must not ZeroDivisionError; weight is finite."""
+    logps = np.array([0.0, -10.0])  # peaked on token 0
+    tok, logp, _ = await geometric_awrs(
+        logps=torch.as_tensor(logps),
+        toks=np.arange(len(logps)),
+        accept=always_accept,
+        make_keys=_keys_from(np.random.default_rng(0)),
+        rng=np.random.default_rng(0),
+        max_rejects=2,
+        max_accepts=1,
+    )
+    assert tok == 0
+    assert logp == 0.0  # estimator == 1
