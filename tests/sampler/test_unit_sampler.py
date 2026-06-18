@@ -264,16 +264,9 @@ async def test_multi_token_unit_sampler_type_error():
 
 @pytest.mark.asyncio
 async def test_multi_token_logw_eos_flattens_nested_context():
-    """Regression for the max_tokens boundary path (sequence.py).
-
-    SequenceModel forces EOS at the boundary via ``unit_sampler.logw_eos(token_ctx)``,
-    and for multi-token units ``token_ctx`` is nested (``[[...], [...], ...]``).
-    ``logw_eos`` must flatten it before consulting the target; otherwise a
-    context-consuming target raises (``WeightedSet`` keys on ``tuple(context)``,
-    so a nested context is an unhashable tuple-of-lists). The override must also
-    return the same value as the target's unnormalized log-weight on EOS at the
-    flattened context.
-    """
+    """ We check MultiTokenUnitSampler computes the forced-EOS importance weight
+    correctly: logw_eos flattens its nested context and returns
+    logw_next(flattened)[eos]. """
     p = WeightedSet(["ab", "a"], [1.0, 2.0])
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=DirectTokenSampler(p),

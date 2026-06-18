@@ -236,14 +236,13 @@ async def test_set_token_sampler(params):
         await sampler.cleanup()
 
 
+# Unit-level logw_eos checks; end-to-end accumulation is covered in test_seq_sampler.py.
 @pytest.mark.asyncio
 @settings(deadline=None)
 @given(iter_item_params())
 async def test_set_token_sampler_logw_eos(params):
-    """SetTokenSampler.logw_eos uses the ``complete - prefix`` identity to avoid
-    materializing the full ``logw_next`` vector. Check it matches the target's
-    unnormalized log-weight on EOS, which is what SequenceModel scores to force
-    EOS at the max_tokens boundary."""
+    """ We check SetTokenSampler computes the forced-EOS importance weight
+    correctly: its cheap logw_eos(context) equals logw_next(context)[eos]. """
     iter_vocab, iter_next_token_ws, item_vocab, item_next_token_ws, context = params
 
     mock_iter = MockPotential(iter_vocab, np.log(iter_next_token_ws))
@@ -266,10 +265,9 @@ async def test_set_token_sampler_logw_eos(params):
 
 @pytest.mark.asyncio
 async def test_awrs_logw_eos():
-    """AWRS inherits the base logw_eos against its ``potential * condition``
-    target. Check it returns that product's unnormalized log-weight on EOS, the
-    quantity SequenceModel scores to force EOS at the max_tokens boundary. The
-    condition allows EOS (0 in log-space) so the boundary weight is finite."""
+    """ We check AWRS computes the forced-EOS importance weight correctly:
+    logw_eos(context) equals logw_next(context)[eos] of its potential*condition
+    target. """
     vocab = [bytes([i]) for i in range(3)]
     potential = MockPotential(vocab, np.log([0.3, 0.3, 0.3, 0.1]))
     condition = MockPotential(vocab, [0.0, float("-inf"), 0.0, 0.0])  # bans vocab[1]

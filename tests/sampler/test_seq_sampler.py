@@ -152,14 +152,15 @@ async def test_smc_weights(params):
 
 @pytest.mark.asyncio
 async def test_max_tokens_boundary_forces_eos():
-    """Every returned sequence ends with EOS, and the boundary weight is the
-    target's unnormalized log-weight on EOS at the boundary context."""
-    seqs = ["a", "ab"]  # prefix-overlap: 'a' is both complete and a prefix
-    p = WeightedSet(seqs, [1.0, 2.0])
+    """ We check each particle's importance weight is correct for both
+    termination modes: natural EOS (L < max_tokens) and EOS forced at the
+    boundary (L == max_tokens). """
+    seqs = ["", "a", "ab"]  # "" lets EOS fire at the start; "a" hits the boundary
+    p = WeightedSet(seqs, [1.0, 2.0, 3.0])
     unit_sampler = DirectTokenSampler(p)
     sampler = SMC(unit_sampler)
 
-    out = await sampler(n_particles=8, ess_threshold=0, max_tokens=2)
+    out = await sampler(n_particles=64, ess_threshold=0, max_tokens=2)
     logeps = await p.prefix([])
 
     for seq, logw in out:
@@ -183,10 +184,8 @@ async def test_max_tokens_boundary_forces_eos():
 
 @pytest.mark.asyncio
 async def test_max_tokens_one_forces_eos():
-    """Edge case max_tokens=1: the first step is already the boundary, so every
-    particle is forced to EOS on the empty context. The only sequence that fits
-    ``|y| <= 1`` is the EOS-only sequence, weighted by the target's mass on the
-    empty completion."""
+    """ We check that if we hit the max tokens, the importance weight
+    of the EOS forced particle is correct. """
     seqs = ["", "a", "ab"]  # "" gives the empty completion positive mass
     weights = [1.0, 2.0, 3.0]
     p = WeightedSet(seqs, weights)
