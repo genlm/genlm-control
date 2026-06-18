@@ -4,7 +4,12 @@ import tempfile
 import numpy as np
 from arsenal.maths import logsumexp
 
-from genlm.control.sampler import DirectTokenSampler, SetTokenSampler, EagerSetSampler
+from genlm.control.sampler import (
+    DirectTokenSampler,
+    SetTokenSampler,
+    EagerSetSampler,
+    AWRS,
+)
 from conftest import (
     mock_params,
     iter_item_params,
@@ -229,6 +234,51 @@ async def test_set_token_sampler(params):
         have.assert_equal(want, atol=1e-5, rtol=1e-5)
     finally:
         await sampler.cleanup()
+
+
+@pytest.mark.asyncio
+@settings(deadline=None)
+@given(iter_item_params())
+async def test_set_token_sampler_logw_eos(params):
+    """SetTokenSampler.logw_eos uses the ``complete - prefix`` identity to avoid
+    materializing the full ``logw_next`` vector. Check it matches the target's
+    unnormalized log-weight on EOS, which is what SequenceModel scores to force
+    EOS at the max_tokens boundary."""
+    iter_vocab, iter_next_token_ws, item_vocab, item_next_token_ws, context = params
+
+    mock_iter = MockPotential(iter_vocab, np.log(iter_next_token_ws))
+    mock_item = MockPotential(item_vocab, np.log(item_next_token_ws))
+
+    sampler = SetTokenSampler(
+        set_sampler=EagerSetSampler(
+            iter_potential=mock_iter,
+            item_potential=mock_item,
+        )
+    )
+
+    try:
+        got = await sampler.logw_eos(context)
+        want = (await sampler.target.logw_next(context))[sampler.target.eos]
+        assert np.isclose(got, want, atol=1e-5, rtol=1e-5)
+    finally:
+        await sampler.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_awrs_logw_eos():
+    """AWRS inherits the base logw_eos against its ``potential * condition``
+    target. Check it returns that product's unnormalized log-weight on EOS, the
+    quantity SequenceModel scores to force EOS at the max_tokens boundary. The
+    condition allows EOS (0 in log-space) so the boundary weight is finite."""
+    vocab = [bytes([i]) for i in range(3)]
+    potential = MockPotential(vocab, np.log([0.3, 0.3, 0.3, 0.1]))
+    condition = MockPotential(vocab, [0.0, float("-inf"), 0.0, 0.0])  # bans vocab[1]
+    sampler = AWRS(potential, condition, seed=0)
+
+    context = [vocab[0], vocab[2]]
+    got = await sampler.logw_eos(context)
+    want = (await sampler.target.logw_next(context))[sampler.target.eos]
+    assert np.isclose(got, want, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.asyncio

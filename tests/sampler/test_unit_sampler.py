@@ -13,7 +13,7 @@ from genlm.control.sampler.unit import flatten_units
 from genlm.control.sampler import CFGBoundary
 from genlm.control.sampler.sequence import SMC
 from genlm.control.constant import EOS
-from conftest import MockPotential
+from conftest import MockPotential, WeightedSet
 
 
 @pytest.mark.asyncio
@@ -260,6 +260,30 @@ async def test_multi_token_unit_sampler_type_error():
             subunit_sampler="not a sampler",
             boundary_predicate=TokenSetBoundary({b" "}),
         )
+
+
+@pytest.mark.asyncio
+async def test_multi_token_logw_eos_flattens_nested_context():
+    """Regression for the max_tokens boundary path (sequence.py).
+
+    SequenceModel forces EOS at the boundary via ``unit_sampler.logw_eos(token_ctx)``,
+    and for multi-token units ``token_ctx`` is nested (``[[...], [...], ...]``).
+    ``logw_eos`` must flatten it before consulting the target; otherwise a
+    context-consuming target raises (``WeightedSet`` keys on ``tuple(context)``,
+    so a nested context is an unhashable tuple-of-lists). The override must also
+    return the same value as the target's unnormalized log-weight on EOS at the
+    flattened context.
+    """
+    p = WeightedSet(["ab", "a"], [1.0, 2.0])
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=DirectTokenSampler(p),
+        boundary_predicate=FixedLengthBoundary(1),
+        max_subunits_per_unit=10,
+    )
+    nested = [["a"], ["b"]]  # token_ctx after two single-token units
+    got = await unit_sampler.logw_eos(nested)
+    want = (await p.logw_next(["a", "b"]))[p.eos]
+    assert np.isclose(got, want)
 
 
 @pytest.mark.asyncio

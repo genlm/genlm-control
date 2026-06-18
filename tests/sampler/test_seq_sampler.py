@@ -182,6 +182,29 @@ async def test_max_tokens_boundary_forces_eos():
 
 
 @pytest.mark.asyncio
+async def test_max_tokens_one_forces_eos():
+    """Edge case max_tokens=1: the first step is already the boundary, so every
+    particle is forced to EOS on the empty context. The only sequence that fits
+    ``|y| <= 1`` is the EOS-only sequence, weighted by the target's mass on the
+    empty completion."""
+    seqs = ["", "a", "ab"]  # "" gives the empty completion positive mass
+    weights = [1.0, 2.0, 3.0]
+    p = WeightedSet(seqs, weights)
+    unit_sampler = DirectTokenSampler(p)
+    sampler = SMC(unit_sampler)
+
+    out = await sampler(n_particles=8, ess_threshold=0, max_tokens=1)
+
+    logeps = await p.prefix([])
+    expected = logeps + (await p.logw_next([]))[p.eos]
+    for seq, logw in out:
+        assert seq == [p.eos]
+        assert np.isclose(logw, expected)
+    # Only the empty completion fits |y| <= 1, so the partition is its weight.
+    assert np.isclose(out.log_ml, np.log(weights[0]))
+
+
+@pytest.mark.asyncio
 async def test_sequence_model_invalid_start_weight():
     class MockPotential(Potential):
         async def prefix(self, context):

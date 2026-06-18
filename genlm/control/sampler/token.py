@@ -38,8 +38,8 @@ class TokenSampler(SubModel):
 
     async def logw_eos(self, context):
         """
-        Returns teh weight of EOS, used to forse termination in sequence.py.
-        
+        Returns the weight of EOS, used to force termination in sequence.py.
+
         Subclasses may override with cheaper, sampler-specific computations
         that avoid materializing the full ``logw_next`` vector.
         """
@@ -47,7 +47,7 @@ class TokenSampler(SubModel):
         return logws[self.target.eos]
 
     async def forward(self):
-        parent = self.parent  # For some reason, need to hold onto this reference.
+        parent = self.parent
         token, logw, logp = await self.sample(parent.token_ctx)
         parent.score(logw)
         parent.logp += logp
