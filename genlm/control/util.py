@@ -386,16 +386,25 @@ def threefry_2x32(c0, c1, k0, k1):
     return x0
 
 
-def threefry_uniform(n, seed, slot, step, device, dtype):
-    """``n`` device-independent uniforms in (0,1) keyed by (seed, slot, step). ``slot``/
-    ``step`` may be scalars (-> ``[n]``) or ``[N]`` tensors (-> ``[N, n]``, one keyed row each)."""
+def threefry_uniform(n, seed, slot, step, device):
+    """``n`` device-independent uniforms keyed by (seed, slot, step), on the SAME 24-bit
+    float32 grid as ``torch.rand`` (``[0, 1-2^-24]``, never exactly 1.0).
+
+    Matching ``torch.rand``'s quantization is deliberate, not incidental. The Gumbel is a
+    deterministic function of ``u``, so the picker is only identical to ``gumbel_max`` (the
+    per-token reference, which draws ``torch.rand``) if ``u`` has the same distribution. A
+    "more precise" full-precision ``u`` reaches closer to 1, giving a fuller Gumbel tail and a
+    *different* (less greedy) sampler -- which diverges from the reference. Capping at
+    ``1-2^-24`` also means ``-log(-log(u))`` is never ``+inf`` (no force-picked garbage token).
+    Counter-based ``->`` bit-identical CPU/CUDA (int shift + exact power-of-two divide).
+    ``slot``/``step`` scalar (-> ``[n]``) or ``[N]`` (-> ``[N, n]``)."""
     i = torch.arange(n, device=device, dtype=torch.int64)  # counter word 0 (index)
     slot = torch.as_tensor(slot, device=device, dtype=torch.int64)
     step = torch.as_tensor(step, device=device, dtype=torch.int64)
     if slot.ndim:  # batched: [N] keys -> [N, 1] against [n] indices
         i, slot, step = i[None, :], slot[:, None], step[:, None]
     x = threefry_2x32(i & _TF_MASK, step & _TF_MASK, seed & _TF_MASK, slot & _TF_MASK)
-    return ((x.double() + 0.5) / 4294967296.0).to(dtype)  # (0,1), bit-identical CPU/CUDA
+    return (x >> 8).to(torch.float32) / 16777216.0  # 24-bit grid, like torch.rand(f32)
 
 
 def threefry_gumbel(logps):
@@ -405,7 +414,7 @@ def threefry_gumbel(logps):
     at once, byte-identical to the per-row scalar draws (noise is keyed, not streamed)."""
     key = _DRAW_KEY.get()
     if key is None:
-        u = torch.rand_like(logps)
+        u = torch.rand_like(logps, dtype=torch.float64)
     else:
         slot, ctr = key
         if torch.is_tensor(slot):  # batched: one draw per row, ordinals fixed
@@ -413,8 +422,8 @@ def threefry_gumbel(logps):
         else:  # scalar: advance the ordinal in this scope
             step = ctr[0]
             ctr[0] = step + 1
-        u = threefry_uniform(logps.shape[-1], _DRAW_SEED, slot, step, logps.device, logps.dtype)
-    g = -torch.log(-torch.log(u))
+        u = threefry_uniform(logps.shape[-1], _DRAW_SEED, slot, step, logps.device)
+    g = (-torch.log(-torch.log(u))).to(logps.dtype)  # finite Gumbel, then to model dtype
     return (logps + g).argmax(dim=-1)
 
 
@@ -433,8 +442,8 @@ def awrs_gumbel_keys(logps, seed, step):
     """``logps + Gumbel`` over the threefry stream keyed by ``(seed, step)`` -- AWRS's OWN
     per-instance (seed, counter), so it is driver-independent yet device-identical."""
     u = threefry_uniform(logps.shape[-1], int(seed) & _TF_MASK, 0, int(step) & _TF_MASK,
-                         logps.device, logps.dtype)
-    return logps + (-torch.log(-torch.log(u)))
+                         logps.device)
+    return logps + (-torch.log(-torch.log(u))).to(logps.dtype)
 
 
 def draw_ordinal(context):
