@@ -448,7 +448,13 @@ def test_multiview_proposal_burst_vs_steploop(llm):
 
     assert can_burst(_controller(make, 8, 0.0, 10))  # K=2 multi-view rides the fast lane
 
-    seeds = (1234, 7, 99, 2024, 555, 31)
+    # The K=2 multiview log_ml estimator is high-variance: a flat proposal ("Once upon a")
+    # makes the burst's warm-KV draws diverge from StepLoop on many tokens, and N=8 marginal
+    # likelihood swings hard per seed (range ~+-10). The burst is unbiased over the seeds
+    # (mean ~0), but a 6-seed mean is brittle -- a tiny draw change tips it past 2.5*sem.
+    # Average over enough seeds that the unbiasedness check is robust (and more sensitive to
+    # a real bias, not less).
+    seeds = tuple(range(24))
     diffs, n_bursts = [], 0
     for seed in seeds:
         slow = _run_steploop(make, 8, 0.0, 10, seed)
