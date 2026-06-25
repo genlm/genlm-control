@@ -54,6 +54,12 @@ When test dependencies are installed, the test suite can be run via:
 pytest tests
 ```
 
+## Public API changes
+
+`griffe check` runs per PR, diffing the public surface vs `main`. It will report breaking API changes as a warning + sticky comments. However, it only catches signature-level breaks, not behavioral changes under an unchanged signature (e.g., a deprecation tombstone that accepts and raises).
+
+To surface those, put the change in the signature: annotate a removed method `-> NoReturn`; change the return annotation or a default when the contract changes.
+
 ## Documentation
 
 Documentation is generated using [mkdocs](https://www.mkdocs.org/) and hosted on GitHub Pages. To build the documentation, run:
@@ -110,9 +116,3 @@ To publish a new version of the library on PyPI:
 
 This triggers the Release workflow. Once it completes, the new version will appear at:
 https://pypi.org/project/genlm-control/#history.
-
-## Public API changes
-
-`griffe check` runs per PR, diffing the public surface vs `main`. It will report breaking API changes as a warning + sticky comments. However, it only catches signature-level breaks, not behavioral changes under an unchanged signature (e.g., a deprecation tombstone that accepts and raises).
-
-To surface those, put the change in the signature: annotate a removed method `-> NoReturn`; change the return annotation or a default when the contract changes.
