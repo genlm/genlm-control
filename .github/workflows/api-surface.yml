@@ -1,0 +1,69 @@
+name: API surface check
+
+# Deterministic public-API-surface diff vs the PR's base branch using griffe (already a
+# transitive docs dependency). Flags signature-level breaks (removed/renamed symbols,
+# changed/removed params, changed return/attribute types). Report-only — never blocks:
+# breaks surface as a PR warning annotation, a job summary, and a sticky PR comment.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # post/update/delete the sticky comment
+
+jobs:
+  griffe-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # griffe needs history to extract the base ref
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.11.5
+      - name: Install griffe
+        run: pip install griffe
+      - name: Check public API surface vs ${{ github.base_ref }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MARKER: "<!-- api-surface-griffe -->"
+        run: |
+          git fetch -q origin "${{ github.base_ref }}"
+          echo "## Public API surface vs \`${{ github.base_ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          # Report-only: `|| true` keeps the step (and check) green even on breaks.
+          python -m griffe check genlm.control -s . -a "origin/${{ github.base_ref }}" > /tmp/griffe.txt 2>&1 || true
+
+          cid=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.body|contains(\"$MARKER\")) | .id" | head -1)
+
+          if [ -s /tmp/griffe.txt ]; then
+            {
+              echo "Breaking public-API changes detected — confirm intentional and that"
+              echo "downstream consumers (genlm-latent, smc_learning) are migrated:"
+              echo '```'
+              cat /tmp/griffe.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Breaking public-API changes detected (see job summary / PR comment)."
+            {
+              echo "$MARKER"
+              echo "## ⚠️ Public API surface changed vs \`${{ github.base_ref }}\`"
+              echo "Confirm intentional, and that downstream consumers (genlm-latent, smc_learning) are migrated."
+              echo '```'
+              cat /tmp/griffe.txt
+              echo '```'
+            } > /tmp/comment.md
+            if [ -n "$cid" ]; then
+              gh api --method PATCH "repos/$REPO/issues/comments/$cid" -F body=@/tmp/comment.md >/dev/null
+            else
+              gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@/tmp/comment.md >/dev/null
+            fi
+          else
+            echo "No breaking public-API changes detected. ✅" >> "$GITHUB_STEP_SUMMARY"
+            # Clean now — drop any stale comment from an earlier push.
+            [ -n "$cid" ] && gh api --method DELETE "repos/$REPO/issues/comments/$cid" >/dev/null || true
+          fi
