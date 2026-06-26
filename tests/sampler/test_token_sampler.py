@@ -4,7 +4,12 @@ import tempfile
 import numpy as np
 from arsenal.maths import logsumexp
 
-from genlm.control.sampler import DirectTokenSampler, SetTokenSampler, EagerSetSampler
+from genlm.control.sampler import (
+    DirectTokenSampler,
+    SetTokenSampler,
+    EagerSetSampler,
+    AWRS,
+)
 from conftest import (
     mock_params,
     iter_item_params,
@@ -231,6 +236,49 @@ async def test_set_token_sampler(params):
         await sampler.cleanup()
 
 
+# Unit-level logw_eos checks; end-to-end accumulation is covered in test_seq_sampler.py.
+@pytest.mark.asyncio
+@settings(deadline=None)
+@given(iter_item_params())
+async def test_set_token_sampler_logw_eos(params):
+    """ We check SetTokenSampler computes the forced-EOS importance weight
+    correctly: its cheap logw_eos(context) equals logw_next(context)[eos]. """
+    iter_vocab, iter_next_token_ws, item_vocab, item_next_token_ws, context = params
+
+    mock_iter = MockPotential(iter_vocab, np.log(iter_next_token_ws))
+    mock_item = MockPotential(item_vocab, np.log(item_next_token_ws))
+
+    sampler = SetTokenSampler(
+        set_sampler=EagerSetSampler(
+            iter_potential=mock_iter,
+            item_potential=mock_item,
+        )
+    )
+
+    try:
+        got = await sampler.logw_eos(context)
+        want = (await sampler.target.logw_next(context))[sampler.target.eos]
+        assert np.isclose(got, want, atol=1e-5, rtol=1e-5)
+    finally:
+        await sampler.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_awrs_logw_eos():
+    """ We check AWRS computes the forced-EOS importance weight correctly:
+    logw_eos(context) equals logw_next(context)[eos] of its potential*condition
+    target. """
+    vocab = [bytes([i]) for i in range(3)]
+    potential = MockPotential(vocab, np.log([0.3, 0.3, 0.3, 0.1]))
+    condition = MockPotential(vocab, [0.0, float("-inf"), 0.0, 0.0])  # bans vocab[1]
+    sampler = AWRS(potential, condition, seed=0)
+
+    context = [vocab[0], vocab[2]]
+    got = await sampler.logw_eos(context)
+    want = (await sampler.target.logw_next(context))[sampler.target.eos]
+    assert np.isclose(got, want, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.asyncio
 async def test_direct_token_sampler_proposal_different_distributions():
     """When target and proposal have different context-dependent distributions
@@ -337,18 +385,27 @@ async def test_sis_with_proposal_weights_match_manual_computation(
 
     proposal_logZ = logsumexp(proposal_ws)
 
+    max_tokens = 5
     seqs = await DirectTokenSampler(target, proposal=proposal).smc(
         n_particles=10,
         ess_threshold=0.0,
-        max_tokens=5,
+        max_tokens=max_tokens,
     )
 
     for ctx, actual_logw in zip(seqs.contexts, seqs.log_weights):
         # start_weight = target.prefix([]) = 0 for MockPotential.
+        # Sequences of length == max_tokens had EOS forced at the boundary, so
+        # their final-position IS correction is target.logw_next[EOS] rather
+        # than the natural-sampling formula used at every other position.
         expected_logw = 0.0
-        for tok in ctx:
+        L = len(ctx)
+        boundary_forced = L == max_tokens
+        for i, tok in enumerate(ctx):
             tid = len(vocab) if tok is EOS else target.lookup[tok]
-            expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
+            if boundary_forced and i == L - 1:
+                expected_logw += target_ws[tid]
+            else:
+                expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
 
         np.testing.assert_allclose(
             actual_logw, expected_logw, rtol=1e-10,

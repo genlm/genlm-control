@@ -327,27 +327,12 @@ def _nobias(label, llm, *, ml_floor=0.3, ml_k=2.5, len_bound=None, len_k=None,
     return np.array(diffs), np.array(len_gaps)
 
 
-# ----- gate 2a: unconstrained (single seed, ABSOLUTE thresholds -- pure warm-KV,
-#       no factor, so length + log_ml track tightly; not a sem-based no-bias case) --
+# ----- gate 2a: unconstrained (no-bias over seeds; the force-EOS boundary weight +
+#       bf16 draw flips make a single-seed tight check invalid) ----------------------
 
 
 def test_unconstrained_burst_vs_slow(llm):
-    c = CASES["unconstrained"]
-    llm.set_prompt_from_str(PROMPT)
-    make = lambda: c.sampler(llm, SEED)  # noqa: E731
-    assert can_burst(_controller(make, c.n_particles, c.ess, c.max_tokens))
-    slow = _steploop_cached(c.label, c.n_particles, c.ess, c.max_tokens, SEED)
-    burst = _run_burst(make, c.n_particles, c.ess, c.max_tokens, SEED)
-    stats = _compare(c.label, c.ess, c.n_particles, slow, burst)
-    assert burst["n_bursts"] > 0, "unconstrained: burst never opened"
-    assert abs(stats["mean_len_burst"] - stats["mean_len_slow"]) <= 2.0, (
-        f"length diverged (slow {stats['mean_len_slow']:.2f} vs "
-        f"burst {stats['mean_len_burst']:.2f})"
-    )
-    assert abs(stats["log_ml_diff"]) <= 0.2, (
-        f"log_ml diverged (slow {stats['slow_log_ml']:.4f} vs "
-        f"burst {stats['burst_log_ml']:.4f})"
-    )
+    _nobias("unconstrained", llm, ml_floor=0.3, ml_k=2.5, len_bound=1.5)
 
 
 # ----- gate 2b: constrained Direct (llm * boolfsa). Looser [a-z ]+ at ess=0 (no

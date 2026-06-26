@@ -123,6 +123,17 @@ class Potential(ABC, PotentialOps, PotentialTests):
         """
         return 0.0  # pragma: no cover
 
+    async def logw_eos(self, context) -> float:
+        """Assess the log-weight of terminating (EOS) after `context`.
+
+        Args:
+            context (list): Sequence of tokens.
+
+        Returns:
+            (float): Log weight of terminating after `context`.
+        """
+        return float((await self.logw_next(context))[self.eos])
+
     async def score(self, context):
         """Assess the weight of `context` based on EOS-termination.
 

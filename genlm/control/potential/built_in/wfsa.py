@@ -1,12 +1,35 @@
 import string
+import warnings
+
 import numpy as np
 from collections import OrderedDict
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
+from genlm.grammar.semiring import Boolean
 from genlm.control.util import logsumexp
 from genlm.grammar.lark_interface import interegular_to_wfsa
 
 from genlm.control.potential.base import Potential
+
+# Default ``_consume`` chart-cache bound (see WFSA.__init__).
+_DEFAULT_CACHE_MAXSIZE = 8_000_000
+
+
+def _float_to_boolean(wfsa):
+    """Convert a Float-semiring WFSA to Boolean: every non-zero weight
+    becomes ``Boolean.one``. Same accepted language."""
+    assert wfsa.R is Float
+    new = BaseWFSA(Boolean)
+    for i, w in wfsa.I:
+        if w != 0:
+            new.add_I(i, Boolean.one)
+    for i, w in wfsa.F:
+        if w != 0:
+            new.add_F(i, Boolean.one)
+    for i, a, j, w in wfsa.arcs():
+        if w != 0:
+            new.add_arc(i, a, j, Boolean.one)
+    return new
 
 
 class WFSA(Potential):
@@ -20,7 +43,7 @@ class WFSA(Potential):
         wfsa (genlm_grammar.WFSA): The weighted finite state automaton used for potential calculations.
     """
 
-    def __init__(self, wfsa, cache_maxsize=8_000_000):
+    def __init__(self, wfsa, cache_maxsize=_DEFAULT_CACHE_MAXSIZE):
         """
         Initializes the WFSA potential.
 
@@ -49,12 +72,15 @@ class WFSA(Potential):
         else:
             self.wfsa = wfsa
 
-        # The empty-prefix base chart is held OUTSIDE the LRU so the recursion base
-        # (`_consume(())`) is never evicted; the LRU holds only non-empty prefixes.
+        self._init_cache(cache_maxsize)
+        super().__init__(vocabulary=list(self.wfsa.alphabet))
+
+    def _init_cache(self, cache_maxsize):
+        """Initialize the ``_consume`` chart cache: empty-prefix base (held outside
+        the LRU so it is never evicted) + the bounded LRU of non-empty prefixes."""
         self._start_chart = self.wfsa.epsremove.start
         self._cache_maxsize = cache_maxsize
         self.cache = OrderedDict()
-        super().__init__(vocabulary=list(self.wfsa.alphabet))
 
     @classmethod
     def from_regex(cls, pattern, charset=None, to_bytes=True):
@@ -208,6 +234,10 @@ class WFSA(Potential):
             raise ValueError(f"Context {context!r} has zero weight.")
         return self._logw_next_from_chart(curr, log_ctx_w)
 
+    async def logw_eos(self, context):
+        """EOS log-weight via the ``complete - prefix`` identity."""
+        return float(await self.complete(context) - await self.prefix(context))
+
     # -- chart-scalar accessors (a "chart" is what `_consume` returns): the
     #    shared-prefix `Coerced._trie_logws` reads each token's prefix/complete
     #    weight from a cached chart sync, with no `asyncio.gather` over the vocab --
@@ -238,33 +268,104 @@ class WFSA(Potential):
 
 
 class BoolFSA(WFSA):
-    """Boolean FSA potential."""
+    """Boolean FSA potential. Returns ``0`` for accepted, ``-inf`` for rejected.
+
+    ``from_regex`` constructs a Boolean-semiring WFSA by default; the
+    ``semiring="log"`` path is deprecated (the Log-semiring FSA closure is
+    unsound because ``Log.star`` is partial).
+    """
+
+    def __init__(self, wfsa):
+        """Initialize the BoolFSA from a WFSA.
+
+        Args:
+            wfsa (genlm_grammar.WFSA): A Float, Log, or Boolean WFSA.
+                Float is converted to Log; Boolean is kept as-is.
+        """
+        if wfsa.R is Boolean:
+            self.wfsa = wfsa
+            self._init_cache(_DEFAULT_CACHE_MAXSIZE)
+            Potential.__init__(self, vocabulary=list(self.wfsa.alphabet))
+        else:
+            super().__init__(wfsa)
+
+    @classmethod
+    def from_regex(cls, pattern, charset=None, to_bytes=True, semiring="boolean"):
+        """Create a BoolFSA from a regex pattern.
+
+        Args:
+            pattern (str): regex pattern.
+            charset (set): see ``WFSA.from_regex``.
+            to_bytes (bool): see ``WFSA.from_regex``.
+            semiring (str): ``"boolean"`` (default) or ``"log"``. ``"log"``
+                is deprecated; its closure is unsound (``Log.star`` is partial).
+
+        Returns:
+            (BoolFSA): An instance of the BoolFSA class.
+        """
+        if semiring not in ("log", "boolean"):
+            raise ValueError(
+                f"semiring must be 'log' or 'boolean', got {semiring!r}"
+            )
+        if semiring == "log":
+            warnings.warn(
+                "semiring='log' is deprecated: the FSA closure is unsound on "
+                "the Log semiring because Log.star is partial. "
+                "Use semiring='boolean'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        charset = charset or set(string.printable)
+        wfsa = interegular_to_wfsa(pattern, charset=charset)
+        if to_bytes:
+            wfsa = wfsa.to_bytes()
+        if semiring == "boolean":
+            wfsa = _float_to_boolean(wfsa)
+        return cls(wfsa)
+
+    def _bool_prefix_logw(self, chart):
+        """Boolean prefix weight of a chart: 0 if any co-accessible state, else -inf."""
+        bkwd = self.wfsa.epsremove.backward
+        return 0.0 if any(bkwd[i].score for i in chart) else float("-inf")
+
+    def _bool_complete_logw(self, chart):
+        """Boolean complete weight of a chart: 0 if any accepting state, else -inf."""
+        finals = dict(self.wfsa.epsremove.F)
+        return 0.0 if any(i in finals and finals[i].score for i in chart) else float("-inf")
+
+    def _prefix(self, context):
+        if self.wfsa.R is Boolean:
+            curr = self._consume(context)
+            return self._bool_prefix_logw(curr), curr
+        return super()._prefix(context)
 
     async def prefix(self, context):
-        """
-        Computes whether the context is accepted as a prefix by the FSA.
+        """Tests whether `context` is accepted as a prefix.
 
         Args:
             context (list): A sequence of tokens in the WFSA's alphabet.
 
         Returns:
-            (float): `0` if the context is accepted as a prefix, `-inf` otherwise.
+            (float): ``0`` if accepted as a prefix, ``-inf`` otherwise.
         """
+        if self.wfsa.R is Boolean:
+            return self._prefix(context)[0]
         prefix_w = await super().prefix(context)
         if prefix_w > float("-inf"):
             return 0
         return float("-inf")
 
     async def complete(self, context):
-        """
-        Computes whether the context is accepted by the FSA.
+        """Tests whether `context` is accepted.
 
         Args:
             context (list): A sequence of tokens in the WFSA's alphabet.
 
         Returns:
-            (float): `0` if the context is accepted, `-inf` otherwise.
+            (float): ``0`` if accepted, ``-inf`` otherwise.
         """
+        if self.wfsa.R is Boolean:
+            return self._bool_complete_logw(self._consume(context))
         complete_w = await super().complete(context)
         if complete_w > float("-inf"):
             return 0
@@ -286,28 +387,48 @@ class BoolFSA(WFSA):
         return 0.0 if w > float("-inf") else float("-inf")
 
     async def logw_next(self, context):
-        """
-        Returns next token log weights given `context`.
+        """Per-token admissibility log weights given `context`.
 
         Args:
             context (list): A sequence of tokens in the WFSA's alphabet.
 
         Returns:
-            (LazyWeights): Boolean log-weights for next token.
+            (LazyWeights): ``0`` for admissible next tokens (incl. EOS),
+                ``-inf`` for rejected.
         """
+        # Boolean fast-path (#141): walk arcs to 0/-inf directly.
+        if self.wfsa.R is Boolean:
+            curr = self._consume(context)
+            if not curr:
+                raise ValueError(f"Context {context!r} has zero weight.")
+            bkwd = self.wfsa.epsremove.backward
+            finals = dict(self.wfsa.epsremove.F)
+            out = self.alloc_logws()
+            for i in curr:
+                for b, j, w in self.wfsa.epsremove.arcs(i=i):
+                    if w.score and bkwd[j].score and b in self.lookup:
+                        out[self.lookup[b]] = 0.0
+            for i in curr:
+                if i in finals and finals[i].score:
+                    out[self.lookup[self.eos]] = 0.0
+                    break
+            return self.make_lazy_weights(out)
         return self._booleanize(await super().logw_next(context))
 
     def prefix_logw(self, chart):
         """Boolean prefix weight of a cached chart (0 if alive, else -inf)."""
+        if self.wfsa.R is Boolean:
+            return self._bool_prefix_logw(chart)
         return self._bool(super().prefix_logw(chart))
 
     def complete_logw(self, chart):
         """Boolean complete weight of a cached chart (0 if accepting, else -inf)."""
+        if self.wfsa.R is Boolean:
+            return self._bool_complete_logw(chart)
         return self._bool(super().complete_logw(chart))
 
     async def batch_logw_next(self, contexts):
-        """
-        Returns next token log weights for a batch of contexts.
+        """Per-token admissibility log weights for a batch of contexts.
 
         Args:
             contexts (list): The list of contexts.
@@ -315,6 +436,8 @@ class BoolFSA(WFSA):
         Returns:
             (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
         """
+        # super().batch_logw_next gathers self.logw_next per context, so the #141
+        # Boolean fast-path propagates here for free.
         return self._booleanize(await super().batch_logw_next(contexts))
 
     def __repr__(self):

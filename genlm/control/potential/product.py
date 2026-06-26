@@ -154,6 +154,13 @@ class Product(Potential):
         )
         return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
 
+    async def logw_eos(self, context) -> float:
+        """Sum of the factors' eos log-weights."""
+        e1, e2 = await asyncio.gather(
+            self.p1.logw_eos(context), self.p2.logw_eos(context)
+        )
+        return float(e1 + e2)
+
     async def batch_logw_next(self, contexts):
         W1, W2 = await asyncio.gather(
             self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)

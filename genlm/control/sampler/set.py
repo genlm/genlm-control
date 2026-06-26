@@ -11,7 +11,7 @@ from genlm.backend.tokenization import Token
 class SetSampler(ABC):
     """Base class for set samplers.
 
-    A set sampler samples a weighted set of tokens from a the vocabulary of a `target` potential.
+    A set sampler samples a weighted set of tokens from the vocabulary of a `target` potential.
 
     Given a context of tokens $x_1, \\ldots, x_{n-1}$ in the target potential's vocabulary and a sampled set of tokens $S \\subseteq \\textsf{target.vocab_eos}$,
     the log-weight associated with each token $x_n$ must correspond to:

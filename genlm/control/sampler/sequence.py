@@ -72,9 +72,14 @@ class SMC:
        particles are resampled according to their weights. This helps focus computation
        on more promising sequences.
 
-    4. Termination: The process continues until either:\n
-        - All sequences reach an end-of-sequence (EOS) token\n
-        - The maximum token length is reached
+    4. Termination: Each sequence terminates either by naturally sampling an
+       end-of-sequence (EOS) token, or by hitting the ``max_tokens`` boundary.
+       In the latter case, EOS is deterministically appended to the sequence
+       and the particle's importance weight is corrected by
+       ``unit_sampler.target.logw_next(context)[EOS]`` (see
+       :meth:`TokenSampler.logw_eos`). This makes the resulting particles
+       properly weighted with respect to the target distribution conditioned
+       on ``|y| <= max_tokens``; every returned sequence ends with EOS.
 
     If a critic is provided, the resulting sequences are properly weighted with respect to the product of the unit sampler's
     target potential and the critic potential (`unit_sampler.target * critic`). If a critic is not provided,
@@ -133,8 +138,10 @@ class SMC:
                 this value, particles are resampled according to their weights. Should be between 0 and 1.
                 Higher values lead to more frequent resampling. Note that when ess_threshold = 0,
                 the critic is only applied at the end of the generation (if it is provided).
-            max_tokens (int): Maximum number of tokens to generate per sequence. Generation
-                may terminate earlier if all sequences reach an EOS token.
+            max_tokens (int): Maximum sequence length (including the terminal EOS token).
+                Sequences that haven't naturally sampled EOS by the boundary have EOS
+                deterministically appended, with an importance-weight correction so the
+                particles target the length-conditioned distribution.
             accelerate (str | bool, optional): The single engine-acceleration knob,
                 keyword-only. One of:\n
                 - ``"auto"`` (default, also ``True``): run the engine-accelerated

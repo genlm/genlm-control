@@ -7,7 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
-from genlm.control.constant import EndOfSequence
+from genlm.control.constant import EndOfSequence, EOS
+from genlm.control.potential.base import burst_logw_next
 from genlm.control.potential.built_in.llm import (
     find_engine_lm,
     constraint_leaf_ids,
@@ -163,6 +164,12 @@ class _Burst:
                 records = await sampler.burst_draw_batch(
                     warm_batch, [p.context for p in parts], rows, self
                 )
+                # Force EOS at the max_tokens boundary (mirrors Controller._step_particle).
+                for k_i, p in enumerate(parts):
+                    if p.max_tokens_left == 1:
+                        with burst_logw_next(sampler._row_injection(warm_batch, k_i)):
+                            logw = await sampler.logw_eos(p.context)
+                        records[k_i] = BurstDraw(token=EOS, step=([EOS], logw, 0.0))
             else:  # no live rows this step (all drained/terminated)
                 records = []
             # (3) Bank: free running defers (overlaps next forward); unit grain banks inline

@@ -71,7 +71,13 @@ class _RefSequenceModel(Model):
     async def step(self):
         from genlm.control.sampler.unit import MultiTokenUnitSampler
 
-        if isinstance(self.unit_sampler, MultiTokenUnitSampler):
+        if self.max_tokens == 1:
+            # Force EOS at the boundary (IS-corrected by logw_eos); mirrors
+            # Controller._step_particle. Kept in the old twist/terminal structure
+            # below so the snapshot stays byte-exact against the controller.
+            self.score(await self.unit_sampler.logw_eos(self.token_ctx))
+            self.token_ctx.append(EOS)
+        elif isinstance(self.unit_sampler, MultiTokenUnitSampler):
             from genlm.control.sampler.unit import flatten_units
 
             flat_context = flatten_units(self.token_ctx)

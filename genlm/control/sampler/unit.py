@@ -169,6 +169,11 @@ class MultiTokenUnitSampler(TokenSampler):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
         return await self.subunit_sampler.start_weight()
 
+    async def logw_eos(self, context):
+        """EOS log-weight at the ``max_tokens`` boundary: defer to the subunit sampler
+        on the flattened context."""
+        return await self.subunit_sampler.logw_eos(flatten_units(context))
+
     async def transition(self, context):
         """The controller-facing per-step transition for multi-token units.
 

@@ -153,7 +153,7 @@ S_AEIOU = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
 CASES = {
     c.label: c
     for c in [
-        Case("unconstrained", 8, 0.0, 12, (1234,), "steploop_cached",
+        Case("unconstrained", 8, 0.0, 12, (1234, 7, 99, 2024, 31, 53, 71, 97), "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm)),
         Case("constrained-boolfsa[a-z ]+", 16, 0.0, 12, (1234, 7), "steploop_cached",
              lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[a-z ]+"))),

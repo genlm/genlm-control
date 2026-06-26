@@ -211,10 +211,126 @@ async def test_bool_fsa_with_generated_regex(pattern, data):
 
 
 def test_wfsa_init_wrong_semiring():
-    # Test initialization with unsupported semiring
-    wfsa = BaseWFSA(Boolean)  # TODO: support this semiring
+    # Float, Log, and Boolean are accepted; anything else is rejected.
+    from genlm.grammar.semiring import MaxPlus
+
+    wfsa = BaseWFSA(MaxPlus)
     with pytest.raises(ValueError, match="Unsupported semiring"):
         WFSA(wfsa=wfsa)
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_from_regex_default_is_boolean():
+    """Default `from_regex` uses the Boolean semiring."""
+    fsa = BoolFSA.from_regex("a(b|c)")
+    assert fsa.wfsa.R is Boolean
+    assert (await fsa.complete(b"ab")) == 0
+    assert (await fsa.prefix(b"a")) == 0
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_from_regex_default_fixes_divergent_scc():
+    """Regression: leading-wildcard regex over a large charset previously
+    silently returned ``-inf`` via the Log path; the Boolean default fixes it."""
+    import warnings
+
+    pat = r"[\s\S]*[eE]njoy\s+[A-Za-z]+[iI][nN][gG][\s\S]*"
+    fsa = BoolFSA.from_regex(pat)
+    assert fsa.wfsa.R is Boolean
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=RuntimeWarning)
+        assert await fsa.prefix(b"") == 0
+        assert await fsa.prefix(b"Hello") == 0
+        assert await fsa.complete(b"I enjoy walking.") == 0
+        assert await fsa.complete(b"I enjoy films.") == -float("inf")
+        lw = await fsa.logw_next(b"")
+        assert not np.isnan(lw.weights).any()
+        assert (lw.weights > -float("inf")).any()
+
+
+def test_bool_fsa_from_regex_log_is_deprecated():
+    """Explicit `semiring="log"` still works but emits a DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        fsa = BoolFSA.from_regex("a(b|c)", semiring="log")
+    assert fsa.wfsa.R is Log
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_boolean_consistency():
+    """Math-consistency invariants hold for the default (Boolean) path."""
+    fsa = BoolFSA.from_regex("a(b|c)")
+    assert fsa.wfsa.R is Boolean
+    await fsa.assert_logw_next_consistency(b"a")
+    await fsa.assert_autoreg_fact(b"a")
+    await fsa.assert_logw_next_consistency(b"")
+    await fsa.assert_autoreg_fact(b"")
+    await fsa.assert_batch_consistency([b"", b"a", b"ab", b"ac"])
+
+
+@pytest.fixture
+def boolean_wfsa():
+    """A tiny Boolean WFSA: accepts only ``ab``."""
+    m = BaseWFSA(Boolean)
+    m.add_I(0, Boolean.one)
+    m.add_arc(0, b"a"[0], 1, Boolean.one)
+    m.add_arc(1, b"b"[0], 2, Boolean.one)
+    m.add_F(2, Boolean.one)
+    return m
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_constructed_from_boolean_wfsa(boolean_wfsa):
+    """`BoolFSA(boolean_wfsa)` exercises the Boolean `__init__` branch and
+    all four boolean public methods on accept / reject / empty-curr paths."""
+    pot = BoolFSA(boolean_wfsa)
+    assert pot.wfsa.R is Boolean
+    # accept paths
+    assert (await pot.prefix(b"a")) == 0
+    assert (await pot.complete(b"ab")) == 0
+    # reject paths
+    assert (await pot.complete(b"a")) == -float("inf")
+    # empty-curr paths (no transition from start on 'c')
+    assert (await pot.prefix(b"c")) == -float("inf")
+    assert (await pot.complete(b"c")) == -float("inf")
+    with pytest.raises(ValueError, match="zero weight"):
+        await pot.logw_next(b"c")
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_boolean_batch_logw_next(boolean_wfsa):
+    """``batch_logw_next`` on the Boolean path matches per-context ``logw_next``."""
+    pot = BoolFSA(boolean_wfsa)
+    contexts = [b"", b"a"]
+    single = [(await pot.logw_next(c)).weights for c in contexts]
+    batch = await pot.batch_logw_next(contexts)  # one batched LazyWeights, [N, V+1]
+    assert batch.weights.shape[0] == len(contexts)
+    for i, s in enumerate(single):
+        assert np.array_equal(s, batch.weights[i])
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_boolean_chart_scalar_accessors():
+    """Boolean ``prefix_logw``/``complete_logw`` match ``prefix``/``complete``."""
+    pot = BoolFSA.from_regex(r"(cat|car)")
+    assert pot.wfsa.R is Boolean
+    for ctx in (b"", b"c", b"ca", b"cat", b"car"):
+        chart = pot._consume(list(ctx))
+        assert pot.prefix_logw(chart) == await pot.prefix(list(ctx))
+        assert pot.complete_logw(chart) == await pot.complete(list(ctx))
+
+
+def test_bool_fsa_from_regex_bad_semiring_arg():
+    with pytest.raises(ValueError, match="semiring must be"):
+        BoolFSA.from_regex("a", semiring="float")
+
+
+def test_wfsa_rejects_boolean():
+    """`WFSA` (weighted) still rejects Boolean; only `BoolFSA` accepts it."""
+    m = BaseWFSA(Boolean)
+    m.add_I(0, Boolean.one)
+    m.add_F(0, Boolean.one)
+    with pytest.raises(ValueError, match="Unsupported semiring"):
+        WFSA(wfsa=m)
 
 
 def test_wfsa_init_float_conversion(log_wfsa):

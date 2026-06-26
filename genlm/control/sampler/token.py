@@ -90,6 +90,10 @@ class TokenSampler:
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
 
+    async def logw_eos(self, context):
+        """EOS log-weight at the ``max_tokens`` boundary, used to force termination."""
+        return await self.target.logw_eos(context)
+
     async def transition(self, context):
         """Controller-facing per-step transition.
 

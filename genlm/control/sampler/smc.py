@@ -227,6 +227,14 @@ class Controller:
             to_append, logw, logp = await self._sampler_of(p).transition(p.context)
         await self._bank_step(p, to_append, logw, logp)
 
+    async def _step_particle(self, p):
+        """One SMC step for ``p``: force EOS at the ``max_tokens`` boundary, else draw + bank."""
+        if p.max_tokens_left == 1:
+            logw = await self._sampler_of(p).logw_eos(p.context)
+            await self._bank_step(p, [EOS], logw, 0.0)
+        else:
+            await self._draw_and_bank(p)
+
     def _sampler_of(self, p):
         return self.samplers[self.particles.group[p._i]]
 
@@ -400,7 +408,7 @@ class StepLoop:
             if c.twist_with_critic:
                 c.particles.untwist_all()
             await asyncio.gather(
-                *[c._draw_and_bank(p) for p in c.particles if not p.done]
+                *[c._step_particle(p) for p in c.particles if not p.done]
             )
             c._record_step()
             c._maybe_resample()

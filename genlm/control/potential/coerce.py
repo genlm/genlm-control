@@ -141,6 +141,10 @@ class Coerced(Potential):
     async def prefix(self, context):
         return await self.potential.prefix(context=self.f(context))
 
+    async def logw_eos(self, context):
+        """EOS log-weight via ``complete - prefix`` on the coerced context."""
+        return float(await self.complete(context) - await self.prefix(context))
+
     async def logw_next(self, context):
         # Fast path: when the wrapped potential carries a memoized chart
         # (`_consume`, i.e. a WFSA/BoolFSA), score every candidate by a shared-prefix
