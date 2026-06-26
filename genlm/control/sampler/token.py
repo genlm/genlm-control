@@ -36,8 +36,18 @@ class TokenSampler(SubModel):
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
 
+    async def logw_eos(self, context):
+        """
+        Returns the weight of EOS, used to force termination in sequence.py.
+
+        Subclasses may override with cheaper, sampler-specific computations
+        that avoid materializing the full ``logw_next`` vector.
+        """
+        logws = await self.target.logw_next(context)
+        return logws[self.target.eos]
+
     async def forward(self):
-        parent = self.parent  # For some reason, need to hold onto this reference.
+        parent = self.parent
         token, logw, logp = await self.sample(parent.token_ctx)
         parent.score(logw)
         parent.logp += logp
@@ -214,6 +224,21 @@ class SetTokenSampler(TokenSampler):
             token = draw(logps.exp().materialize())
             selected_logp = logps[token]
         return token, log_z, logp + selected_logp
+
+    async def logw_eos(self, context):
+        """Boundary EOS log-weight via the ``complete - prefix`` identity.
+
+        Set samplers exist to avoid materializing the full ``target.logw_next``
+        vector; for the EOS entry specifically we get the same value as
+        ``complete(context) - prefix(context)``, which for the typical
+        ``iter_potential * item_potential`` target reduces to a constant
+        number of scalar evaluations on the underlying potentials.
+        """
+        complete_w, prefix_w = await asyncio.gather(
+            self.target.complete(context),
+            self.target.prefix(context),
+        )
+        return complete_w - prefix_w
 
     async def cleanup(self):
         """Clean up the sampler.

@@ -91,6 +91,16 @@ class MultiTokenUnitSampler(TokenSampler):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
         return await self.subunit_sampler.start_weight()
 
+    async def logw_eos(self, context):
+        """EOS log-weight at the ``max_tokens`` boundary.
+
+        ``context`` is the nested unit context (``[[...], [...], ...]``) that
+        ``SequenceModel`` carries for multi-token units. Flatten it to the token
+        list the underlying target expects, then defer to the subunit sampler so
+        its own (possibly cheaper) ``logw_eos`` is reused.
+        """
+        return await self.subunit_sampler.logw_eos(flatten_units(context))
+
     async def forward(self):
         """Called by LLaMPPL Model.call() to sample one multi-token unit.
 
