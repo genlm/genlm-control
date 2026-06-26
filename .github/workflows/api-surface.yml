@@ -56,7 +56,6 @@ jobs:
               echo '```'
               cat /tmp/griffe.txt
               echo '```'
-              echo "_Report-only — does not block merge._"
             } > /tmp/comment.md
             if [ -n "$cid" ]; then
               gh api --method PATCH "repos/$REPO/issues/comments/$cid" -F body=@/tmp/comment.md >/dev/null
