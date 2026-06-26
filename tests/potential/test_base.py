@@ -73,11 +73,11 @@ async def test_batch_logw_next(potential):
     seq1 = [b"a"]
     seq2 = [b"b", b"c"]
 
-    haves = await potential.batch_logw_next([seq1, seq2])
+    haves = await potential.batch_logw_next([seq1, seq2])  # one batched LazyWeights [N, V+1]
     wants = await asyncio.gather(potential.logw_next(seq1), potential.logw_next(seq2))
 
-    for want, have in zip(haves, wants):
-        np.testing.assert_array_equal(have.weights, want.weights)
+    for i, want in enumerate(wants):
+        haves.spawn(haves.weights[i]).assert_equal(want)
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,141 @@
+"""Ground-truth per-token parity gate for the SMC controller.
+
+This compares the new controller-driven slow path (``genlm.control.sampler.SMC``)
+against a stored snapshot of the original llamppl ``smc_standard`` path
+(``parity_snapshot.json``, produced by ``_gen_parity_snapshot.py`` while
+llamppl was still installed). Under a fixed numpy+torch seed the per-particle
+(context, logw), ``Sequences.log_ml``, and the serialized JSON record must
+match the snapshot exactly: weights atol ~1e-9, contexts exact, JSON exact
+modulo float formatting.
+
+The matrix exercises {no critic, terminal critic} x ess in {0, 0.5, 1} over
+DirectTokenSampler (on WeightedSet and MockPotential) and MultiTokenUnitSampler;
+the ess=0.5 + critic cases exercise the twist/untwist-across-resample
+interaction.
+
+Regenerate the snapshot (only when the algorithm intentionally changes) with:
+    python tests/sampler/_gen_parity_snapshot.py
+"""
+
+import json
+import os
+
+import numpy as np
+import pytest
+
+from genlm.control.sampler.sequence import SMC
+
+from _harness import seed_all, ctx_repr, num, load_snapshot
+from parity_cases import (
+    SAMPLER_BUILDERS,
+    matrix_combos,
+    N_PARTICLES,
+    MAX_TOKENS,
+    SEED,
+)
+
+SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "parity_snapshot.json")
+
+if not os.path.exists(SNAPSHOT_PATH):  # pragma: no cover
+    pytest.skip(
+        "parity_snapshot.json missing; run tests/sampler/_gen_parity_snapshot.py",
+        allow_module_level=True,
+    )
+
+SNAPSHOT = load_snapshot(SNAPSHOT_PATH)
+
+
+# seed_all / ctx_repr / num come from the shared harness so the gate and the snapshot
+# generator share one serialization -- drift here would be a silent false-green.
+
+
+def _canonical_record(record_text):
+    """Canonicalize a record JSON string so only structurally meaningful
+    differences register: NaN compares equal, infinities normalized, finite
+    floats round-tripped through float() to erase formatting noise."""
+    history = json.loads(record_text)
+
+    def fix(s):
+        if s == "-Infinity":
+            return "-inf"
+        f = float(s)
+        if np.isnan(f):
+            return "nan"
+        if np.isneginf(f):
+            return "-inf"
+        if np.isposinf(f):
+            return "inf"
+        return f
+
+    out = []
+    for entry in history:
+        e = {"mode": entry["mode"], "step": entry["step"]}
+        if "ancestors" in entry:
+            e["ancestors"] = entry["ancestors"]
+        e["particles"] = [
+            {
+                "contents": p["contents"],
+                "logweight": fix(p["logweight"]),
+                "weight_incr": fix(p["weight_incr"]),
+            }
+            for p in entry["particles"]
+        ]
+        out.append(e)
+    return out
+
+
+@pytest.mark.parametrize("sampler_name,use_critic,ess_threshold", list(matrix_combos()))
+def test_per_token_parity(sampler_name, use_critic, ess_threshold, tmp_path):
+    # Synchronous test driving the controller with a fresh ``asyncio.run`` per case,
+    # matching the snapshot generator.
+    #
+    # Byte-exact token parity requires a deterministic vocabulary order: the
+    # Gumbel-max draw (``fast_sample_lazyweights``) is indexed by vocab
+    # position, so a vocab whose order varies run-to-run would map the same RNG
+    # stream onto different tokens. The conftest ``WeightedSet`` fixture
+    # previously built its vocab via ``set(...)``, whose string iteration order
+    # is randomized per process (PYTHONHASHSEED); this made BOTH the controller and the
+    # original llamppl ``smc_standard`` path draw different tokens across fresh
+    # processes (root-caused on the GPU box). The fixture now dedupes by
+    # first-seen order, so the vocab -- and hence the whole population -- is
+    # bit-stable run-to-run under the default randomized hash seed, and the controller
+    # reproduces the original path bit-for-bit.
+    import asyncio
+
+    key = f"{sampler_name}|critic={use_critic}|ess={ess_threshold}"
+    snap = SNAPSHOT[key]
+
+    seed_all(SEED)
+    sampler, critic_pot = SAMPLER_BUILDERS[sampler_name]()
+    critic = critic_pot if use_critic else None
+    json_path = str(tmp_path / "got.json")
+    got = asyncio.run(
+        SMC(sampler, critic=critic)(
+            n_particles=N_PARTICLES,
+            ess_threshold=ess_threshold,
+            max_tokens=MAX_TOKENS,
+            json_path=json_path,
+        )
+    )
+
+    # Per-particle contexts (exact) and log weights (atol 1e-9).
+    got_contexts = [ctx_repr(c) for c, _ in got]
+    assert got_contexts == snap["contexts"], "context mismatch"
+
+    for (_, gw), sw in zip(got, snap["logws"]):
+        if sw in ("nan", "-inf", "inf"):
+            assert num(gw) == sw
+        else:
+            assert abs(gw - sw) <= 1e-9, f"logw mismatch: {gw} vs {sw}"
+
+    # log_ml.
+    gml = num(got.log_ml)
+    if snap["log_ml"] in ("nan", "-inf", "inf"):
+        assert gml == snap["log_ml"]
+    else:
+        assert abs(got.log_ml - snap["log_ml"]) <= 1e-9
+
+    # JSON record (exact modulo float formatting).
+    with open(json_path) as f:
+        got_record = f.read()
+    assert _canonical_record(got_record) == _canonical_record(snap["record"])

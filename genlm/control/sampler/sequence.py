@@ -1,17 +1,60 @@
+import logging
 import numpy as np
 from genlm.grammar import Float
-from arsenal.maths import logsumexp
+from genlm.control.util import logsumexp
 from functools import cached_property
 from dataclasses import dataclass
-from arsenal import colors
-
-from llamppl import Model
-from llamppl import smc_standard
 
 from genlm.control.potential import Potential
-from genlm.control.constant import EOS, EndOfSequence
+from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.util import escape
+from genlm.control.sampler.smc import Controller, StepLoop
+from genlm.control.sampler.burst import BurstLoop, burst_blocker, NotAcceleratable
+
+logger = logging.getLogger("genlm.control")
+
+
+def _normalize_accelerate(accelerate):
+    """Map the ``accelerate`` argument onto the canonical "auto"/"off"/"require".
+
+    Accepts the bare booleans as friendly aliases: ``True`` -> "auto" (so the
+    common ``accelerate=True`` never silently *requires* and errors) and
+    ``False`` -> "off".
+    """
+    if accelerate is True:
+        return "auto"
+    if accelerate is False:
+        return "off"
+    if accelerate in ("auto", "off", "require"):
+        return accelerate
+    raise ValueError(
+        f"`accelerate` must be one of 'auto', 'off', 'require' (or True/False); "
+        f"got {accelerate!r}"
+    )
+
+
+async def _drive(controller, mode):
+    """Select and run the SMC driver for ``mode`` (already-normalized
+    'off'/'auto'/'require'), returning the final particle population. The burst-
+    capability check, the ``require`` raise, and the ``auto`` fallback logging live
+    here so single (:meth:`SMC.__call__`) and batched (:meth:`SMC.batched`) runs
+    share one selection -- they cannot drift."""
+    if mode != "off":
+        reason = burst_blocker(controller)
+        if mode == "require" and reason is not None:
+            raise NotAcceleratable(reason.detail)
+        if reason is None:
+            if mode == "auto":
+                logger.info("running the engine-accelerated burst path.")
+            return await BurstLoop(controller).run()
+        if mode == "auto":
+            logger.info(
+                "running the exact per-token path -- acceleration unavailable: %s. "
+                'Pass accelerate="off" to silence, or accelerate="require" to make '
+                "this an error.",
+                reason.detail,
+            )
+    return await StepLoop(controller).run()
 
 
 class SMC:
@@ -78,6 +121,8 @@ class SMC:
         n_particles,
         ess_threshold,
         max_tokens,
+        *,
+        accelerate="auto",
         verbosity=0,
         json_path=None,
         **kwargs,
@@ -97,32 +142,56 @@ class SMC:
                 Sequences that haven't naturally sampled EOS by the boundary have EOS
                 deterministically appended, with an importance-weight correction so the
                 particles target the length-conditioned distribution.
+            accelerate (str | bool, optional): The single engine-acceleration knob,
+                keyword-only. One of:\n
+                - ``"auto"`` (default, also ``True``): run the engine-accelerated
+                  `BurstLoop` when the configuration is burst-capable, else the
+                  exact per-token `StepLoop`. Logs (INFO) which path ran, and on
+                  fallback the reason it was not accelerated.\n
+                - ``"off"`` (also ``False``): always run the exact per-token
+                  `StepLoop` -- byte-reproducible given a seed (the ground truth).\n
+                - ``"require"``: run the engine path, or raise
+                  `NotAcceleratable` with the reason if not burst-capable
+                  (guarantees the fast path; use for benchmarks / production E-steps).\n
+                Acceleration is vLLM-only for now. The engine is derived from the
+                sampler's `PromptedLLM` -- you do not pass it. The burst is
+                statistically identical to `"off"` (same target, unbiased weights)
+                but not byte-identical (warm-KV residual + batched-draw RNG); use
+                `"off"` for exact reproducibility.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
-            **kwargs (dict): Additional keyword arguments to pass to the SMC algorithm.
-                See the `llamppl.inference.smc_standard` documentation for more details.
+            **kwargs (dict): Additional keyword arguments to pass to the SMC controller.
+                Currently ``resampling_method`` (one of 'multinomial', 'stratified',
+                'systematic', 'residual'; defaults to 'multinomial').
 
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
+
+        Raises:
+            NotAcceleratable: If ``accelerate="require"`` but the configuration is
+                not burst-capable.
         """
-        model = SequenceModel(
+        mode = _normalize_accelerate(accelerate)
+
+        controller = Controller(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
-            max_tokens=max_tokens,
-            verbosity=verbosity,
-            twist_with_critic=ess_threshold > 0,
-        )
-
-        particles = await smc_standard(
-            model=model,
             n_particles=n_particles,
             ess_threshold=ess_threshold,
-            json_file=json_path,
+            max_tokens=max_tokens,
+            twist_with_critic=ess_threshold > 0,
+            record=json_path is not None,
+            verbosity=verbosity,
             **kwargs,
         )
+
+        particles = await _drive(controller, mode)
+
+        if json_path is not None:
+            controller.save_record(json_path)
 
         return Sequences(*_unpack_particles(particles))
 
@@ -133,7 +202,7 @@ class SMC:
 
         Example:
             ```python
-            sampler = SequenceSampler(unit_sampler, critic)
+            sampler = SMC(unit_sampler, critic)
             try:
                 sequences = await sampler(n_particles=10, ess_threshold=0.5, max_tokens=20)
             finally:
@@ -143,6 +212,62 @@ class SMC:
         await self.unit_sampler.cleanup()
         if self.critic:
             await self.critic.cleanup()
+
+    @classmethod
+    async def batched(
+        cls,
+        smcs,
+        n_particles,
+        ess_threshold,
+        max_tokens,
+        *,
+        accelerate="auto",
+        verbosity=0,
+        **kwargs,
+    ):
+        """Run ``B = len(smcs)`` :class:`SMC` problems as ONE batched population.
+
+        ``smcs`` is a list of :class:`SMC` instances (each its own
+        ``unit_sampler`` + ``critic``, validated at construction). They run as B
+        independent sub-populations ("groups") of ``n_particles`` each in one
+        ``Controller``; ESS / resample / log_ml are per-group, so **each group is
+        statistically identical to running that ``SMC`` alone** (no cross-group
+        coupling -- the parity bar). Returns a list of B :class:`Sequences`, one
+        per problem, in ``smcs`` order.
+
+        Run params and ``accelerate`` carry the same meaning as
+        :meth:`__call__`; the burst lane needs the batch to be burst-homogeneous
+        (one shared forward over all B*N rows -- see
+        :func:`~genlm.control.sampler.burst._batch_blocker`), else it falls
+        back to the exact per-token loop.
+        """
+        samplers = [s.unit_sampler for s in smcs]
+        critics = [s.critic for s in smcs]
+        B = len(smcs)
+        # The controller's critic-presence branch uses the group-0 representative,
+        # so a mixed batch (some groups with a critic, some without) is unsupported
+        # -- make that contract explicit rather than crash deep in the transition.
+        assert len({c is None for c in critics}) == 1, (
+            "all SMC problems must have a critic or all none (homogeneous batch)"
+        )
+        controller = Controller(
+            unit_sampler=samplers[0],
+            critic=critics[0],
+            n_particles=n_particles * B,  # TOTAL rows across all groups
+            ess_threshold=ess_threshold,
+            max_tokens=max_tokens,
+            twist_with_critic=ess_threshold > 0,
+            verbosity=verbosity,
+            group_sizes=[n_particles] * B,
+            samplers=samplers,
+            critics=critics,
+            **kwargs,
+        )
+        await _drive(controller, _normalize_accelerate(accelerate))
+        return [
+            Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
+            for rows in controller._group_rows
+        ]
 
 
 @dataclass
@@ -266,94 +391,12 @@ class Sequences:
             print(p)
 
 
-class SequenceModel(Model):
-    def __init__(
-        self,
-        unit_sampler,
-        critic=None,
-        max_tokens=float("inf"),
-        verbosity=0,
-        twist_with_critic=True,
-    ):
-        assert max_tokens > 0
-
-        super().__init__()
-        self.token_ctx = []
-        self.unit_sampler = unit_sampler
-        self.max_tokens = max_tokens
-        self.critic = critic
-        self.logp = 0
-        self.verbosity = verbosity
-        self.twist_with_critic = twist_with_critic
-
-    async def start(self):
-        start_w = await self.unit_sampler.start_weight()
-        if start_w == float("-inf"):
-            raise ValueError(
-                "Start weight is -inf (log(0)). This is likely because a potential assigns zero weight to "
-                "the empty sequence under `prefix`, which violates the potential contract."
-            )
-        self.score(start_w)
-
-    async def step(self):
-        if self.verbosity > 0:
-            print(self.__repr__())
-
-        # Advance the context: either sample, or force EOS at the max_tokens
-        # boundary. Forcing EOS is equivalent to swapping the proposal for a
-        # point mass at EOS for that step; its IS correction is therefore the
-        # target's unnormalized log-weight on EOS (see TokenSampler.logw_eos).
-        if self.max_tokens == 1:
-            self.score(await self.unit_sampler.logw_eos(self.token_ctx))
-            self.token_ctx.append(EOS)
-        else:
-            unit = await self.call(self.unit_sampler)
-            self.token_ctx.append(unit)
-
-        if self.weight == float("-inf"):
-            if self.critic:
-                assert self.twist_amount != float("-inf")
-            self.finish()
-            return
-
-        if self.token_ctx[-1] is EOS:
-            self.finish()
-            if self.critic:
-                self.score(await self.critic.score(self.token_ctx))
-            return
-
-        if self.critic and self.twist_with_critic:
-            twist_amt = await self.critic.score(self.token_ctx)
-            if twist_amt != float("-inf"):
-                self.twist(twist_amt)
-            else:
-                self.score(twist_amt)
-                self.finish()
-                return
-
-        self.max_tokens -= 1
-
-    def __repr__(self):
-        return (
-            f"{self.weight:.2f}:\t"
-            + colors.magenta % "["
-            + (colors.magenta % "|").join(escape(y) for y in self.token_ctx)
-            + colors.magenta % "]"
-        )
-
-    def string_for_serialization(self):
-        return "|".join(escape(y) for y in self.token_ctx)
-
-    def immutable_properties(self):
-        return set(["unit_sampler", "critic"])
-
-
 def _unpack_particles(particles):
     contexts, logws = map(
         list,
         zip(
             *[
-                (p.token_ctx, float("-inf") if np.isnan(p.weight) else p.weight)
+                (p.context, float("-inf") if np.isnan(p.logw) else p.logw)
                 for p in particles
             ]
         ),

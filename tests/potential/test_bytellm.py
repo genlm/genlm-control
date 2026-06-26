@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import asyncio
+import warnings
 
 from genlm.bytes import BeamParams
 from genlm.backend import load_model_by_name
@@ -12,10 +13,30 @@ def model_name():
     return "gpt2"
 
 
+# On a GPU box the default backend is vLLM at gpu_memory_utilization=0.9. This
+# module instantiates BOTH a module-scoped `llm` engine and a per-test
+# `byte_llm`/`ByteLLM` engine, so two 0.9-util engines must coexist on one GPU
+# -> "Free memory ... less than desired GPU memory utilization". gpt2 is tiny, so
+# cap each engine's footprint to a small fraction so they fit together. (CPU/HF
+# backend ignores engine_opts, so this is a no-op off-GPU.)
+_LOW_GPU = {"engine_opts": {"gpu_memory_utilization": 0.3}}
+
+
 @pytest.fixture(scope="module")
 def llm(model_name):
     """Provides the underlying LLM for the test module."""
-    return load_model_by_name(model_name)
+    instance = load_model_by_name(model_name, llm_opts=_LOW_GPU)
+    yield instance
+    # Release the GPU engine when the module finishes so it doesn't linger and
+    # starve subsequent test modules of GPU memory.
+    cleanup = getattr(instance, "cleanup", None)
+    if cleanup is not None:
+        try:
+            asyncio.run(cleanup())
+        except Exception as e:
+            # Surface (don't swallow) a failing teardown: a silently-failing
+            # cleanup is exactly how a later module hits an unexplained OOM.
+            warnings.warn(f"engine cleanup failed during teardown: {e}")
 
 
 @pytest.fixture(scope="module")
@@ -26,12 +47,14 @@ def beam_params(llm):
 
 
 @pytest.fixture
-def byte_llm(model_name, beam_params):
-    """Provides a fresh ByteLLM instance for each test and handles cleanup."""
-    instance = ByteLLM.from_name(model_name, beam_params)
+def byte_llm(llm, beam_params):
+    """Provides a fresh ByteLLM instance for each test and handles cleanup.
+
+    Reuses the single module-scoped ``llm`` engine instead of creating its own,
+    so we don't accumulate multiple vLLM engines on the GPU (cleanup doesn't
+    promptly reclaim GPU memory within a process)."""
+    instance = ByteLLM(llm, beam_params)
     yield instance
-    # Cleanup code will run after the test has finished
-    asyncio.run(instance.cleanup())
 
 
 @pytest.mark.asyncio
@@ -132,9 +155,8 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
 
 
 @pytest.mark.asyncio
-async def test_cache_size_limit(model_name, beam_params):
+async def test_cache_size_limit(llm, beam_params):
     """Test that cache respects the size limit."""
-    llm = load_model_by_name(model_name)
     cache_size = 5
     byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
 
@@ -153,9 +175,8 @@ async def test_cache_size_limit(model_name, beam_params):
 
 
 @pytest.mark.asyncio
-async def test_cache_lru_eviction(model_name, beam_params):
+async def test_cache_lru_eviction(llm, beam_params):
     """Test that LRU eviction removes oldest entries."""
-    llm = load_model_by_name(model_name)
     cache_size = 3
     byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
 
@@ -212,9 +233,8 @@ async def measure_prefix_reach(byte_llm: ByteLLM, context: list) -> int:
 
 
 @pytest.mark.asyncio
-async def test_healing_disabled_fails(model_name):
+async def test_healing_disabled_fails(llm):
     """Without healing, K=1 beam fails on text requiring alternative tokenization."""
-    llm = load_model_by_name(model_name)
     eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
     # Explicitly disable healing to test failure mode
     beam_params = BeamParams(K=1, eos_byte_strings=[eos], heal=False)
@@ -231,9 +251,8 @@ async def test_healing_disabled_fails(model_name):
 
 
 @pytest.mark.asyncio
-async def test_healing_enabled_succeeds(model_name):
+async def test_healing_enabled_succeeds(llm):
     """With healing enabled, K=1 beam processes more text than without healing."""
-    llm = load_model_by_name(model_name)
     eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
@@ -253,9 +272,8 @@ async def test_healing_enabled_succeeds(model_name):
 
 
 @pytest.mark.asyncio
-async def test_healing_max_backoff(model_name):
+async def test_healing_max_backoff(llm):
     """Limited backoff constrains healing effectiveness."""
-    llm = load_model_by_name(model_name)
     eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
@@ -286,9 +304,8 @@ async def test_healing_max_backoff(model_name):
 
 
 @pytest.mark.asyncio
-async def test_context_manager_basic(model_name, beam_params):
+async def test_context_manager_basic(llm, beam_params):
     """Test that ByteLLM works as an async context manager."""
-    llm = load_model_by_name(model_name)
 
     async with ByteLLM(llm, beam_params) as byte_llm:
         # Verify we can use the instance inside the context
@@ -312,9 +329,8 @@ async def test_context_manager_basic(model_name, beam_params):
 
 
 @pytest.mark.asyncio
-async def test_context_manager_cleanup_on_exception(model_name, beam_params):
+async def test_context_manager_cleanup_on_exception(llm, beam_params):
     """Test that cleanup is called even when an exception occurs inside the context."""
-    llm = load_model_by_name(model_name)
 
     class TestException(Exception):
         pass
@@ -341,9 +357,8 @@ async def test_context_manager_cleanup_on_exception(model_name, beam_params):
 
 
 @pytest.mark.asyncio
-async def test_context_manager_with_smc(model_name, beam_params):
+async def test_context_manager_with_smc(llm, beam_params):
     """Test that ByteLLM context manager works correctly with SMC sampling."""
-    llm = load_model_by_name(model_name)
 
     async with ByteLLM(llm, beam_params) as byte_llm:
         byte_llm.set_prompt_from_str("The answer is:")

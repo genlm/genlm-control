@@ -41,7 +41,7 @@ def test_lazy_weights_normalize():
     # Test normal-space normalization
     lw = LazyWeights(weights, encode, decode, log=False)
     normalized = lw.normalize()
-    np.testing.assert_allclose(np.sum(normalized.weights), 1.0)
+    np.testing.assert_allclose(float(normalized.weights.sum()), 1.0)
 
     # Test log-space normalization
     lw_log = LazyWeights(np.log(weights), encode, decode, log=True)
