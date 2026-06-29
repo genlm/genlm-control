@@ -89,10 +89,9 @@ async def test_mp_logw_next(mp_potential, regular_potential):
 @pytest.mark.asyncio
 async def test_mp_batch_logw_next(mp_potential, regular_potential):
     contexts = [[b"a"], [b"a", b"b"], [b"a", b"b", regular_potential.eos]]
-    haves = await mp_potential.batch_logw_next(contexts)
+    haves = await mp_potential.batch_logw_next(contexts)  # batched LazyWeights [N, V+1]
     wants = await regular_potential.batch_logw_next(contexts)
-    for have, want in zip(haves, wants):
-        np.testing.assert_array_equal(have.weights, want.weights)
+    haves.assert_equal(wants)
 
 
 def test_cleanup(mp_potential):

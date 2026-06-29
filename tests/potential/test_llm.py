@@ -276,17 +276,22 @@ async def test_vllm_backend():
     llm = PromptedLLM.from_name(
         "gpt2",
         backend="vllm",
-        engine_opts={"dtype": "float", "gpu_memory_utilization": 0.5},
+        engine_opts={"dtype": "float", "gpu_memory_utilization": 0.3},
     )
 
-    llm.set_prompt_from_str("hello")
-    context = llm.tokenize(" world!")
+    try:
+        llm.set_prompt_from_str("hello")
+        context = llm.tokenize(" world!")
 
-    await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await llm.assert_batch_consistency(
-        [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
-    )
+        await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
+        await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
+        await llm.assert_batch_consistency(
+            [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
+        )
+    finally:
+        cleanup = getattr(llm.model, "cleanup", None)
+        if cleanup is not None:
+            await cleanup()
 
     new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
     assert new_llm.token_maps.eos_idxs == [0]

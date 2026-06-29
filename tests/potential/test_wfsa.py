@@ -302,10 +302,21 @@ async def test_bool_fsa_boolean_batch_logw_next(boolean_wfsa):
     pot = BoolFSA(boolean_wfsa)
     contexts = [b"", b"a"]
     single = [(await pot.logw_next(c)).weights for c in contexts]
-    batch = await pot.batch_logw_next(contexts)
-    assert len(batch) == len(contexts)
-    for s, b in zip(single, batch):
-        assert np.array_equal(s, b.weights)
+    batch = await pot.batch_logw_next(contexts)  # one batched LazyWeights, [N, V+1]
+    assert batch.weights.shape[0] == len(contexts)
+    for i, s in enumerate(single):
+        assert np.array_equal(s, batch.weights[i])
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_boolean_chart_scalar_accessors():
+    """Boolean ``prefix_logw``/``complete_logw`` match ``prefix``/``complete``."""
+    pot = BoolFSA.from_regex(r"(cat|car)")
+    assert pot.wfsa.R is Boolean
+    for ctx in (b"", b"c", b"ca", b"cat", b"car"):
+        chart = pot._consume(list(ctx))
+        assert pot.prefix_logw(chart) == await pot.prefix(list(ctx))
+        assert pot.complete_logw(chart) == await pot.complete(list(ctx))
 
 
 def test_bool_fsa_from_regex_bad_semiring_arg():
@@ -363,9 +374,23 @@ def test_wfsa_spawn(log_wfsa):
 
 def test_wfsa_clear_cache(log_wfsa):
     pot = WFSA(wfsa=log_wfsa)
+    # The empty-prefix base chart lives outside the LRU (``_start_chart``), so the
+    # ``_consume`` cache holds only non-empty prefixes and is empty after a clear.
+    pot._consume(b"a")
+    assert len(pot.cache) > 0
     pot.clear_cache()
-    assert len(pot.cache) == 1
-    assert () in pot.cache
+    assert len(pot.cache) == 0
+    # `_consume(())` still returns the base chart after a clear (held separately).
+    assert pot._consume(()) is pot._start_chart
+
+
+def test_wfsa_consume_lru_evicts(log_wfsa):
+    # The LRU bounds the chart cache: with a tiny cap, consuming more distinct
+    # prefixes than the cap keeps the cache at the cap (no unbounded growth).
+    pot = WFSA(wfsa=log_wfsa, cache_maxsize=3)
+    for bs in [b"a", b"ab", b"abc", b"abcd", b"abcde"]:
+        pot._consume(bs)
+    assert len(pot.cache) <= 3
 
 
 @pytest.mark.asyncio

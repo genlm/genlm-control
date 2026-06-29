@@ -3,13 +3,44 @@ import weakref
 import torch
 import warnings
 from typing import NamedTuple
-from genlm.control.potential.base import Potential
+from genlm.control.potential.base import Potential, _burst_logw_next_overrides
 from genlm.backend.tokenization import Token
 
 
 _prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_prompt_ids_overrides", default=None
 )
+
+
+def _walk_leaves(potential):
+    """Yield the leaf potentials (no ``children``), recursing composites' ``children``."""
+    children = potential.children
+    if not children:
+        yield potential
+        return
+    for child in children:
+        yield from _walk_leaves(child)
+
+
+def _is_burst_lm(p):
+    return isinstance(p, PromptedLLM) and p.model.supports_burst
+
+
+def find_engine_lm(potential):
+    """The single burst-capable engine LM leaf, or ``None`` if not exactly one."""
+    lms = [lf for lf in _walk_leaves(potential) if _is_burst_lm(lf)]
+    return lms[0] if len(lms) == 1 else None
+
+
+def lm_leaves(potential):
+    """All ``PromptedLLM`` leaves."""
+    return [lf for lf in _walk_leaves(potential) if isinstance(lf, PromptedLLM)]
+
+
+def constraint_leaf_ids(potential):
+    """``id``s of the non-(burst-LM) leaves -- the constraint identity a batched burst's
+    groups must share (counts a non-burst ``PromptedLLM``)."""
+    return frozenset(id(lf) for lf in _walk_leaves(potential) if not _is_burst_lm(lf))
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):
@@ -200,6 +231,7 @@ class PromptedLLM(Potential):
         eos_byte_strings=None,
         temperature=1.0,
         token_maps=None,
+        lora_name=None,
         **kwargs,
     ):
         """`
@@ -219,6 +251,7 @@ class PromptedLLM(Potential):
         self.model = llm
         self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
+        self.lora_name = lora_name  # property setter derives self._fwd
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -283,6 +316,20 @@ class PromptedLLM(Potential):
             "Cannot reset eos_byte_strings after initialization. "
             "Use spawn_new_eos(new_eos_byte_strings) instead."
         )
+
+    @property
+    def lora_name(self):
+        """LoRA adapter this view forwards under (``None`` = base model). The burst
+        tags each substream with it; the slow lane forwards through ``_fwd`` (an
+        adapter-bound view of the engine), so both lanes apply the adapter
+        consistently. Assigning rebinds the forward handle — rebind between SMC
+        runs, never mid-burst (the burst snapshots adapter names at start)."""
+        return self._lora_name
+
+    @lora_name.setter
+    def lora_name(self, lora_name):
+        self._lora_name = lora_name
+        self._fwd = self.model.lora_view(lora_name)
 
     @property
     def prompt_ids(self):
@@ -439,7 +486,7 @@ class PromptedLLM(Potential):
     async def _log_probability(self, context_ids):
         prefixes = [self.prompt_ids + context_ids[:i] for i in range(len(context_ids))]
         log_ps = self._maybe_temper(
-            await self.model.batch_next_token_logprobs(prefixes)
+            await self._fwd.batch_next_token_logprobs(prefixes)
         )
         target_ids = torch.tensor(context_ids, device=log_ps.device)
         with torch.no_grad():
@@ -480,10 +527,81 @@ class PromptedLLM(Potential):
         context_ids = self.encode_tokens(context)
         logp_context = await self._log_probability(context_ids)
         logp_next = self._maybe_temper(
-            await self.model.next_token_logprobs(self.prompt_ids + context_ids)
+            await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
         )
         logp_eos = torch.logsumexp(logp_next[self.token_maps.eos_idxs], dim=0).item()
         return logp_context + logp_eos
+
+    def _eos_index_tensors(self, device):
+        """Cache (and return) the EOS / non-EOS column-index tensors used to fold
+        the engine vocab into the control vocab (EOS kept last). Shared by the
+        per-row :meth:`_process_logw_next` and the batched
+        :meth:`_process_logw_next_batch`."""
+        if (
+            not hasattr(self, "_eos_idxs_tensor")
+            or not hasattr(self, "_non_eos_indices")
+            or self._eos_idxs_tensor.device != device
+        ):
+            self._eos_idxs_tensor = torch.tensor(
+                self.token_maps.eos_idxs, device=device
+            )
+            all_indices = torch.arange(len(self.token_maps.decode), device=device)
+            self._non_eos_indices = all_indices[
+                ~torch.isin(all_indices, self._eos_idxs_tensor)
+            ]
+        return self._eos_idxs_tensor, self._non_eos_indices
+
+    def _verify_logit_padding(self, n_logits):
+        """Guard the tail-padding done when the model emits fewer logits than
+        ``len(token_maps.decode)`` (the tokenizer added tokens beyond the embedding
+        matrix, e.g. Gemma's <image_soft_token>). Padding the tail with -inf is only
+        correct if the model's logit indices are contiguous ``0..n_logits-1``;
+        verify that once. Shared by the per-row :meth:`_process_logw_next` and the
+        batched :meth:`_process_logw_next_batch` so both raise (rather than silently
+        mis-fold columns) on a model that violates the assumption."""
+        if not hasattr(self, "_logit_padding_verified"):
+            for i in range(n_logits):
+                if self.token_maps.decode[i].token_id != i:
+                    raise ValueError(
+                        f"Token ID / index mismatch at position {i}: "
+                        f"decode[{i}].token_id={self.token_maps.decode[i].token_id}. "
+                        f"Padding assumes added tokens are at indices >= vocab_size."
+                    )
+            self._logit_padding_verified = True
+
+    def _process_logw_next_batch(self, logits):
+        """Vectorized, on-device analog of :meth:`_process_logw_next`: maps a
+        ``[N, n_logits]`` batch of raw engine logits to ``[N, V+1]`` control-vocab
+        log-weights (EOS folded into the last column) entirely on device, no host
+        transfer. Returns a ``torch.Tensor`` (not a ``LazyWeights``); the caller samples
+        on-device and transfers only the N drawn ids back."""
+        eos_idxs, non_eos = self._eos_index_tensors(logits.device)
+        n_decode = len(self.token_maps.decode)
+        n_logits = logits.shape[1]
+        if n_logits < n_decode:
+            self._verify_logit_padding(n_logits)  # same guard as the per-row path
+            pad = torch.full(
+                (logits.shape[0], n_decode - n_logits),
+                float("-inf"),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            logits = torch.cat([logits, pad], dim=1)
+        logits = logits[:, :n_decode].log_softmax(dim=1)  # [N, n_decode]
+        out = torch.full(
+            (logits.shape[0], len(self.vocab) + 1),
+            float("-inf"),
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        out[:, : len(self.vocab)] = logits[:, non_eos]
+        if eos_idxs.numel() == 1:
+            # On-device single-EOS gather: index with the 0-dim tensor, NOT
+            # `eos_idxs.item()`, so the EOS column needs no host sync.
+            out[:, -1] = logits[:, eos_idxs[0]]
+        else:
+            out[:, -1] = torch.logsumexp(logits[:, eos_idxs], dim=1)
+        return out
 
     def _process_logw_next(self, logw_next):
         """Process the log probabilities for the next tokens.
@@ -497,70 +615,10 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Processed log probabilities for the next tokens.
         """
-        # This is ugly, but it's useful for all potentials to adhere to the convention
-        # of keeping the EOS token at the end of the weights array.
-
-        # Cache eos_idxs_tensor and non_eos_indices on first use
-        if (
-            not hasattr(self, "_eos_idxs_tensor")
-            or not hasattr(self, "_non_eos_indices")
-            or self._eos_idxs_tensor.device != logw_next.device
-        ):
-            self._eos_idxs_tensor = torch.tensor(
-                self.token_maps.eos_idxs, device=logw_next.device
-            )
-            all_indices = torch.arange(
-                len(self.token_maps.decode), device=logw_next.device
-            )
-            self._non_eos_indices = all_indices[
-                ~torch.isin(all_indices, self._eos_idxs_tensor)
-            ]
-
-        # The model may produce fewer logits than len(token_maps.decode) when
-        # the tokenizer has added tokens beyond the model's embedding matrix
-        # (e.g. Gemma's <image_soft_token>). Pad with -inf so these tokens
-        # are unscorable but still present in the vocabulary.
-        # We assert that HF models always produce logits for token indices
-        # 0..vocab_size-1, and added tokens are at indices >= vocab_size.
-        n_decode = len(self.token_maps.decode)
-        n_logits = len(logw_next)
-        if n_logits < n_decode:
-            # Verify (once) that token IDs in the model's logit range are
-            # contiguous 0..n_logits-1, so padding the tail is safe.
-            if not hasattr(self, "_logit_padding_verified"):
-                for i in range(n_logits):
-                    if self.token_maps.decode[i].token_id != i:
-                        raise ValueError(
-                            f"Token ID / index mismatch at position {i}: "
-                            f"decode[{i}].token_id={self.token_maps.decode[i].token_id}. "
-                            f"Padding assumes added tokens are at indices >= vocab_size."
-                        )
-                self._logit_padding_verified = True
-            pad = torch.full(
-                (n_decode - n_logits,),
-                float("-inf"),
-                dtype=logw_next.dtype,
-                device=logw_next.device,
-            )
-            logw_next = torch.cat([logw_next, pad])
-
-        logw_next = logw_next[:n_decode]
-        logw_next = logw_next.log_softmax(dim=0)
-        _logw_next = torch.full(
-            (len(self.vocab) + 1,),
-            float("-inf"),
-            dtype=logw_next.dtype,
-            device=logw_next.device,
-        )
-        _logw_next[: len(self.vocab)] = logw_next[self._non_eos_indices]
-
-        # Special case: if only one EOS idx, just assign directly (avoids cost of logsumexp)
-        if self._eos_idxs_tensor.numel() == 1:
-            _logw_next[-1] = logw_next[self._eos_idxs_tensor]
-        else:
-            _logw_next[-1] = torch.logsumexp(logw_next[self._eos_idxs_tensor], dim=0)
-
-        return self.make_lazy_weights(_logw_next.float().cpu().numpy())
+        # N=1 adapter over the batched on-device fold: same pad / slice / log_softmax /
+        # EOS fold, kept as a CPU torch tensor for the slow lane's LazyWeights.
+        out = self._process_logw_next_batch(logw_next.unsqueeze(0))
+        return self.make_lazy_weights(out[0].float().cpu())
 
     async def logw_next(self, context):
         """Get log probabilities for next tokens given the prompt and `context`.
@@ -571,28 +629,39 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
+        override = _burst_logw_next_overrides.get()
+        if override is not None and self in override:
+            return override[self]  # burst: serve the engine's warm logits, no forward
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
-            await self.model.next_token_logprobs(self.prompt_ids + context_ids)
+            await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
         )
         return self._process_logw_next(logw_next)
 
     async def batch_logw_next(self, contexts):
-        """Get log probabilities for next tokens given the prompt and `context`, for a batch of contexts.
+        """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
+        (`.weights` shape `[N, V+1]`). In a batched burst the engine's warm `[N, V+1]` batch
+        is injected via the `burst_logw_next` override (same ContextVar as the scalar path,
+        value batched) -- served directly, no forward.
 
         Args:
-            contexts (list[list[bytes]] | list[list[Token]]): A list of sequences of byte tokens or Token objects.
+            contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.
 
         Returns:
-            (list[LazyWeights]): Log probabilities for next tokens and EOS for each context. Keys are Token objects.
+            (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
+        override = _burst_logw_next_overrides.get()
+        if override is not None and self in override:
+            return override[self]  # burst: the engine's warm [N, V+1] batch, no forward
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
-            await self.model.batch_next_token_logprobs(
+            await self._fwd.batch_next_token_logprobs(
                 [self.prompt_ids + context_ids for context_ids in context_ids_batch]
             )
         )
-        return [self._process_logw_next(logw_next) for logw_next in logw_nexts]
+        # One on-device fold over the [N, n_logits] batch -> [N, V+1] (== stacking the
+        # per-row `_process_logw_next`), wrapped as one batched LazyWeights.
+        return self.make_lazy_weights(self._process_logw_next_batch(logw_nexts).float().cpu())
 
     def __repr__(self):
         return f"PromptedLLM(prompt={self.prompt!r})"
@@ -626,6 +695,7 @@ class PromptedLLM(Potential):
                 prompt_ids=prompt_ids,
                 temperature=temperature,
                 token_maps=self.token_maps,
+                lora_name=self.lora_name,
             )
 
         return PromptedLLM(
@@ -633,6 +703,7 @@ class PromptedLLM(Potential):
             prompt_ids=prompt_ids,
             eos_byte_strings=eos_byte_strings,
             temperature=temperature,
+            lora_name=self.lora_name,
         )
 
     def spawn_new_eos(self, eos_byte_strings=None, **kwargs):

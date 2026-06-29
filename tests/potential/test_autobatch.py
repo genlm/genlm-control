@@ -82,8 +82,7 @@ async def test_batch_methods():
 
     want_logw_next = await potential.batch_logw_next(sequences)
     have_logw_next = await autobatched.batch_logw_next(sequences)
-    for have, want in zip(have_logw_next, want_logw_next):
-        have.assert_equal(want)
+    have_logw_next.assert_equal(want_logw_next)  # both batched LazyWeights [N, V+1]
 
     await autobatched.cleanup()
 

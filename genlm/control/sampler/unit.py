@@ -1,28 +1,44 @@
+import asyncio
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from genlm.control.constant import EOS
+from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
+from genlm.control.sampler.burst import BurstDraw
+from genlm.control.potential.base import burst_logw_next
+from genlm.control.util import draw_key, draw_ordinal
 from lark import Lark
 from lark.exceptions import LarkError
 
 
+@dataclass
+class _UnitAccum:
+    """Per-row, per-burst accumulator for an in-progress unit: the subunits drawn
+    so far this unit round and their summed importance weight / log-prob.
+
+    Lives in the burst's ``scratch`` dict keyed by the row's handle, and is discarded
+    the moment the unit completes (one unit per burst, so nothing carries across)."""
+
+    buffer: list
+    logw: float
+    logp: float
+
+
 def flatten_units(context):
-    """
-    Flatten nested unit context to a flat token list. When using MultiTokenUnitSampler, token_ctx becomes nested [[...], [...], ...].
-    This helper flattens it for use with coercion functions like b"".join.
+    """Flatten a (possibly nested) unit context to a flat token list. A
+    MultiTokenUnitSampler nests units as sub-lists, and a nested unit sampler nests
+    deeper -- so this recurses (matching the engine-prompt flatten in
+    ``_Burst.context_ids``); a one-level flatten would leave deeper nesting for the
+    subunit sampler / coercion to choke on.
 
     Usage:
         potential.coerce(LLM, f=lambda ctx: b"".join(flatten_units(ctx)))
-    Args:
-        context: Either a flat list [token1, token2, ...] or nested [[token1, token2], [token3], ...]
-    Returns:
-        list: Flattened list of tokens
     """
     flattened = []
     for item in context:
         if isinstance(item, list):
-            flattened.extend(item)
+            flattened.extend(flatten_units(item))
         else:
             flattened.append(item)
     return flattened
@@ -78,6 +94,10 @@ class MultiTokenUnitSampler(TokenSampler):
             raise TypeError(
                 f"subunit_sampler must be a TokenSampler, got {type(subunit_sampler)}"
             )
+        if max_subunits_per_unit < 1:
+            raise ValueError(
+                f"max_subunits_per_unit must be >= 1, got {max_subunits_per_unit}"
+            )
 
         # Initialized with subunit sampler's target
         # We may want to add support for different samplers in the future
@@ -87,49 +107,123 @@ class MultiTokenUnitSampler(TokenSampler):
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
 
+    def supports_burst(self) -> bool:
+        # Rides the fast lane iff its subunit sampler can (the subunits ARE the burst draws).
+        return self.subunit_sampler.supports_burst()
+
+    def burst_draw_sampler(self):
+        # The subunit does the per-step draw, so recurse to its draw sampler.
+        return self.subunit_sampler.burst_draw_sampler()
+
+    def burst_free_running(self) -> bool:
+        # Synchronized (unit grain): one SMC step is one whole unit, with ESS tested once
+        # per unit round at the synced boundary (not per subunit decode step).
+        return False
+
+    def burst_max_steps(self, live) -> int:
+        # One unit's worth of subunit decode steps (+1 margin); the control-side reject at
+        # ``max_subunits_per_unit`` fires before this engine cap.
+        return self.max_subunits_per_unit + 1
+
+    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
+        """Burst draw for one unit round: one subunit per decode step, completing an
+        SMC step only at the unit boundary. Per particle, slice the batched warm
+        (``{view: [N, V+1] LazyWeights}``) into a per-row injection and run the subunit
+        sampler's REAL ``sample`` (one subunit); accumulate it in ``burst.scratch`` (keyed by
+        particle ``handle``); then apply the SAME EOS-split / boundary / max-subunit logic as
+        the slow ``sample``/``transition``:
+
+        * EOS subunit -> split the content off so ``context[-1]`` is EOS (terminate).
+        * boundary fires -> finalize the unit; the row pops out at the synced boundary.
+        * max subunits without a boundary -> reject (``-inf`` weight, finishes).
+        * otherwise -> mid-unit: emit the subunit, bank nothing (``step=None``)."""
+        accums = burst.scratch  # handle -> _UnitAccum, fresh each burst
+
+        async def one(i, context, handle):
+            injection = self._row_injection(warm_batch, i)
+            accum = accums.get(handle)
+            buf = accum.buffer if accum is not None else []
+            # Subunit context: completed units flattened to subunits + in-progress
+            # subunits this unit, so the subunit sampler's factor scores statelessly.
+            sub_context = flatten_units(context) + list(buf)
+            # ordinal = subunits committed (leaf count) + those drawn this unit so far,
+            # matching the slow loop's per-subunit ordinal under one transition scope.
+            with burst_logw_next(injection), draw_key(handle, draw_ordinal(context) + len(buf)):
+                subunit, sub_logw, sub_logp = await self.subunit_sampler.sample(sub_context)
+
+            if accum is None:
+                accum = accums[handle] = _UnitAccum([], 0.0, 0.0)
+            status, unit = self._feed(accum, subunit, sub_logw, sub_logp, context)
+            if status == "mid":
+                return BurstDraw(token=subunit, step=None, pop=False)  # emit subunit, bank nothing
+            accums.pop(handle, None)
+            weight = float("-inf") if status == "max" else accum.logw
+            step = (self._to_append(unit), weight, accum.logp)
+            return BurstDraw(token=subunit, step=step, pop=status == "boundary")
+
+        return await asyncio.gather(
+            *(one(i, c, h) for i, (c, h) in enumerate(zip(contexts, handles)))
+        )
+
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
         return await self.subunit_sampler.start_weight()
 
     async def logw_eos(self, context):
-        """EOS log-weight at the ``max_tokens`` boundary.
-
-        ``context`` is the nested unit context (``[[...], [...], ...]``) that
-        ``SequenceModel`` carries for multi-token units. Flatten it to the token
-        list the underlying target expects, then defer to the subunit sampler so
-        its own (possibly cheaper) ``logw_eos`` is reused.
-        """
+        """EOS log-weight at the ``max_tokens`` boundary: defer to the subunit sampler
+        on the flattened context."""
         return await self.subunit_sampler.logw_eos(flatten_units(context))
 
-    async def forward(self):
-        """Called by LLaMPPL Model.call() to sample one multi-token unit.
+    async def transition(self, context):
+        """The controller-facing per-step transition for multi-token units.
 
-        Called by SequenceModel.step() when it calls self.call(unit_sampler).
+        Samples one multi-token unit and returns the list of items to append to
+        the particle context, the importance-weight increment, and the
+        log-probability of the random choices.
+
+        The context passed by the controller is the structured (possibly nested) unit
+        context; it is flattened before sampling so the subunit sampler sees a flat token
+        list. The trailing-EOS split (when a unit ends with EOS) is done by ``_to_append``.
+
+        Args:
+            context (list): The particle's structured unit context.
+
+        Returns:
+            (to_append, logw, logp): items to extend the context with, the
+                weight increment, and the log-probability of random choices.
         """
-        parent = self.parent
-
-        # Flatten parent.token_ctx before passing to sample
-        # This ensures sample() always works with a flat list
-        flat_context = flatten_units(parent.token_ctx)
-
-        # Sample multi-token unit, passing both flat context and structured unit context
+        flat_context = flatten_units(context)
         unit, logw, logp = await self.sample(
-            flat_context, unit_context=parent.token_ctx, draw=None
+            flat_context, unit_context=context, draw=None
         )
+        return self._to_append(unit), logw, logp
 
-        # Update parent's weight and logp
-        parent.score(logw)
-        parent.logp += logp
-
-        # If the unit ends with EOS, return EOS directly so SequenceModel can detect completion
-        # SequenceModel.step() checks `token_ctx[-1] is EOS` to finish generation
+    @staticmethod
+    def _to_append(unit):
+        """Controller ``to_append`` from a completed unit, shared by the slow
+        ``transition`` and the burst: if the unit ends with EOS, split the content off
+        and append EOS separately so ``context[-1] is EOS`` (the terminal check fires);
+        otherwise the unit is a single item."""
         if unit and unit[-1] is EOS:
-            # Keep the unit content before EOS in token_ctx, then return EOS separately
-            if len(unit) > 1:
-                parent.token_ctx.append(unit[:-1])  # Add unit without EOS
-            return EOS  # Return EOS directly for SequenceModel to detect
+            return ([unit[:-1]] if len(unit) > 1 else []) + [EOS]
+        return [unit]
 
-        return unit
+    def _feed(self, accum, subunit, sub_logw, sub_logp, unit_context):
+        """Accumulate one subunit into ``accum`` and classify the unit -- the single
+        per-subunit step shared by the slow loop and the burst (they differ only in how
+        the subunit is drawn). Returns ``(status, unit)``: ``status`` in
+        ``{"eos","boundary","max","mid"}``; ``unit`` is the completed unit (``None``
+        mid-unit) -- the raw buffer for eos/max, the finalized unit for a boundary."""
+        accum.buffer.append(subunit)
+        accum.logw += sub_logw
+        accum.logp += sub_logp
+        if subunit is EOS:
+            return "eos", accum.buffer
+        if self.boundary_predicate(unit_context, accum.buffer):
+            return "boundary", self.boundary_predicate.finalize_unit(accum.buffer)
+        if len(accum.buffer) >= self.max_subunits_per_unit:
+            return "max", accum.buffer
+        return "mid", None
 
     async def sample(self, flat_token_context, unit_context=None, draw=None):
         """Sample a multi-token unit by running sequence sampling for $\\varphi_{\\bm{x}}$.
@@ -141,7 +235,7 @@ class MultiTokenUnitSampler(TokenSampler):
 
         Args:
             flat_token_context (list): Flat sequence of all previously sampled tokens.
-                This is pre-flattened by forward() to ensure compatibility with potentials.
+                This is pre-flattened by transition() to ensure compatibility with potentials.
             unit_context (list, optional): Structured sequence of previously sampled units.
                 Used by boundary predicates that need context. Defaults to [].
             draw (callable, optional): Sampling function passed to subunit_sampler
@@ -156,45 +250,28 @@ class MultiTokenUnitSampler(TokenSampler):
         if unit_context is None:
             unit_context = []
 
-        subunit_buffer = []
+        accum = _UnitAccum([], 0.0, 0.0)
         current_context = list(flat_token_context)
 
-        # Accumulate weights
-        cumulative_logw = 0.0
-        cumulative_logp = 0.0
-
-        # Sequential sampling until EOT
+        # Draw subunits until the unit completes; ``_feed`` (shared with the burst)
+        # accumulates each and decides eos / boundary / max.
         for _ in range(self.max_subunits_per_unit):
-            # Sample next subunit $(s_i, w_i) \\sim q_{\\text{sub}}(\\cdot \\mid \\bm{s}_{<i})$
             try:
                 subunit, logw_i, logp_i = await self.subunit_sampler.sample(
                     current_context, draw
                 )
             except (RuntimeError, OSError, TimeoutError):
-                # Expected failures (network, timeout, system errors)
-                # Return current buffer with -inf weight to discard this sample
-                return subunit_buffer, float("-inf"), cumulative_logp
+                # Expected failures (network/timeout/system): reject with -inf weight.
+                return accum.buffer, float("-inf"), accum.logp
 
-            # Accumulate weight and logp
-            cumulative_logw += logw_i
-            cumulative_logp += logp_i
-
-            # Add to both buffer and context
-            subunit_buffer.append(subunit)
             current_context.append(subunit)
-
-            # Check for EOS
-            if subunit is EOS:
-                return subunit_buffer, cumulative_logw, cumulative_logp
-
-            # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
-            if self.boundary_predicate(unit_context, subunit_buffer):
-                # Let the predicate finalize the unit (e.g., remove delimiter tokens)
-                unit = self.boundary_predicate.finalize_unit(subunit_buffer)
-                return unit, cumulative_logw, cumulative_logp
-
-        # Max subunits exceeded: we return -inf weight to reject incomplete/invalid unit
-        return subunit_buffer, float("-inf"), cumulative_logp
+            status, unit = self._feed(accum, subunit, logw_i, logp_i, unit_context)
+            if status == "mid":
+                continue
+            weight = float("-inf") if status == "max" else accum.logw
+            return unit, weight, accum.logp
+        # No fall-through: max_subunits_per_unit >= 1 (checked in __init__), so the last
+        # iteration always returns via _feed's "max" branch.
 
     async def cleanup(self):
         """Clean up resources."""
@@ -262,10 +339,29 @@ class TokenSetBoundary(BoundaryPredicate):
 
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
+        # Compare by BYTE CONTENT, not by hash-set membership. A real-LLM token is a
+        # ``Token`` (subclass of ``bytes`` that hashes by ``token_id``), so
+        # ``Token(13, b" ") in {b" "}`` is False even though the bytes match -- the
+        # boundary would silently never fire on the real-LLM grain. Precompute a
+        # plain-bytes set (``bytes(t)`` is the content for both ``Token`` and
+        # ``bytes``) plus an EOS flag (EOS is matched by identity, having no bytes).
+        self._eos_boundary = any(
+            isinstance(t, EndOfSequence) for t in self.boundary_tokens
+        )
+        self._byte_boundaries = {
+            bytes(t) for t in self.boundary_tokens if not isinstance(t, EndOfSequence)
+        }
 
     def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
-        """Check boundary (ignore unit_context for stateless predicate)."""
-        return bool(subunit_buffer and subunit_buffer[-1] in self.boundary_tokens)
+        """Check boundary (ignore unit_context for stateless predicate). Matches by
+        byte content so it fires identically on ``bytes`` and real-LLM ``Token``
+        subunits; EOS is matched by identity."""
+        if not subunit_buffer:
+            return False
+        last = subunit_buffer[-1]
+        if isinstance(last, EndOfSequence):
+            return self._eos_boundary
+        return bytes(last) in self._byte_boundaries
 
     def __repr__(self) -> str:
         return f"TokenSetBoundary({self.boundary_tokens!r})"

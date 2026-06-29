@@ -1,12 +1,31 @@
 import asyncio
+import contextlib
+import contextvars
 import numpy as np
 from abc import ABC, abstractmethod
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import LazyWeights
+from genlm.control.util import LazyWeights, stack_weights
 from genlm.control.typing import TokenType, infer_vocabulary_type
 from genlm.control.potential.operators import PotentialOps
 from genlm.control.potential.testing import PotentialTests
+
+
+# Per-burst override: {potential: LazyWeights} a potential's ``logw_next`` returns for
+# itself instead of computing. Read by ``PromptedLLM`` and ``Product``.
+_burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_logw_next", default=None
+)
+
+
+@contextlib.contextmanager
+def burst_logw_next(overrides):
+    """Inject ``{potential: LazyWeights}`` for one burst step (set per particle task)."""
+    token = _burst_logw_next_overrides.set(overrides)
+    try:
+        yield
+    finally:
+        _burst_logw_next_overrides.reset(token)
 
 
 class Potential(ABC, PotentialOps, PotentialTests):
@@ -104,6 +123,17 @@ class Potential(ABC, PotentialOps, PotentialTests):
         """
         return 0.0  # pragma: no cover
 
+    async def logw_eos(self, context) -> float:
+        """Assess the log-weight of terminating (EOS) after `context`.
+
+        Args:
+            context (list): Sequence of tokens.
+
+        Returns:
+            (float): Log weight of terminating after `context`.
+        """
+        return float((await self.logw_next(context))[self.eos])
+
     async def score(self, context):
         """Assess the weight of `context` based on EOS-termination.
 
@@ -119,6 +149,30 @@ class Potential(ABC, PotentialOps, PotentialTests):
             return await self.complete(context[:-1])
         else:
             return await self.prefix(context)
+
+    def is_terminal_only(self) -> bool:
+        """Whether this potential contributes weight only at sequence termination.
+
+        A terminal-only potential has ``prefix(context) == 0`` for every proper
+        prefix, so it never reweights mid-generation; all of its weight comes from
+        ``complete`` (equivalently, ``score`` at EOS). Indicator critics like
+        ``1[f(z) == y]`` are the canonical example.
+
+        When used as an SMC critic, returning ``True`` makes the Controller skip
+        the per-step critic twist (both the slow and burst lanes) and reweight only
+        at termination -- byte-identical to twisting per step, since a terminal-only
+        critic's per-step twist is ``twist(0)``, but it avoids the per-step critic
+        call. In a batched run this fires only when EVERY group's critic is
+        terminal-only (the flag is population-wide). The default is ``False``: a
+        potential is assumed to reweight per step unless it explicitly opts in.
+        Override in subclasses that satisfy the ``prefix == 0`` invariant.
+        """
+        return False
+
+    @property
+    def children(self):
+        """Sub-potentials this composes (``[]`` for a leaf; ``Product`` -> ``[p1, p2]``)."""
+        return []
 
     async def logw_next(self, context):
         """Compute the next-token weights of each token in `self.vocab_eos` given `context`.
@@ -219,15 +273,16 @@ class Potential(ABC, PotentialOps, PotentialTests):
         return results
 
     async def batch_logw_next(self, contexts):
-        """Batched equivalent to `logw_next`.
-
-        Computes the next-token weights of each token in `self.vocab_eos` given each context in the batch.
+        """Batched equivalent to `logw_next`: the next-token weights for every context in the
+        batch, as ONE `LazyWeights` whose weights are `[N, V+1]` (the batch dim leads). Row
+        `i` is `result.weights[i]`. Default: stack the per-particle `logw_next` (preserving
+        backend); `Product` composes batched, `PromptedLLM` serves its injected warm batch.
 
         Args:
             contexts (list): List of sequences of tokens.
 
         Returns:
-            (list): List of LazyWeights objects, one for each context.
+            (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
 
         Raises:
             ValueError: If any context has zero weight (log weight of -inf) under `prefix`.
@@ -235,7 +290,8 @@ class Potential(ABC, PotentialOps, PotentialTests):
         if not contexts:
             raise ValueError("Contexts must be non-empty.")
 
-        return await asyncio.gather(*[self.logw_next(context) for context in contexts])
+        lws = await asyncio.gather(*[self.logw_next(context) for context in contexts])
+        return self.make_lazy_weights(stack_weights([lw.weights for lw in lws]))
 
     #############
     # Utilities #

@@ -1,16 +1,25 @@
 import asyncio
 import numpy as np
+import torch
 from arsenal import colors
-from llamppl import SubModel
-from arsenal.maths import log1mexp, logsumexp
+from arsenal.maths import log1mexp
 import warnings
 
-from genlm.control.util import fast_sample_logprobs
+from genlm.control.util import (
+    select,
+    picker_indices,
+    draw_key,
+    draw_ordinal,
+    awrs_gumbel_keys,
+    get_draw_seed,
+)
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
+from genlm.control.sampler.burst import BurstDraw
+from genlm.control.potential.base import burst_logw_next
 
 
-class TokenSampler(SubModel):
+class TokenSampler:
     """Base class for sampling a token from a potential's vocabulary.
 
     `TokenSampler`s generate properly weighted samples with respect to a `target` potential.
@@ -23,42 +32,86 @@ class TokenSampler(SubModel):
     \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})
     $$
 
+    Collapses to a single per-step :meth:`transition` the controller calls,
+    mapping a particle context to ``(to_append, logw, logp)``.
+
     Args:
         target (Potential): The potential that samples are properly weighted with respect to.
     """
 
+    # ``None`` unless the sampler draws from a separate proposal (Direct/AWRS/Set).
+    proposal = None
+
     def __init__(self, target):
-        super().__init__()
         self.target = target
         self.token_type = self.target.token_type
+
+    def supports_burst(self) -> bool:
+        """Whether this sampler can run inside the engine burst (implements
+        :meth:`burst_draw_batch`). Default ``False`` (stays on ``StepLoop``)."""
+        return False
+
+    def burst_draw_sampler(self):
+        """The sampler whose ``target``/``proposal`` are the injected views: ``self``
+        at token grain; a unit sampler delegates to its subunit."""
+        return self
+
+    def burst_free_running(self) -> bool:
+        """``True`` = free-running (token grain): one SMC step per decode step, ESS
+        every step. ``False`` = synchronized (unit grain): one step per unit."""
+        return True
+
+    def burst_max_steps(self, live) -> int:
+        """Engine decode-step budget for one burst (token grain). The unit sampler overrides."""
+        return max(p.max_tokens_left for p in live) + 1
+
+    @staticmethod
+    def _row_injection(warm_batch, i):
+        """Slice batched warm ``{view: [N, V+1]}`` into particle ``i``'s per-row
+        injection ``{view: [V+1]}`` for the sequential draw."""
+        return {view: view.make_lazy_weights(W.weights[i]) for view, W in warm_batch.items()}
+
+    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
+        """Sequential engine-burst draw, one BurstDraw per particle (token grain): slice
+        each row's warm logits and run the real per-step ``transition``. `DirectTokenSampler`
+        overrides with a vectorized draw, the unit sampler for subunit accumulation."""
+
+        async def one(i, context, handle):
+            injection = self._row_injection(warm_batch, i)
+            with burst_logw_next(injection), draw_key(handle, draw_ordinal(context)):
+                to_append, logw, logp = await self.transition(context)
+            return BurstDraw(token=to_append[-1], step=(to_append, logw, logp))
+
+        return await asyncio.gather(
+            *(one(i, c, h) for i, (c, h) in enumerate(zip(contexts, handles)))
+        )
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
 
     async def logw_eos(self, context):
+        """EOS log-weight at the ``max_tokens`` boundary, used to force termination."""
+        return await self.target.logw_eos(context)
+
+    async def transition(self, context):
+        """Controller-facing per-step transition.
+
+        Args:
+            context (list): The particle's current token context.
+
+        Returns:
+            (to_append, logw, logp): items to append (``[token]``, or more for a
+                multi-token unit), the weight increment, and the choice log-prob.
         """
-        Returns the weight of EOS, used to force termination in sequence.py.
+        token, logw, logp = await self.sample(context)
+        return [token], logw, logp
 
-        Subclasses may override with cheaper, sampler-specific computations
-        that avoid materializing the full ``logw_next`` vector.
-        """
-        logws = await self.target.logw_next(context)
-        return logws[self.target.eos]
-
-    async def forward(self):
-        parent = self.parent
-        token, logw, logp = await self.sample(parent.token_ctx)
-        parent.score(logw)
-        parent.logp += logp
-        return token
-
-    async def sample(self, context, draw):
+    async def sample(self, context):
         """Sample a token and weight from the `target`potential's vocabulary.
 
         Args:
             context (list[int]): A sequence of tokens in the `target` potential's vocabulary.
-            draw (callable): A callable that draws a sample from a distribution.
 
         Returns:
             (token, weight, logp): A tuple containing the sampled token, weight, and log-probability of the sampled token.
@@ -70,7 +123,16 @@ class TokenSampler(SubModel):
     async def cleanup(self):
         pass  # pragma: no cover
 
-    async def smc(self, n_particles, ess_threshold, max_tokens, critic=None, **kwargs):
+    async def smc(
+        self,
+        n_particles,
+        ess_threshold,
+        max_tokens,
+        critic=None,
+        *,
+        accelerate="auto",
+        **kwargs,
+    ):
         """Generate sequences using sequential Monte Carlo (SMC) inference with this token sampler and an optional critic.
 
         This method is a convenience wrapper around [`SMC`][genlm.control.sampler.sequence.SMC].
@@ -82,6 +144,10 @@ class TokenSampler(SubModel):
             max_tokens (int): The maximum number of tokens to generate.
             critic (Potential, optional): A potential function that guides the generation process
                 by scoring candidate sequences. Must have the same token type as the token sampler.
+            accelerate (str | bool, optional): Engine-acceleration knob forwarded to
+                `SMC.__call__`: ``"auto"`` (default), ``"off"`` (force per-token), or
+                ``"require"`` (engine or raise `NotAcceleratable`). ``True``/``False``
+                alias ``"auto"``/``"off"``.
             **kwargs (dict): Additional keyword arguments to pass to `SMC`'s `__call__` method.
         """
         from genlm.control.sampler.sequence import SMC
@@ -90,6 +156,7 @@ class TokenSampler(SubModel):
             n_particles=n_particles,
             ess_threshold=ess_threshold,
             max_tokens=max_tokens,
+            accelerate=accelerate,
             **kwargs,
         )
 
@@ -121,6 +188,10 @@ class DirectTokenSampler(TokenSampler):
             _validate_proposal_vocab(potential, proposal)
         self.proposal = proposal
 
+    def supports_burst(self) -> bool:
+        # Target (and proposal) logw_next are reproduced as injected views.
+        return True
+
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
 
@@ -142,32 +213,54 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            log_z = logsumexp(logws.weights)
-            if draw is None:
-                token_id = int(fast_sample_logprobs(logws.weights, size=1)[0])
-                token = logws.decode[token_id]
-                logp = logws.weights[token_id] - log_z
-            else:
-                logps = logws.spawn(logws.weights - log_z)
-                token = draw(logps.exp().materialize())
-                logp = logps[token]
-            return token, log_z, logp
+            logZ = logws.sum()  # normalizer == the weight
+            logps = logws.spawn(logws.weights - logZ)  # logws.normalize()
+            token = select(logps) if draw is None else draw(logps.exp().materialize())
+            return token, logZ, logps[token]
 
         proposal_logws, target_logws = await asyncio.gather(
-            self.proposal.logw_next(context),
-            self.potential.logw_next(context),
+            self.proposal.logw_next(context), self.potential.logw_next(context)
         )
-        proposal_log_z = logsumexp(proposal_logws.weights)
+        proposal_logZ = proposal_logws.sum()
+        proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_logZ)
         if draw is None:
-            token_id = int(fast_sample_logprobs(proposal_logws.weights, size=1)[0])
-            token = proposal_logws.decode[token_id]
-            proposal_logp = proposal_logws.weights[token_id] - proposal_log_z
+            token = select(proposal_logps)
         else:
-            proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_log_z)
             token = draw(proposal_logps.exp().materialize())
-            proposal_logp = proposal_logps[token]
-        logw = target_logws[token] - proposal_logws[token] + proposal_log_z
-        return token, logw, proposal_logp
+        logw = target_logws[token] - proposal_logws[token] + proposal_logZ
+        return token, logw, proposal_logps[token]
+
+    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
+        """Vectorized engine-burst draw over the population: one logsumexp + one keyed
+        Gumbel draw + one gather over the ``[N, V+1]`` proposal. Threefry keyed by
+        ``(row, draw_ordinal)``, so byte-identical to the per-particle path."""
+        rows = torch.tensor(handles, dtype=torch.int64)
+        ordinals = torch.tensor([draw_ordinal(c) for c in contexts], dtype=torch.int64)
+        with burst_logw_next(warm_batch):
+            if self.proposal is None:
+                proposal, target = await self.potential.batch_logw_next(contexts), None
+            else:
+                proposal, target = await asyncio.gather(
+                    self.proposal.batch_logw_next(contexts),
+                    self.potential.batch_logw_next(contexts),
+                )
+            pw = proposal.weights
+            pZ = torch.logsumexp(pw, dim=-1)  # [N], == per-row .sum()
+            plogps = pw - pZ[:, None]  # normalized proposal [N, V+1]
+            with draw_key(rows, ordinals):
+                idx = picker_indices(plogps)  # [N]
+            ar = torch.arange(len(handles), device=pw.device)
+            logp, decode = plogps[ar, idx], proposal.decode
+            if target is None:
+                weight = pZ  # the normalizer is the weight
+            else:
+                tw = target.weights.to(pw.device)
+                weight = tw[ar, idx] - pw[ar, idx] + pZ  # importance weight
+        idx_l, w_l, lp_l = idx.tolist(), weight.tolist(), logp.tolist()
+        return [
+            BurstDraw(token=decode[idx_l[i]], step=([decode[idx_l[i]]], w_l[i], lp_l[i]))
+            for i in range(len(handles))
+        ]
 
     async def cleanup(self):
         pass  # pragma: no cover
@@ -187,6 +280,10 @@ class SetTokenSampler(TokenSampler):
         assert isinstance(set_sampler, SetSampler)
         super().__init__(set_sampler.target)
         self.set_sampler = set_sampler
+
+    def supports_burst(self) -> bool:
+        # The async-trie set draw runs on the main loop via the per-step hop.
+        return True
 
     async def sample(self, context, draw=None):
         """Sample a token and weight by sampling a weighted set of tokens from the `set_sampler`
@@ -214,31 +311,10 @@ class SetTokenSampler(TokenSampler):
             `SetSampler` for more details.
         """
         logws, logp = await self.set_sampler.sample_set(context, draw=draw)
-        log_z = logsumexp(logws.weights)
-        if draw is None:
-            token_id = int(fast_sample_logprobs(logws.weights, size=1)[0])
-            token = logws.decode[token_id]
-            selected_logp = logws.weights[token_id] - log_z
-        else:
-            logps = logws.spawn(logws.weights - log_z)
-            token = draw(logps.exp().materialize())
-            selected_logp = logps[token]
-        return token, log_z, logp + selected_logp
-
-    async def logw_eos(self, context):
-        """Boundary EOS log-weight via the ``complete - prefix`` identity.
-
-        Set samplers exist to avoid materializing the full ``target.logw_next``
-        vector; for the EOS entry specifically we get the same value as
-        ``complete(context) - prefix(context)``, which for the typical
-        ``iter_potential * item_potential`` target reduces to a constant
-        number of scalar evaluations on the underlying potentials.
-        """
-        complete_w, prefix_w = await asyncio.gather(
-            self.target.complete(context),
-            self.target.prefix(context),
-        )
-        return complete_w - prefix_w
+        logZ = logws.sum()  # one logsumexp, reused as the weight
+        logps = logws.spawn(logws.weights - logZ)  # == logws.normalize()
+        token = select(logps) if draw is None else draw(logps.exp().materialize())
+        return token, logZ, logp + logps[token]
 
     async def cleanup(self):
         """Clean up the sampler.
@@ -319,18 +395,37 @@ class AWRS(TokenSampler):
 
         self.vocab_eos_set = set(self.target.vocab_eos)
         self.V = len(self.potential.vocab_eos)
-        self.rng = np.random.default_rng(seed=seed)
+        self.rng = np.random.default_rng(seed=seed)  # phantom-geometric (CPU scalar)
+        # Gumbel keys: per-instance threefry stream (driver-independent, on-device).
+        self._draw_seed = (seed if seed is not None else get_draw_seed()) & 0xFFFFFFFF
+        self._draw_ctr = 0
+        self._valid_idxs_cache = None
 
-    def _prune_logws(self, logws):
-        # Prune the logws to only include the tokens in the
-        # target vocabulary. (This zeros-out tokens which we know a priori
-        # will be rejected.) Note: We need an additional correction term
-        # to account for the fact that we're throwing away some probability mass.
-        # This should be handled in `sample`.
-        pruned = self.potential.alloc_logws()
-        pruned[self.valid_idxs] = logws.weights[self.valid_idxs]
-        logws.weights = pruned
-        return logws
+    def supports_burst(self) -> bool:
+        # Rejection runs over the engine LM logits (injected), condition checked per
+        # probed token (CPU). With a proposal, both LM reads are injected views.
+        return True
+
+    def _prune_logws(self, w):
+        # Keep only target-vocab tokens (-inf elsewhere; mass corrected via logZ). On-device.
+        pruned = torch.full_like(w, float("-inf"))
+        idx = self._valid_idxs_t(w.device)
+        pruned[idx] = w[idx]
+        return pruned
+
+    def _valid_idxs_t(self, device):
+        c = self._valid_idxs_cache
+        if c is None or c.device != device:
+            c = self._valid_idxs_cache = torch.as_tensor(
+                self.valid_idxs, dtype=torch.int64, device=device
+            )
+        return c
+
+    def _make_keys(self, logps):
+        """Fresh Gumbel keys for one round; advance the counter so each round is independent."""
+        keys = awrs_gumbel_keys(logps, self._draw_seed, self._draw_ctr)
+        self._draw_ctr += 1
+        return keys
 
     async def _accept(self, context, token, verbosity=0):
         if self.prune_logws or token in self.vocab_eos_set:
@@ -368,27 +463,35 @@ class AWRS(TokenSampler):
             target_logws = None
         else:
             target_logws, logws = await asyncio.gather(
-                self.potential.logw_next(context),
-                self.proposal.logw_next(context),
+                self.potential.logw_next(context), self.proposal.logw_next(context)
             )
 
-        if self.prune_logws:
-            logws = self._prune_logws(logws)
+        async def accept(tok):
+            return await self._accept(context, tok, verbosity)
 
-        logZ = logsumexp(logws.weights)
-        logps = logws.weights - logZ
+        return await self._run_rejection(logws, accept, target_logws)
+
+    async def _run_rejection(self, logws, accept, target_logws=None):
+        """Shared AWRS rejection over next-token ``logws`` with a boolean ``accept``
+        coroutine (optional ``target_logws`` proposal correction)."""
+        # On-device: prune/normalize/top-k stay on the native device, only the walked
+        # slice crosses to the CPU condition checks.
+        lw = torch.as_tensor(logws.weights)  # no-op when already a device tensor
+        if self.prune_logws:
+            lw = self._prune_logws(lw)
+        logZ = float(torch.logsumexp(lw, 0))
+        logps = lw - logZ  # device [V]
         toks = logws.decode
 
-        # We cache successful calls, as algorithms may want to see the
-        # same successful token more than once (currently just geometric_awrs)
+        # Cache successful calls (geometric_awrs may revisit a token).
         cache = {}
 
-        async def accept(tok):
+        async def cached_accept(tok):
             try:
                 return cache[tok]
             except KeyError:
                 pass
-            result = await self._accept(context, tok, verbosity)
+            result = await accept(tok)
             if result:
                 cache[tok] = result
             return result
@@ -397,32 +500,18 @@ class AWRS(TokenSampler):
             return await improper_sample(
                 logps=logps,
                 toks=toks,
-                accept=accept,
-                rng=self.rng,
+                accept=cached_accept,
+                make_keys=self._make_keys,
                 max_rejects=self.max_rejects,
             )
-        # We pick which algorithm to use based on parameters and the
-        # shape of the distribution, as this lets us pick the most
-        # effective option.
-        elif (
-            # If max_accepts is large then recursive_awrs (which
-            # does not currently support this parameter) isn't very
-            # useful, because the recursive step means that you never
-            # revisit the same value, so will often throw away most
-            # of the accepted mass if you were to continue. Also
-            # this parameter is only really relevant if you want to
-            # lower the variance, and geometric_awrs is lower variance.
-            self.max_accepts > 2
-            or
-            # If the distribution is strongly peaked around a single value
-            # then geometric_awrs will be more efficient. See below
-            # for specific derivation.
-            logps.max() >= GEOMETRIC_THRESHOLD
-        ):
+        # geometric_awrs when max_accepts>2 (recursive_awrs ignores it) or when
+        # the distribution is peaked (then geometric is more efficient).
+        elif self.max_accepts > 2 or float(logps.max()) >= GEOMETRIC_THRESHOLD:
             tok, w, _ = await geometric_awrs(
                 logps=logps,
                 toks=toks,
-                accept=accept,
+                accept=cached_accept,
+                make_keys=self._make_keys,
                 rng=self.rng,
                 max_rejects=self.max_rejects,
                 max_accepts=self.max_accepts,
@@ -431,8 +520,8 @@ class AWRS(TokenSampler):
             tok, w, _ = await recursive_awrs(
                 logps=logps,
                 toks=toks,
-                accept=accept,
-                rng=self.rng,
+                accept=cached_accept,
+                make_keys=self._make_keys,
                 max_rejects=self.max_rejects,
             )
 
@@ -440,10 +529,11 @@ class AWRS(TokenSampler):
             return tok, w + logZ, np.nan
 
         # `tok` was drawn with finite sampling weight, so `_prune_logws` left
-        # `logws.weights[tok_idx]` untouched even when pruning is on. When
-        # `w == -inf` (rejection failure) the result stays -inf.
+        # `lw[tok_idx]` untouched even when pruning is on. When `w == -inf`
+        # (rejection failure) the result stays -inf.
         tok_idx = self.potential.lookup[tok]
-        log_ratio = target_logws.weights[tok_idx] - logws.weights[tok_idx]
+        tw = torch.as_tensor(target_logws.weights)
+        log_ratio = float(tw[tok_idx]) - float(lw[tok_idx])
         return tok, w + logZ + log_ratio, np.nan
 
 
@@ -459,24 +549,56 @@ class AWRS(TokenSampler):
 GEOMETRIC_THRESHOLD = np.log(2 / 3)
 
 
-async def improper_sample(*, logps, toks, accept, rng, max_rejects):
-    """Implements a single rejection sampling loop which returns
-    the first value found with no attempt to make a properly
-    weighted sample."""
-    keys = logps - np.log(-np.log(rng.random((len(logps),))))
-    order = np.argsort(-keys)
-    if len(order) > max_rejects:
-        order = order[:max_rejects]
-    for item in order:
-        if keys[item] == -np.inf:
+class _AwrsOrder:
+    """Descending Gumbel-perturbed order over device ``logps``, materialized lazily via
+    ``torch.topk`` (only the walked top-k slice crosses to the CPU checks; a deep walk
+    triggers one full sort). ``order[i]`` -> ``(vocab_id, logp)`` of the i-th best
+    (``logp == -inf`` for a pruned token). ``reject(vid)`` scatters -inf for the next round."""
+
+    __slots__ = ("_logps", "_keys", "_n", "_ids", "_lvals", "_k")
+
+    def __init__(self, logps, make_keys, k=256):
+        self._logps = logps  # device [V]; geometric mutates it via reject()
+        self._keys = make_keys(logps)  # device [V]; advances AWRS's per-instance counter
+        self._n = logps.shape[-1]
+        self._materialize(min(k, self._n))
+
+    def _materialize(self, k):
+        _, idx = torch.topk(self._keys, k)  # descending order; the key VALUES aren't needed
+        self._ids = idx.cpu().numpy()
+        self._lvals = self._logps[idx].cpu().numpy()  # logps at materialization
+        self._k = k
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):
+        if i < 0 or i >= self._n:
+            raise IndexError(i)
+        if i >= self._k:  # walked past the materialized top-k -> one full sort
+            self._materialize(self._n)
+        return int(self._ids[i]), float(self._lvals[i])
+
+    def reject(self, vid):
+        self._logps[vid] = float("-inf")  # device scatter; next round re-reads it
+
+
+async def improper_sample(*, logps, toks, accept, make_keys, max_rejects):
+    """Single rejection loop returning the first accepted value, no proper weight.
+    The walk stops at the first ``key == -inf`` (pruned token)."""
+    order = _AwrsOrder(logps, make_keys)
+    tok = None
+    for count in range(len(order)):
+        vid, lp = order[count]
+        if count >= max_rejects or lp == -np.inf:
             break
-        tok = toks[item]
+        tok = toks[vid]
         if await accept(tok):
             return tok, 0.0, np.nan
     return tok, -float("inf"), np.nan
 
 
-async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
+async def recursive_awrs(*, logps, toks, accept, make_keys, max_rejects):
     """Implements Recursive AWRS.
 
     This uses the observation that
@@ -498,22 +620,21 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     # cases are all ones where the remaining weight is very bad.
     error_tolerance = 10e-6
 
-    keys = logps - np.log(-np.log(rng.random((len(logps),))))
-    order = np.argsort(-keys)
-    for index_into_list, item in enumerate(order):
+    order = _AwrsOrder(logps, make_keys)
+    n = len(order)
+    for index_into_list in range(n):
+        vid, lp = order[index_into_list]
         assert n_accepts == 0
-        tok = toks[item]
-        last = (
-            index_into_list + 1 == len(order)
-            or keys[order[index_into_list + 1]] == -np.inf
-        )
+        tok = toks[vid]
+        nxt = order[index_into_list + 1] if index_into_list + 1 < n else None
+        last = nxt is None or nxt[1] == -np.inf  # nxt is (vid, logp)
 
-        log_q = logps[item] - np.log1p(-rejected_mass)
+        log_q = lp - np.log1p(-rejected_mass)
 
         # The last check is because in the case where there is a single
         # accepted token with very low log probability, numerical stability
         # issues make it very hard to get this calculation right.
-        assert not last or log_q >= -error_tolerance or logps[item] < -32
+        assert not last or log_q >= -error_tolerance or lp < -32
         assert log_q <= error_tolerance
         assert log_multiplier <= error_tolerance
         assert rejected_mass <= 1
@@ -524,14 +645,14 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
         log_q = min(log_q, 0)
         log_multiplier = min(log_multiplier, 0)
 
-        if await accept(toks[item]):
+        if await accept(tok):
             n_accepts += 1
             if n_rejects == max_rejects - 1:
                 return tok, log_multiplier, np.nan
             elif last:
                 final_estimator = 0.0
             else:
-                next_token = toks[order[index_into_list + 1]]
+                next_token = toks[nxt[0]]
                 if await accept(next_token):
                     final_estimator = 0
                 else:
@@ -543,7 +664,7 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
             return tok, float("-inf"), np.nan
         else:
             n_rejects += 1
-            rejected_mass += np.exp(logps[item])
+            rejected_mass += np.exp(lp)
             if rejected_mass >= 1 - error_tolerance:
                 # We've explored all the probability mass and still found no
                 # accepted token.
@@ -556,7 +677,7 @@ async def recursive_awrs(*, logps, toks, accept, rng, max_rejects):
     raise AssertionError("Unreachable")
 
 
-async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
+async def geometric_awrs(*, logps, toks, accept, make_keys, rng, max_rejects, max_accepts):
     """Implements Geometric AWRS.
 
     This simulates a single run of sampling with replacement from a sampling
@@ -575,13 +696,14 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
     for _ in range(max_accepts):
         if n_rejects >= max_rejects:
             break
-        keys = logps - np.log(-np.log(rng.random((len(logps),))))
-        order = np.argsort(-keys)
-        for item in order:
-            if keys[item] == -np.inf:
+        # Re-perturb the (mutated) device logps; prior-round rejects are -inf and fall out.
+        cur_order = _AwrsOrder(logps, make_keys)
+        for pos in range(len(cur_order)):
+            vid, lp = cur_order[pos]
+            if lp == -np.inf:
                 break
 
-            tok = toks[item]
+            tok = toks[vid]
 
             if rejected_mass >= 1:
                 # If rejected mass is >= 1 but we have a non-zero probability
@@ -615,8 +737,8 @@ async def geometric_awrs(*, logps, toks, accept, rng, max_rejects, max_accepts):
                 if rejected_token is None:
                     rejected_token = tok
                 n_rejects += 1
-                rejected_mass += np.exp(logps[item])
-                logps[item] = -float("inf")
+                rejected_mass += np.exp(lp)
+                cur_order.reject(vid)
 
     if n_accepts == 0:
         assert rejected_token is not None

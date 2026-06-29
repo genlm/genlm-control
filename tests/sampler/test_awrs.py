@@ -1,9 +1,10 @@
 import pytest
 import asyncio
 import numpy as np
+import torch
 from arsenal.maths import logsumexp
 from conftest import MockPotential
-from hypothesis import given, strategies as st, settings, example, assume, note
+from hypothesis import given, strategies as st, settings, example, assume, note, HealthCheck
 import hypothesis.extra.numpy as hnp
 from genlm.control.sampler.token import AWRS, recursive_awrs, geometric_awrs
 
@@ -861,6 +862,18 @@ class FakeRNG:
         return result
 
 
+def _keys_from(rng):
+    """The ``make_keys`` closure the rejection functions now take, drawing the Gumbel noise
+    from a ``FakeRNG`` -- mirrors the old ``logps - log(-log(rng.random((V,))))`` so the
+    controlled walk (and hypothesis' ``assume`` filtering) is byte-for-byte preserved."""
+
+    def make_keys(logps):
+        u = torch.as_tensor(rng.random((len(logps),)), dtype=logps.dtype, device=logps.device)
+        return logps + (-torch.log(-torch.log(u)))
+
+    return make_keys
+
+
 @st.composite
 def numpy_rng(draw):
     return FakeRNG(
@@ -940,15 +953,19 @@ accepts = st.one_of(
     max_rejects=st.integers(1, 100),
     accept=accepts,
 )
-@settings(max_examples=500, report_multiple_bugs=False)
+@settings(
+    max_examples=500,
+    report_multiple_bugs=False,
+    suppress_health_check=[HealthCheck.filter_too_much],
+)
 async def test_recursive_awrs_validity(logps, accept, rng, max_rejects):
     toks = np.arange(len(logps))
 
     tok, logp, _ = await recursive_awrs(
-        logps=logps,
+        logps=torch.as_tensor(logps),
         toks=toks,
         accept=accept,
-        rng=rng,
+        make_keys=_keys_from(rng),
         max_rejects=max_rejects,
     )
 
@@ -973,14 +990,19 @@ async def test_recursive_awrs_validity(logps, accept, rng, max_rejects):
     max_accepts=2,
     accept=always_reject,
 )
-@settings(max_examples=500, report_multiple_bugs=False)
+@settings(
+    max_examples=500,
+    report_multiple_bugs=False,
+    suppress_health_check=[HealthCheck.filter_too_much],
+)
 async def test_geometric_awrs_validity(logps, accept, rng, max_rejects, max_accepts):
     toks = np.arange(len(logps))
 
     tok, logp, _ = await geometric_awrs(
-        logps=logps,
+        logps=torch.as_tensor(logps),
         toks=toks,
         accept=accept,
+        make_keys=_keys_from(rng),
         rng=rng,
         max_rejects=max_rejects,
         max_accepts=max_accepts,
