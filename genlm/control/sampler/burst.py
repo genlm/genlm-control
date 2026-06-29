@@ -168,8 +168,8 @@ class _Burst:
                 for k_i, p in enumerate(parts):
                     if p.max_tokens_left == 1:
                         with burst_logw_next(sampler._row_injection(warm_batch, k_i)):
-                            logw = await sampler.logw_eos(p.context)
-                        records[k_i] = BurstDraw(token=EOS, step=([EOS], logw, 0.0))
+                            step = await c._force_eos_step(p, sampler)
+                        records[k_i] = BurstDraw(token=EOS, step=step)
             else:  # no live rows this step (all drained/terminated)
                 records = []
             # (3) Bank: free running defers (overlaps next forward); unit grain banks inline
