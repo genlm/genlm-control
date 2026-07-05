@@ -164,11 +164,12 @@ class _Burst:
                 records = await sampler.burst_draw_batch(
                     warm_batch, [p.context for p in parts], rows, self
                 )
-                # Force EOS at the max_tokens boundary (mirrors Controller._step_particle).
+                # Force EOS at the max_tokens boundary (mirrors Controller._step_particle,
+                # including the particle's OWN group sampler — group state may differ).
                 for k_i, p in enumerate(parts):
                     if p.max_tokens_left == 1:
                         with burst_logw_next(sampler._row_injection(warm_batch, k_i)):
-                            step = await c._force_eos_step(p, sampler)
+                            step = await c._force_eos_step(p, c._sampler_of(p))
                         records[k_i] = BurstDraw(token=EOS, step=step)
             else:  # no live rows this step (all drained/terminated)
                 records = []
