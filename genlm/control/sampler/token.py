@@ -65,6 +65,13 @@ class TokenSampler:
         """Engine decode-step budget for one burst (token grain). The unit sampler overrides."""
         return max(p.max_tokens_left for p in live) + 1
 
+    def burst_routes_groups(self) -> bool:
+        """Whether this sampler's ``burst_draw_batch`` routes each row to its own group's
+        sampler (rather than drawing every row through group 0's). A routing sampler lifts
+        the batched burst's constraint-homogeneity requirement: groups may then carry
+        different constraints (``_batch_blocker`` skips that check). Default ``False``."""
+        return False
+
     @staticmethod
     def _row_injection(warm_batch, i):
         """Slice batched warm ``{view: [N, V+1]}`` into particle ``i``'s per-row

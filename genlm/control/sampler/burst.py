@@ -313,7 +313,9 @@ def burst_blocker(controller):
 def _batch_blocker(samplers):
     """Why a batched burst can't draw every group through group 0's sampler, or ``None`` if
     burst-homogeneous. Groups must share sampler kind, K views, per-view engine/temperature/
-    LoRA, and constraint; they may differ only in prompt and critic."""
+    LoRA, and constraint; they may differ only in prompt and critic. A sampler that
+    ``burst_routes_groups`` draws each row through its own group's sampler, so groups may
+    additionally differ in constraint."""
     s0 = samplers[0]
     views0 = _views_of(s0)
     constraint0 = constraint_leaf_ids(s0.target)
@@ -334,7 +336,7 @@ def _batch_blocker(samplers):
                 return blocked(f"view {vi} temperature differs from group 0")
             if v.lora_name != v0.lora_name:
                 return blocked(f"view {vi} uses a different LoRA adapter from group 0")
-        if constraint_leaf_ids(s.target) != constraint0:
+        if not s0.burst_routes_groups() and constraint_leaf_ids(s.target) != constraint0:
             return blocked("has a different constraint")
     return None
 
