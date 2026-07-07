@@ -166,10 +166,16 @@ class _Burst:
                 )
                 # Force EOS at the max_tokens boundary (mirrors Controller._step_particle,
                 # including the particle's OWN group sampler — group state may differ).
+                # The injection must be keyed by THAT sampler's views, not group 0's:
+                # a mis-keyed injection makes its logw_eos forward inside the engine's
+                # own step (deadlock).
                 for k_i, p in enumerate(parts):
                     if p.max_tokens_left == 1:
-                        with burst_logw_next(sampler._row_injection(warm_batch, k_i)):
-                            step = await c._force_eos_step(p, c._sampler_of(p))
+                        sp = c._sampler_of(p)
+                        inj = {rv: rv.make_lazy_weights(warm_batch[gv].weights[k_i])
+                               for rv, gv in zip(_views_of(sp), self.views)}
+                        with burst_logw_next(inj):
+                            step = await c._force_eos_step(p, sp)
                         records[k_i] = BurstDraw(token=EOS, step=step)
             else:  # no live rows this step (all drained/terminated)
                 records = []
