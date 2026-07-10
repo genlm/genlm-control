@@ -297,19 +297,27 @@ def burst_blocker(controller):
         return BurstBlock(
             BlockReason.NO_ENGINE_LEAF, "sampler target has no single engine-burst LM leaf"
         )
-    # Forward-free invariant: every LM leaf in a group's per-step path (target/proposal/critic)
-    # must be an injected view, else it would forward inside the burst (which can't supply it).
+    # Forward-free invariant: every LM leaf in a group's per-step DRAW path (target/
+    # proposal) must be an injected view, else it would forward inside the burst (which
+    # can't supply it). The critic is boundary-scored (``apply_critic_boundary`` runs at
+    # the engine drain), so its LM leaves are legal — EXCEPT token-grain in-burst
+    # resampling (free-running + twist_with_critic), which consumes twists mid-burst.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
         draw = samp.burst_draw_sampler()
-        for pot in (draw.target, draw.proposal, crit):
+        critic_deferred = not (
+            samp.burst_free_running() and controller.twist_with_critic
+        )
+        pots = (draw.target, draw.proposal) + ((crit,) if not critic_deferred else ())
+        for pot in pots:
             if pot is None:
                 continue
             if any(lm not in injected for lm in lm_leaves(pot)):
                 return BurstBlock(
                     BlockReason.FORWARD_NOT_INJECTABLE,
                     f"group {g}: an LM leaf would forward inside the burst (it is not an "
-                    "injected view) -- e.g. an LM critic or a second engine LM",
+                    "injected view) -- e.g. a second engine LM, or an LM critic under "
+                    "token-grain in-burst resampling",
                 )
     if len(controller.samplers) > 1:
         return _batch_blocker(controller.samplers)
@@ -354,6 +362,7 @@ class BurstLoop:
 
     def __init__(self, controller):
         self.controller = controller
+        controller.defer_critic = True  # critic math settles at the round boundary
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         self.sampler = controller.unit_sampler
         # views: LM leaves whose warm logits the burst injects (group 0's target+proposal);
@@ -410,6 +419,9 @@ class BurstLoop:
         while any(not p.done for p in controller.particles):
             live = [p for p in controller.particles if not p.done]
             reason = await self._run_burst(live, loop)
+            # Deferred critic math first: the engine is drained, forwards are legal, and
+            # the boundary resample must see the twisted weights.
+            await controller.apply_critic_boundary()
             # Token grain resampled in place at ESS crossings; a unit-grain round records +
             # resamples here at the synced boundary.
             if reason == _EXIT_UNIT_SYNC:

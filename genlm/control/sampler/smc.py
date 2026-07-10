@@ -212,6 +212,10 @@ class Controller:
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
         self.record = SMCRecord(n_particles) if record else None
+        # Burst lane: critic math deferred to the round boundary (engine drained) —
+        # ``_bank_step`` pends instead of awaiting; ``apply_critic_boundary`` settles.
+        self.defer_critic = False
+        self._critic_pending: list = []
         # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
         self._pending_resample = False
         self._pending_ancestors = list(range(n_particles))
@@ -263,6 +267,12 @@ class Controller:
         Caller untwists ``p`` before the draw."""
         if not self.critic:
             self._bank_step_no_critic(p, to_append, logw, logp)
+            return
+
+        if self.defer_critic:
+            self._bank_step_no_critic(p, to_append, logw, logp)
+            if p.done or self.twist_with_critic:
+                self._critic_pending.append(p)
             return
 
         p.score(logw)
@@ -374,6 +384,22 @@ class Controller:
         else:
             self.record.add_smc_step(self.particles)
         self._pending_resample = False
+
+    async def apply_critic_boundary(self):
+        """The deferred critic math, at the round boundary (engine drained; forwards are
+        legal). Same math as the inline path: a finished particle scores ``complete``
+        permanently; a live one twists for the upcoming resample (the caller untwists at
+        the next round's draw)."""
+        parts, self._critic_pending = self._critic_pending, []
+        for p in parts:
+            amt = await self._critic_of(p).score(p.context)
+            if p.done:
+                p.score(amt)
+            elif amt == float("-inf"):
+                p.score(amt)
+                p.finish()
+            else:
+                p.twist(amt)
 
     # burst-lane math the engine seam (_Burst) calls into
 
