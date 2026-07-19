@@ -38,6 +38,7 @@ nav:
     - Getting Started: getting_started.md
     - Potentials: potentials.md
     - Samplers: samplers.md
+    - Conditional SMC: csmc.md
     - Performance: performance.md
 
 markdown_extensions:
