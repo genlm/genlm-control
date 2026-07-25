@@ -391,6 +391,9 @@ class Controller:
         permanently; a live one twists for the upcoming resample (the caller untwists at
         the next round's draw)."""
         parts, self._critic_pending = self._critic_pending, []
+        # One settle per particle per boundary: a duplicate entry would re-run the
+        # terminal critic (an exec, or an LM forward) on the same context.
+        assert len({id(p) for p in parts}) == len(parts)
         for p in parts:
             amt = await self._critic_of(p).score(p.context)
             if p.done:

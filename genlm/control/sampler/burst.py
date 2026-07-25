@@ -283,6 +283,17 @@ def _views_of(sampler):
     return views
 
 
+def critic_deferred(sampler, controller):
+    """Whether critic math settles at round boundaries (engine drained) rather than
+    being consumed per step. Single source of truth shared by :func:`burst_blocker`
+    (legality: a deferred critic's LM leaves may forward at the drain) and
+    :class:`BurstLoop` (routing: a non-deferred critic scores inline in ``_bank_step``'s
+    pre-boundary path — engine-free there by ``burst_blocker``). Free-running in-burst
+    resampling consumes twists mid-burst, so there the critic is NOT deferrable;
+    everywhere else (unit grain; ess=0 terminal-only) it is."""
+    return not (sampler.burst_free_running() and controller.twist_with_critic)
+
+
 def burst_blocker(controller):
     """Why this config can't run the engine burst, or ``None`` if it can. Needs a
     burst-capable sampler over a target with one engine-burst LM leaf, must be forward-free,
@@ -305,10 +316,8 @@ def burst_blocker(controller):
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
         draw = samp.burst_draw_sampler()
-        critic_deferred = not (
-            samp.burst_free_running() and controller.twist_with_critic
-        )
-        pots = (draw.target, draw.proposal) + ((crit,) if not critic_deferred else ())
+        deferred = critic_deferred(samp, controller)
+        pots = (draw.target, draw.proposal) + ((crit,) if not deferred else ())
         for pot in pots:
             if pot is None:
                 continue
@@ -362,9 +371,12 @@ class BurstLoop:
 
     def __init__(self, controller):
         self.controller = controller
-        controller.defer_critic = True  # critic math settles at the round boundary
-        self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         self.sampler = controller.unit_sampler
+        # Deferred critics settle at round boundaries; a non-deferred critic
+        # (free-running in-burst resampling) scores inline per step in ``_bank_step`` —
+        # engine-free there by ``burst_blocker``, so the inline await cannot deadlock.
+        controller.defer_critic = critic_deferred(self.sampler, controller)
+        self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         # views: LM leaves whose warm logits the burst injects (group 0's target+proposal);
         # the batched burst draws every group through group 0's sampler.
         self.views = _views_of(self.sampler)
