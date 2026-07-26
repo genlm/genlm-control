@@ -157,6 +157,10 @@ class Controller:
         ess_threshold (float): ESS fraction below which we resample.
         max_tokens (int): per-particle token budget.
         twist_with_critic (bool): whether the critic twists during stepping.
+        contrast_twist (bool): twist with ``critic.score(context) - particle.logp``
+            (the log-ratio against the proposal) instead of ``critic.score(context)``.
+            Terminal scores are unaffected, so the twist still cancels at termination.
+        twist_temperature (float): scales the twist; 0 disables twisting entirely.
         resampling_method (str): multinomial/stratified/systematic/residual.
         record (bool): build an :class:`SMCRecord`.
         verbosity (int): 0 silent, 1 prints particles per step.
@@ -170,6 +174,8 @@ class Controller:
         ess_threshold,
         max_tokens,
         twist_with_critic,
+        contrast_twist=False,
+        twist_temperature=1.0,
         resampling_method="multinomial",
         record=False,
         verbosity=0,
@@ -195,6 +201,8 @@ class Controller:
         self.n_resamples = 0
         self.ess_threshold = ess_threshold
         self.twist_with_critic = twist_with_critic
+        self.contrast_twist = contrast_twist
+        self.twist_temperature = twist_temperature
         # A terminal-only critic has no per-step signal: reweight only at termination.
         if twist_with_critic and all(
             c is not None and c.is_terminal_only() for c in critics
@@ -248,6 +256,11 @@ class Controller:
     def _critic_of(self, p):
         return self.critics[self.particles.group[p._i]]
 
+    def _twist_value(self, p, amt):
+        if self.contrast_twist:
+            amt -= p.logp
+        return self.twist_temperature * amt
+
     def _bank_step_no_critic(self, p, to_append, logw, logp):
         """Sync score + advance + terminate, no-critic path."""
         p.score(logw)
@@ -287,7 +300,7 @@ class Controller:
         if self.twist_with_critic:
             twist_amt = await self._critic_of(p).score(p.context)
             if twist_amt != float("-inf"):
-                p.twist(twist_amt)
+                p.twist(self._twist_value(p, twist_amt))
             else:
                 p.score(twist_amt)
                 p.finish()
@@ -418,7 +431,7 @@ class Controller:
                     p.score(amt)
                     p.finish()
                 else:
-                    p.twist(amt)
+                    p.twist(self._twist_value(p, amt))
 
     # burst-lane math the engine seam (_Burst) calls into
 
