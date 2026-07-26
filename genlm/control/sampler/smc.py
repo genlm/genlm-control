@@ -391,18 +391,34 @@ class Controller:
         permanently; a live one twists for the upcoming resample (the caller untwists at
         the next round's draw)."""
         parts, self._critic_pending = self._critic_pending, []
+        if not parts:
+            return
         # One settle per particle per boundary: a duplicate entry would re-run the
         # terminal critic (an exec, or an LM forward) on the same context.
         assert len({id(p) for p in parts}) == len(parts)
+        # Score the whole pending population through the critics' BATCHED path,
+        # one call per critic (groups concurrent). Awaiting ``score`` per particle
+        # serializes the seam: an LM-leaf critic pays a round trip per particle
+        # instead of one batched forward, and exec critics don't overlap.
+        by_group = {}
         for p in parts:
-            amt = await self._critic_of(p).score(p.context)
-            if p.done:
-                p.score(amt)
-            elif amt == float("-inf"):
-                p.score(amt)
-                p.finish()
-            else:
-                p.twist(amt)
+            by_group.setdefault(self.particles.group[p._i], []).append(p)
+
+        async def _settle(g, ps):
+            return ps, await self.critics[g].batch_score([p.context for p in ps])
+
+        for ps, amts in await asyncio.gather(
+            *[_settle(g, ps) for g, ps in by_group.items()]
+        ):
+            for p, amt in zip(ps, amts):
+                amt = float(amt)
+                if p.done:
+                    p.score(amt)
+                elif amt == float("-inf"):
+                    p.score(amt)
+                    p.finish()
+                else:
+                    p.twist(amt)
 
     # burst-lane math the engine seam (_Burst) calls into
 
