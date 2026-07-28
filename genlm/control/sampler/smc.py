@@ -7,6 +7,8 @@ import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
+from genlm.control.potential.base import burst_prefix
+from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
@@ -20,6 +22,8 @@ class Population:
         "n",
         "logw",
         "logp",
+        "twist_logp",
+        "twist_clip_sum",
         "twist_amount",
         "done",
         "max_tokens_left",
@@ -37,6 +41,11 @@ class Population:
         )
         self.logw = np.zeros(n)
         self.logp = np.zeros(n)
+        # The critic LM leaf's banked per-token logp sums (fed by the burst's twist
+        # view), and the per-token CLIPPED contrast sum (live under
+        # ``Controller(twist_clip=...)``, accumulated in the same gather).
+        self.twist_logp = np.zeros(n)
+        self.twist_clip_sum = np.zeros(n)
         self.twist_amount = np.zeros(n)
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
@@ -68,6 +77,8 @@ class Population:
         idx = ancestor_indices
         self.logw = self.logw[idx]
         self.logp = self.logp[idx]
+        self.twist_logp = self.twist_logp[idx]
+        self.twist_clip_sum = self.twist_clip_sum[idx]
         self.twist_amount = self.twist_amount[idx]
         self.done = self.done[idx]
         self.max_tokens_left = self.max_tokens_left[idx]
@@ -104,6 +115,14 @@ class Particle:
     @property
     def twist_amount(self):
         return self._pop.twist_amount[self._i]
+
+    @property
+    def twist_logp(self):
+        return self._pop.twist_logp[self._i]
+
+    @property
+    def twist_clip_sum(self):
+        return self._pop.twist_clip_sum[self._i]
 
     @property
     def done(self):
@@ -161,6 +180,14 @@ class Controller:
             (the log-ratio against the proposal) instead of ``critic.score(context)``.
             Terminal scores are unaffected, so the twist still cancels at termination.
         twist_temperature (float): scales the twist; 0 disables twisting entirely.
+        twist_clip (tuple, optional): ``(neg, pos)`` per-token caps for the critic-LM
+            contrast. When set, the boundary serves the critic LM
+            ``sum_t clip(delta_t, -neg, +pos)`` (plus ``logp``, so the contrast
+            subtraction yields the clipped sum) instead of its raw prefix. Burst
+            lane only; the cold path scores the unclipped prefix.
+        terminate_when (callable, optional): ``context -> bool`` stop condition. When it
+            fires, EOS closes the sequence in that same step. The context is in the
+            sampler's own representation, so unit nesting is the caller's business.
         resampling_method (str): multinomial/stratified/systematic/residual.
         record (bool): build an :class:`SMCRecord`.
         verbosity (int): 0 silent, 1 prints particles per step.
@@ -176,6 +203,8 @@ class Controller:
         twist_with_critic,
         contrast_twist=False,
         twist_temperature=1.0,
+        twist_clip=None,
+        terminate_when=None,
         resampling_method="multinomial",
         record=False,
         verbosity=0,
@@ -203,6 +232,12 @@ class Controller:
         self.twist_with_critic = twist_with_critic
         self.contrast_twist = contrast_twist
         self.twist_temperature = twist_temperature
+        self.twist_clip = twist_clip
+        # The clipped serving folds logp back in so the contrast subtraction yields
+        # the clipped sum; without the subtraction it would leak logp into the twist.
+        assert twist_clip is None or contrast_twist, (
+            "twist_clip requires contrast_twist")
+        self.terminate_when = terminate_when
         # A terminal-only critic has no per-step signal: reweight only at termination.
         if twist_with_critic and all(
             c is not None and c.is_terminal_only() for c in critics
@@ -237,7 +272,22 @@ class Controller:
         counter-based picker match the burst draw."""
         with draw_key(p._i, draw_ordinal(p.context)):
             to_append, logw, logp = await self._sampler_of(p).transition(p.context)
-        await self._bank_step(p, to_append, logw, logp)
+        await self._bank_step(p, *self._close_if_stopped(p, (to_append, logw, logp)))
+
+    def _close_if_stopped(self, p, step):
+        """``step`` with EOS appended if ``terminate_when`` fires on the context it
+        produces, so the particle terminates in the step that wrote the stop.
+
+        No ``logw_eos``: that corrects for forcing EOS against the proposal, but the
+        stop condition defines what a complete sequence *is*, so there is no deviation
+        to correct. Charging it would penalise exactly the particles that close."""
+        to_append, logw, logp = step
+        if self.terminate_when is None or not to_append:
+            return step
+        context = p.context + list(to_append)
+        if context[-1] is EOS or not self.terminate_when(context):
+            return step
+        return [*to_append, EOS], logw, logp
 
     async def _force_eos_step(self, p, sampler):
         """Forced-EOS step ``(to_append, logw, logp)`` at the ``max_tokens`` boundary."""
@@ -418,7 +468,23 @@ class Controller:
             by_group.setdefault(self.particles.group[p._i], []).append(p)
 
         async def _settle(g, ps):
-            return ps, await self.critics[g].batch_score([p.context for p in ps])
+            critic = self.critics[g]
+            contexts = [p.context for p in ps]
+            leaf = find_engine_lm(critic) if self.twist_with_critic else None
+            if leaf is None:
+                return ps, await critic.batch_score(contexts)
+            # batch_score routes non-EOS contexts to batch_prefix in list order;
+            # serve the banked sums for exactly that subset. Under twist_clip the
+            # served value is logp + clipped contrast, so the contrast subtraction
+            # in _twist_value yields the clipped sum.
+            served = np.array([
+                (p.logp + p.twist_clip_sum) if self.twist_clip is not None
+                else p.twist_logp
+                for p, ctx in zip(ps, contexts)
+                if not (ctx and ctx[-1] == critic.eos)
+            ])
+            with burst_prefix({leaf: served}):
+                return ps, await critic.batch_score(contexts)
 
         for ps, amts in await asyncio.gather(
             *[_settle(g, ps) for g, ps in by_group.items()]

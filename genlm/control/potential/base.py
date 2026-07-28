@@ -28,6 +28,23 @@ def burst_logw_next(overrides):
         _burst_logw_next_overrides.reset(token)
 
 
+# Boundary override: {potential: values} a potential's ``batch_prefix`` returns for
+# itself (banked from the burst's warm rows) instead of re-scoring. Read by ``PromptedLLM``.
+_burst_prefix_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_prefix", default=None
+)
+
+
+@contextlib.contextmanager
+def burst_prefix(overrides):
+    """Inject ``{potential: values}`` served as that potential's ``batch_prefix`` result."""
+    token = _burst_prefix_overrides.set(overrides)
+    try:
+        yield
+    finally:
+        _burst_prefix_overrides.reset(token)
+
+
 class Potential(ABC, PotentialOps, PotentialTests):
     """Abstract base class for potentials.
 

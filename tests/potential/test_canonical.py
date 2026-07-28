@@ -20,8 +20,10 @@ class MockAsyncTransformer:  # Mock the backend LLM object
             self.byte_vocab, _ = decode_vocab(tokenizer)
         except ValueError:
             self.byte_vocab = None  # Handle cases like BERT where byte vocab fails
-        # maybe add other attributes if PromptedLLM.__init__ needs them
-        # e.g., self.model_name_or_path = tokenizer.name_or_path
+
+    def lora_view(self, lora_name):
+        # PromptedLLM binds its forward handle via lora_view; no adapters here.
+        return self
 
 
 class MockLLM(PromptedLLM):

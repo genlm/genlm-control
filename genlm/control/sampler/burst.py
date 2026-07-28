@@ -3,7 +3,7 @@ Resample/ESS/log_ml stay Controller-owned, never in the backend."""
 
 import asyncio
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -150,6 +150,25 @@ class _Burst:
                 if row not in seen:
                     seen.add(row)
                     rows.append(row)
+            # Lockstep guard: the engine can sample a strict subset of a row's K
+            # substreams in one step (prefill-chunk boundary / KV preemption landing
+            # between siblings). The sampled sibling would advance while the other
+            # never receives the token — permanent stream desync. Stall such rows:
+            # flush their engine requests and re-add all K substreams at the current
+            # context (prefix-cached), so the pair re-enters together next step.
+            # No token is banked for a stalled row, so the SMC math is untouched.
+            stalled = {row for row in rows
+                       if any(h not in warm for h in self.row_handles[row])}
+            if stalled:
+                for row in stalled:
+                    self._drop_row(row)
+                    p = c.particles[row]
+                    self.row_handles[row] = [
+                        self._add_substream(p, vi) for vi in range(len(self.views))
+                    ]
+                print(f"[burst] lockstep stall: flushed+readded rows "
+                      f"{sorted(stalled)}", flush=True)
+                rows = [row for row in rows if row not in stalled]
             parts = [c.particles[row] for row in rows]
             if c.twist_with_critic:
                 c.particles.untwist_subset([p._i for p in parts])
@@ -177,6 +196,35 @@ class _Burst:
                         with burst_logw_next(inj):
                             step = await c._force_eos_step(p, sp)
                         records[k_i] = BurstDraw(token=EOS, step=step)
+                    elif records[k_i].step is not None:
+                        step = c._close_if_stopped(p, records[k_i].step)
+                        if step is not records[k_i].step:
+                            records[k_i] = replace(records[k_i], step=step)
+                # Bank the twist view: the drawn token's warm-row logp, summed per
+                # particle — the increments of the critic LM leaf's prefix. Under
+                # twist_clip, also the per-token contrast against the draw target,
+                # clipped (both rows are already in hand).
+                if self.d.twist_view is not None:
+                    tw = warm_batch[self.d.twist_view].weights  # [N, V+1] device tensor
+                    lk = self.d.twist_view.lookup
+                    ks = [k for k, r in enumerate(records)
+                          if not isinstance(r.token, EndOfSequence)]
+                    if ks:
+                        rows_t = torch.tensor(ks, device=tw.device)
+                        idx = torch.tensor([lk[records[k].token] for k in ks],
+                                           device=tw.device)
+                        vals = tw[rows_t, idx].tolist()
+                        if c.twist_clip is not None:
+                            neg, pos = c.twist_clip
+                            tgt = warm_batch[self.d.views[0]].weights
+                            tvals = tgt[rows_t, idx].tolist()
+                            for k, v, t in zip(ks, vals, tvals):
+                                c.particles.twist_logp[rows[k]] += v
+                                c.particles.twist_clip_sum[rows[k]] += min(
+                                    max(v - t, -neg), pos)
+                        else:
+                            for k, v in zip(ks, vals):
+                                c.particles.twist_logp[rows[k]] += v
             else:  # no live rows this step (all drained/terminated)
                 records = []
             # (3) Bank: free running defers (overlaps next forward); unit grain banks inline
@@ -377,9 +425,21 @@ class BurstLoop:
         # engine-free there by ``burst_blocker``, so the inline await cannot deadlock.
         controller.defer_critic = critic_deferred(self.sampler, controller)
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
-        # views: LM leaves whose warm logits the burst injects (group 0's target+proposal);
-        # the batched burst draws every group through group 0's sampler.
-        self.views = _views_of(self.sampler)
+        # views: LM leaves whose warm logits the burst injects (group 0's target+proposal,
+        # plus the critic's engine leaf when boundary twisting will read it); the batched
+        # burst draws every group through group 0's sampler.
+        serve = controller.defer_critic and controller.twist_with_critic
+        self.twist_leaves = [
+            find_engine_lm(c) if (serve and c is not None) else None
+            for c in controller.critics
+        ]
+        self.twist_view = self.twist_leaves[0]
+        assert all(
+            (lf is None) == (self.twist_view is None) for lf in self.twist_leaves
+        ), "batched groups must agree on having an engine-LM critic leaf"
+        self.views = _views_of(self.sampler) + (
+            [self.twist_view] if self.twist_view is not None else []
+        )
         # The engine LM the burst drives (run_burst + eos id); views share its model.
         self.llm = self.views[0]
         if self.llm is None:  # pragma: no cover - guarded by burst_blocker
@@ -388,7 +448,9 @@ class BurstLoop:
         # Per-(group, view) prompt prefix, snapshotted on the main thread (``prompt_ids`` is a
         # ContextVar invisible on the ``run_burst`` worker thread).
         self.view_prefixes = [
-            [list(v.prompt_ids) for v in _views_of(s)] for s in controller.samplers
+            [list(v.prompt_ids) for v in _views_of(s)]
+            + ([list(lf.prompt_ids)] if lf is not None else [])
+            for s, lf in zip(controller.samplers, self.twist_leaves)
         ]
 
         # Engine token id committed as the placeholder for an aborted/EOS row.

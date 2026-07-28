@@ -1,9 +1,15 @@
 import contextvars
 import weakref
+import numpy as np
 import torch
 import warnings
 from typing import NamedTuple
-from genlm.control.potential.base import Potential, _burst_logw_next_overrides
+from genlm.control.potential.base import (
+    Potential,
+    _burst_logw_next_overrides,
+    _burst_prefix_overrides,
+)
+from genlm.control.potential.coerce import Coerced
 from genlm.backend.tokenization import Token
 
 
@@ -13,7 +19,11 @@ _prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
 
 
 def _walk_leaves(potential):
-    """Yield the leaf potentials (no ``children``), recursing composites' ``children``."""
+    """Yield the leaf potentials (no ``children``), recursing composites' ``children``
+    and unwrapping ``Coerced`` (the wrapped potential is what ultimately computes)."""
+    if isinstance(potential, Coerced):
+        yield from _walk_leaves(potential.potential)
+        return
     children = potential.children
     if not children:
         yield potential
@@ -511,6 +521,19 @@ class PromptedLLM(Potential):
             (float): The log probability of `context`.
         """
         return await self.log_probability(context)
+
+    async def batch_prefix(self, contexts):
+        """Batched ``prefix``. At a burst boundary the controller serves the banked
+        warm-row sums via ``burst_prefix`` instead of re-scoring every context."""
+        override = _burst_prefix_overrides.get()
+        if override is not None and self in override:
+            vals = override[self]
+            if len(vals) != len(contexts):
+                raise ValueError(
+                    f"burst_prefix served {len(vals)} values for {len(contexts)} contexts"
+                )
+            return np.asarray(vals, dtype=float)
+        return await super().batch_prefix(contexts)
 
     async def complete(self, context):
         """

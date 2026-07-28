@@ -264,10 +264,14 @@ class SMC:
             **kwargs,
         )
         await _drive(controller, _normalize_accelerate(accelerate))
-        return [
+        seqs = [
             Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
             for rows in controller._group_rows
         ]
+        if controller.record is not None:
+            for s in seqs:
+                s.record = controller.record  # whole-batch SMCRecord (global slots)
+        return seqs
 
 
 @dataclass

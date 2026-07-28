@@ -75,7 +75,10 @@ class PotentialTests:
         for i, (want, have) in enumerate(zip(wants, haves)):
             abs_diff, rel_diff = self._compute_diff(want, have)
             info = (want, have, abs_diff, rel_diff, tokens[i])
-            (valids if abs_diff <= atol and rel_diff <= rtol else errors).append(info)
+            # np.isclose semantics: near-zero values must not fail on relative
+            # noise the absolute tolerance already accepts.
+            ok = abs_diff <= atol + rtol * abs(want)
+            (valids if ok else errors).append(info)
 
         if valids and verbosity > 0:
             print(
@@ -135,7 +138,7 @@ class PotentialTests:
         )
 
         abs_diff, rel_diff = self._compute_diff(want, have)
-        if abs_diff > atol or rel_diff > rtol:
+        if abs_diff > atol + rtol * abs(want):
             error_msg = (
                 f"{self.colors['red']}Factorization not satisfied for context {context!r}:{self.colors['reset']}\n"
                 + self._format_diff(want, have, abs_diff, rel_diff, atol, rtol)

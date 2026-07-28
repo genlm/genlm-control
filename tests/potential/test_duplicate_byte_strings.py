@@ -445,7 +445,9 @@ async def test_logw_next_with_fewer_logits(truncated_llm):
     truncated_llm.set_prompt_from_str("Hello")
     lw = await truncated_llm.logw_next([])
     assert len(lw) > 0
-    assert np.any(np.isfinite(lw.weights))
+    # .any() on the native container: lw.weights may be a torch tensor, and
+    # np.any's dispatch passes kwargs torch rejects.
+    assert bool(np.isfinite(lw.weights).any())
 
 
 @pytest.mark.asyncio
