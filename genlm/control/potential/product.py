@@ -1,6 +1,7 @@
 import asyncio
 import warnings
 import torch
+from genlm.control.constant import EOS
 from genlm.control.potential.base import Potential
 
 
@@ -57,10 +58,20 @@ class Product(Potential):
                 )
             )
 
-        if self.p1.vocab == self.p2.vocab:
+        if self.p1.vocab is self.p2.vocab or self.p1.vocab == self.p2.vocab:
             self._v1_idxs = ...
             self._v2_idxs = ...
-            super().__init__(self.p1.vocab, token_type=token_type)
+            if self.p1.eos is EOS and self.p2.eos is EOS:
+                # Same vocab, default sentinel: the operands' tables ARE the
+                # product's -- adopt them instead of rebuilding (a product over
+                # an engine-LM vocab otherwise rebuilds a 128k lookup).
+                self.token_type = token_type
+                self.eos = EOS
+                self.vocab = self.p1.vocab
+                self.vocab_eos = self.p1.vocab_eos
+                self.lookup = self.p1.lookup
+            else:
+                super().__init__(self.p1.vocab, token_type=token_type)
 
         else:
             common_vocab = list(set(self.p1.vocab) & set(self.p2.vocab))

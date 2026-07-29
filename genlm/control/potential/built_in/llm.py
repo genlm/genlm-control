@@ -4,12 +4,14 @@ import numpy as np
 import torch
 import warnings
 from typing import NamedTuple
+from genlm.control.constant import EOS
 from genlm.control.potential.base import (
     Potential,
     _burst_logw_next_overrides,
     _burst_prefix_overrides,
 )
 from genlm.control.potential.coerce import Coerced
+from genlm.control.typing import infer_vocabulary_type
 from genlm.backend.tokenization import Token
 
 
@@ -149,6 +151,11 @@ class TokenMappings(NamedTuple):
         eos_byte_strings: EOS tokens as byte strings
         eos_token_objs: Actual EOS Token objects
         potential_vocab: Vocabulary excluding EOS tokens
+        token_type: TokenType of potential_vocab (the Potential-layer tables,
+            derived once here so every PromptedLLM sharing these mappings --
+            spawns in particular -- adopts them instead of rebuilding)
+        vocab_eos: potential_vocab + [EOS]
+        lookup: token -> index over vocab_eos
     """
 
     decode: list[Token]
@@ -157,6 +164,9 @@ class TokenMappings(NamedTuple):
     eos_byte_strings: list[bytes]
     eos_token_objs: list[Token]
     potential_vocab: list[Token]
+    token_type: object
+    vocab_eos: list
+    lookup: dict
 
     @classmethod
     def create(cls, decode, eos_byte_strings=None, **kwargs):
@@ -207,8 +217,16 @@ class TokenMappings(NamedTuple):
         potential_vocab = [
             token for token in decode if token.token_id not in eos_token_ids
         ]
+        if not potential_vocab:
+            raise ValueError("vocabulary cannot be empty")
 
         encode = _TokenEncodeDict({token: i for i, token in enumerate(decode)})
+
+        # The Potential-layer tables, derived once (tokens are unique by
+        # token_id, so the duplicate check Potential.__init__ performs cannot
+        # fire on this vocabulary).
+        lookup = {token: i for i, token in enumerate(potential_vocab)}
+        lookup[EOS] = len(potential_vocab)
 
         return cls(
             decode=decode,
@@ -217,6 +235,9 @@ class TokenMappings(NamedTuple):
             eos_byte_strings=eos_byte_strings,
             eos_token_objs=eos_token_objs,
             potential_vocab=potential_vocab,
+            token_type=infer_vocabulary_type(potential_vocab),
+            vocab_eos=potential_vocab + [EOS],
+            lookup=lookup,
         )
 
 
@@ -277,7 +298,14 @@ class PromptedLLM(Potential):
                 eos_byte_strings=eos_byte_strings or [default_eos],
             )
 
-        super().__init__(vocabulary=self.token_maps.potential_vocab)
+        # Adopt the Potential-layer tables from the token mappings: they are pure
+        # functions of potential_vocab, computed once in TokenMappings.create --
+        # a spawn (which shares token_maps) constructs in O(1).
+        self.token_type = self.token_maps.token_type
+        self.eos = EOS
+        self.vocab = self.token_maps.potential_vocab
+        self.vocab_eos = self.token_maps.vocab_eos
+        self.lookup = self.token_maps.lookup
 
     @classmethod
     def from_name(
