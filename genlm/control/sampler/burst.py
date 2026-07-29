@@ -51,11 +51,6 @@ class BurstDraw:
     pop: bool = False
 
 
-# Burst exit reasons (ESS is not one: a token-grain crossing resamples in place, no exit).
-_EXIT_TERMINATED = "terminated"  # every flagged row finished on its own
-_EXIT_UNIT_SYNC = "unit_sync"  # unit-grain round done; driver runs ESS/resample
-
-
 class _Burst:
     """Per-burst engine state for one ``run_burst``. ``draw``/``drain_*``/``context_ids``/
     ``on_burst_end`` are the engine seam (the backend drives the control through them)."""
@@ -77,7 +72,6 @@ class _Burst:
                 self._add_substream(p, vi) for vi in range(len(self.views))
             ]
         self.scratch = {}
-        self.exit_reason = _EXIT_TERMINATED
         self._pending_bank = None  # last step's deferred bank Future (overlaps next forward)
 
     def context_ids(self, p, view_idx):
@@ -183,27 +177,23 @@ class _Burst:
                 records = await sampler.burst_draw_batch(
                     warm_batch, [p.context for p in parts], rows, self
                 )
-                # Force EOS at the max_tokens boundary (mirrors Controller._step_particle,
-                # including the particle's OWN group sampler — group state may differ).
-                # The injection must be keyed by THAT sampler's views, not group 0's:
-                # a mis-keyed injection makes its logw_eos forward inside the engine's
-                # own step (deadlock).
+                # Settle each row through the controller's own step shape. At the
+                # max_tokens boundary ``draw_step`` forces EOS via ``logw_eos``, whose
+                # injection must be keyed by THAT row's sampler's views, not group 0's:
+                # a mis-keyed injection forwards inside the engine's own step (deadlock).
                 for k_i, p in enumerate(parts):
                     if p.max_tokens_left == 1:
-                        sp = c._sampler_of(p)
                         inj = {rv: rv.make_lazy_weights(warm_batch[gv].weights[k_i])
-                               for rv, gv in zip(_views_of(sp), self.views)}
+                               for rv, gv in zip(_views_of(c._sampler_of(p)), self.views)}
                         with burst_logw_next(inj):
-                            step = await c._force_eos_step(p, sp)
-                        records[k_i] = BurstDraw(token=EOS, step=step)
+                            records[k_i] = BurstDraw(token=EOS, step=await c.draw_step(p))
                     elif records[k_i].step is not None:
                         step = c._close_if_stopped(p, records[k_i].step)
                         if step is not records[k_i].step:
                             records[k_i] = replace(records[k_i], step=step)
-                # Bank the twist view: the drawn token's warm-row logp, summed per
-                # particle — the increments of the critic LM leaf's prefix. Under
-                # twist_clip, also the per-token contrast against the draw target,
-                # clipped (both rows are already in hand).
+                # Bank the twist view: the drawn token's warm-row logp per particle —
+                # the increments of the critic LM leaf's prefix (plus, under clip, the
+                # contrast against the draw target; both rows are already in hand).
                 if self.d.twist_view is not None:
                     tw = warm_batch[self.d.twist_view].weights  # [N, V+1] device tensor
                     lk = self.d.twist_view.lookup
@@ -213,18 +203,11 @@ class _Burst:
                         rows_t = torch.tensor(ks, device=tw.device)
                         idx = torch.tensor([lk[records[k].token] for k in ks],
                                            device=tw.device)
-                        vals = tw[rows_t, idx].tolist()
-                        if c.twist_clip is not None:
-                            neg, pos = c.twist_clip
-                            tgt = warm_batch[self.d.views[0]].weights
-                            tvals = tgt[rows_t, idx].tolist()
-                            for k, v, t in zip(ks, vals, tvals):
-                                c.particles.twist_logp[rows[k]] += v
-                                c.particles.twist_clip_sum[rows[k]] += min(
-                                    max(v - t, -neg), pos)
-                        else:
-                            for k, v in zip(ks, vals):
-                                c.particles.twist_logp[rows[k]] += v
+                        tvals = None
+                        if c.twist.clip is not None:
+                            tvals = warm_batch[self.d.views[0]].weights[rows_t, idx].tolist()
+                        c.twist.bank(c.particles, [rows[k] for k in ks],
+                                     tw[rows_t, idx].tolist(), tvals)
             else:  # no live rows this step (all drained/terminated)
                 records = []
             # (3) Bank: free running defers (overlaps next forward); unit grain banks inline
@@ -289,8 +272,10 @@ class _Burst:
     async def _bank_pop(self, parts, records):
         """Bank one step's records into the population (score/extend/critic; sets p.done)."""
         c = self.d.controller
-        await c._bank_steps(parts, records)
-        # Token grain records per step here; unit grain once per round in BurstLoop.run.
+        for p, rec in zip(parts, records):
+            if rec.step is not None:
+                await c.bank_row(p, *rec.step)
+        # Token grain records per step here; unit grain once per round boundary.
         if self.d.sampler.burst_free_running() and any(r.step is not None for r in records):
             c._record_step()
 
@@ -335,7 +320,7 @@ def critic_deferred(sampler, controller):
     """Whether critic math settles at round boundaries (engine drained) rather than
     being consumed per step. Single source of truth shared by :func:`burst_blocker`
     (legality: a deferred critic's LM leaves may forward at the drain) and
-    :class:`BurstLoop` (routing: a non-deferred critic scores inline in ``_bank_step``'s
+    :class:`BurstLoop` (routing: a non-deferred critic scores inline in ``bank_row``'s
     pre-boundary path — engine-free there by ``burst_blocker``). Free-running in-burst
     resampling consumes twists mid-burst, so there the critic is NOT deferrable;
     everywhere else (unit grain; ess=0 terminal-only) it is."""
@@ -346,7 +331,7 @@ def burst_blocker(controller):
     """Why this config can't run the engine burst, or ``None`` if it can. Needs a
     burst-capable sampler over a target with one engine-burst LM leaf, must be forward-free,
     and (if batched) burst-homogeneous (:func:`_batch_blocker`)."""
-    s = controller.unit_sampler
+    s = controller.samplers[0]
     if not s.supports_burst():
         return BurstBlock(
             BlockReason.UNSUPPORTED_SAMPLER,
@@ -377,6 +362,13 @@ def burst_blocker(controller):
                     "token-grain in-burst resampling",
                 )
     if len(controller.samplers) > 1:
+        # The burst serves one twist view per group, present for all or none; a mixed
+        # batch runs the exact per-token loop (which handles it per-row).
+        if len({c is None for c in controller.critics}) != 1:
+            return BurstBlock(
+                BlockReason.BATCH_HETEROGENEOUS,
+                "groups mix critic-present and critic-free problems",
+            )
         return _batch_blocker(controller.samplers)
     return None
 
@@ -413,22 +405,21 @@ def _batch_blocker(samplers):
 
 
 class BurstLoop:
-    """Engine-accelerated SMC driver: runs each step as an engine burst over the live
-    contexts. The burst never resamples; :meth:`run` dispatches the controller-owned
-    resample. Only valid when :func:`burst_blocker` is ``None``."""
+    """Engine-accelerated SMC driver: each :meth:`round` runs the live rows as an
+    engine burst. The burst never resamples; the controller-owned loop does. Only
+    valid when :func:`burst_blocker` is ``None``."""
 
     def __init__(self, controller):
         self.controller = controller
-        self.sampler = controller.unit_sampler
-        # Deferred critics settle at round boundaries; a non-deferred critic
-        # (free-running in-burst resampling) scores inline per step in ``_bank_step`` —
-        # engine-free there by ``burst_blocker``, so the inline await cannot deadlock.
-        controller.defer_critic = critic_deferred(self.sampler, controller)
+        self.sampler = controller.samplers[0]
+        # Unit grain hands back at the synced boundary (controller runs the round
+        # boundary); token grain records/resamples in place inside the burst.
+        self.sync_boundary = not self.sampler.burst_free_running()
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         # views: LM leaves whose warm logits the burst injects (group 0's target+proposal,
         # plus the critic's engine leaf when boundary twisting will read it); the batched
         # burst draws every group through group 0's sampler.
-        serve = controller.defer_critic and controller.twist_with_critic
+        serve = critic_deferred(self.sampler, controller) and controller.twist_with_critic
         self.twist_leaves = [
             find_engine_lm(c) if (serve and c is not None) else None
             for c in controller.critics
@@ -461,45 +452,27 @@ class BurstLoop:
             )
         self.eos_id = eos_idxs[0]
 
-    async def _run_burst(self, live, loop):
-        """Run one burst over ``live`` to a pop-out; return its ``_EXIT_*`` reason. Runs the
-        engine decode loop in a worker thread; each step's draw hops back to this loop via
-        ``run_coroutine_threadsafe`` (see ``_Burst.draw``)."""
+    def defers_critic(self, controller):
+        # A non-deferred critic (free-running in-burst resampling) scores inline per
+        # step in ``bank_row`` — engine-free there by ``burst_blocker``, so the inline
+        # await cannot deadlock.
+        return critic_deferred(self.sampler, controller)
+
+    async def round(self, c):
+        """One burst over the live rows: a whole generation at token grain (resampling
+        in place at ESS crossings), one synced unit per row at unit grain. Runs the
+        engine decode loop in a worker thread; each step's draw hops back to this loop
+        (parked in ``run_in_executor``) via ``run_coroutine_threadsafe`` (see
+        ``_Burst.draw``)."""
+        loop = self.main_loop = asyncio.get_running_loop()
         self.n_bursts += 1
+        live = [p for p in c.particles if not p.done]
         b = _Burst(self, live)
-        # Unit grain hands back at the synced boundary; token grain stays terminated
-        # (resampling in place at ESS crossings).
-        b.exit_reason = (
-            _EXIT_TERMINATED if self.sampler.burst_free_running() else _EXIT_UNIT_SYNC
-        )
-        # Decode budget for one burst.
         max_steps = self.sampler.burst_max_steps(live)
         await loop.run_in_executor(
             None,
             lambda: self.llm.model.run_burst(control=b, max_steps=max_steps),
         )
-        return b.exit_reason
 
     async def run(self):
-        """Outer driver: each iteration runs the live rows' next step as a burst, then
-        dispatches the controller-owned ESS/resample, until every particle is done."""
-        controller = self.controller
-        await controller.start()
-
-        # Stash this loop for _Burst: the worker thread hops each step's SMC coroutine back
-        # here (loop parked in run_in_executor) via run_coroutine_threadsafe.
-        loop = self.main_loop = asyncio.get_running_loop()
-
-        while any(not p.done for p in controller.particles):
-            live = [p for p in controller.particles if not p.done]
-            reason = await self._run_burst(live, loop)
-            # Deferred critic math first: the engine is drained, forwards are legal, and
-            # the boundary resample must see the twisted weights.
-            await controller.apply_critic_boundary()
-            # Token grain resampled in place at ESS crossings; a unit-grain round records +
-            # resamples here at the synced boundary.
-            if reason == _EXIT_UNIT_SYNC:
-                controller._record_step()
-                controller._maybe_resample()
-
-        return controller.particles
+        return await self.controller.run(self)

@@ -73,7 +73,7 @@ class _RefSequenceModel(Model):
 
         if self.max_tokens == 1:
             # Force EOS at the boundary (IS-corrected by logw_eos); mirrors
-            # Controller._step_particle. Kept in the old twist/terminal structure
+            # Controller.draw_step. Kept in the old twist/terminal structure
             # below so the snapshot stays byte-exact against the controller.
             self.score(await self.unit_sampler.logw_eos(self.token_ctx))
             self.token_ctx.append(EOS)

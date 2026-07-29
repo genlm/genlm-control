@@ -218,9 +218,9 @@ async def test_controller_invalid_start_weight():
 
     unit_sampler = DirectTokenSampler(MockPotential([0]))
     controller = Controller(
-        unit_sampler=unit_sampler,
-        critic=None,
-        n_particles=1,
+        samplers=[unit_sampler],
+        critics=[None],
+        group_sizes=[1],
         ess_threshold=0.5,
         max_tokens=10,
         twist_with_critic=True,

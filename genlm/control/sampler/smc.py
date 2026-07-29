@@ -42,8 +42,8 @@ class Population:
         self.logw = np.zeros(n)
         self.logp = np.zeros(n)
         # The critic LM leaf's banked per-token logp sums (fed by the burst's twist
-        # view), and the per-token CLIPPED contrast sum (live under
-        # ``Controller(twist_clip=...)``, accumulated in the same gather).
+        # view), and the per-token CLIPPED contrast sum (live under ``Twist(clip=...)``,
+        # accumulated in the same gather). Written only by ``Twist``.
         self.twist_logp = np.zeros(n)
         self.twist_clip_sum = np.zeros(n)
         self.twist_amount = np.zeros(n)
@@ -165,26 +165,73 @@ class Particle:
 
 
 
-class Controller:
-    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. Every
-    sampler collapses to one per-step ``transition``.
+class Twist:
+    """Critic-twist policy: the twist value formula plus the burst-banked per-token
+    serving sums. The columns live in :class:`Population`; every formula that reads
+    or writes them lives here.
 
     Args:
-        unit_sampler (TokenSampler): produces ``(to_append, logw, logp)`` per step.
-        critic (Potential, optional): reweights/twists particles.
-        n_particles (int): number of particles.
-        ess_threshold (float): ESS fraction below which we resample.
+        contrast (bool): twist with ``critic.score(context) - particle.logp`` (the
+            log-ratio against the proposal) instead of ``critic.score(context)``.
+            Terminal scores are unaffected, so the twist still cancels at termination.
+        temperature (float): scales the twist; 0 disables twisting entirely.
+        clip (tuple, optional): ``(neg, pos)`` per-token caps for the critic-LM
+            contrast. When set, the burst banks ``sum_t clip(delta_t, -neg, +pos)``
+            and serving folds ``logp`` back in so the contrast subtraction in
+            :meth:`value` yields the clipped sum. Burst lane only; the cold path
+            scores the unclipped prefix.
+    """
+
+    def __init__(self, contrast=False, temperature=1.0, clip=None):
+        assert clip is None or contrast, "clip requires contrast"
+        self.contrast = contrast
+        self.temperature = temperature
+        self.clip = clip
+
+    def value(self, p, amt):
+        """The twist applied for critic score ``amt`` on particle ``p``."""
+        if self.contrast:
+            amt -= p.logp
+        return self.temperature * amt
+
+    def served_prefix(self, ps):
+        """Banked warm-row sums served as the critic LM leaf's ``batch_prefix``."""
+        return np.array([
+            (p.logp + p.twist_clip_sum) if self.clip is not None else p.twist_logp
+            for p in ps
+        ])
+
+    def bank(self, pop, rows, vals, tvals):
+        """Accumulate one step's drawn-token increments: the critic leaf's logp per
+        row (``vals``), and under ``clip`` the clipped contrast against the draw
+        target's logp (``tvals``)."""
+        if self.clip is None:
+            for row, v in zip(rows, vals):
+                pop.twist_logp[row] += v
+        else:
+            neg, pos = self.clip
+            for row, v, t in zip(rows, vals, tvals):
+                pop.twist_logp[row] += v
+                pop.twist_clip_sum[row] += min(max(v - t, -neg), pos)
+
+
+class Controller:
+    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. Every
+    sampler collapses to one per-step ``transition``. The population is B independent
+    SMC problems ("groups") in one flat row space — ESS/resample/log_ml are per-group,
+    and B=1 is the plain single-problem case.
+
+    Args:
+        samplers (list[TokenSampler]): per-group sampler producing
+            ``(to_append, logw, logp)`` per step.
+        critics (list[Potential | None]): per-group critic reweighting/twisting
+            that group's particles.
+        group_sizes (list[int]): particles per group.
+        ess_threshold (float): per-group ESS fraction below which that group resamples.
         max_tokens (int): per-particle token budget.
         twist_with_critic (bool): whether the critic twists during stepping.
-        contrast_twist (bool): twist with ``critic.score(context) - particle.logp``
-            (the log-ratio against the proposal) instead of ``critic.score(context)``.
-            Terminal scores are unaffected, so the twist still cancels at termination.
-        twist_temperature (float): scales the twist; 0 disables twisting entirely.
-        twist_clip (tuple, optional): ``(neg, pos)`` per-token caps for the critic-LM
-            contrast. When set, the boundary serves the critic LM
-            ``sum_t clip(delta_t, -neg, +pos)`` (plus ``logp``, so the contrast
-            subtraction yields the clipped sum) instead of its raw prefix. Burst
-            lane only; the cold path scores the unclipped prefix.
+        twist (Twist, optional): the twist policy (contrast/temperature/clip);
+            defaults to the bare critic score.
         terminate_when (callable, optional): ``context -> bool`` stop condition. When it
             fires, EOS closes the sequence in that same step. The context is in the
             sampler's own representation, so unit nesting is the caller's business.
@@ -195,48 +242,29 @@ class Controller:
 
     def __init__(
         self,
-        unit_sampler,
-        critic,
-        n_particles,
+        samplers,
+        critics,
+        group_sizes,
         ess_threshold,
         max_tokens,
         twist_with_critic,
-        contrast_twist=False,
-        twist_temperature=1.0,
-        twist_clip=None,
+        twist=None,
         terminate_when=None,
         resampling_method="multinomial",
         record=False,
         verbosity=0,
-        group_sizes=None,
-        samplers=None,
-        critics=None,
     ):
         assert max_tokens > 0
-        # B groups in one population; default is one group.
-        if group_sizes is None:
-            group_sizes = [n_particles]
-            samplers = [unit_sampler]
-            critics = [critic]
-        assert n_particles == sum(group_sizes), "n_particles must be the TOTAL row count"
-        assert len(samplers) == len(critics) == len(group_sizes)
+        assert len(samplers) == len(critics) == len(group_sizes) > 0
+        n_particles = sum(group_sizes)
 
         self.samplers = samplers
         self.critics = critics
-        # Representatives for the capability check / BurstLoop (groups share structure).
-        self.unit_sampler = samplers[0]
-        self.critic = critics[0]
         self.n_particles = n_particles
         self.n_resamples = 0
         self.ess_threshold = ess_threshold
         self.twist_with_critic = twist_with_critic
-        self.contrast_twist = contrast_twist
-        self.twist_temperature = twist_temperature
-        self.twist_clip = twist_clip
-        # The clipped serving folds logp back in so the contrast subtraction yields
-        # the clipped sum; without the subtraction it would leak logp into the twist.
-        assert twist_clip is None or contrast_twist, (
-            "twist_clip requires contrast_twist")
+        self.twist = twist if twist is not None else Twist()
         self.terminate_when = terminate_when
         # A terminal-only critic has no per-step signal: reweight only at termination.
         if twist_with_critic and all(
@@ -256,7 +284,8 @@ class Controller:
         ]
         self.record = SMCRecord(n_particles) if record else None
         # Burst lane: critic math deferred to the round boundary (engine drained) —
-        # ``_bank_step`` pends instead of awaiting; ``apply_critic_boundary`` settles.
+        # ``bank_row`` pends instead of awaiting; ``apply_critic_boundary`` settles.
+        # Set per run from the driver (``run``); False is the inline default.
         self.defer_critic = False
         self._critic_pending: list = []
         # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
@@ -267,12 +296,19 @@ class Controller:
         with np.errstate(divide="ignore"):
             self._log_ess_threshold = np.log(ess_threshold)
 
-    async def _draw_and_bank(self, p):
-        """Per-step transition: draw, then bank. The (slot, ordinal) draw key lets a
-        counter-based picker match the burst draw."""
+    async def draw_step(self, p):
+        """One row's step ``(to_append, logw, logp)``: forced EOS at the ``max_tokens``
+        boundary, else the sampler's transition (closed by ``terminate_when``). The
+        (slot, ordinal) draw key lets a counter-based picker match the burst draw."""
+        if p.max_tokens_left == 1:
+            return await self._force_eos_step(p, self._sampler_of(p))
         with draw_key(p._i, draw_ordinal(p.context)):
-            to_append, logw, logp = await self._sampler_of(p).transition(p.context)
-        await self._bank_step(p, *self._close_if_stopped(p, (to_append, logw, logp)))
+            step = await self._sampler_of(p).transition(p.context)
+        return self._close_if_stopped(p, step)
+
+    async def step_row(self, p):
+        """Draw + bank one live row: a per-token driver's whole per-row step."""
+        await self.bank_row(p, *(await self.draw_step(p)))
 
     def _close_if_stopped(self, p, step):
         """``step`` with EOS appended if ``terminate_when`` fires on the context it
@@ -293,64 +329,43 @@ class Controller:
         """Forced-EOS step ``(to_append, logw, logp)`` at the ``max_tokens`` boundary."""
         return [EOS], await sampler.logw_eos(p.context), 0.0
 
-    async def _step_particle(self, p):
-        """One SMC step for ``p``: force EOS at the ``max_tokens`` boundary, else draw + bank."""
-        if p.max_tokens_left == 1:
-            await self._bank_step(p, *(await self._force_eos_step(p, self._sampler_of(p))))
-        else:
-            await self._draw_and_bank(p)
-
     def _sampler_of(self, p):
         return self.samplers[self.particles.group[p._i]]
 
     def _critic_of(self, p):
         return self.critics[self.particles.group[p._i]]
 
-    def _twist_value(self, p, amt):
-        if self.contrast_twist:
-            amt -= p.logp
-        return self.twist_temperature * amt
-
-    def _bank_step_no_critic(self, p, to_append, logw, logp):
-        """Sync score + advance + terminate, no-critic path."""
+    async def bank_row(self, p, to_append, logw, logp):
+        """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
+        Caller untwists ``p`` before the draw. Critic-free rows (no critic, or the
+        critic deferred to the round boundary) bank without awaiting; an inline
+        critic twists/reweights here."""
         p.score(logw)
         p.logp += logp
         p.context.extend(to_append)
-        if p.logw == float("-inf"):
-            p.finish()
-            return
-        if self.verbosity > 0:
-            print(self._repr_particle(p))
-        p.max_tokens_left -= 1
-        if p.max_tokens_left == 0 or self._is_terminal(p):
-            p.finish()
 
-    async def _bank_step(self, p, to_append, logw, logp):
-        """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
-        Caller untwists ``p`` before the draw."""
-        if not self.critic:
-            self._bank_step_no_critic(p, to_append, logw, logp)
-            return
-
-        if self.defer_critic:
-            self._bank_step_no_critic(p, to_append, logw, logp)
-            if p.done or self.twist_with_critic:
+        critic = self._critic_of(p)
+        if critic is None or self.defer_critic:
+            if p.logw == float("-inf"):
+                p.finish()
+            else:
+                if self.verbosity > 0:
+                    print(self._repr_particle(p))
+                p.max_tokens_left -= 1
+                if p.max_tokens_left == 0 or self._is_terminal(p):
+                    p.finish()
+            if critic is not None and (p.done or self.twist_with_critic):
                 self._critic_pending.append(p)
             return
 
-        p.score(logw)
-        p.logp += logp
-        p.context.extend(to_append)
-
         if p.logw == float("-inf"):
-            assert p.twist_amount != float("-inf")
             p.finish()
             return
 
         if self.twist_with_critic:
-            twist_amt = await self._critic_of(p).score(p.context)
+            twist_amt = await critic.score(p.context)
             if twist_amt != float("-inf"):
-                p.twist(self._twist_value(p, twist_amt))
+                p.twist(self.twist.value(p, twist_amt))
             else:
                 p.score(twist_amt)
                 p.finish()
@@ -363,9 +378,8 @@ class Controller:
         if p.max_tokens_left == 0 or self._is_terminal(p):
             p.finish()
             if not self.twist_with_critic:
-                twist_amt = await self._critic_of(p).score(p.context)
+                twist_amt = await critic.score(p.context)
             p.score(twist_amt)
-            return
 
     def _is_terminal(self, p):
         return bool(p.context) and p.context[-1] is EOS
@@ -448,6 +462,25 @@ class Controller:
             self.record.add_smc_step(self.particles)
         self._pending_resample = False
 
+    def round_boundary(self):
+        """Close a round: record the step, then the per-group ESS test/resample."""
+        self._record_step()
+        return self._maybe_resample()
+
+    async def run(self, driver):
+        """The SMC loop, driver-agnostic: each iteration the driver turns every live
+        row's next step (one token per round for the per-token driver, a whole burst
+        for the engine driver), then deferred critic math settles and the round
+        boundary runs. The driver owns scheduling; the controller owns the math."""
+        self.defer_critic = driver.defers_critic(self)
+        await self.start()
+        while any(not p.done for p in self.particles):
+            await driver.round(self)
+            await self.apply_critic_boundary()
+            if driver.sync_boundary:
+                self.round_boundary()
+        return self.particles
+
     async def apply_critic_boundary(self):
         """The deferred critic math, at the round boundary (engine drained; forwards are
         legal). Same math as the inline path: a finished particle scores ``complete``
@@ -474,13 +507,9 @@ class Controller:
             if leaf is None:
                 return ps, await critic.batch_score(contexts)
             # batch_score routes non-EOS contexts to batch_prefix in list order;
-            # serve the banked sums for exactly that subset. Under twist_clip the
-            # served value is logp + clipped contrast, so the contrast subtraction
-            # in _twist_value yields the clipped sum.
-            served = np.array([
-                (p.logp + p.twist_clip_sum) if self.twist_clip is not None
-                else p.twist_logp
-                for p, ctx in zip(ps, contexts)
+            # serve the banked sums for exactly that subset.
+            served = self.twist.served_prefix([
+                p for p, ctx in zip(ps, contexts)
                 if not (ctx and ctx[-1] == critic.eos)
             ])
             with burst_prefix({leaf: served}):
@@ -497,48 +526,27 @@ class Controller:
                     p.score(amt)
                     p.finish()
                 else:
-                    p.twist(self._twist_value(p, amt))
-
-    # burst-lane math the engine seam (_Burst) calls into
-
-    async def _bank_steps(self, parts, records):
-        """Bank every row's completed step (``rec.step``), same math as the slow loop.
-        Runs on the main loop (hopped from the burst worker)."""
-        steps = [
-            (p, rec.step) for p, rec in zip(parts, records) if rec.step is not None
-        ]
-        if not steps:
-            return
-        if self.critic is None:
-            for p, (to_append, logw, logp) in steps:
-                self._bank_step_no_critic(p, to_append, logw, logp)
-            return
-        for p, (to_append, logw, logp) in steps:
-            await self._bank_step(p, to_append, logw, logp)
-
-
+                    p.twist(self.twist.value(p, amt))
 
 class StepLoop:
-    """Per-token round-trip driver (byte-exact ground truth); recomputes logprobs from
-    the full context every step."""
+    """Per-token driver (byte-exact ground truth): each round draws + banks every live
+    row concurrently, recomputing logprobs from the full context every step."""
+
+    sync_boundary = True
 
     def __init__(self, controller):
         self.controller = controller
 
+    def defers_critic(self, controller):
+        return False
+
+    async def round(self, c):
+        """One token for every live row."""
+        if c.twist_with_critic:
+            c.particles.untwist_all()
+        await asyncio.gather(*[c.step_row(p) for p in c.particles if not p.done])
+
     async def run(self):
-        """Turn the population per-token to completion: each step draws + scores every
-        live particle concurrently, records, then runs the controller-owned
-        ESS/resample."""
-        c = self.controller
-        await c.start()
-        while any(not p.done for p in c.particles):
-            if c.twist_with_critic:
-                c.particles.untwist_all()
-            await asyncio.gather(
-                *[c._step_particle(p) for p in c.particles if not p.done]
-            )
-            c._record_step()
-            c._maybe_resample()
-        return c.particles
+        return await self.controller.run(self)
 
 

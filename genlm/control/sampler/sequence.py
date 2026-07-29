@@ -177,9 +177,9 @@ class SMC:
         mode = _normalize_accelerate(accelerate)
 
         controller = Controller(
-            unit_sampler=self.unit_sampler,
-            critic=self.critic,
-            n_particles=n_particles,
+            samplers=[self.unit_sampler],
+            critics=[self.critic],
+            group_sizes=[n_particles],
             ess_threshold=ess_threshold,
             max_tokens=max_tokens,
             twist_with_critic=ess_threshold > 0,
@@ -241,26 +241,15 @@ class SMC:
         :func:`~genlm.control.sampler.burst._batch_blocker`), else it falls
         back to the exact per-token loop.
         """
-        samplers = [s.unit_sampler for s in smcs]
-        critics = [s.critic for s in smcs]
         B = len(smcs)
-        # The controller's critic-presence branch uses the group-0 representative,
-        # so a mixed batch (some groups with a critic, some without) is unsupported
-        # -- make that contract explicit rather than crash deep in the transition.
-        assert len({c is None for c in critics}) == 1, (
-            "all SMC problems must have a critic or all none (homogeneous batch)"
-        )
         controller = Controller(
-            unit_sampler=samplers[0],
-            critic=critics[0],
-            n_particles=n_particles * B,  # TOTAL rows across all groups
+            samplers=[s.unit_sampler for s in smcs],
+            critics=[s.critic for s in smcs],
+            group_sizes=[n_particles] * B,
             ess_threshold=ess_threshold,
             max_tokens=max_tokens,
             twist_with_critic=ess_threshold > 0,
             verbosity=verbosity,
-            group_sizes=[n_particles] * B,
-            samplers=samplers,
-            critics=critics,
             **kwargs,
         )
         await _drive(controller, _normalize_accelerate(accelerate))

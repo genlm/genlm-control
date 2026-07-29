@@ -60,9 +60,9 @@ def _run(model, q_lora_name, seed, driver_cls):
     p0 = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS)
     q = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS, lora_name=q_lora_name)
     controller = Controller(
-        unit_sampler=DirectTokenSampler(potential=p0, proposal=q),
-        critic=None,
-        n_particles=8,
+        samplers=[DirectTokenSampler(potential=p0, proposal=q)],
+        critics=[None],
+        group_sizes=[8],
         ess_threshold=0.0,
         max_tokens=12,
         twist_with_critic=False,

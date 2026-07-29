@@ -109,9 +109,9 @@ def _controller(make_sampler, n_particles, ess_threshold, max_tokens, make_criti
     # seeded by `seed_all` + its own seed). `twist_with_critic` mirrors SMC.__call__
     # exactly (per-step twist iff ess_threshold > 0).
     return Controller(
-        unit_sampler=make_sampler(),
-        critic=make_critic() if make_critic is not None else None,
-        n_particles=n_particles,
+        samplers=[make_sampler()],
+        critics=[make_critic() if make_critic is not None else None],
+        group_sizes=[n_particles],
         ess_threshold=ess_threshold,
         max_tokens=max_tokens,
         twist_with_critic=ess_threshold > 0,
@@ -358,8 +358,8 @@ def test_awrs_burst_vs_slow(llm):
 # ----- gate 2d: critic (terminal reweight + per-step twist) -------------------
 #
 # The critic is NOT a sampler -- it reweights the population. The burst scores it
-# via the SAME Controller._bank_step the slow loop uses (driven by
-# run_sync from the engine-thread draw), so a terminal reweight (ess=0, the
+# via the SAME Controller.bank_row the slow loop uses (hopped onto the main loop
+# from the engine-thread draw), so a terminal reweight (ess=0, the
 # genlm-latent production regime) and a per-step twist (ess>0) are handled
 # identically to the slow path. There is deliberately NO critic-category gate
 # (is_terminal_only is not consulted): a critic is just a potential, scored the
