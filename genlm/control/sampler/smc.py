@@ -258,8 +258,6 @@ class Controller:
         # Burst lane: critic math deferred to the round boundary (engine drained) —
         # ``_bank_step`` pends instead of awaiting; ``apply_critic_boundary`` settles.
         self.defer_critic = False
-        # Per-group critic engine leaf the burst serves from banked sums; set by BurstLoop.
-        self.twist_leaves = None
         self._critic_pending: list = []
         # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
         self._pending_resample = False
@@ -313,25 +311,6 @@ class Controller:
             amt -= p.logp
         return self.twist_temperature * amt
 
-    def _served_prefix(self, ps):
-        """Banked warm-row prefix sums for ``ps``. Under ``twist_clip`` the served value
-        is ``logp + clipped contrast``, so the subtraction in ``_twist_value`` leaves the
-        clipped sum."""
-        return np.array([
-            (p.logp + p.twist_clip_sum) if self.twist_clip is not None else p.twist_logp
-            for p in ps
-        ])
-
-    async def _score_critic_inline(self, p):
-        """Per-step critic score. Inside a burst the critic's engine leaf must not
-        forward, so its prefix comes from the banked sums instead."""
-        critic = self._critic_of(p)
-        leaf = self.twist_leaves[self.particles.group[p._i]] if self.twist_leaves else None
-        if leaf is None or (p.context and p.context[-1] == critic.eos):
-            return await critic.score(p.context)
-        with burst_prefix({leaf: self._served_prefix([p])}):
-            return float((await critic.batch_score([p.context]))[0])
-
     def _bank_step_no_critic(self, p, to_append, logw, logp):
         """Sync score + advance + terminate, no-critic path."""
         p.score(logw)
@@ -369,7 +348,7 @@ class Controller:
             return
 
         if self.twist_with_critic:
-            twist_amt = await self._score_critic_inline(p)
+            twist_amt = await self._critic_of(p).score(p.context)
             if twist_amt != float("-inf"):
                 p.twist(self._twist_value(p, twist_amt))
             else:
@@ -494,11 +473,16 @@ class Controller:
             leaf = find_engine_lm(critic) if self.twist_with_critic else None
             if leaf is None:
                 return ps, await critic.batch_score(contexts)
-            # batch_score routes non-EOS contexts to batch_prefix in list order; serve
-            # the banked sums for exactly that subset.
-            served = self._served_prefix(
-                [p for p, ctx in zip(ps, contexts)
-                 if not (ctx and ctx[-1] == critic.eos)])
+            # batch_score routes non-EOS contexts to batch_prefix in list order;
+            # serve the banked sums for exactly that subset. Under twist_clip the
+            # served value is logp + clipped contrast, so the contrast subtraction
+            # in _twist_value yields the clipped sum.
+            served = np.array([
+                (p.logp + p.twist_clip_sum) if self.twist_clip is not None
+                else p.twist_logp
+                for p, ctx in zip(ps, contexts)
+                if not (ctx and ctx[-1] == critic.eos)
+            ])
             with burst_prefix({leaf: served}):
                 return ps, await critic.batch_score(contexts)
 

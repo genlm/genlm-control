@@ -358,15 +358,13 @@ def burst_blocker(controller):
         )
     # Forward-free invariant: every LM leaf in a group's per-step DRAW path (target/
     # proposal) must be an injected view, else it would forward inside the burst (which
-    # can't supply it). A deferred critic scores at the engine drain, so its LM leaves are
-    # legal there; a non-deferred one (token grain) scores inline, legal only for its own
-    # engine leaf, which is served from the banked twist view.
+    # can't supply it). The critic is boundary-scored (``apply_critic_boundary`` runs at
+    # the engine drain), so its LM leaves are legal — EXCEPT token-grain in-burst
+    # resampling (free-running + twist_with_critic), which consumes twists mid-burst.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
         draw = samp.burst_draw_sampler()
         deferred = critic_deferred(samp, controller)
-        if not deferred and crit is not None:
-            injected |= {find_engine_lm(crit)} - {None}
         pots = (draw.target, draw.proposal) + ((crit,) if not deferred else ())
         for pot in pots:
             if pot is None:
@@ -428,18 +426,17 @@ class BurstLoop:
         controller.defer_critic = critic_deferred(self.sampler, controller)
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         # views: LM leaves whose warm logits the burst injects (group 0's target+proposal,
-        # plus the critic's engine leaf when twisting will read it); the batched burst
-        # draws every group through group 0's sampler. The leaf is served from the banked
-        # per-token sums either way -- at the boundary when deferred, inline when not.
+        # plus the critic's engine leaf when boundary twisting will read it); the batched
+        # burst draws every group through group 0's sampler.
+        serve = controller.defer_critic and controller.twist_with_critic
         self.twist_leaves = [
-            find_engine_lm(c) if (controller.twist_with_critic and c is not None) else None
+            find_engine_lm(c) if (serve and c is not None) else None
             for c in controller.critics
         ]
         self.twist_view = self.twist_leaves[0]
         assert all(
             (lf is None) == (self.twist_view is None) for lf in self.twist_leaves
         ), "batched groups must agree on having an engine-LM critic leaf"
-        controller.twist_leaves = self.twist_leaves
         self.views = _views_of(self.sampler) + (
             [self.twist_view] if self.twist_view is not None else []
         )
