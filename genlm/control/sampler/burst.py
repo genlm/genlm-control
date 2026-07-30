@@ -53,24 +53,22 @@ class BurstDraw:
 
 class _Burst:
     """Per-burst engine state for one ``run_burst``. ``draw``/``drain_*``/``context_ids``/
-    ``on_burst_end`` are the engine seam (the backend drives the control through them)."""
+    ``on_burst_end`` are the engine seam (the backend drives the control through them).
+    One engine group per particle: K view requests the backend keeps in lockstep."""
 
     def __init__(self, d, live):
         self.d = d
         self.views = d.views
-        # Adapter names snapshotted at burst start (like view_prefixes): a rebind
-        # of a view's lora_name mid-run must not split this burst across adapters.
+        # Adapter names snapshotted at burst start: a lora_name rebind mid-run must
+        # not split this burst across adapters.
         self.view_loras = [v.lora_name for v in d.views]
-        self.abort_rows = set()
-        self.add_rows = []
-        # K substreams per particle: handle -> (row, view_idx); row -> [handle/view].
-        self.handle_rv = {}
-        self.row_handles = {}
+        self.abort_handles = set()
+        self.add_handles = []
+        self.handle_row = {}  # engine group handle -> particle row
+        self.row_handle = {}  # particle row -> engine group handle
         self.next_handle = 0
         for p in live:
-            self.row_handles[p._i] = [
-                self._add_substream(p, vi) for vi in range(len(self.views))
-            ]
+            self._add_group(p)
         self.scratch = {}
         self._pending_bank = None  # last step's deferred bank Future (overlaps next forward)
 
@@ -93,85 +91,56 @@ class _Burst:
             _emit(item)
         return ids
 
-    def _add_substream(self, p, vi):
-        """Mint+register a handle for one (particle, view) substream, queue its engine add.
-        Sole add path (initial population + mid-burst re-add)."""
+    def _add_group(self, p):
+        """Mint+register the group handle for one particle, queue its K-view engine
+        add. Sole add path (initial population + mid-burst re-add)."""
         h = self.next_handle
         self.next_handle += 1
-        self.handle_rv[h] = (p._i, vi)
-        self.add_rows.append((h, self.context_ids(p, vi), self.view_loras[vi]))
-        return h
+        self.handle_row[h] = p._i
+        self.row_handle[p._i] = h
+        self.add_handles.append((
+            h,
+            [self.context_ids(p, vi) for vi in range(len(self.views))],
+            self.view_loras,
+        ))
 
     def drain_aborts(self):
-        rows = self.abort_rows
-        self.abort_rows = set()
-        return list(rows)
+        handles = self.abort_handles
+        self.abort_handles = set()
+        return list(handles)
 
     def drain_adds(self):
-        rows = self.add_rows
-        self.add_rows = []
-        return rows
+        adds = self.add_handles
+        self.add_handles = []
+        return adds
 
     def draw(self, logits, handles):
-        """Engine callback, once per decode step: (1) join prior step's deferred bank +
-        resample; (2) select this step's token for live rows; (3) kick this step's bank
-        async to overlap the next forward. Popped rows (gone from ``handle_rv``) skipped."""
+        """Engine per-step callback over the complete groups' ``[G, K, vocab]``
+        logits: one token per live group. Banking is deferred under free running to
+        overlap the next forward; dropped groups get a placeholder token."""
         c = self.d.controller
         sampler = self.d.sampler
-        idx_of = {h: i for i, h in enumerate(handles)}
-
-        # warm: handle -> [V+1] device tensor of warm logits per forwarded substream.
-        warm = {}
-        for vi, view in enumerate(self.views):
-            vh = [h for h in handles if (h in self.handle_rv and self.handle_rv[h][1] == vi)]
-            if not vh:
-                continue
-            rowsidx = [idx_of[h] for h in vh]
-            batch = view._process_logw_next_batch(view._maybe_temper(logits[rowsidx].float()))
-            for h, row_w in zip(vh, batch):  # row_w: [V+1] device-tensor view, no host xfer
-                warm[h] = row_w
+        # Per view: [G, V+1] warm log-weights (device tensors, no host xfer).
+        processed = [
+            view._process_logw_next_batch(view._maybe_temper(logits[:, vi].float()))
+            for vi, view in enumerate(self.views)
+        ]
 
         async def _step():
             # (1) Join prior deferred bank so select draws over the resampled population.
             await self._join_pending_bank()
-            # (2) live rows still in handle_rv.
-            rows, seen = [], set()
-            for h in handles:
-                rv = self.handle_rv.get(h)
-                if rv is None:
-                    continue
-                row = rv[0]
-                if row not in seen:
-                    seen.add(row)
-                    rows.append(row)
-            # Lockstep guard: the engine can sample a strict subset of a row's K
-            # substreams in one step (prefill-chunk boundary / KV preemption landing
-            # between siblings). The sampled sibling would advance while the other
-            # never receives the token — permanent stream desync. Stall such rows:
-            # flush their engine requests and re-add all K substreams at the current
-            # context (prefix-cached), so the pair re-enters together next step.
-            # No token is banked for a stalled row, so the SMC math is untouched.
-            stalled = {row for row in rows
-                       if any(h not in warm for h in self.row_handles[row])}
-            if stalled:
-                for row in stalled:
-                    self._drop_row(row)
-                    p = c.particles[row]
-                    self.row_handles[row] = [
-                        self._add_substream(p, vi) for vi in range(len(self.views))
-                    ]
-                print(f"[burst] lockstep stall: flushed+readded rows "
-                      f"{sorted(stalled)}", flush=True)
-                rows = [row for row in rows if row not in stalled]
+            # (2) live groups still in handle_row.
+            live_k = [k for k, h in enumerate(handles) if h in self.handle_row]
+            rows = [self.handle_row[handles[k]] for k in live_k]
             parts = [c.particles[row] for row in rows]
             if c.twist_with_critic:
-                c.particles.untwist_subset([p._i for p in parts])
+                c.particles.untwist_subset(rows)
+            out = [0] * len(handles)
             if rows:
                 # One batched warm per view ([N, V+1], rows-order).
+                sel = torch.tensor(live_k, dtype=torch.int64, device=logits.device)
                 warm_batch = {
-                    view: view.make_lazy_weights(
-                        torch.stack([warm[self.row_handles[row][vi]] for row in rows])
-                    )
+                    view: view.make_lazy_weights(processed[vi][sel])
                     for vi, view in enumerate(self.views)
                 }
                 records = await sampler.burst_draw_batch(
@@ -208,7 +177,12 @@ class _Burst:
                             tvals = warm_batch[self.d.views[0]].weights[rows_t, idx].tolist()
                         c.twist.bank(c.particles, [rows[k] for k in ks],
                                      tw[rows_t, idx].tolist(), tvals)
-            else:  # no live rows this step (all drained/terminated)
+                for k, rec in zip(live_k, records):
+                    tok = rec.token
+                    out[k] = (
+                        self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
+                    )
+            else:  # no live groups this step (all drained/terminated)
                 records = []
             # (3) Bank: free running defers (overlaps next forward); unit grain banks inline
             # (its pop-out abort must take effect this step).
@@ -221,16 +195,6 @@ class _Burst:
                 )
             else:
                 await self._bank_pop(parts, records)
-
-            out = [0] * len(handles)
-            for k_i, (p, row) in enumerate(zip(parts, rows)):
-                tok = records[k_i].token
-                tok_id = self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
-                for h in self.row_handles[row]:  # fan the token to the K substreams
-                    if h in idx_of:
-                        out[idx_of[h]] = tok_id
-
-            if not sampler.burst_free_running():
                 self._flag_after_bank(parts, rows, records)
             return out
 
@@ -254,15 +218,17 @@ class _Burst:
             self.resample_realize()
 
     def _flag_after_bank(self, parts, rows, records):
-        """Per banked row: evict if terminated; if pop, abort its engine rows but keep maps."""
+        """Per banked row: evict if terminated; if pop, abort its engine group but
+        keep maps."""
         for k_i, (p, row) in enumerate(zip(parts, rows)):
             if isinstance(records[k_i].token, EndOfSequence):
                 assert p.done, "burst drew EOS for a particle that did not terminate"
             if p.done:
                 self._drop_row(row)
             elif records[k_i].pop:
-                for h in self.row_handles.get(row, ()):
-                    self.abort_rows.add(h)
+                h = self.row_handle.get(row)
+                if h is not None:
+                    self.abort_handles.add(h)
 
     def _on_main(self, coro):
         """Run ``coro`` on the main loop (parked in ``run_in_executor``) from the burst
@@ -280,10 +246,11 @@ class _Burst:
             c._record_step()
 
     def _drop_row(self, row):
-        """Evict a row's K substreams: abort their engine requests, drop both maps."""
-        for h in self.row_handles.pop(row, []):
-            self.abort_rows.add(h)
-            self.handle_rv.pop(h, None)
+        """Evict a particle's engine group: abort it, drop both maps."""
+        h = self.row_handle.pop(row, None)
+        if h is not None:
+            self.handle_row.pop(h, None)
+            self.abort_handles.add(h)
 
     def resample_realize(self):
         """Translate a completed per-group resample into engine abort/re-add; return whether
@@ -294,13 +261,9 @@ class _Burst:
             for row in c._group_rows[g]:
                 self._drop_row(int(row))
             for row in c._group_rows[g]:
-                row = int(row)
-                p = c.particles[row]
-                if p.done:
-                    continue
-                self.row_handles[row] = [  # re-add all K substreams
-                    self._add_substream(p, vi) for vi in range(len(self.views))
-                ]
+                p = c.particles[int(row)]
+                if not p.done:
+                    self._add_group(p)
         return bool(groups)
 
 
@@ -317,13 +280,9 @@ def _views_of(sampler):
 
 
 def critic_deferred(sampler, controller):
-    """Whether critic math settles at round boundaries (engine drained) rather than
-    being consumed per step. Single source of truth shared by :func:`burst_blocker`
-    (legality: a deferred critic's LM leaves may forward at the drain) and
-    :class:`BurstLoop` (routing: a non-deferred critic scores inline in ``bank_row``'s
-    pre-boundary path — engine-free there by ``burst_blocker``). Free-running in-burst
-    resampling consumes twists mid-burst, so there the critic is NOT deferrable;
-    everywhere else (unit grain; ess=0 terminal-only) it is."""
+    """Whether the critic settles at round boundaries (engine drained) rather than
+    per step. False only for free-running in-burst resampling with
+    ``twist_with_critic`` (it consumes twists mid-burst); true otherwise."""
     return not (sampler.burst_free_running() and controller.twist_with_critic)
 
 
@@ -341,11 +300,12 @@ def burst_blocker(controller):
         return BurstBlock(
             BlockReason.NO_ENGINE_LEAF, "sampler target has no single engine-burst LM leaf"
         )
-    # Forward-free invariant: every LM leaf in a group's per-step DRAW path (target/
-    # proposal) must be an injected view, else it would forward inside the burst (which
-    # can't supply it). The critic is boundary-scored (``apply_critic_boundary`` runs at
-    # the engine drain), so its LM leaves are legal — EXCEPT token-grain in-burst
-    # resampling (free-running + twist_with_critic), which consumes twists mid-burst.
+    # Forward-free invariant: every LM leaf on a group's per-step draw path (target/
+    # proposal) must be an injected view, or it would forward inside the burst (which
+    # can't supply it). The critic is boundary-scored, so its LM leaves may forward
+    # at the drain -- except token-grain in-burst resampling (free-running +
+    # twist_with_critic), which consumes twists mid-burst and needs the critic
+    # forward-free too.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
         draw = samp.burst_draw_sampler()
@@ -362,8 +322,8 @@ def burst_blocker(controller):
                     "token-grain in-burst resampling",
                 )
     if len(controller.samplers) > 1:
-        # The burst serves one twist view per group, present for all or none; a mixed
-        # batch runs the exact per-token loop (which handles it per-row).
+        # The burst serves one twist view per group, present for all or none; mixed
+        # batches fall back to the per-token loop.
         if len({c is None for c in controller.critics}) != 1:
             return BurstBlock(
                 BlockReason.BATCH_HETEROGENEOUS,
@@ -415,11 +375,14 @@ class BurstLoop:
         # Unit grain hands back at the synced boundary (controller runs the round
         # boundary); token grain records/resamples in place inside the burst.
         self.sync_boundary = not self.sampler.burst_free_running()
+        # A deferred critic (non-free-running, or ess=0 terminal-only) settles at the
+        # round boundary — engine drained, its LM leaves may forward there.
+        self.defers_critic = critic_deferred(self.sampler, controller)
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         # views: LM leaves whose warm logits the burst injects (group 0's target+proposal,
         # plus the critic's engine leaf when boundary twisting will read it); the batched
         # burst draws every group through group 0's sampler.
-        serve = critic_deferred(self.sampler, controller) and controller.twist_with_critic
+        serve = self.defers_critic and controller.twist_with_critic
         self.twist_leaves = [
             find_engine_lm(c) if (serve and c is not None) else None
             for c in controller.critics
@@ -452,13 +415,7 @@ class BurstLoop:
             )
         self.eos_id = eos_idxs[0]
 
-    def defers_critic(self, controller):
-        # A non-deferred critic (free-running in-burst resampling) scores inline per
-        # step in ``bank_row`` — engine-free there by ``burst_blocker``, so the inline
-        # await cannot deadlock.
-        return critic_deferred(self.sampler, controller)
-
-    async def round(self, c):
+    async def round(self):
         """One burst over the live rows: a whole generation at token grain (resampling
         in place at ESS crossings), one synced unit per row at unit grain. Runs the
         engine decode loop in a worker thread; each step's draw hops back to this loop
@@ -466,7 +423,7 @@ class BurstLoop:
         ``_Burst.draw``)."""
         loop = self.main_loop = asyncio.get_running_loop()
         self.n_bursts += 1
-        live = [p for p in c.particles if not p.done]
+        live = [p for p in self.controller.particles if not p.done]
         b = _Burst(self, live)
         max_steps = self.sampler.burst_max_steps(live)
         await loop.run_in_executor(
