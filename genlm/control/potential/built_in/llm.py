@@ -522,6 +522,8 @@ class PromptedLLM(Potential):
         return await self._log_probability(context_ids)
 
     async def _log_probability(self, context_ids):
+        if not context_ids:  # empty context: log(1); no forwards to batch
+            return 0.0
         prefixes = [self.prompt_ids + context_ids[:i] for i in range(len(context_ids))]
         log_ps = self._maybe_temper(
             await self._fwd.batch_next_token_logprobs(prefixes)

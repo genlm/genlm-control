@@ -42,7 +42,8 @@ if not torch.cuda.is_available():  # pragma: no cover
 
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
-from genlm.control.sampler.unit import MultiTokenUnitSampler  # noqa: E402
+from genlm.control.potential.coerce import Coerced  # noqa: E402
+from genlm.control.sampler.unit import MultiTokenUnitSampler, flatten_units  # noqa: E402
 from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
 from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
 
@@ -462,13 +463,17 @@ def test_lm_critic_twist_unit_burst_vs_steploop(llm):
         )
 
     def make_critic():
-        # The critic needs its own prompt: an unprompted PromptedLLM sends the
-        # empty-context prefix as an empty engine prompt (vLLM rejects it).
-        return PromptedLLM(
+        # Unit-grain contexts hold nested units, so the token-level critic is
+        # coerced through flatten_units (the standard unit-critic pattern; a bare
+        # PromptedLLM would choke on list items). Its own prompt is required: an
+        # unprompted critic sends the empty-context prefix as an empty engine
+        # prompt (vLLM rejects it).
+        lm = PromptedLLM(
             llm.model,
             prompt_ids=llm.model.tokenizer.encode(PROMPT),
             eos_byte_strings=EOS_BYTES,
         )
+        return Coerced(lm, lm.vocab, f=flatten_units, prune=False)
 
     assert can_burst(_controller(make, 8, 0.5, 6, make_critic=make_critic))
 
