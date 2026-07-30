@@ -18,9 +18,10 @@ SPECS=(
 for spec in "${SPECS[@]}"; do
   m="${spec%%:*}"; L="${spec##*:}"
   echo "##### MODEL $m (max_model_len=$L) #####"
-  "$PY" benchmarks/bench_burst.py \
-      --model "$m" --max-model-len "$L" \
+  "$PY" benchmarks/bench.py \
+      --scenario direct --model "$m" --max-model-len "$L" \
       --n-particles 16 --max-tokens 128 --n-trials 3 --gpu-mem 0.7 \
+      --label "sweep-$m" \
       2>&1 | grep -vE "WARNING|Loading|Capturing|it/s\]|INFO 0|^\(|Processed prompts|Adding requests"
   echo
 done
