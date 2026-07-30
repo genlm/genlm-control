@@ -76,8 +76,9 @@ class PotentialTests:
             abs_diff, rel_diff = self._compute_diff(want, have)
             info = (want, have, abs_diff, rel_diff, tokens[i])
             # np.isclose semantics: near-zero values must not fail on relative
-            # noise the absolute tolerance already accepts.
-            ok = abs_diff <= atol + rtol * abs(want)
+            # noise the absolute tolerance already accepts; equal infinities
+            # pass, an infinite/finite mismatch fails.
+            ok = np.isclose(have, want, rtol=rtol, atol=atol)
             (valids if ok else errors).append(info)
 
         if valids and verbosity > 0:
@@ -138,7 +139,7 @@ class PotentialTests:
         )
 
         abs_diff, rel_diff = self._compute_diff(want, have)
-        if abs_diff > atol + rtol * abs(want):
+        if not np.isclose(have, want, rtol=rtol, atol=atol):
             error_msg = (
                 f"{self.colors['red']}Factorization not satisfied for context {context!r}:{self.colors['reset']}\n"
                 + self._format_diff(want, have, abs_diff, rel_diff, atol, rtol)
