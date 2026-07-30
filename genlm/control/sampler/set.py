@@ -138,10 +138,7 @@ class EagerSetSampler(TrieSetSampler):
         Args:
             context (list): A sequence of tokens in the `iter_potential`'s vocabulary.
             iter_logws (LazyWeights, optional): Precomputed `iter_potential.logw_next`
-                weights. The engine burst supplies these from the warm-KV decode
-                logits so the iterable potential is not re-prefilled; when `None`
-                (the slow path) they are computed here. Everything else (the trie
-                and `item_potential`) is identical either way.
+                weights; if `None`, computed here from `context`.
 
         Returns:
             (LazyWeights, float): A weighted set of tokens and the log-probability of the sampled set.
@@ -232,8 +229,7 @@ class TopKSetSampler(TrieSetSampler):
         Args:
             context (list): A sequence of tokens in the `iter_potential`'s vocabulary.
             iter_logws (LazyWeights, optional): Precomputed `iter_potential.logw_next`
-                weights (the engine burst supplies these from warm-KV decode logits;
-                `None` computes them here, the slow path).
+                weights; if `None`, computed here from `context`.
 
         Returns:
             (LazyWeights, float): A weighted set of tokens and the log-probability of the sampled set.

@@ -1,19 +1,13 @@
 # Vendored from llamppl.inference.smc_record (llamppl>=0.2.2).
-#
-# Provenance: `SMCRecord` is a verbatim copy of llamppl's SMCRecord, vendored
-# so that genlm-control can drop the llamppl runtime dependency while
-# preserving the exact JSON record contract consumed by `viz.py` and
-# `html/smc.html`. The standalone `string_for_serialization` helper reproduces
-# the per-particle string emitted by the old `SequenceModel.string_for_serialization`
-# (i.e. `"|".join(escape(y) for y in token_ctx)`), so the serialized JSON is
-# byte-for-byte identical to the previous llamppl-backed path.
+# JSON record format must stay byte-identical: consumed by viz.py and html/smc.html.
 import json
 
 from genlm.control.util import escape
 
 
 def string_for_serialization(ctx):
-    """Serialize a particle's token context exactly as the old SequenceModel did.
+    """Serialize a particle's token context to the pipe-joined, escaped string used in
+    the SMC visualization JSON.
 
     Args:
         ctx (list): A particle's token context (list of tokens / units).
@@ -31,7 +25,6 @@ class SMCRecord:
         self.step_num = 1
 
     def prepare_string(self, s):
-        # If the string doesn't have <<< and >>>, prepend <<<>>> at the front.
         if "<<<" not in s and ">>>" not in s:
             return f"<<<>>>{s}"
         return s

@@ -66,10 +66,10 @@ class TokenSampler:
         return max(p.max_tokens_left for p in live) + 1
 
     def burst_routes_groups(self) -> bool:
-        """Whether this sampler's ``burst_draw_batch`` routes each row to its own group's
-        sampler (rather than drawing every row through group 0's). A routing sampler lifts
-        the batched burst's constraint-homogeneity requirement: groups may then carry
-        different constraints (``_batch_blocker`` skips that check). Default ``False``."""
+        """Whether ``burst_draw_batch`` routes each row to its own group's sampler
+        rather than group 0's. Routing lifts the batched burst's constraint-
+        homogeneity requirement (``_batch_blocker`` skips that check). Default
+        ``False``."""
         return False
 
     @staticmethod

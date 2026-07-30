@@ -151,9 +151,7 @@ class TokenMappings(NamedTuple):
         eos_byte_strings: EOS tokens as byte strings
         eos_token_objs: Actual EOS Token objects
         potential_vocab: Vocabulary excluding EOS tokens
-        token_type: TokenType of potential_vocab (the Potential-layer tables,
-            derived once here so every PromptedLLM sharing these mappings --
-            spawns in particular -- adopts them instead of rebuilding)
+        token_type: TokenType of potential_vocab
         vocab_eos: potential_vocab + [EOS]
         lookup: token -> index over vocab_eos
     """
@@ -177,8 +175,8 @@ class TokenMappings(NamedTuple):
             eos_byte_strings (list[bytes]): List of byte strings representing EOS tokens.
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
-        # Coerce to bytes -> make spawn_new_eos accept tokens, bytes, or any
-        # mix without the caller having to remember.
+        # Token objects are a bytes subclass, so this also normalizes any mix
+        # of Token and plain bytes to plain bytes.
         eos_byte_strings = [bytes(bs) for bs in eos_byte_strings]
         if len(set(eos_byte_strings)) != len(eos_byte_strings):
             raise ValueError("Duplicate eos byte strings")
@@ -222,9 +220,8 @@ class TokenMappings(NamedTuple):
 
         encode = _TokenEncodeDict({token: i for i, token in enumerate(decode)})
 
-        # The Potential-layer tables, derived once (tokens are unique by
-        # token_id, so the duplicate check Potential.__init__ performs cannot
-        # fire on this vocabulary).
+        # Tokens are unique by token_id, so the duplicate check
+        # Potential.__init__ performs cannot fire on this vocabulary.
         lookup = {token: i for i, token in enumerate(potential_vocab)}
         lookup[EOS] = len(potential_vocab)
 
@@ -298,9 +295,8 @@ class PromptedLLM(Potential):
                 eos_byte_strings=eos_byte_strings or [default_eos],
             )
 
-        # Adopt the Potential-layer tables from the token mappings: they are pure
-        # functions of potential_vocab, computed once in TokenMappings.create --
-        # a spawn (which shares token_maps) constructs in O(1).
+        # Adopt the Potential-layer tables from token_maps directly rather
+        # than calling super().__init__(); they are already validated there.
         self.token_type = self.token_maps.token_type
         self.eos = EOS
         self.vocab = self.token_maps.potential_vocab
@@ -358,10 +354,10 @@ class PromptedLLM(Potential):
     @property
     def lora_name(self):
         """LoRA adapter this view forwards under (``None`` = base model). The burst
-        tags each substream with it; the slow lane forwards through ``_fwd`` (an
-        adapter-bound view of the engine), so both lanes apply the adapter
-        consistently. Assigning rebinds the forward handle — rebind between SMC
-        runs, never mid-burst (the burst snapshots adapter names at start)."""
+        tags each substream with it; the slow lane forwards through ``_fwd``, an
+        adapter-bound view of the engine, so both lanes apply the adapter
+        consistently. Assigning rebinds ``_fwd`` -- rebind between SMC runs,
+        never mid-burst (the burst snapshots adapter names at start)."""
         return self._lora_name
 
     @lora_name.setter
@@ -605,13 +601,11 @@ class PromptedLLM(Potential):
         return self._eos_idxs_tensor, self._non_eos_indices
 
     def _verify_logit_padding(self, n_logits):
-        """Guard the tail-padding done when the model emits fewer logits than
-        ``len(token_maps.decode)`` (the tokenizer added tokens beyond the embedding
-        matrix, e.g. Gemma's <image_soft_token>). Padding the tail with -inf is only
-        correct if the model's logit indices are contiguous ``0..n_logits-1``;
-        verify that once. Shared by the per-row :meth:`_process_logw_next` and the
-        batched :meth:`_process_logw_next_batch` so both raise (rather than silently
-        mis-fold columns) on a model that violates the assumption."""
+        """Guard the tail-padding used when the model emits fewer logits than
+        ``len(token_maps.decode)`` (e.g. Gemma's <image_soft_token>, added beyond
+        the embedding matrix). Padding the tail with -inf is only correct if the
+        model's logit indices are contiguous ``0..n_logits-1``; raises otherwise
+        instead of silently mis-folding columns. Verified once and cached."""
         if not hasattr(self, "_logit_padding_verified"):
             for i in range(n_logits):
                 if self.token_maps.decode[i].token_id != i:
@@ -668,8 +662,7 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Processed log probabilities for the next tokens.
         """
-        # N=1 adapter over the batched on-device fold: same pad / slice / log_softmax /
-        # EOS fold, kept as a CPU torch tensor for the slow lane's LazyWeights.
+        # N=1 wrapper around the batched on-device fold, returned as a CPU tensor.
         out = self._process_logw_next_batch(logw_next.unsqueeze(0))
         return self.make_lazy_weights(out[0].float().cpu())
 
@@ -712,8 +705,7 @@ class PromptedLLM(Potential):
                 [self.prompt_ids + context_ids for context_ids in context_ids_batch]
             )
         )
-        # One on-device fold over the [N, n_logits] batch -> [N, V+1] (== stacking the
-        # per-row `_process_logw_next`), wrapped as one batched LazyWeights.
+        # Equivalent to stacking per-row `_process_logw_next`, folded as one batch.
         return self.make_lazy_weights(self._process_logw_next_batch(logw_nexts).float().cpu())
 
     def __repr__(self):

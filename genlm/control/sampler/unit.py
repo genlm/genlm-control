@@ -26,11 +26,8 @@ class _UnitAccum:
 
 
 def flatten_units(context):
-    """Flatten a (possibly nested) unit context to a flat token list. A
-    MultiTokenUnitSampler nests units as sub-lists, and a nested unit sampler nests
-    deeper -- so this recurses (matching the engine-prompt flatten in
-    ``_Burst.context_ids``); a one-level flatten would leave deeper nesting for the
-    subunit sampler / coercion to choke on.
+    """Recursively flatten a (possibly nested) unit context to a flat token list.
+    Matches the engine-prompt flatten in ``_Burst.context_ids``.
 
     Usage:
         potential.coerce(LLM, f=lambda ctx: b"".join(flatten_units(ctx)))
@@ -127,11 +124,11 @@ class MultiTokenUnitSampler(TokenSampler):
 
     async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
         """Burst draw for one unit round: one subunit per decode step, completing an
-        SMC step only at the unit boundary. Per particle, slice the batched warm
-        (``{view: [N, V+1] LazyWeights}``) into a per-row injection and run the subunit
-        sampler's REAL ``sample`` (one subunit); accumulate it in ``burst.scratch`` (keyed by
-        particle ``handle``); then apply the SAME EOS-split / boundary / max-subunit logic as
-        the slow ``sample``/``transition``:
+        SMC step only at the unit boundary. Per particle, slices the batched warm
+        (``{view: [N, V+1] LazyWeights}``) into a per-row injection and runs the subunit
+        sampler's real ``sample`` (one subunit), accumulating in ``burst.scratch`` (keyed
+        by particle ``handle``). Applies the same EOS-split / boundary / max-subunit
+        logic as the slow ``sample``/``transition``:
 
         * EOS subunit -> split the content off so ``context[-1]`` is EOS (terminate).
         * boundary fires -> finalize the unit; the row pops out at the synced boundary.
@@ -143,11 +140,11 @@ class MultiTokenUnitSampler(TokenSampler):
             injection = self._row_injection(warm_batch, i)
             accum = accums.get(handle)
             buf = accum.buffer if accum is not None else []
-            # Subunit context: completed units flattened to subunits + in-progress
-            # subunits this unit, so the subunit sampler's factor scores statelessly.
+            # Subunit context must match the slow path: completed units flattened +
+            # subunits drawn so far this unit, so the subunit sampler scores statelessly.
             sub_context = flatten_units(context) + list(buf)
-            # ordinal = subunits committed (leaf count) + those drawn this unit so far,
-            # matching the slow loop's per-subunit ordinal under one transition scope.
+            # ordinal = subunits committed (leaf count) + drawn this unit so far --
+            # must match the slow loop's per-subunit ordinal for RNG parity.
             with burst_logw_next(injection), draw_key(handle, draw_ordinal(context) + len(buf)):
                 subunit, sub_logw, sub_logp = await self.subunit_sampler.sample(sub_context)
 
@@ -155,7 +152,7 @@ class MultiTokenUnitSampler(TokenSampler):
                 accum = accums[handle] = _UnitAccum([], 0.0, 0.0)
             status, unit = self._feed(accum, subunit, sub_logw, sub_logp, context)
             if status == "mid":
-                return BurstDraw(token=subunit, step=None, pop=False)  # emit subunit, bank nothing
+                return BurstDraw(token=subunit, step=None, pop=False)
             accums.pop(handle, None)
             weight = float("-inf") if status == "max" else accum.logw
             step = (self._to_append(unit), weight, accum.logp)
@@ -339,12 +336,11 @@ class TokenSetBoundary(BoundaryPredicate):
 
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
-        # Compare by BYTE CONTENT, not by hash-set membership. A real-LLM token is a
-        # ``Token`` (subclass of ``bytes`` that hashes by ``token_id``), so
-        # ``Token(13, b" ") in {b" "}`` is False even though the bytes match -- the
-        # boundary would silently never fire on the real-LLM grain. Precompute a
-        # plain-bytes set (``bytes(t)`` is the content for both ``Token`` and
-        # ``bytes``) plus an EOS flag (EOS is matched by identity, having no bytes).
+        # Match by byte content, not hash-set membership: a real-LLM ``Token``
+        # (bytes subclass hashing by token_id) has ``Token(13, b" ") in {b" "}``
+        # False despite matching bytes, so the boundary would silently never fire
+        # on that grain. Precompute a plain-bytes set (``bytes(t)`` works for both
+        # ``Token`` and ``bytes``) plus an EOS flag (EOS matches by identity).
         self._eos_boundary = any(
             isinstance(t, EndOfSequence) for t in self.boundary_tokens
         )

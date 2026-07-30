@@ -1,10 +1,5 @@
 # Vendored verbatim from llamppl.inference.resampling (llamppl>=0.2.2).
-#
-# Provenance: this is a verbatim copy of llamppl's pure-numpy resampling
-# functions, vendored so that genlm-control can drop the llamppl runtime
-# dependency while guaranteeing bit-for-bit parity with the resampling RNG
-# behavior of the original `smc_standard` path. Do not "improve" these
-# functions; the consumed-RNG order must match llamppl exactly.
+# Do not modify: RNG consumption order must match llamppl's smc_standard exactly.
 import numpy as np
 
 
@@ -16,10 +11,6 @@ def systematic_resample(weights):
     these points through the inverse CDF of the categorical distribution
     defined by the weights. Each index i is resampled exactly
     floor(N * w_i) or ceil(N * w_i) times.
-
-    Unlike stratified and residual resampling, systematic resampling
-    is not provably lower-variance than multinomial in all cases;
-    see Douc et al. (2005), Sec. 3.4: https://arxiv.org/abs/cs/0507025
 
     Adapted from FilterPy (R. Labbe):
     https://filterpy.readthedocs.io/en/latest/monte_carlo/resampling.html

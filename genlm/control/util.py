@@ -93,8 +93,7 @@ class LazyWeights:
         if token in self.encode:
             return self.weights[self.encode[token]].item()
 
-        # Fallback: if token is plain bytes (not Token), look up by byte_string content.
-        # This supports old code that indexes by bytes; returns the first match.
+        # Fallback: look up plain-bytes tokens by byte_string content (first match wins).
         if Token.is_plain_bytes(token):
             if not hasattr(self, "_bytes_fallback"):
                 self._bytes_fallback = {}
@@ -388,16 +387,10 @@ def threefry_2x32(c0, c1, k0, k1):
 
 def threefry_uniform(n, seed, slot, step, device):
     """``n`` device-independent uniforms keyed by (seed, slot, step), on the SAME 24-bit
-    float32 grid as ``torch.rand`` (``[0, 1-2^-24]``, never exactly 1.0).
-
-    Matching ``torch.rand``'s quantization is deliberate, not incidental. The Gumbel is a
-    deterministic function of ``u``, so the picker is only identical to ``gumbel_max`` (the
-    per-token reference, which draws ``torch.rand``) if ``u`` has the same distribution. A
-    "more precise" full-precision ``u`` reaches closer to 1, giving a fuller Gumbel tail and a
-    *different* (less greedy) sampler -- which diverges from the reference. Capping at
-    ``1-2^-24`` also means ``-log(-log(u))`` is never ``+inf`` (no force-picked garbage token).
-    Counter-based ``->`` bit-identical CPU/CUDA (int shift + exact power-of-two divide).
-    ``slot``/``step`` scalar (-> ``[n]``) or ``[N]`` (-> ``[N, n]``)."""
+    float32 grid as ``torch.rand``: ``(x >> 8) / 2**24``, in ``[0, 1-2^-24]``. Must match
+    ``torch.rand``'s grid exactly or ``threefry_gumbel`` diverges from ``gumbel_max``.
+    Bit-identical across CPU/CUDA. ``slot``/``step`` scalar (-> ``[n]``) or ``[N]`` (->
+    ``[N, n]``)."""
     i = torch.arange(n, device=device, dtype=torch.int64)  # counter word 0 (index)
     slot = torch.as_tensor(slot, device=device, dtype=torch.int64)
     step = torch.as_tensor(step, device=device, dtype=torch.int64)

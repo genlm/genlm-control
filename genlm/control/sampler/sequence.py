@@ -15,12 +15,8 @@ logger = logging.getLogger("genlm.control")
 
 
 def _normalize_accelerate(accelerate):
-    """Map the ``accelerate`` argument onto the canonical "auto"/"off"/"require".
-
-    Accepts the bare booleans as friendly aliases: ``True`` -> "auto" (so the
-    common ``accelerate=True`` never silently *requires* and errors) and
-    ``False`` -> "off".
-    """
+    """Map ``accelerate`` to the canonical "auto"/"off"/"require"; ``True``/``False``
+    alias "auto"/"off"."""
     if accelerate is True:
         return "auto"
     if accelerate is False:
@@ -34,11 +30,10 @@ def _normalize_accelerate(accelerate):
 
 
 async def _drive(controller, mode):
-    """Select and run the SMC driver for ``mode`` (already-normalized
-    'off'/'auto'/'require'), returning the final particle population. The burst-
-    capability check, the ``require`` raise, and the ``auto`` fallback logging live
-    here so single (:meth:`SMC.__call__`) and batched (:meth:`SMC.batched`) runs
-    share one selection -- they cannot drift."""
+    """Select and run the SMC driver for ``mode`` ('off'/'auto'/'require'),
+    returning the final particle population. Shared by :meth:`SMC.__call__` and
+    :meth:`SMC.batched` so the burst-capability check, ``require`` raise, and
+    ``auto`` fallback logging stay in one place."""
     if mode != "off":
         reason = burst_blocker(controller)
         if mode == "require" and reason is not None:
@@ -149,15 +144,14 @@ class SMC:
                   exact per-token `StepLoop`. Logs (INFO) which path ran, and on
                   fallback the reason it was not accelerated.\n
                 - ``"off"`` (also ``False``): always run the exact per-token
-                  `StepLoop` -- byte-reproducible given a seed (the ground truth).\n
+                  `StepLoop`, byte-reproducible given a seed.\n
                 - ``"require"``: run the engine path, or raise
-                  `NotAcceleratable` with the reason if not burst-capable
-                  (guarantees the fast path; use for benchmarks / production E-steps).\n
-                Acceleration is vLLM-only for now. The engine is derived from the
-                sampler's `PromptedLLM` -- you do not pass it. The burst is
-                statistically identical to `"off"` (same target, unbiased weights)
-                but not byte-identical (warm-KV residual + batched-draw RNG); use
-                `"off"` for exact reproducibility.
+                  `NotAcceleratable` with the reason if not burst-capable.\n
+                Acceleration is vLLM-only for now; the engine is derived from the
+                sampler's `PromptedLLM`. The burst is statistically identical to
+                `"off"` (same target, unbiased weights) but not byte-identical
+                (warm-KV residual + batched-draw RNG); use `"off"` for exact
+                reproducibility.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
@@ -225,15 +219,14 @@ class SMC:
         verbosity=0,
         **kwargs,
     ):
-        """Run ``B = len(smcs)`` :class:`SMC` problems as ONE batched population.
+        """Run ``B = len(smcs)`` :class:`SMC` problems as one batched population.
 
         ``smcs`` is a list of :class:`SMC` instances (each its own
-        ``unit_sampler`` + ``critic``, validated at construction). They run as B
-        independent sub-populations ("groups") of ``n_particles`` each in one
-        ``Controller``; ESS / resample / log_ml are per-group, so **each group is
-        statistically identical to running that ``SMC`` alone** (no cross-group
-        coupling -- the parity bar). Returns a list of B :class:`Sequences`, one
-        per problem, in ``smcs`` order.
+        ``unit_sampler`` + ``critic``). They run as B independent sub-populations
+        ("groups") of ``n_particles`` each in one ``Controller``; ESS / resample /
+        log_ml are computed per-group, so each group is statistically identical to
+        running that ``SMC`` alone (no cross-group coupling). Returns a list of B
+        :class:`Sequences`, one per problem, in ``smcs`` order.
 
         Run params and ``accelerate`` carry the same meaning as
         :meth:`__call__`; the burst lane needs the batch to be burst-homogeneous

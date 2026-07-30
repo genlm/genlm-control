@@ -75,9 +75,8 @@ class PotentialTests:
         for i, (want, have) in enumerate(zip(wants, haves)):
             abs_diff, rel_diff = self._compute_diff(want, have)
             info = (want, have, abs_diff, rel_diff, tokens[i])
-            # np.isclose semantics: near-zero values must not fail on relative
-            # noise the absolute tolerance already accepts; equal infinities
-            # pass, an infinite/finite mismatch fails.
+            # np.isclose: atol covers near-zero relative noise; equal infinities
+            # pass, an inf/finite mismatch fails.
             ok = np.isclose(have, want, rtol=rtol, atol=atol)
             (valids if ok else errors).append(info)
 
@@ -182,7 +181,7 @@ class PotentialTests:
 
         for i, context in enumerate(contexts):
             logw_next = await self.logw_next(context, *method_args)
-            # batch_logw_next now returns ONE batched LazyWeights ([N, V+1]); row i is .weights[i]
+            # batch_logw_next returns ONE batched LazyWeights ([N, V+1]); row i is .weights[i]
             batch_row = to_numpy(batch_logw_nexts.weights[i])
             try:
                 np.testing.assert_allclose(

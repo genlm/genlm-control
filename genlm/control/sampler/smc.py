@@ -41,9 +41,8 @@ class Population:
         )
         self.logw = np.zeros(n)
         self.logp = np.zeros(n)
-        # The critic LM leaf's banked per-token logp sums (fed by the burst's twist
-        # view), and the per-token CLIPPED contrast sum (live under ``Twist(clip=...)``,
-        # accumulated in the same gather). Written only by ``Twist``.
+        # Critic LM leaf's banked per-token logp sum, and the clipped contrast sum
+        # used under ``Twist(clip=...)``. Written only by ``Twist``.
         self.twist_logp = np.zeros(n)
         self.twist_clip_sum = np.zeros(n)
         self.twist_amount = np.zeros(n)
@@ -283,9 +282,8 @@ class Controller:
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
         self.record = SMCRecord(n_particles) if record else None
-        # Burst lane: critic math deferred to the round boundary (engine drained) —
-        # ``bank_row`` pends instead of awaiting; ``apply_critic_boundary`` settles.
-        # Set per run from the driver (``run``); False is the inline default.
+        # True when critic math defers to the round boundary (``bank_row`` pends
+        # instead of awaiting; ``apply_critic_boundary`` settles). Set by ``run``.
         self.defer_critic = False
         self._critic_pending: list = []
         # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
@@ -314,9 +312,9 @@ class Controller:
         """``step`` with EOS appended if ``terminate_when`` fires on the context it
         produces, so the particle terminates in the step that wrote the stop.
 
-        No ``logw_eos``: that corrects for forcing EOS against the proposal, but the
-        stop condition defines what a complete sequence *is*, so there is no deviation
-        to correct. Charging it would penalise exactly the particles that close."""
+        No ``logw_eos``: the stop condition defines what a complete sequence *is*,
+        not a deviation from the proposal, so charging it would penalize exactly
+        the particles that close."""
         to_append, logw, logp = step
         if self.terminate_when is None or not to_append:
             return step
@@ -465,17 +463,17 @@ class Controller:
     def round_boundary(self):
         """Close a round: record the step, then the per-group ESS test/resample."""
         self._record_step()
-        return self._maybe_resample()
+        self._maybe_resample()
 
     async def run(self, driver):
         """The SMC loop, driver-agnostic: each iteration the driver turns every live
         row's next step (one token per round for the per-token driver, a whole burst
         for the engine driver), then deferred critic math settles and the round
         boundary runs. The driver owns scheduling; the controller owns the math."""
-        self.defer_critic = driver.defers_critic(self)
+        self.defer_critic = driver.defers_critic
         await self.start()
         while any(not p.done for p in self.particles):
-            await driver.round(self)
+            await driver.round()
             await self.apply_critic_boundary()
             if driver.sync_boundary:
                 self.round_boundary()
@@ -492,10 +490,8 @@ class Controller:
         # One settle per particle per boundary: a duplicate entry would re-run the
         # terminal critic (an exec, or an LM forward) on the same context.
         assert len({id(p) for p in parts}) == len(parts)
-        # Score the whole pending population through the critics' BATCHED path,
-        # one call per critic (groups concurrent). Awaiting ``score`` per particle
-        # serializes the seam: an LM-leaf critic pays a round trip per particle
-        # instead of one batched forward, and exec critics don't overlap.
+        # Score the whole pending population through each critic's batched path,
+        # one call per critic (groups concurrent).
         by_group = {}
         for p in parts:
             by_group.setdefault(self.particles.group[p._i], []).append(p)
@@ -534,15 +530,14 @@ class StepLoop:
     row concurrently, recomputing logprobs from the full context every step."""
 
     sync_boundary = True
+    defers_critic = False
 
     def __init__(self, controller):
         self.controller = controller
 
-    def defers_critic(self, controller):
-        return False
-
-    async def round(self, c):
+    async def round(self):
         """One token for every live row."""
+        c = self.controller
         if c.twist_with_critic:
             c.particles.untwist_all()
         await asyncio.gather(*[c.step_row(p) for p in c.particles if not p.done])

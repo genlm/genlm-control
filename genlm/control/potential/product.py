@@ -62,9 +62,8 @@ class Product(Potential):
             self._v1_idxs = ...
             self._v2_idxs = ...
             if self.p1.eos is EOS and self.p2.eos is EOS:
-                # Same vocab, default sentinel: the operands' tables ARE the
-                # product's -- adopt them instead of rebuilding (a product over
-                # an engine-LM vocab otherwise rebuilds a 128k lookup).
+                # Same vocab, default sentinel: adopt the operands' tables
+                # directly instead of rebuilding (e.g. a 128k engine-LM vocab).
                 self.token_type = token_type
                 self.eos = EOS
                 self.vocab = self.p1.vocab
@@ -139,13 +138,10 @@ class Product(Potential):
         return W1 + W2
 
     def _compose(self, w1_full, w2_full):
-        """Sum the operands' weights over the shared vocab, slicing the vocab on the LAST
-        axis so the same code composes a single ``[V]`` draw and a batched ``[N, V]`` one
-        (``v*_idxs`` may be ``...`` when vocabs already match, so index the vocab axis
-        directly rather than prepend an ellipsis). The reconcile edge: a burst composes the
-        engine-LM operand (GPU torch) with a factor mask (numpy or CPU torch) -- lift the
-        numpy/CPU operand to the LM's backend + device. Both-numpy (slow lane) stays numpy,
-        byte-identical to the per-token path."""
+        """Sum the operands' weights over the shared vocab, slicing on the last axis
+        so the same code handles a single ``[V]`` draw and a batched ``[N, V]`` one.
+        Reconciles mixed backends: a numpy operand is lifted to the other's torch
+        device; both-numpy stays numpy and matches the per-token path exactly."""
         w1 = w1_full[self.v1_idxs] if w1_full.ndim == 1 else w1_full[:, self.v1_idxs]
         w2 = w2_full[self.v2_idxs] if w2_full.ndim == 1 else w2_full[:, self.v2_idxs]
         t1, t2 = torch.is_tensor(w1), torch.is_tensor(w2)
