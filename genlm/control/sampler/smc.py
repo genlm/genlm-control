@@ -528,6 +528,7 @@ class Controller:
                 else:
                     p.twist(self.twist.value(p, amt))
 
+
 class StepLoop:
     """Per-token driver (byte-exact ground truth): each round draws + banks every live
     row concurrently, recomputing logprobs from the full context every step."""

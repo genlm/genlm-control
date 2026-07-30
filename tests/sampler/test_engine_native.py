@@ -421,7 +421,13 @@ def test_lm_critic_terminal_burst_vs_steploop(llm):
         return DirectTokenSampler(llm)
 
     def make_critic():
-        return PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
+        # The critic needs its own prompt: an unprompted PromptedLLM sends the
+        # empty-context prefix as an empty engine prompt (vLLM rejects it).
+        return PromptedLLM(
+            llm.model,
+            prompt_ids=llm.model.tokenizer.encode(PROMPT),
+            eos_byte_strings=EOS_BYTES,
+        )
 
     llm.set_prompt_from_str(PROMPT)
     seeds = (1234, 7, 99, 2024, 555, 31)
@@ -456,7 +462,13 @@ def test_lm_critic_twist_unit_burst_vs_steploop(llm):
         )
 
     def make_critic():
-        return PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
+        # The critic needs its own prompt: an unprompted PromptedLLM sends the
+        # empty-context prefix as an empty engine prompt (vLLM rejects it).
+        return PromptedLLM(
+            llm.model,
+            prompt_ids=llm.model.tokenizer.encode(PROMPT),
+            eos_byte_strings=EOS_BYTES,
+        )
 
     assert can_burst(_controller(make, 8, 0.5, 6, make_critic=make_critic))
 
