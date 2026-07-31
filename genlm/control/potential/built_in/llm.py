@@ -9,6 +9,7 @@ from genlm.control.potential.base import (
     Potential,
     _burst_logw_next_overrides,
     _burst_prefix_overrides,
+    _burst_complete_overrides,
 )
 from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
@@ -560,6 +561,19 @@ class PromptedLLM(Potential):
                 )
             return np.asarray(vals, dtype=float)
         return await super().batch_prefix(contexts)
+
+    async def batch_complete(self, contexts):
+        """Batched ``complete``. A burst serves the banked warm-row sums via
+        ``burst_complete`` instead of scoring."""
+        override = _burst_complete_overrides.get()
+        if override is not None and self in override:
+            vals = override[self]
+            if len(vals) != len(contexts):
+                raise ValueError(
+                    f"burst_complete served {len(vals)} values for {len(contexts)} contexts"
+                )
+            return np.asarray(vals, dtype=float)
+        return await super().batch_complete(contexts)
 
     async def complete(self, context):
         """

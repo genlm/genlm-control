@@ -392,26 +392,68 @@ def test_twisting_critic_burst_vs_slow(llm):
 # step -- deadlock).
 
 
-def test_lm_critic_routed_to_slow_lane(llm):
-    """Token-grain per-step twist (ess>0) with an LM critic cannot defer: burst_blocker
-    gives FORWARD_NOT_INJECTABLE and accelerate="require" raises. The same critic at
-    ess=0 defers to the boundary and is burst-legal."""
-    from genlm.control.sampler.burst import NotAcceleratable, BlockReason
+def test_lm_critic_burst_legality(llm):
+    """A pure LM critic is burst-legal at every grain: deferred at ess=0 (boundary),
+    served from banked twist sums at token grain (ess>0). A critic with an LM leaf
+    beyond its own engine leaf cannot be served and stays blocked."""
+    from genlm.control.sampler.burst import BlockReason
 
     def make():
         return DirectTokenSampler(llm)
 
     lm_critic = PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
-    reason = burst_blocker(_controller(make, 8, 0.5, 8, make_critic=lambda: lm_critic))
+    assert burst_blocker(_controller(make, 8, 0.5, 8, make_critic=lambda: lm_critic)) is None
+    assert burst_blocker(_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic)) is None
+
+    composite = lm_critic * PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
+    reason = burst_blocker(_controller(make, 8, 0.5, 8, make_critic=lambda: composite))
     assert reason is not None and reason.reason is BlockReason.FORWARD_NOT_INJECTABLE, reason
 
-    llm.set_prompt_from_str(PROMPT)
-    seed_all(SEED)
-    with pytest.raises(NotAcceleratable):
-        asyncio.run(make().smc(8, 0.5, 8, critic=lm_critic, accelerate="require"))
 
-    # ess=0: terminal-only critic math defers to the engine drain -> burst-legal.
-    assert burst_blocker(_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic)) is None
+def test_lm_critic_twist_token_burst_vs_steploop(llm):
+    """Token-grain LM critic (ess>0, free-running): the per-step twist and the
+    terminal score are served from banked warm-row sums (prefix and complete) --
+    the critic's LM leaf never forwards mid-burst. Unbiased log_ml vs StepLoop
+    across paired seeds.
+
+    The critic runs under its OWN prompt, distinct from the sampler's: a
+    critic-equals-target twist is the full sequence logp, which degenerates
+    resampling to every step and makes the paired log_ml diff heavy-tailed
+    (one near-tie draw flip -> tens of nats); a distinct critic keeps the twist
+    moderate so the statistic converges."""
+    def make():
+        return DirectTokenSampler(llm)
+
+    def make_critic():
+        # Distinct prompt (see docstring); also, an unprompted PromptedLLM sends
+        # the empty-context prefix as an empty engine prompt (vLLM rejects it).
+        return PromptedLLM(
+            llm.model,
+            prompt_ids=llm.model.tokenizer.encode("It is known that"),
+            eos_byte_strings=EOS_BYTES,
+        )
+
+    assert can_burst(_controller(make, 8, 0.5, 8, make_critic=make_critic))
+
+    llm.set_prompt_from_str(PROMPT)
+    seeds = (1234, 7, 99, 2024, 555, 31, 42, 271, 828, 1618)
+    diffs, n_bursts = [], 0
+    for seed in seeds:
+        slow = _run_steploop(make, 8, 0.5, 8, seed, make_critic=make_critic)
+        burst = _run_burst(make, 8, 0.5, 8, seed, make_critic=make_critic)
+        s = _compare("lm-critic-twist-token", 0.5, 8, slow, burst)
+        diffs.append(s["log_ml_diff"])
+        n_bursts = max(n_bursts, s["n_bursts"])
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    print(
+        f"\nlm-critic token twist over {len(seeds)} seeds: "
+        f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
+    )
+    assert n_bursts > 0, "lm-critic token twist config did not burst"
+    assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
+        f"lm-critic token twist burst log_ml biased: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+    )
 
 
 def test_lm_critic_terminal_burst_vs_steploop(llm):

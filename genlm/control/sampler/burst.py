@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from genlm.control.constant import EndOfSequence, EOS
-from genlm.control.potential.base import burst_logw_next
+from genlm.control.potential.base import burst_logw_next, burst_prefix, burst_complete
 from genlm.control.potential.built_in.llm import (
     find_engine_lm,
     constraint_leaf_ids,
@@ -177,6 +177,14 @@ class _Burst:
                             tvals = warm_batch[self.d.views[0]].weights[rows_t, idx].tolist()
                         c.twist.bank(c.particles, [rows[k] for k in ks],
                                      tw[rows_t, idx].tolist(), tvals)
+                    if not self.d.defers_critic:
+                        # Token grain serves the terminal critic warm too: bank the
+                        # EOS increment so served_complete covers the full sequence.
+                        eos_ks = [k for k, r in enumerate(records)
+                                  if isinstance(r.token, EndOfSequence)]
+                        if eos_ks:
+                            c.twist.bank_eos(c.particles, [rows[k] for k in eos_ks],
+                                             tw[eos_ks, -1].tolist())
                 for k, rec in zip(live_k, records):
                     tok = rec.token
                     out[k] = (
@@ -236,11 +244,21 @@ class _Burst:
         return asyncio.run_coroutine_threadsafe(coro, self.d.main_loop).result()
 
     async def _bank_pop(self, parts, records):
-        """Bank one step's records into the population (score/extend/critic; sets p.done)."""
+        """Bank one step's records into the population (score/extend/critic; sets
+        p.done). A token-grain critic's LM leaf is served from the banked twist
+        sums (prefix and complete) -- it must not forward mid-burst."""
         c = self.d.controller
+        leaf = self.d.twist_view if not self.d.defers_critic else None
         for p, rec in zip(parts, records):
-            if rec.step is not None:
+            if rec.step is None:
+                continue
+            if leaf is None:
                 await c.bank_row(p, *rec.step)
+            else:
+                sp = c.twist.served_row(p, dlogp=rec.step[2])
+                sc = c.twist.served_complete(p)
+                with burst_prefix({leaf: [sp]}), burst_complete({leaf: [sc]}):
+                    await c.bank_row(p, *rec.step)
         # Token grain records per step here; unit grain once per round boundary.
         if self.d.sampler.burst_free_running() and any(r.step is not None for r in records):
             c._record_step()
@@ -302,24 +320,28 @@ def burst_blocker(controller):
         )
     # Forward-free invariant: every LM leaf on a group's per-step draw path (target/
     # proposal) must be an injected view, or it would forward inside the burst (which
-    # can't supply it). The critic is boundary-scored, so its LM leaves may forward
-    # at the drain -- except token-grain in-burst resampling (free-running +
-    # twist_with_critic), which consumes twists mid-burst and needs the critic
-    # forward-free too.
+    # can't supply it). A deferred critic scores at the drain; a non-deferred
+    # (token-grain) critic is served per step from banked twist sums, which covers
+    # exactly its own engine leaf.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
         injected = set(_views_of(samp))
         draw = samp.burst_draw_sampler()
-        deferred = critic_deferred(samp, controller)
-        pots = (draw.target, draw.proposal) + ((crit,) if not deferred else ())
-        for pot in pots:
+        for pot in (draw.target, draw.proposal):
             if pot is None:
                 continue
             if any(lm not in injected for lm in lm_leaves(pot)):
                 return BurstBlock(
                     BlockReason.FORWARD_NOT_INJECTABLE,
-                    f"group {g}: an LM leaf would forward inside the burst (it is not an "
-                    "injected view) -- e.g. a second engine LM, or an LM critic under "
-                    "token-grain in-burst resampling",
+                    f"group {g}: a draw-path LM leaf would forward inside the burst "
+                    "(it is not an injected view)",
+                )
+        if crit is not None and not critic_deferred(samp, controller):
+            servable = {find_engine_lm(crit)}
+            if any(lm not in servable for lm in lm_leaves(crit)):
+                return BurstBlock(
+                    BlockReason.FORWARD_NOT_INJECTABLE,
+                    f"group {g}: the token-grain critic has an LM leaf beyond its own "
+                    "engine leaf; it cannot be served from banked twist sums",
                 )
     if len(controller.samplers) > 1:
         # The burst serves one twist view per group, present for all or none; mixed
@@ -380,14 +402,17 @@ class BurstLoop:
         self.defers_critic = critic_deferred(self.sampler, controller)
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
         # views: LM leaves whose warm logits the burst injects (group 0's target+proposal,
-        # plus the critic's engine leaf when boundary twisting will read it); the batched
-        # burst draws every group through group 0's sampler.
-        serve = self.defers_critic and controller.twist_with_critic
+        # plus the critic's engine leaf when twisting will read it -- at the boundary
+        # if deferred, per step if token-grain); the batched burst draws every group
+        # through group 0's sampler.
+        serve = controller.twist_with_critic
         self.twist_leaves = [
             find_engine_lm(c) if (serve and c is not None) else None
             for c in controller.critics
         ]
         self.twist_view = self.twist_leaves[0]
+        # The burst banks per-token twist sums whenever a twist view is injected.
+        self.banks_twist = self.twist_view is not None
         assert all(
             (lf is None) == (self.twist_view is None) for lf in self.twist_leaves
         ), "batched groups must agree on having an engine-LM critic leaf"

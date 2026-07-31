@@ -175,10 +175,9 @@ class Twist:
             Terminal scores are unaffected, so the twist still cancels at termination.
         temperature (float): scales the twist; 0 disables twisting entirely.
         clip (tuple, optional): ``(neg, pos)`` per-token caps for the critic-LM
-            contrast. When set, the burst banks ``sum_t clip(delta_t, -neg, +pos)``
-            and serving folds ``logp`` back in so the contrast subtraction in
-            :meth:`value` yields the clipped sum. Burst lane only; the cold path
-            scores the unclipped prefix.
+            contrast: the twist becomes ``temperature * sum_t clip(v_t - t_t, -neg,
+            +pos)`` over per-token critic/target logp increments, in both lanes.
+            Terminal scores stay unclipped.
     """
 
     def __init__(self, contrast=False, temperature=1.0, clip=None):
@@ -193,12 +192,23 @@ class Twist:
             amt -= p.logp
         return self.temperature * amt
 
+    def served_row(self, p, dlogp=0.0):
+        """One particle's banked prefix sum, served as the critic LM leaf's
+        ``prefix``. Under clip, ``logp`` is folded back in so the contrast
+        subtraction in :meth:`value` yields the clipped sum; ``dlogp`` covers a
+        step increment not yet applied to ``p.logp``."""
+        if self.clip is not None:
+            return p.logp + dlogp + p.twist_clip_sum
+        return p.twist_logp
+
+    def served_complete(self, p):
+        """One particle's banked sum (EOS increment included) served as the critic
+        LM leaf's ``complete``. Never clipped."""
+        return p.twist_logp
+
     def served_prefix(self, ps):
         """Banked warm-row sums served as the critic LM leaf's ``batch_prefix``."""
-        return np.array([
-            (p.logp + p.twist_clip_sum) if self.clip is not None else p.twist_logp
-            for p in ps
-        ])
+        return np.array([self.served_row(p) for p in ps])
 
     def bank(self, pop, rows, vals, tvals):
         """Accumulate one step's drawn-token increments: the critic leaf's logp per
@@ -212,6 +222,12 @@ class Twist:
             for row, v, t in zip(rows, vals, tvals):
                 pop.twist_logp[row] += v
                 pop.twist_clip_sum[row] += min(max(v - t, -neg), pos)
+
+    def bank_eos(self, pop, rows, vals):
+        """Accumulate terminating rows' EOS logp increments (completes the sum
+        :meth:`served_complete` serves; the clip column is terminal-irrelevant)."""
+        for row, v in zip(rows, vals):
+            pop.twist_logp[row] += v
 
 
 class Controller:
@@ -285,6 +301,9 @@ class Controller:
         # True when critic math defers to the round boundary (``bank_row`` pends
         # instead of awaiting; ``apply_critic_boundary`` settles). Set by ``run``.
         self.defer_critic = False
+        # Whether the driver banks the per-token twist sums itself (the burst's
+        # warm rows); False means the inline clip path banks from critic scores.
+        self.twist_banked = False
         self._critic_pending: list = []
         # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
         self._pending_resample = False
@@ -361,13 +380,21 @@ class Controller:
             return
 
         if self.twist_with_critic:
-            twist_amt = await critic.score(p.context)
-            if twist_amt != float("-inf"):
-                p.twist(self.twist.value(p, twist_amt))
-            else:
+            # batch_score so a burst-served critic LM leaf reads its overrides.
+            twist_amt = float((await critic.batch_score([p.context]))[0])
+            if twist_amt == float("-inf"):
                 p.score(twist_amt)
                 p.finish()
                 return
+            if self.twist.clip is not None and not self._is_terminal(p):
+                # Clip lives on per-token increments: bank this step's (the burst
+                # already banked it from warm rows), then twist off the served sum.
+                if not self.twist_banked:
+                    self.twist.bank(
+                        self.particles, [p._i], [twist_amt - p.twist_logp], [logp]
+                    )
+                twist_amt = self.twist.served_row(p)
+            p.twist(self.twist.value(p, twist_amt))
 
         if self.verbosity > 0:
             print(self._repr_particle(p))
@@ -471,6 +498,7 @@ class Controller:
         for the engine driver), then deferred critic math settles and the round
         boundary runs. The driver owns scheduling; the controller owns the math."""
         self.defer_critic = driver.defers_critic
+        self.twist_banked = driver.banks_twist
         await self.start()
         while any(not p.done for p in self.particles):
             await driver.round()
@@ -531,6 +559,7 @@ class StepLoop:
 
     sync_boundary = True
     defers_critic = False
+    banks_twist = False
 
     def __init__(self, controller):
         self.controller = controller

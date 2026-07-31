@@ -45,6 +45,22 @@ def burst_prefix(overrides):
         _burst_prefix_overrides.reset(token)
 
 
+# Same seam for ``batch_complete``: {potential: values} served instead of scoring.
+_burst_complete_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_complete", default=None
+)
+
+
+@contextlib.contextmanager
+def burst_complete(overrides):
+    """Inject ``{potential: values}`` served as that potential's ``batch_complete`` result."""
+    token = _burst_complete_overrides.set(overrides)
+    try:
+        yield
+    finally:
+        _burst_complete_overrides.reset(token)
+
+
 class Potential(ABC, PotentialOps, PotentialTests):
     """Abstract base class for potentials.
 
