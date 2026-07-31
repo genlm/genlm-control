@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import pytest
 import torch
 import numpy as np
@@ -291,7 +292,9 @@ async def test_vllm_backend():
     finally:
         cleanup = getattr(llm.model, "cleanup", None)
         if cleanup is not None:
-            await cleanup()
+            res = cleanup()
+            if inspect.isawaitable(res):
+                await res
 
     new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
     assert new_llm.token_maps.eos_idxs == [0]
