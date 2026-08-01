@@ -280,6 +280,8 @@ async def test_vllm_backend():
         engine_opts={"dtype": "float", "gpu_memory_utilization": 0.3},
     )
 
+    # Cleanup releases the engine, so it must outlive every use below --
+    # ``spawn_new_eos`` shares this same model.
     try:
         llm.set_prompt_from_str("hello")
         context = llm.tokenize(" world!")
@@ -289,23 +291,25 @@ async def test_vllm_backend():
         await llm.assert_batch_consistency(
             [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
         )
+
+        new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
+        assert new_llm.token_maps.eos_idxs == [0]
+        assert new_llm.token_maps.decode[0].byte_string == b"!"
+
+        context = llm.tokenize(" world")
+        await new_llm.assert_logw_next_consistency(
+            context, top=10, rtol=1e-3, atol=1e-3
+        )
+        await new_llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
+        await new_llm.assert_batch_consistency(
+            [context, llm.tokenize(" worlds")], rtol=1e-3, atol=1e-3
+        )
     finally:
         cleanup = getattr(llm.model, "cleanup", None)
         if cleanup is not None:
             res = cleanup()
             if inspect.isawaitable(res):
                 await res
-
-    new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
-    assert new_llm.token_maps.eos_idxs == [0]
-    assert new_llm.token_maps.decode[0].byte_string == b"!"
-
-    context = llm.tokenize(" world")
-    await new_llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await new_llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await new_llm.assert_batch_consistency(
-        [context, llm.tokenize(" worlds")], rtol=1e-3, atol=1e-3
-    )
 
 
 def test_llm_repr(llm):
