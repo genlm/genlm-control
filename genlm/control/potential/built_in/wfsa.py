@@ -138,16 +138,27 @@ class WFSA(Potential):
             cache.move_to_end(bs)  # LRU touch -- keeps the active prefix chain hot
             return curr
 
-        wfsa = self.wfsa.epsremove
-        curr = wfsa.R.chart()
-        prev = self._consume(bs[:-1])
-        for i in prev:
-            for j, w in wfsa.arcs(i, bs[-1]):
-                curr[j] += prev[i] * w
+        # Longest cached prefix, then extend forward one symbol at a time. The chain is
+        # as long as the context, so walking it by recursion blows the stack.
+        n = len(bs) - 1
+        while n > 0 and bs[:n] not in cache:
+            n -= 1
+        if n:
+            cache.move_to_end(bs[:n])
+            prev = cache[bs[:n]]
+        else:
+            prev = self._start_chart
 
-        cache[bs] = curr
-        if len(cache) > self._cache_maxsize:
-            cache.popitem(last=False)  # evict least-recently-used prefix
+        wfsa = self.wfsa.epsremove
+        for k in range(n, len(bs)):
+            curr = wfsa.R.chart()
+            for i in prev:
+                for j, w in wfsa.arcs(i, bs[k]):
+                    curr[j] += prev[i] * w
+            cache[bs[: k + 1]] = curr
+            if len(cache) > self._cache_maxsize:
+                cache.popitem(last=False)  # evict least-recently-used prefix
+            prev = curr
 
         return curr
 
