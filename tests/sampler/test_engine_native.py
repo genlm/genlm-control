@@ -776,3 +776,60 @@ def test_batched_smc_burst_unbiased(llm):
         f"batched burst group-mean log_ml biased vs the exact batched path: "
         f"mean diff {diffs.mean():+.4f} (sem {sem:.4f})"
     )
+
+
+def test_batched_per_group_lm_critic_burst_vs_steploop(llm):
+    """B groups carrying DISTINCT token-grain LM critics (own prompt each). Every row's
+    served twist must be keyed by ITS group's critic leaf: keyed by group 0's, the other
+    groups' leaves miss the override and forward mid-burst, which re-enters the engine's
+    own decode step and deadlocks. Group-mean log_ml stays unbiased vs StepLoop."""
+    from genlm.control.sampler.sequence import SMC
+
+    llm.set_prompt_from_str(PROMPT)
+    critics = [
+        PromptedLLM(
+            llm.model,
+            prompt_ids=llm.model.tokenizer.encode(hint),
+            eos_byte_strings=EOS_BYTES,
+        )
+        for hint in ("It is known that", "Consider instead", "Recall the fact that")
+    ]
+    B = len(critics)
+    seeds = (1234, 7, 99, 2024, 555, 31, 42, 271, 828, 1618,
+             6, 71, 900, 17, 808, 2718, 3141, 5772, 88, 909)
+
+    def group_mean(seed, accelerate):
+        seed_all(seed)
+        smcs = [SMC(DirectTokenSampler(llm), critic=c) for c in critics]
+        seqs = asyncio.run(
+            SMC.batched(
+                smcs, n_particles=8, ess_threshold=0.5,
+                max_tokens=8, accelerate=accelerate,
+            )
+        )
+        assert len(seqs) == B, f"SMC.batched returned {len(seqs)} groups, expected {B}"
+        mls = np.array([s.log_ml for s in seqs])
+        return mls[np.isfinite(mls)].mean()
+
+    # An LM critic twist over a short horizon resamples hard, so a single paired diff
+    # runs to several nats; the seed count is what makes the mean a usable statistic.
+    diffs = []
+    for s in seeds:
+        t0 = time.perf_counter()
+        burst = group_mean(s, "require")
+        slow = group_mean(s, "off")
+        diffs.append(burst - slow)
+        _log(
+            f"per-group LM critic B={B} seed={s}: {time.perf_counter() - t0:.1f}s  "
+            f"burst group-mean={burst:+.4f} slow={slow:+.4f} diff={burst - slow:+.4f}"
+        )
+    diffs = np.array(diffs)
+    sem = diffs.std() / np.sqrt(len(diffs))
+    _log(
+        f"batched per-group LM critic (paired): group-mean log_ml diff "
+        f"mean={diffs.mean():+.4f} sem={sem:.4f}"
+    )
+    assert abs(diffs.mean()) <= max(0.4, 3.0 * sem), (
+        f"per-group LM critic burst group-mean log_ml biased: "
+        f"mean diff {diffs.mean():+.4f} (sem {sem:.4f})"
+    )

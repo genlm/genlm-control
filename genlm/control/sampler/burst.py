@@ -248,10 +248,17 @@ class _Burst:
         p.done). A token-grain critic's LM leaf is served from the banked twist
         sums (prefix and complete) -- it must not forward mid-burst."""
         c = self.d.controller
-        leaf = self.d.twist_view if not self.d.defers_critic else None
         for p, rec in zip(parts, records):
             if rec.step is None:
                 continue
+            # Serving is keyed by THAT row's group's critic leaf: groups carry their own
+            # critic LM (own prompt), so group 0's object would miss the override and
+            # forward inside the burst (deadlock).
+            leaf = (
+                None
+                if self.d.defers_critic
+                else self.d.twist_leaves[c.particles.group[p._i]]
+            )
             if leaf is None:
                 await c.bank_row(p, *rec.step)
             else:
