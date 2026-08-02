@@ -12,7 +12,7 @@ from genlm.control.potential.testing import PotentialTests
 
 
 # Per-burst override: {potential: LazyWeights} a potential's ``logw_next`` returns for
-# itself instead of computing. Read by ``PromptedLLM`` and ``Product``.
+# itself instead of computing. Read by ``PromptedLLM``.
 _burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_burst_logw_next", default=None
 )

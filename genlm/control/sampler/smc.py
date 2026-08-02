@@ -2,12 +2,13 @@
 driver). Engine acceleration lives in ``burst.py``."""
 
 import asyncio
+import contextlib
 
 import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.potential.base import burst_prefix
+from genlm.control.potential.base import burst_prefix, burst_complete
 from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
@@ -286,6 +287,12 @@ class Controller:
             c is not None and c.is_terminal_only() for c in critics
         ):
             self.twist_with_critic = False
+        # Per-group critic LM leaf, served from banked twist sums instead of forwarding.
+        # ``None`` where that group's critic has no engine leaf (or isn't twisting).
+        self.twist_leaves = [
+            find_engine_lm(c) if (self.twist_with_critic and c is not None) else None
+            for c in critics
+        ]
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
 
@@ -351,6 +358,31 @@ class Controller:
 
     def _critic_of(self, p):
         return self.critics[self.particles.group[p._i]]
+
+    @contextlib.contextmanager
+    def serve_row(self, p, dlogp=0.0):
+        """Serve one row's banked twist sums as its critic LM leaf's ``prefix``/
+        ``complete``. Keyed by the row's OWN group: groups carry their own critic LM,
+        so another group's leaf would miss the override and forward."""
+        leaf = self.twist_leaves[self.particles.group[p._i]]
+        if leaf is None:
+            yield
+            return
+        prefix = {leaf: [self.twist.served_row(p, dlogp)]}
+        complete = {leaf: [self.twist.served_complete(p)]}
+        with burst_prefix(prefix), burst_complete(complete):
+            yield
+
+    @contextlib.contextmanager
+    def serve_prefix(self, g, ps):
+        """Serve rows ``ps`` their banked prefix sums as group ``g``'s critic LM leaf's
+        ``batch_prefix``."""
+        leaf = self.twist_leaves[g]
+        if leaf is None:
+            yield
+            return
+        with burst_prefix({leaf: self.twist.served_prefix(ps)}):
+            yield
 
     async def bank_row(self, p, to_append, logw, logp):
         """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
@@ -527,16 +559,13 @@ class Controller:
         async def _settle(g, ps):
             critic = self.critics[g]
             contexts = [p.context for p in ps]
-            leaf = find_engine_lm(critic) if self.twist_with_critic else None
-            if leaf is None:
-                return ps, await critic.batch_score(contexts)
             # batch_score routes non-EOS contexts to batch_prefix in list order;
             # serve the banked sums for exactly that subset.
-            served = self.twist.served_prefix([
-                p for p, ctx in zip(ps, contexts)
-                if not (ctx and ctx[-1] == critic.eos)
-            ])
-            with burst_prefix({leaf: served}):
+            with self.serve_prefix(
+                g,
+                [p for p, ctx in zip(ps, contexts)
+                 if not (ctx and ctx[-1] == critic.eos)],
+            ):
                 return ps, await critic.batch_score(contexts)
 
         for ps, amts in await asyncio.gather(

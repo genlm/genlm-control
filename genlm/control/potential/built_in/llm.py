@@ -549,29 +549,38 @@ class PromptedLLM(Potential):
         """
         return await self.log_probability(context)
 
+    def _served(self, overrides, n=None):
+        """This LM's injected value from ``overrides``, or ``None`` to compute it.
+
+        A miss while a burst owns the engine raises: the forward would re-enter the
+        burst's decode loop, so this leaf should have been among its injected views
+        (see ``burst_blocker``)."""
+        override = overrides.get()
+        if override is not None and self in override:
+            vals = override[self]
+            if n is not None and len(vals) != n:
+                raise ValueError(f"burst served {len(vals)} values for {n} contexts")
+            return vals
+        if self.model.burst_active:
+            raise RuntimeError(
+                f"{self!r} would forward while an engine burst is running: it is not "
+                "among the burst's injected views, so it cannot be served."
+            )
+        return None
+
     async def batch_prefix(self, contexts):
         """Batched ``prefix``. At a burst boundary the controller serves the banked
         warm-row sums via ``burst_prefix`` instead of re-scoring every context."""
-        override = _burst_prefix_overrides.get()
-        if override is not None and self in override:
-            vals = override[self]
-            if len(vals) != len(contexts):
-                raise ValueError(
-                    f"burst_prefix served {len(vals)} values for {len(contexts)} contexts"
-                )
+        vals = self._served(_burst_prefix_overrides, len(contexts))
+        if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_prefix(contexts)
 
     async def batch_complete(self, contexts):
         """Batched ``complete``. A burst serves the banked warm-row sums via
         ``burst_complete`` instead of scoring."""
-        override = _burst_complete_overrides.get()
-        if override is not None and self in override:
-            vals = override[self]
-            if len(vals) != len(contexts):
-                raise ValueError(
-                    f"burst_complete served {len(vals)} values for {len(contexts)} contexts"
-                )
+        vals = self._served(_burst_complete_overrides, len(contexts))
+        if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_complete(contexts)
 
@@ -689,9 +698,9 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
-        override = _burst_logw_next_overrides.get()
-        if override is not None and self in override:
-            return override[self]  # burst: serve the engine's warm logits, no forward
+        served = self._served(_burst_logw_next_overrides)
+        if served is not None:
+            return served  # burst: the engine's warm logits, no forward
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
             await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
@@ -710,9 +719,9 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
-        override = _burst_logw_next_overrides.get()
-        if override is not None and self in override:
-            return override[self]  # burst: the engine's warm [N, V+1] batch, no forward
+        served = self._served(_burst_logw_next_overrides)
+        if served is not None:
+            return served  # burst: the engine's warm [N, V+1] batch, no forward
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
             await self._fwd.batch_next_token_logprobs(

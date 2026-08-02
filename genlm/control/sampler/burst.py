@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from genlm.control.constant import EndOfSequence, EOS
-from genlm.control.potential.base import burst_logw_next, burst_prefix, burst_complete
+from genlm.control.potential.base import burst_logw_next
 from genlm.control.potential.built_in.llm import (
     find_engine_lm,
     constraint_leaf_ids,
@@ -251,20 +251,10 @@ class _Burst:
         for p, rec in zip(parts, records):
             if rec.step is None:
                 continue
-            # Serving is keyed by THAT row's group's critic leaf: groups carry their own
-            # critic LM (own prompt), so group 0's object would miss the override and
-            # forward inside the burst (deadlock).
-            leaf = (
-                None
-                if self.d.defers_critic
-                else self.d.twist_leaves[c.particles.group[p._i]]
-            )
-            if leaf is None:
+            if self.d.defers_critic:  # settles at the boundary, nothing to serve
                 await c.bank_row(p, *rec.step)
             else:
-                sp = c.twist.served_row(p, dlogp=rec.step[2])
-                sc = c.twist.served_complete(p)
-                with burst_prefix({leaf: [sp]}), burst_complete({leaf: [sc]}):
+                with c.serve_row(p, dlogp=rec.step[2]):
                     await c.bank_row(p, *rec.step)
         # Token grain records per step here; unit grain once per round boundary.
         if self.d.sampler.burst_free_running() and any(r.step is not None for r in records):
@@ -412,11 +402,7 @@ class BurstLoop:
         # plus the critic's engine leaf when twisting will read it -- at the boundary
         # if deferred, per step if token-grain); the batched burst draws every group
         # through group 0's sampler.
-        serve = controller.twist_with_critic
-        self.twist_leaves = [
-            find_engine_lm(c) if (serve and c is not None) else None
-            for c in controller.critics
-        ]
+        self.twist_leaves = controller.twist_leaves
         self.twist_view = self.twist_leaves[0]
         # The burst banks per-token twist sums whenever a twist view is injected.
         self.banks_twist = self.twist_view is not None
