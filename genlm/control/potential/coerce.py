@@ -44,7 +44,9 @@ class Coerced(Potential):
         no such assumption -- so a non-homomorphic `f` is correct, just not accelerated.
     """
 
-    def __init__(self, potential, target_vocab, f, prune=True, homomorphic=None):
+    def __init__(
+        self, potential, target_vocab, f, prune=True, homomorphic=None, trie=None
+    ):
         """
         Initialize a Coerced potential.
 
@@ -63,12 +65,24 @@ class Coerced(Potential):
                 probe is a finite heuristic, not a proof, so a custom `f` that is only
                 locally homomorphic should pass `homomorphic=False` to force the safe
                 (assumption-free) path.
+            trie (dict | None): The symbol trie over `(target_vocab, f)`, as built by
+                :meth:`build_trie`. It is a function of those two alone, so coercions
+                sharing a vocabulary should build it once and pass it here rather than
+                each paying for its own. `None` (default) builds one lazily.
 
         Raises:
             ValueError: If no valid tokens are found in the target vocabulary that can be mapped to the original potential's vocabulary.
         """
         self.potential = potential
         self.f = f
+        if trie is not None and prune:
+            # The trie's leaves are indices into `self.vocab`, which pruning is about
+            # to shrink -- an outside trie would silently address the wrong tokens.
+            raise ValueError(
+                "an injected `trie` indexes the coerced vocabulary, which `prune=True` "
+                "narrows; pass `prune=False` or build the trie over the pruned vocab"
+            )
+        self._sym_trie_cache = trie
 
         if prune:
             # When vocab contains Token objects (bytes subclass), the coercion
@@ -168,24 +182,32 @@ class Coerced(Potential):
     # -- fast logw_next: a shared-prefix trie over the target vocab, scored from the
     #    wrapped potential's MEMOIZED chart (``_consume``), no per-vocab replay --
 
+    @staticmethod
+    def build_trie(vocab, f):
+        """Prefix trie over the symbol sequences ``f([t])`` of `vocab`. A node is a
+        dict ``{sym: child}``; tokens that END at a node are recorded under the
+        sentinel key ``()`` as a list of vocab indices (a list because distinct
+        target tokens can share an ``f``-image). Sharing common prefixes lets
+        :meth:`_trie_logws` score each shared prefix ONCE instead of re-prefixing
+        every token's full symbol path.
+
+        A function of `(vocab, f)` alone -- build it once per vocabulary and pass it
+        to every coercion over that vocabulary via `trie=`.
+        """
+        trie = {}
+        for idx, tok in enumerate(vocab):
+            node = trie
+            for sym in f([tok]):
+                node = node.setdefault(sym, {})
+            node.setdefault((), []).append(idx)
+        return trie
+
     @property
     def _sym_trie(self):
-        """Prefix trie over the wrapped-vocab symbol sequences ``f([t])`` of the
-        target tokens, built once. A node is a dict ``{sym: child}``; tokens that
-        END at a node are recorded under the sentinel key ``()`` as a list of vocab
-        indices (a list because distinct target tokens can share an ``f``-image).
-        Sharing common prefixes lets :meth:`_trie_logws` score each shared prefix
-        ONCE instead of re-prefixing every token's full symbol path."""
-        trie = getattr(self, "_sym_trie_cache", None)
-        if trie is None:
-            trie = {}
-            for idx, tok in enumerate(self.vocab):
-                node = trie
-                for sym in self.f([tok]):
-                    node = node.setdefault(sym, {})
-                node.setdefault((), []).append(idx)
-            self._sym_trie_cache = trie
-        return trie
+        """This coercion's symbol trie -- the injected one, else built and held."""
+        if self._sym_trie_cache is None:
+            self._sym_trie_cache = self.build_trie(self.vocab, self.f)
+        return self._sym_trie_cache
 
     async def _trie_logws(self, context):
         """``logw_next`` via the shared-prefix trie, scoring each token from the

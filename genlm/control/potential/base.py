@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import contextvars
 import numpy as np
+import torch
 from abc import ABC, abstractmethod
 
 from genlm.control.constant import EOS, EndOfSequence
@@ -204,6 +205,50 @@ class Potential(ABC, PotentialOps, PotentialTests):
         """Sub-potentials this composes (``[]`` for a leaf; ``Product`` -> ``[p1, p2]``)."""
         return []
 
+    async def live_logws(self, context):
+        """Live next-token weights as `(indices, values, eos)`: the vocabulary indices
+        carrying finite weight, their weights, and the EOS weight -- or `None` when
+        this potential has no sparse enumeration.
+
+        `values` may be a single float when every live token shares a weight (a
+        support mask). `indices` is consumed once, so a generator is fine.
+
+        Implementing this replaces the dense per-context build in `logw_next` AND
+        lets `batch_logw_next` scatter the whole population into one `alloc_rows`
+        block, so a potential that provides it must not also override `logw_next`.
+
+        Args:
+            context (list): Sequence of tokens.
+
+        Returns:
+            (tuple | None): `(indices, values, eos)`, or `None` for no sparse path.
+        """
+        return None
+
+    def _rows_from_live(self, lives):
+        """Scatter `live_logws` triples into one `[N, len(vocab_eos)]` block from
+        `alloc_rows` -- one allocation and one flat write for the whole batch,
+        never a dense row per context."""
+        V1 = len(self.vocab_eos)
+        W = self.alloc_rows(len(lives))
+        flat, vals = [], []
+        for j, (idx, val, eos) in enumerate(lives):
+            n0 = len(flat)
+            flat.extend(j * V1 + int(i) for i in idx)
+            if isinstance(val, (int, float)):
+                vals.extend([float(val)] * (len(flat) - n0))
+            else:
+                vals.extend(float(v) for v in val)
+            W[j, -1] = eos
+        if flat:
+            if torch.is_tensor(W):
+                W.view(-1)[torch.tensor(flat, device=W.device)] = torch.tensor(
+                    vals, dtype=W.dtype, device=W.device
+                )
+            else:
+                W.reshape(-1)[np.asarray(flat)] = np.asarray(vals)
+        return W
+
     async def logw_next(self, context):
         """Compute the next-token weights of each token in `self.vocab_eos` given `context`.
 
@@ -213,6 +258,10 @@ class Potential(ABC, PotentialOps, PotentialTests):
         Returns:
             (LazyWeights): Weights of each token in the vocabulary and EOS.
         """
+        live = await self.live_logws(context)
+        if live is not None:
+            return self.make_lazy_weights(self._rows_from_live([live])[0])
+
         ctx_log_w = await self.prefix(context)
 
         if ctx_log_w == float("-inf"):
@@ -320,6 +369,10 @@ class Potential(ABC, PotentialOps, PotentialTests):
         if not contexts:
             raise ValueError("Contexts must be non-empty.")
 
+        lives = await asyncio.gather(*[self.live_logws(c) for c in contexts])
+        if all(live is not None for live in lives):
+            return self.make_lazy_weights(self._rows_from_live(lives))
+
         lws = await asyncio.gather(*[self.logw_next(context) for context in contexts])
         return self.make_lazy_weights(stack_weights([lw.weights for lw in lws]))
 
@@ -351,6 +404,20 @@ class Potential(ABC, PotentialOps, PotentialTests):
             (np.array): Array of length `len(self.vocab_eos)` filled with `default`.
         """
         return np.full((len(self.vocab_eos),), default)
+
+    def alloc_rows(self, n, default=float("-inf")):
+        """Allocate an `[n, len(vocab_eos)]` weight block. Override to place the
+        block on a device (or in another backend); `live_logws` assembly and
+        `LazyWeights` both follow whatever this returns.
+
+        Args:
+            n (int): Number of rows.
+            default (float, optional): Fill value. Defaults to -inf.
+
+        Returns:
+            Array of shape `[n, len(self.vocab_eos)]` filled with `default`.
+        """
+        return np.full((n, len(self.vocab_eos)), default)
 
     def spawn(self):
         """
