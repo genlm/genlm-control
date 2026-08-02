@@ -4,6 +4,7 @@ import contextvars
 import numpy as np
 import torch
 from abc import ABC, abstractmethod
+from typing import NamedTuple
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.util import LazyWeights, stack_weights
@@ -62,6 +63,16 @@ def burst_complete(overrides):
         _burst_complete_overrides.reset(token)
 
 
+class VocabTables(NamedTuple):
+    """What a vocabulary determines, built once and shareable by every potential over
+    it (see `Potential.build_tables`)."""
+
+    token_type: TokenType
+    eos: EndOfSequence
+    vocab_eos: list
+    lookup: dict
+
+
 class Potential(ABC, PotentialOps, PotentialTests):
     """Abstract base class for potentials.
 
@@ -89,19 +100,14 @@ class Potential(ABC, PotentialOps, PotentialTests):
         lookup (dict): Mapping from tokens and `eos` to their indices in `vocab_eos`.
     """
 
-    def __init__(self, vocabulary, token_type=None, eos=None):
-        """
-        Initialize the potential.
+    @staticmethod
+    def build_tables(vocabulary, token_type=None, eos=None):
+        """The tables a vocabulary determines: `(token_type, eos, vocab_eos, lookup)`.
 
-        Args:
-            vocabulary (list): List of tokens that make up the vocabulary.
-            token_type (TokenType, optional): Optional TokenType of all elements of the vocabulary.
-                If None, will be inferred from vocabulary.
-            eos (EndOfSequence, optional): Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
-
-        Raises:
-            ValueError: If vocabulary is empty.
-            TypeError: If vocabulary contains tokens which are not of `token_type`.
+        A function of `(vocabulary, token_type, eos)` alone and O(len(vocabulary)) to
+        build, so potentials sharing a vocabulary should build it once and pass it to
+        each of them via `tables=` rather than each paying for its own. Validation
+        (token types, duplicate tokens) happens here, once.
         """
         if not vocabulary:
             raise ValueError("vocabulary cannot be empty")
@@ -116,18 +122,56 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
         if eos is not None and not isinstance(eos, EndOfSequence):
             raise ValueError("EOS must be an instance of EndOfSequence")
+        eos = eos if eos is not None else EOS
 
-        self.eos = eos if eos is not None else EOS
-
-        self.token_type = token_type
-        self.vocab = vocabulary
-        self.vocab_eos = self.vocab + [self.eos]
-        self.lookup = {}
+        lookup = {}
         for i, x in enumerate(vocabulary):
-            if x in self.lookup:
+            if x in lookup:
                 raise ValueError(f"Duplicate token {x!r} found in vocabulary")
-            self.lookup[x] = i
-        self.lookup[self.eos] = len(self.vocab)
+            lookup[x] = i
+        lookup[eos] = len(vocabulary)
+
+        return VocabTables(token_type, eos, vocabulary + [eos], lookup)
+
+    def __init__(self, vocabulary, token_type=None, eos=None, tables=None):
+        """
+        Initialize the potential.
+
+        Args:
+            vocabulary (list): List of tokens that make up the vocabulary.
+            token_type (TokenType, optional): Optional TokenType of all elements of the vocabulary.
+                If None, will be inferred from vocabulary.
+            eos (EndOfSequence, optional): Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
+            tables (VocabTables, optional): Prebuilt tables for this exact `vocabulary`,
+                as returned by :meth:`build_tables` -- skips the O(len(vocabulary))
+                construction and its validation. Mutually exclusive with `token_type`
+                and `eos`, which the tables already carry.
+
+        Raises:
+            ValueError: If vocabulary is empty, or `tables` does not match `vocabulary`.
+            TypeError: If vocabulary contains tokens which are not of `token_type`.
+        """
+        if tables is None:
+            tables = self.build_tables(vocabulary, token_type, eos)
+        else:
+            if token_type is not None or eos is not None:
+                raise ValueError(
+                    "`tables` already carries `token_type` and `eos`; pass them to "
+                    "`build_tables` instead"
+                )
+            # Cheap arity check only -- comparing the vocabularies elementwise would
+            # cost exactly what injecting the tables is meant to avoid.
+            if len(vocabulary) + 1 != len(tables.vocab_eos):
+                raise ValueError(
+                    f"`tables` covers {len(tables.vocab_eos) - 1} tokens but "
+                    f"`vocabulary` has {len(vocabulary)}; they must be built together"
+                )
+
+        self.eos = tables.eos
+        self.token_type = tables.token_type
+        self.vocab = vocabulary
+        self.vocab_eos = tables.vocab_eos
+        self.lookup = tables.lookup
 
     ####################
     # Instance methods #

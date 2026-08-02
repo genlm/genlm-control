@@ -45,7 +45,14 @@ class Coerced(Potential):
     """
 
     def __init__(
-        self, potential, target_vocab, f, prune=True, homomorphic=None, trie=None
+        self,
+        potential,
+        target_vocab,
+        f,
+        prune=True,
+        homomorphic=None,
+        trie=None,
+        tables=None,
     ):
         """
         Initialize a Coerced potential.
@@ -69,18 +76,23 @@ class Coerced(Potential):
                 :meth:`build_trie`. It is a function of those two alone, so coercions
                 sharing a vocabulary should build it once and pass it here rather than
                 each paying for its own. `None` (default) builds one lazily.
+            tables (VocabTables | None): Prebuilt vocabulary tables for `target_vocab`
+                (`Potential.build_tables`), shared for the same reason as `trie`.
+                Like `trie`, incompatible with `prune=True`, which narrows the
+                vocabulary the tables describe.
 
         Raises:
             ValueError: If no valid tokens are found in the target vocabulary that can be mapped to the original potential's vocabulary.
         """
         self.potential = potential
         self.f = f
-        if trie is not None and prune:
-            # The trie's leaves are indices into `self.vocab`, which pruning is about
-            # to shrink -- an outside trie would silently address the wrong tokens.
+        if prune and (trie is not None or tables is not None):
+            # Both index the coerced vocabulary, which pruning is about to shrink --
+            # injected ones would silently describe the wrong tokens.
             raise ValueError(
-                "an injected `trie` indexes the coerced vocabulary, which `prune=True` "
-                "narrows; pass `prune=False` or build the trie over the pruned vocab"
+                "an injected `trie`/`tables` indexes the coerced vocabulary, which "
+                "`prune=True` narrows; pass `prune=False` or build them over the "
+                "pruned vocab"
             )
         self._sym_trie_cache = trie
 
@@ -107,7 +119,7 @@ class Coerced(Potential):
         if not tokens:
             raise ValueError("No valid tokens found in target vocabulary")
 
-        super().__init__(tokens)
+        super().__init__(tokens, tables=tables)
 
         # The `_trie_logws` fast path assumes `f` distributes over token-sequence
         # concatenation (`f(xs+[t]) == f(xs)+f([t])`); see `logw_next`. A
