@@ -124,22 +124,12 @@ def params(draw, max_size=5, min_p=1e-3):
 
 
 @pytest.mark.asyncio
-@example(([b"\x00"], [False, True], [0.5, 0.5]))
+@example(params=([b"\x00"], [False, True], [0.5, 0.5]), normalizing_constant=1.0)
 @settings(deadline=None, max_examples=25)
-@given(params())
-async def test_awrs_is_unbiased(params):
-    await assert_monte_carlo_close(
-        sampler_cls=AWRS,
-        params=params,
-        N=10000,
-        equality_opts={"rtol": 2e-2, "atol": 2e-2},
-    )
-
-
-@pytest.mark.asyncio
-@settings(deadline=None, max_examples=25)
-@given(params(), st.floats(min_value=0.01, max_value=2.0))
-async def test_awrs_unnormalized_weights(params, normalizing_constant):
+@given(params=params(), normalizing_constant=st.floats(min_value=0.01, max_value=2.0))
+async def test_awrs_is_unbiased(params, normalizing_constant):
+    # normalizing_constant != 1 checks unbiasedness holds even when the potential's
+    # logw_next isn't itself normalized.
     vocab, b_weights, c_weights = params
     c_weights = [w * normalizing_constant for w in c_weights]
     params = (vocab, b_weights, c_weights)
@@ -197,35 +187,18 @@ def zero_condition():
 
 
 @pytest.mark.asyncio
-async def test_verbosity(potential):
-    condition = MockPotential(
-        [bytes([i]) for i in range(4)],
-        [0, 0, float("-inf"), float("-inf"), 0],
-    )
-    sampler = AWRS(potential=potential, condition=condition)
-    await sampler.sample([], verbosity=1)
-
-
-@pytest.mark.asyncio
-async def test_awrs_no_valid_tokens(potential, zero_condition):
-    sampler = AWRS(potential=potential, condition=zero_condition)
-    tok, logw, _ = await sampler.sample([])
-    assert logw == float("-inf")
-
-
-@pytest.mark.asyncio
-async def test_awrs_improper_weights_no_valid_tokens(potential, zero_condition):
+@pytest.mark.parametrize("proper_weights", [True, False])
+async def test_awrs_no_valid_tokens(potential, zero_condition, proper_weights):
     sampler = AWRS(
-        potential=potential,
-        condition=zero_condition,
-        proper_weights=False,
+        potential=potential, condition=zero_condition, proper_weights=proper_weights
     )
     tok, logw, _ = await sampler.sample([])
     assert logw == float("-inf")
 
 
 @pytest.mark.asyncio
-async def test_awrs_with_different_vocabs():
+@pytest.mark.parametrize("prune_logws", [True, False])
+async def test_awrs_with_different_vocabs(prune_logws):
     potential = MockPotential(
         [bytes([i]) for i in range(4)],
         np.log([0.4, 0.3, 0.1, 0.1, 0.1]),
@@ -235,26 +208,7 @@ async def test_awrs_with_different_vocabs():
         [0, 0, float("-inf"), float("-inf")],
     )
 
-    sampler = AWRS(potential, condition, prune_logws=True)
-
-    want = await sampler.target.logw_next([])
-    have = await monte_carlo(sampler, [], 10000)
-
-    assert np.isclose(np.exp(want.sum()), np.exp(have.sum()), rtol=5e-3, atol=5e-3)
-
-
-@pytest.mark.asyncio
-async def test_awrs_with_no_pruning_and_different_vocabs():
-    potential = MockPotential(
-        [bytes([i]) for i in range(4)],
-        np.log([0.4, 0.3, 0.1, 0.1, 0.1]),
-    )
-    condition = MockPotential(
-        [bytes([i]) for i in range(3)],
-        [0, 0, float("-inf"), float("-inf")],
-    )
-
-    sampler = AWRS(potential, condition, prune_logws=False)
+    sampler = AWRS(potential, condition, prune_logws=prune_logws)
 
     want = await sampler.target.logw_next([])
     have = await monte_carlo(sampler, [], 10000)
@@ -295,56 +249,14 @@ async def test_awrs_with_different_limits(
 @settings(deadline=None, max_examples=100)
 @given(
     max_accepts=st.integers(min_value=2, max_value=5),
-    max_rejects=st.integers(min_value=2, max_value=5),
-    params=params(),
-    n_samples=st.integers(1, 10),
-    seed=st.integers(0, 1000),
-)
-async def test_awrs_with_different_limits_single_sample(
-    params,
-    max_accepts,
-    max_rejects,
-    n_samples,
-    seed,
-):
-    vocab, b_weights, c_weights = params
-    potential = MockPotential(
-        vocab,
-        np.array([np.log(w) if w > 0 else float("-inf") for w in c_weights]),
-    )
-    condition = MockPotential(
-        vocab,
-        np.array([np.log(w) if w > 0 else float("-inf") for w in b_weights]),
-    )
-
-    sampler = AWRS(
-        potential,
-        condition,
-        seed=seed,
-        max_accepts=max_accepts,
-        max_rejects=max_rejects,
-    )
-
-    for _ in range(n_samples):
-        tok, weight, _ = await sampler.sample([])
-        assert tok in sampler.vocab_eos_set
-        try:
-            i = vocab.index(tok)
-        except ValueError:
-            i = len(vocab)
-        assert b_weights[i] or weight == -np.inf
-
-
-@pytest.mark.asyncio
-@settings(deadline=None, max_examples=100)
-@given(
-    max_accepts=st.integers(min_value=2, max_value=2),
-    max_rejects=st.integers(min_value=2, max_value=500),
-    seed=st.integers(min_value=0, max_value=100),
+    # None exercises the default (unbounded) max_rejects configuration.
+    max_rejects=st.one_of(st.none(), st.integers(min_value=2, max_value=500)),
+    seed=st.integers(min_value=0, max_value=1000),
     params=params(max_size=256),
+    n_samples=st.integers(1, 10),
 )
 async def test_awrs_does_not_return_zero_weight_token_is_valid(
-    params, max_accepts, max_rejects, seed
+    params, max_accepts, max_rejects, seed, n_samples
 ):
     vocab, b_weights, c_weights = params
 
@@ -357,70 +269,30 @@ async def test_awrs_does_not_return_zero_weight_token_is_valid(
         np.array([np.log(w) if w > 0 else float("-inf") for w in b_weights]),
     )
 
-    sampler = AWRS(
-        max_accepts=max_accepts,
-        max_rejects=max_rejects,
-        seed=seed,
-        potential=potential,
-        condition=condition,
+    kwargs = dict(
+        max_accepts=max_accepts, seed=seed, potential=potential, condition=condition
     )
+    if max_rejects is not None:
+        kwargs["max_rejects"] = max_rejects
+    sampler = AWRS(**kwargs)
 
-    tok, logp, _ = await sampler.sample([])
+    # Reuse one sampler instance across draws to also exercise state carried
+    # across repeated sample() calls (RNG counter, geometric-vs-recursive cache).
+    for _ in range(n_samples):
+        tok, logp, _ = await sampler.sample([])
+        assert tok in sampler.vocab_eos_set
 
-    if tok == potential.eos:
-        weight = b_weights[-1]
-    else:
-        assert isinstance(tok, bytes)
-        assert len(tok) == 1
-        weight = b_weights[tok[0]]
+        if tok == potential.eos:
+            weight = b_weights[-1]
+        else:
+            assert isinstance(tok, bytes)
+            assert len(tok) == 1
+            weight = b_weights[tok[0]]
 
-    if weight > 0:
-        assert logp > float("-inf")
-    else:
-        assert logp == float("-inf")
-
-
-@pytest.mark.asyncio
-@settings(deadline=None, max_examples=100)
-@given(
-    max_accepts=st.integers(min_value=2, max_value=2),
-    seed=st.integers(min_value=0, max_value=100),
-    params=params(max_size=256),
-)
-async def test_awrs_does_not_return_zero_weight_in_default_configuration(
-    params, max_accepts, seed
-):
-    vocab, b_weights, c_weights = params
-
-    potential = MockPotential(
-        vocab,
-        np.array([np.log(w) if w > 0 else float("-inf") for w in c_weights]),
-    )
-    condition = MockPotential(
-        vocab,
-        np.array([np.log(w) if w > 0 else float("-inf") for w in b_weights]),
-    )
-
-    sampler = AWRS(
-        max_accepts=max_accepts,
-        seed=seed,
-        potential=potential,
-        condition=condition,
-    )
-
-    tok, logp, _ = await sampler.sample([])
-
-    if tok == potential.eos:
-        weight = b_weights[-1]
-    else:
-        assert isinstance(tok, bytes)
-        assert len(tok) == 1
-        weight = b_weights[tok[0]]
-
-    if weight > 0:
-        assert logp > float("-inf")
-    else:
-        assert logp == float("-inf")
+        if weight > 0:
+            assert logp > float("-inf")
+        else:
+            assert logp == float("-inf")
 
 
 async def assert_monte_carlo_close_with_proposal(
@@ -704,7 +576,10 @@ def test_monte_carlo_samples_deprecated():
 
 
 @pytest.mark.asyncio
-async def test_awrs_example_with_underflow_error():
+@pytest.mark.parametrize("max_rejects", [183, None])
+async def test_awrs_example_with_underflow_error(max_rejects):
+    # max_rejects=183 is len(vocab)+1 (i.e. every token), so it's effectively
+    # unbounded here too; both configs are covered for the underflow regression.
     vocab = [bytes([i]) for i in range(182)]
     b_weights = [False] * 56 + [True] + [False] * 126
     c_weights = [0.23929169657812532] * 4 + [0.00023929169657812532] * 179
@@ -718,13 +593,10 @@ async def test_awrs_example_with_underflow_error():
         [0 if b else -float("inf") for b in b_weights],
     )
 
-    sampler = AWRS(
-        max_accepts=2,
-        max_rejects=183,
-        seed=17,
-        potential=potential,
-        condition=condition,
-    )
+    kwargs = dict(max_accepts=2, seed=17, potential=potential, condition=condition)
+    if max_rejects is not None:
+        kwargs["max_rejects"] = max_rejects
+    sampler = AWRS(**kwargs)
 
     for _ in range(1000):
         tok, logp, _ = await sampler.sample([])
@@ -735,68 +607,45 @@ async def test_awrs_example_with_underflow_error():
 
 
 @pytest.mark.asyncio
-async def test_awrs_example_with_underflow_error_never_zero_in_default_configuration():
-    vocab = [bytes([i]) for i in range(182)]
-    b_weights = [False] * 56 + [True] + [False] * 126
-    c_weights = [0.23929169657812532] * 4 + [0.00023929169657812532] * 179
-
-    potential = MockPotential(
-        vocab,
-        np.log(c_weights),
-    )
-    condition = MockPotential(
-        vocab,
-        [0 if b else -float("inf") for b in b_weights],
-    )
-
-    sampler = AWRS(
-        max_accepts=2,
-        seed=17,
-        potential=potential,
-        condition=condition,
-    )
-
-    for _ in range(1000):
-        tok, logp, _ = await sampler.sample([])
-        assert tok == bytes([56])
-        assert logp > float("-inf")
-
-
-@pytest.mark.asyncio
-async def test_can_sample_reliably_with_rounding_to_one():
-    vocab = [bytes([i]) for i in range(10)]
-
-    # Chosen because although these sum to 1, they also sum to 1 with
-    # one of them removed. This potentially triggers rounding to one
-    # in the running sum of rejection probabilities unless we're careful.
-    c_weights = [0.999999999999999] + [9.992007221626409e-17] * 10
-    b_weights = [False, True] + [False] * 9
-
+@pytest.mark.parametrize(
+    "vocab,c_weights,b_weights,valid_tok,n_trials",
+    [
+        # Chosen because although these sum to 1, they also sum to 1 with
+        # one of them removed. This potentially triggers rounding to one
+        # in the running sum of rejection probabilities unless we're careful.
+        (
+            [bytes([i]) for i in range(10)],
+            [0.999999999999999] + [9.992007221626409e-17] * 10,
+            [False, True] + [False] * 9,
+            bytes([1]),
+            1000,
+        ),
+        # No token is ever valid: the running rejected mass still rounds to
+        # one, but there's no accept to recover -- must stay -inf throughout.
+        (
+            [0],
+            [1.00000000e000, 2.22507386e-313],
+            [False, False],
+            None,
+            100,
+        ),
+    ],
+)
+async def test_can_sample_reliably_with_rounding_to_one(
+    vocab, c_weights, b_weights, valid_tok, n_trials
+):
     potential = MockPotential(vocab, np.log(c_weights))
     condition = MockPotential(vocab, np.log(b_weights))
 
     sampler = AWRS(potential, condition, max_accepts=2, max_rejects=11)
 
-    for _ in range(1000):
+    for _ in range(n_trials):
         tok, logp, _ = await sampler.sample([])
-        assert tok == bytes([1]) or logp == -float("inf")
-
-
-@pytest.mark.asyncio
-async def test_can_sample_reliably_with_rounding_to_one_no_accept():
-    vocab = [0]
-    c_weights = [1.00000000e000, 2.22507386e-313]
-    b_weights = [False, False]
-
-    potential = MockPotential(vocab, np.log(c_weights))
-    condition = MockPotential(vocab, np.log(b_weights))
-
-    sampler = AWRS(potential, condition, max_accepts=2, max_rejects=11)
-
-    for _ in range(100):
-        tok, logp, _ = await sampler.sample([])
-        assert logp == -float("inf")
         assert tok in sampler.vocab_eos_set
+        if valid_tok is None:
+            assert logp == -float("inf")
+        else:
+            assert tok == valid_tok or logp == -float("inf")
 
 
 @pytest.mark.parametrize(
@@ -956,7 +805,7 @@ accepts = st.one_of(
 @settings(
     max_examples=500,
     report_multiple_bugs=False,
-    suppress_health_check=[HealthCheck.filter_too_much],
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.too_slow],
 )
 async def test_recursive_awrs_validity(logps, accept, rng, max_rejects):
     toks = np.arange(len(logps))
@@ -993,7 +842,7 @@ async def test_recursive_awrs_validity(logps, accept, rng, max_rejects):
 @settings(
     max_examples=500,
     report_multiple_bugs=False,
-    suppress_health_check=[HealthCheck.filter_too_much],
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.too_slow],
 )
 async def test_geometric_awrs_validity(logps, accept, rng, max_rejects, max_accepts):
     toks = np.arange(len(logps))

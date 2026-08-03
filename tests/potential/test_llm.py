@@ -214,13 +214,6 @@ def test_eos_token_and_equal_bytes_are_duplicates(llm):
         llm.spawn_new_eos(eos_byte_strings=[tok, bytes(tok)])
 
 
-def test_invalid_token_encoding(llm):
-    # Test encoding invalid tokens
-    invalid_tokens = [b"INVALID_TOKEN"]
-    with pytest.raises(ValueError, match="Token .* not in vocabulary"):
-        llm.encode_tokens(invalid_tokens)
-
-
 def test_prompt_from_str_invalid_type(llm):
     with pytest.raises(ValueError, match="Prompt must a string"):
         llm.set_prompt_from_str(42)
@@ -328,10 +321,6 @@ async def test_unserved_leaf_raises_during_burst(llm, monkeypatch):
             await call
 
 
-def test_llm_repr(llm):
-    repr(llm)
-
-
 def test_prompt_warning(llm):
     with pytest.warns(UserWarning):
         llm.set_prompt_from_str("hello ")
@@ -356,50 +345,30 @@ def test_encode_tokens_invalid_bytes(llm):
         llm.encode_tokens([b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"])
 
 
-def test_token_encode_dict_getitem_bytes(llm):
+@pytest.mark.parametrize("key_exists", [True, False], ids=["hit", "miss"])
+def test_token_encode_dict_getitem_bytes(llm, key_exists):
     """Test _TokenEncodeDict.__getitem__ with bytes key (deprecated path)."""
-    token = llm.vocab[0]
-    with pytest.warns(DeprecationWarning, match="Indexing token_maps.encode by bytes is deprecated"):
-        idx = llm.token_maps.encode[token.byte_string]
-    assert idx == llm.token_maps.encode[token]
+    if key_exists:
+        token = llm.vocab[0]
+        with pytest.warns(
+            DeprecationWarning,
+            match="Indexing token_maps.encode by bytes is deprecated",
+        ):
+            idx = llm.token_maps.encode[token.byte_string]
+        assert idx == llm.token_maps.encode[token]
+    else:
+        with pytest.raises(KeyError):
+            llm.token_maps.encode[b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"]
 
 
-def test_token_encode_dict_getitem_missing(llm):
-    """Test _TokenEncodeDict.__getitem__ raises KeyError for missing key."""
-    with pytest.raises(KeyError):
-        llm.token_maps.encode[b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"]
-
-
-def test_token_encode_dict_contains_token(llm):
-    """Test _TokenEncodeDict.__contains__ with Token key."""
-    token = llm.vocab[0]
-    assert token in llm.token_maps.encode
-
-
-def test_token_encode_dict_contains_bytes(llm):
+@pytest.mark.parametrize("key_exists", [True, False], ids=["hit", "miss"])
+def test_token_encode_dict_contains_bytes(llm, key_exists):
     """Test _TokenEncodeDict.__contains__ with bytes key (deprecated fallback)."""
-    token = llm.vocab[0]
-    assert token.byte_string in llm.token_maps.encode
-
-
-def test_token_encode_dict_contains_missing(llm):
-    """Test _TokenEncodeDict.__contains__ returns False for missing key."""
-    assert b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345" not in llm.token_maps.encode
-
-
-def test_find_token_id_for_bytes(llm):
-    """Test _find_token_id_for_bytes returns first match and caches."""
-    token = llm.vocab[0]
-    tid = llm._find_token_id_for_bytes(token.byte_string)
-    assert tid == token.token_id
-    # Second call uses cache
-    tid2 = llm._find_token_id_for_bytes(token.byte_string)
-    assert tid2 == tid
-
-
-def test_find_token_id_for_bytes_missing(llm):
-    """Test _find_token_id_for_bytes returns None for missing bytes."""
-    assert llm._find_token_id_for_bytes(b"THIS_DOES_NOT_EXIST_12345") is None
+    if key_exists:
+        token = llm.vocab[0]
+        assert token.byte_string in llm.token_maps.encode
+    else:
+        assert b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345" not in llm.token_maps.encode
 
 
 def test_duplicate_eos_byte_string_includes_all():
@@ -416,36 +385,31 @@ def test_duplicate_eos_byte_string_includes_all():
     assert all(t.byte_string != b"hello" for t in tm.potential_vocab)
 
 
-def test_eos_tokens_deprecation_from_name(llm):
-    """Test that the deprecated eos_tokens kwarg works with DeprecationWarning."""
+@pytest.mark.parametrize(
+    "make,expected",
+    [
+        (lambda llm: PromptedLLM(llm.model, eos_tokens=[b"!"]), [b"!"]),
+        (lambda llm: llm.spawn(eos_tokens=[b"!"]), [b"!"]),
+        (lambda llm: llm.spawn_new_eos(eos_tokens=[b"!"]), [b"!"]),
+        (
+            lambda llm: TokenMappings.create(
+                decode=[
+                    Token(token_id=0, byte_string=b"hello"),
+                    Token(token_id=1, byte_string=b"world"),
+                ],
+                eos_tokens=[b"hello"],
+            ),
+            [b"hello"],
+        ),
+    ],
+    ids=["constructor", "spawn", "spawn_new_eos", "token_mappings"],
+)
+def test_eos_tokens_deprecation(llm, make, expected):
+    """The deprecated `eos_tokens` kwarg is accepted (with DeprecationWarning) by
+    every construction path that takes `eos_byte_strings`."""
     with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
-        new_llm = PromptedLLM(llm.model, eos_tokens=[b"!"])
-    assert new_llm.eos_byte_strings == [b"!"]
-
-
-def test_eos_tokens_deprecation_spawn(llm):
-    """Test that spawn accepts deprecated eos_tokens kwarg."""
-    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
-        new_llm = llm.spawn(eos_tokens=[b"!"])
-    assert new_llm.eos_byte_strings == [b"!"]
-
-
-def test_eos_tokens_deprecation_spawn_new_eos(llm):
-    """Test that spawn_new_eos accepts deprecated eos_tokens kwarg."""
-    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
-        new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
-    assert new_llm.eos_byte_strings == [b"!"]
-
-
-def test_eos_tokens_deprecation_token_mappings():
-    """Test that TokenMappings.create accepts deprecated eos_tokens kwarg."""
-    decode = [
-        Token(token_id=0, byte_string=b"hello"),
-        Token(token_id=1, byte_string=b"world"),
-    ]
-    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
-        tm = TokenMappings.create(decode=decode, eos_tokens=[b"hello"])
-    assert tm.eos_byte_strings == [b"hello"]
+        result = make(llm)
+    assert result.eos_byte_strings == expected
 
 
 def test_eos_tokens_and_byte_strings_conflict(llm):

@@ -59,25 +59,59 @@ def test_initialization_different_vocab():
     assert len(product.v2_idxs) == 3  # (2 + eos)
 
 
-def test_vocab_errors():
-    p1 = SimplePotential([b"a", b"b", b"c"], scale=1.0)
+class _IntVocabPotential(SimplePotential):
+    """A potential with a different token type (int), via a subclass rather
+    than a direct constructor call, to exercise that construction path too."""
 
-    # Test mismatched token types
-    class DifferentPotential(SimplePotential):
-        def __init__(self):
-            super().__init__([1, 2, 3])  # Different token type (int)
+    def __init__(self):
+        super().__init__([1, 2, 3])
 
-    with pytest.raises(
-        ValueError, match="Potentials in product must have the same token type"
-    ):
-        Product(p1, DifferentPotential())
 
-    # Test non-overlapping vocabularies
-    p3 = SimplePotential([b"e", b"f", b"g"])
-    with pytest.raises(
-        ValueError, match="Potentials in product must share a common vocabulary"
-    ):
-        Product(p1, p3)
+@pytest.mark.parametrize(
+    "make_p1_p2, expected_match",
+    [
+        pytest.param(
+            lambda: (SimplePotential([b"a", b"b", b"c"], scale=1.0), _IntVocabPotential()),
+            "Potentials in product must have the same token type",
+            id="bytes_vs_int_subclass_loose",
+        ),
+        pytest.param(
+            lambda: (
+                SimplePotential([b"a", b"b", b"c"], scale=1.0),
+                SimplePotential([0, 1, 2], scale=2.0),
+            ),
+            re.escape(
+                "Potentials in product must have the same token type. "
+                + "Got Atomic(bytes) and Atomic(int)."
+                + "\nMaybe you forgot to coerce the potentials to the same token type? See `Coerce`."
+            ),
+            id="bytes_vs_int_exact_with_hint",
+        ),
+        pytest.param(
+            lambda: (
+                SimplePotential([b"a", b"b", b"c"], scale=1.0),
+                SimplePotential(["a", "b", "c"], scale=2.0),
+            ),
+            re.escape(
+                "Potentials in product must have the same token type. "
+                + "Got Atomic(bytes) and Atomic(str)."
+            ),
+            id="bytes_vs_str_exact_no_hint",
+        ),
+        pytest.param(
+            lambda: (
+                SimplePotential([b"a", b"b", b"c"], scale=1.0),
+                SimplePotential([b"e", b"f", b"g"]),
+            ),
+            "Potentials in product must share a common vocabulary",
+            id="no_common_vocabulary",
+        ),
+    ],
+)
+def test_vocab_errors(make_p1_p2, expected_match):
+    p1, p2 = make_p1_p2()
+    with pytest.raises(ValueError, match=expected_match):
+        Product(p1, p2)
 
 
 @pytest.mark.asyncio
@@ -99,24 +133,6 @@ async def test_complete(product):
 
 
 @pytest.mark.asyncio
-async def test_logw_next(product):
-    context = [b"a", b"b"]
-    result = await product.logw_next(context)
-
-    # Test that weights are properly combined
-    weights = result.weights
-    assert len(weights) == len(product.vocab_eos)
-
-    # Test individual token weights
-    for token in product.vocab:
-        extended = context + [token]
-        score = await product.score(extended)
-        prefix_score = await product.prefix(context)
-        expected_weight = score - prefix_score
-        assert np.isclose(result.weights[product.lookup[token]], expected_weight)
-
-
-@pytest.mark.asyncio
 async def test_batch_operations(product):
     contexts = [[b"a"], [b"a", b"b"]]
 
@@ -132,11 +148,16 @@ async def test_batch_operations(product):
 
 
 @pytest.mark.asyncio
-async def test_properties(product):
+@pytest.mark.parametrize("context", [[b"a", b"b"], [b"b", b"a"]], ids=["ab", "ba"])
+async def test_properties(product, context):
+    # Test that weights are properly combined
+    logw_next = await product.logw_next(context)
+    assert len(logw_next.weights) == len(product.vocab_eos)
+
     # Test the inherited property checks
-    await product.assert_logw_next_consistency([b"b", b"a"], verbosity=1)
-    await product.assert_autoreg_fact([b"b", b"a"], verbosity=1)
-    await product.assert_batch_consistency([[b"b", b"a"], [b"a"]], verbosity=1)
+    await product.assert_logw_next_consistency(context, verbosity=1)
+    await product.assert_autoreg_fact(context, verbosity=1)
+    await product.assert_batch_consistency([context, [b"a"]], verbosity=1)
 
 
 def test_product_repr(product):
@@ -188,28 +209,3 @@ async def test_product_laziness():
     await product.complete([])
     assert product.p1.complete_calls == 1
     assert product.p2.complete_calls == 0
-
-
-def test_product_token_type_mismatch():
-    p1 = SimplePotential([b"a", b"b", b"c"], scale=1.0)
-    p2 = SimplePotential([0, 1, 2], scale=2.0)
-    with pytest.raises(
-        ValueError,
-        match=re.escape(
-            "Potentials in product must have the same token type. "
-            + "Got Atomic(bytes) and Atomic(int)."
-            + "\nMaybe you forgot to coerce the potentials to the same token type? See `Coerce`."
-        ),
-    ):
-        Product(p1, p2)
-
-    p1 = SimplePotential([b"a", b"b", b"c"], scale=1.0)
-    p2 = SimplePotential(["a", "b", "c"], scale=2.0)
-    with pytest.raises(
-        ValueError,
-        match=re.escape(
-            "Potentials in product must have the same token type. "
-            + "Got Atomic(bytes) and Atomic(str)."
-        ),
-    ):
-        Product(p1, p2)

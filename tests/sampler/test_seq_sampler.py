@@ -1,4 +1,7 @@
+import json
+import pathlib
 import pytest
+import tempfile
 import numpy as np
 
 
@@ -106,6 +109,19 @@ async def test_smc_with_critic(ess_threshold):
         np.exp(sequences.log_ml), sum(intersection_ws), atol=0.5, rtol=0.05
     )
 
+    # `.smc()` (the TokenSampler convenience wrapper) must thread `json_path`
+    # through to `SMC.__call__` without crashing, critic and all.
+    with tempfile.NamedTemporaryFile() as tmp:
+        via_smc = await unit_sampler.smc(
+            n_particles=10,
+            ess_threshold=ess_threshold,
+            max_tokens=10,
+            critic=critic,
+            json_path=tmp.name,
+        )
+        assert len(via_smc) == 10
+        assert all(len(seq) <= 10 for seq in via_smc)
+
 
 @st.composite
 def smc_params(draw, item_sampler, max_seq_len=5, max_size=5):
@@ -153,22 +169,26 @@ async def test_smc_weights(params):
 
 
 @pytest.mark.asyncio
-async def test_max_tokens_boundary_forces_eos():
+@pytest.mark.parametrize("max_tokens, n_particles", [(2, 64), (1, 8)])
+async def test_max_tokens_boundary_forces_eos(max_tokens, n_particles):
     """ We check each particle's importance weight is correct for both
     termination modes: natural EOS (L < max_tokens) and EOS forced at the
-    boundary (L == max_tokens). """
+    boundary (L == max_tokens). At max_tokens=1, EOS is forced for every
+    particle, and the empty completion is the only sequence fitting the
+    boundary, so it also holds the entire partition. """
     seqs = ["", "a", "ab"]  # "" lets EOS fire at the start; "a" hits the boundary
-    p = WeightedSet(seqs, [1.0, 2.0, 3.0])
+    weights = [1.0, 2.0, 3.0]
+    p = WeightedSet(seqs, weights)
     unit_sampler = DirectTokenSampler(p)
     sampler = SMC(unit_sampler)
 
-    out = await sampler(n_particles=64, ess_threshold=0, max_tokens=2)
+    out = await sampler(n_particles=n_particles, ess_threshold=0, max_tokens=max_tokens)
     logeps = await p.prefix([])
 
     for seq, logw in out:
         assert seq[-1] == p.eos
         L = len(seq)
-        if L < 2:
+        if L < max_tokens:
             expected = (
                 logeps
                 + sum([(await p.logw_next(seq[:n])).sum() for n in range(L)])
@@ -183,26 +203,10 @@ async def test_max_tokens_boundary_forces_eos():
             )
         assert np.isclose(logw, expected)
 
-
-@pytest.mark.asyncio
-async def test_max_tokens_one_forces_eos():
-    """ We check that if we hit the max tokens, the importance weight
-    of the EOS forced particle is correct. """
-    seqs = ["", "a", "ab"]  # "" gives the empty completion positive mass
-    weights = [1.0, 2.0, 3.0]
-    p = WeightedSet(seqs, weights)
-    unit_sampler = DirectTokenSampler(p)
-    sampler = SMC(unit_sampler)
-
-    out = await sampler(n_particles=8, ess_threshold=0, max_tokens=1)
-
-    logeps = await p.prefix([])
-    expected = logeps + (await p.logw_next([]))[p.eos]
-    for seq, logw in out:
-        assert seq == [p.eos]
-        assert np.isclose(logw, expected)
-    # Only the empty completion fits |y| <= 1, so the partition is its weight.
-    assert np.isclose(out.log_ml, np.log(weights[0]))
+    if max_tokens == 1:
+        assert all(seq == [p.eos] for seq, _ in out)
+        # Only the empty completion fits |y| <= 1, so the partition is its weight.
+        assert np.isclose(out.log_ml, np.log(weights[0]))
 
 
 @pytest.mark.asyncio
@@ -230,5 +234,42 @@ async def test_controller_invalid_start_weight():
 
 
 def test_string_for_serialization():
-    out = string_for_serialization([b"a", b"b"])
-    assert isinstance(out, str) and "|" in out
+    assert string_for_serialization([b"a", b"b"]) == "a|b"
+    assert string_for_serialization([]) == ""
+
+
+@pytest.mark.asyncio
+async def test_record_increments_rebuild_each_context():
+    """A step records only what it appended, so a particle's context is the
+    concatenation of its increments along the ancestor chain (the walk the viewer
+    does). Resampling is on, so the fork bookkeeping is exercised."""
+    p = WeightedSet(["0", "00", "1"], [3.0, 2.0, 1.0])
+    sampler = SMC(DirectTokenSampler(p))
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
+        out = await sampler(
+            n_particles=8, ess_threshold=0.9, max_tokens=6, json_path=tmp.name
+        )
+        history = json.loads(pathlib.Path(tmp.name).read_text())
+
+    rebuilt = None  # per-row token lists, carried forward step to step
+    for step in history:
+        parts = step["particles"]
+        assert all("contents" not in rec for rec in parts), "record stores increments"
+        if rebuilt is None:
+            parent = [[] for _ in parts]
+        elif step["mode"] == "resample":
+            parent = [list(rebuilt[a]) for a in step["ancestors"]]
+        else:
+            parent = [list(row) for row in rebuilt]
+        assert len(parent) == len(parts)
+        rebuilt = [
+            row + ([] if not rec["contents_incr"] else rec["contents_incr"].split("|"))
+            for row, rec in zip(parent, parts)
+        ]
+
+    # Every rebuilt row is a prefix of that particle's final serialized context;
+    # a dropped increment, a mis-keyed ancestor, or a bad separator all break this.
+    for row, (context, _) in zip(rebuilt, out):
+        final = string_for_serialization(context).split("|") if context else []
+        assert row == final[: len(row)], (row, final)

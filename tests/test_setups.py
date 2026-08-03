@@ -196,51 +196,20 @@ async def test_with_llm_and_fsa(llm, best_fsa):
 
 
 @pytest.mark.asyncio
-async def test_with_llm_and_fsa_eager_sampler(llm, best_fsa):
+@pytest.mark.parametrize(
+    "make_sampler",
+    [
+        lambda llm, fsa: eager_token_sampler(llm, fsa),
+        lambda llm, fsa: topk_token_sampler(llm, fsa, K=10),
+        lambda llm, fsa: AWRS(llm, fsa.coerce(llm, f=b"".join)),
+    ],
+    ids=["eager", "topk", "awrs"],
+)
+async def test_with_llm_and_fsa_sampler(llm, best_fsa, make_sampler):
     mtl_llm = llm.spawn_new_eos([b"."])
     mtl_llm.set_prompt_from_str("Montreal is")
 
-    sampler = eager_token_sampler(mtl_llm, best_fsa)
-    engine = SMC(sampler)
-
-    await assert_engine_run(engine, n_particles=10, max_tokens=25, ess_threshold=0.5)
-
-    nyc_llm = mtl_llm.spawn()
-    nyc_llm.set_prompt_from_str("NYC is")
-
-    engine = SMC(sampler, critic=nyc_llm)
-
-    await assert_engine_run(engine, n_particles=10, max_tokens=25, ess_threshold=0.5)
-
-    await engine.cleanup()
-
-
-@pytest.mark.asyncio
-async def test_with_llm_and_fsa_topk_sampler(llm, best_fsa):
-    mtl_llm = llm.spawn_new_eos([b"."])
-    mtl_llm.set_prompt_from_str("Montreal is")
-
-    sampler = topk_token_sampler(mtl_llm, best_fsa, K=10)
-    engine = SMC(sampler)
-
-    await assert_engine_run(engine, n_particles=10, max_tokens=25, ess_threshold=0.5)
-
-    nyc_llm = mtl_llm.spawn()
-    nyc_llm.set_prompt_from_str("NYC is")
-
-    engine = SMC(sampler, critic=nyc_llm)
-
-    await assert_engine_run(engine, n_particles=10, max_tokens=25, ess_threshold=0.5)
-
-    await engine.cleanup()
-
-
-@pytest.mark.asyncio
-async def test_with_llm_and_fsa_awrs_sampler(llm, best_fsa):
-    mtl_llm = llm.spawn_new_eos([b"."])
-    mtl_llm.set_prompt_from_str("Montreal is")
-
-    sampler = AWRS(mtl_llm, best_fsa.coerce(mtl_llm, f=b"".join))
+    sampler = make_sampler(mtl_llm, best_fsa)
     engine = SMC(sampler)
 
     await assert_engine_run(engine, n_particles=10, max_tokens=25, ess_threshold=0.5)
@@ -261,10 +230,9 @@ def test_invalids(llm, best_fsa):
 
     sampler = direct_token_sampler(llm)
 
-    with pytest.raises(ValueError):
-        SMC(llm, critic=sampler)
+    with pytest.raises(ValueError, match="must be a Potential"):
+        SMC(sampler, critic="not a potential")
 
-    sampler = direct_token_sampler(llm)
     with pytest.raises(ValueError):
         # Fail to coerce beforehand.
         SMC(sampler, critic=best_fsa)

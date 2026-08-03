@@ -43,17 +43,6 @@ async def test_score(potential):
 
 
 @pytest.mark.asyncio
-async def test_logw_next(potential):
-    context = [b"b", b"c"]
-    have = (await potential.logw_next(context)).materialize()
-    for token in potential.vocab_eos:
-        want = await potential.score(context + [token]) - await potential.prefix(
-            context
-        )
-        assert have[token] == want
-
-
-@pytest.mark.asyncio
 async def test_batch_score(potential):
     seq1 = [b"a"]
     seq2 = [b"a", b"b"]

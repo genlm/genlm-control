@@ -9,7 +9,6 @@ The point of the counter-based picker is twofold and both are tested here:
 Local (CPU) covers everything but the CPU==CUDA identity, which skips without CUDA.
 """
 
-import numpy as np
 import pytest
 import torch
 

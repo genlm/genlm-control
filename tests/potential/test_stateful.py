@@ -18,13 +18,13 @@ from hypothesis import assume
 from genlm.control.potential.stateful import PriorityMap
 
 
-def test_make_immutable_converts_non_bytes_to_tuple():
-    assert make_immutable([257]) == (257,)
-
-
-def test_make_immutable_converts_to_bytes_if_possible():
-    assert make_immutable([]) == b""
-    assert make_immutable([0]) == b"\x00"
+@pytest.mark.parametrize(
+    "context, expected",
+    [([257], (257,)), ([], b""), ([0], b"\x00")],
+    ids=["non_byte_value", "empty", "single_byte"],
+)
+def test_make_immutable(context, expected):
+    assert make_immutable(context) == expected
 
 
 class DummyPotential(AsyncStreamingPotential):

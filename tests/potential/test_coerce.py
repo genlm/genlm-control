@@ -40,10 +40,15 @@ async def test_simple():
     want = await p.score(b"aabb" + EOS)
     assert have == want
 
-    have = await c.logw_next([b"aa", b"bb"])
-    for x in c.vocab_eos:
-        want = await p.score(b"aabb" + x) - await p.prefix(b"aabb")
-        assert have[x] == want, [have[x], want, x]
+
+@pytest.mark.asyncio
+async def test_properties():
+    p = MockPotential([b"a"[0], b"b"[0], b"c"[0]])
+    c = Coerced(p, [b"aa", b"bb", b"aab", b"aad"], f=b"".join)
+
+    await c.assert_logw_next_consistency([b"aa", b"bb"], verbosity=1)
+    await c.assert_autoreg_fact([b"aa", b"bb"], verbosity=1)
+    await c.assert_batch_consistency([[b"aa", b"bb"], [b"aa"]], verbosity=1)
 
 
 @pytest.mark.asyncio
@@ -60,14 +65,9 @@ async def test_coerced_batch_operations():
     want = np.array([await coerced.prefix(sequence) for sequence in sequences])
     np.testing.assert_array_equal(have, want)
 
-    have = await coerced.batch_score(sequences)
-    want = np.array([await coerced.score(sequence) for sequence in sequences])
-    np.testing.assert_array_equal(have, want)
-
-    haves = await coerced.batch_logw_next(sequences)  # one batched LazyWeights [N, V+1]
-    wants = [await coerced.logw_next(sequence) for sequence in sequences]
-    for i, want in enumerate(wants):
-        haves.spawn(haves.weights[i]).assert_equal(want)
+    # batch_score/batch_logw_next vs their non-batch counterparts, via the shared
+    # testing.py helper (rtol/atol=0 since MockPotential's arithmetic is exact).
+    await coerced.assert_batch_consistency(sequences, rtol=0, atol=0, verbosity=1)
 
 
 @pytest.mark.asyncio

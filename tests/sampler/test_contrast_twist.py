@@ -1,4 +1,5 @@
 """``Twist(contrast=..., temperature=...)``: the twist SMC actually holds."""
+
 import pytest
 
 from genlm.control.potential import Potential
@@ -27,33 +28,20 @@ def _controller(**kwargs):
     )
 
 
-def test_default_twist_is_the_bare_score():
-    c = _controller()
+@pytest.mark.parametrize(
+    "twist, expected",
+    [
+        (None, -1.5),  # bare critic score
+        (Twist(contrast=True), 5.5),  # log-ratio against the proposal
+        (Twist(contrast=True, temperature=0.25), 0.25 * 5.5),  # beta scales the ratio
+        (Twist(contrast=True, temperature=0.0), 0.0),  # inert
+    ],
+)
+def test_twist_value(twist, expected):
+    c = _controller(twist=twist)
     p = c.particles[0]
     p.logp = -7.0
-    assert c.twist.value(p, -1.5) == pytest.approx(-1.5)
-
-
-def test_contrast_subtracts_the_proposal_logp():
-    c = _controller(twist=Twist(contrast=True))
-    p = c.particles[0]
-    p.logp = -7.0
-    assert c.twist.value(p, -1.5) == pytest.approx(5.5)
-
-
-def test_temperature_scales_the_contrasted_value():
-    """beta multiplies the whole log-ratio, not just the critic's side."""
-    c = _controller(twist=Twist(contrast=True, temperature=0.25))
-    p = c.particles[0]
-    p.logp = -7.0
-    assert c.twist.value(p, -1.5) == pytest.approx(0.25 * 5.5)
-
-
-def test_zero_temperature_is_inert():
-    c = _controller(twist=Twist(contrast=True, temperature=0.0))
-    p = c.particles[0]
-    p.logp = -7.0
-    assert c.twist.value(p, -1.5) == 0.0
+    assert c.twist.value(p, -1.5) == pytest.approx(expected)
 
 
 def test_clip_requires_contrast():

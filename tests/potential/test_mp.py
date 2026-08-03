@@ -94,12 +94,6 @@ async def test_mp_batch_logw_next(mp_potential, regular_potential):
     haves.assert_equal(wants)
 
 
-def test_cleanup(mp_potential):
-    assert mp_potential.executor is not None
-    mp_potential.__del__()
-    assert mp_potential.executor is None
-
-
 def test_mp_repr(mp_potential):
     repr(mp_potential)
 

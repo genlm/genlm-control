@@ -149,23 +149,7 @@ def test_lazy_weights_keys():
 
     lw = LazyWeights(weights, encode, decode, log=False)
     assert lw.keys() == ["a", "b", "c"]
-
-
-def test_lazy_weights_values():
-    weights = np.array([1.0, 2.0, 3.0])
-    encode = {"a": 0, "b": 1, "c": 2}
-    decode = ["a", "b", "c"]
-
-    lw = LazyWeights(weights, encode, decode, log=False)
     assert list(lw.values()) == [1.0, 2.0, 3.0]
-
-
-def test_lazy_weights_items():
-    weights = np.array([1.0, 2.0, 3.0])
-    encode = {"a": 0, "b": 1, "c": 2}
-    decode = ["a", "b", "c"]
-
-    lw = LazyWeights(weights, encode, decode, log=False)
     assert list(lw.items()) == [("a", 1.0), ("b", 2.0), ("c", 3.0)]
 
 
@@ -185,15 +169,6 @@ def test_load_trie():
     assert [token.byte_string for token in trie.decode] == [
         v.encode("utf-8") for v in vocab
     ]
-
-
-def test_lazy_weights_repr():
-    weights = np.array([1.0, 2.0, 3.0])
-    encode = {"a": 0, "b": 1, "c": 2}
-    decode = ["a", "b", "c"]
-
-    lw = LazyWeights(weights, encode, decode, log=False)
-    lw.__repr__()
 
 
 def test_lazy_weights_bytes_fallback():

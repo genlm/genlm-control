@@ -36,7 +36,7 @@ def test_data():
             "mode": "init",
             "particles": [
                 {
-                    "contents": "<<<>>>b'h'",
+                    "contents_incr": "h",
                     "logweight": "-11.892930183943907",
                     "weight_incr": "-11.892930183943907",
                 }

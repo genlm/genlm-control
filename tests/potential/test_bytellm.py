@@ -176,36 +176,31 @@ async def test_cache_size_limit(llm, beam_params):
 
 @pytest.mark.asyncio
 async def test_cache_lru_eviction(llm, beam_params):
-    """Test that LRU eviction removes oldest entries."""
+    """Test that eviction removes the least-recently-*accessed* entry, not
+    simply the oldest-inserted one."""
     cache_size = 3
     byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
 
     try:
-        # Create cache entries for "a", "ab", "abc"
-        await byte_llm.prefix([b"a"])
-        await byte_llm.prefix([b"a", b"b"])
-        await byte_llm.prefix([b"a", b"b", b"c"])
+        # Three independent single-byte contexts: none is a prefix of another,
+        # so caching one never touches another's recency as a side effect.
+        await byte_llm.prefix([b"p"])
+        await byte_llm.prefix([b"q"])
+        await byte_llm.prefix([b"r"])
+        assert set(byte_llm._beam_cache) == {b"p", b"q", b"r"}
 
-        # All three should be cached
+        # Touch "p" again -- an exact cache hit -- making it most-recently-used.
+        await byte_llm.prefix([b"p"])
+
+        # A new entry pushes the cache over the limit: eviction must take the
+        # least-recently-used entry ("q", never re-accessed), not "p".
+        await byte_llm.prefix([b"s"])
+
         assert len(byte_llm._beam_cache) == cache_size
-
-        # Access "a" to make it recently used
-        await byte_llm.prefix([b"a"])
-
-        # Add a new entry "x" - should evict "ab" (least recently used)
-        byte_llm._beam_cache.clear()  # Reset for cleaner test
-        byte_llm._initial_beam = None
-
-        await byte_llm.prefix([b"x"])
-        await byte_llm.prefix([b"x", b"y"])
-        await byte_llm.prefix([b"x", b"y", b"z"])
-
-        # Cache should be at limit
-        assert len(byte_llm._beam_cache) == cache_size
-
-        # Adding one more should trigger eviction
-        await byte_llm.prefix([b"x", b"y", b"z", b"w"])
-        assert len(byte_llm._beam_cache) <= cache_size
+        assert b"q" not in byte_llm._beam_cache, "LRU entry should have been evicted"
+        assert b"p" in byte_llm._beam_cache, (
+            "recently-accessed entry should survive eviction"
+        )
     finally:
         await byte_llm.cleanup()
 
@@ -273,29 +268,42 @@ async def test_healing_enabled_succeeds(llm):
 
 @pytest.mark.asyncio
 async def test_healing_max_backoff(llm):
-    """Limited backoff constrains healing effectiveness."""
+    """heal_max_backoff bounds how far back healing may search for a valid
+    retokenization point (TokenHealer.try_heal only tries k in
+    [partial_len - max_backoff, partial_len]). At K=1, max_backoff=0 restricts
+    the healer to the exact token boundary the normal (pre-heal) extend step
+    already tried and failed at, so it can do no better than healing disabled
+    -- and must reach strictly less far than unlimited backoff."""
     eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
-
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
-    # Unlimited healing
-    beam_params_unlimited = BeamParams(
-        K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=None
+    no_heal_len = await measure_prefix_reach(
+        ByteLLM(llm, BeamParams(K=1, eos_byte_strings=[eos], heal=False)), context
+    )
+    no_backoff_len = await measure_prefix_reach(
+        ByteLLM(
+            llm, BeamParams(K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=0)
+        ),
+        context,
     )
     unlimited_len = await measure_prefix_reach(
-        ByteLLM(llm, beam_params_unlimited), context
+        ByteLLM(
+            llm,
+            BeamParams(K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=None),
+        ),
+        context,
     )
 
-    # Limited healing
-    beam_params_limited = BeamParams(
-        K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=2
+    assert no_backoff_len == no_heal_len, (
+        f"max_backoff=0 ({no_backoff_len}) retries only the boundary the "
+        f"pre-heal extend step already failed at, so it should behave "
+        f"exactly like heal=False ({no_heal_len})"
     )
-    limited_len = await measure_prefix_reach(ByteLLM(llm, beam_params_limited), context)
-
-    assert (
-        limited_len <= unlimited_len
-    ), f"Limited ({limited_len}) should not exceed unlimited ({unlimited_len})"
+    assert no_backoff_len < unlimited_len, (
+        f"heal_max_backoff=0 ({no_backoff_len}) should reach strictly less far "
+        f"than unlimited backoff ({unlimited_len}) -- the knob must constrain healing"
+    )
 
 
 # -------------------------
@@ -305,7 +313,8 @@ async def test_healing_max_backoff(llm):
 
 @pytest.mark.asyncio
 async def test_context_manager_basic(llm, beam_params):
-    """Test that ByteLLM works as an async context manager."""
+    """Test that ByteLLM works as an async context manager, including driving
+    a full SMC run from inside the context."""
 
     async with ByteLLM(llm, beam_params) as byte_llm:
         # Verify we can use the instance inside the context
@@ -320,6 +329,17 @@ async def test_context_manager_basic(llm, beam_params):
 
         # Verify cache was populated
         assert byte_llm._beam_cache or byte_llm._initial_beam is not None
+
+        # SMC sampling must also work while the engine is held via the context manager
+        byte_llm.set_prompt_from_str("The answer is:")
+        fsa = BoolFSA.from_regex(r" (yes|no)")
+        sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))
+        sequences = await sampler.smc(
+            n_particles=5, max_tokens=10, ess_threshold=0.5, verbosity=0
+        )
+        assert len(sequences) > 0
+        for seq in sequences.decoded_posterior.keys():
+            assert "yes" in seq or "no" in seq
 
     # After exiting context, cleanup should have been called
     # Cache should be cleared
@@ -354,29 +374,3 @@ async def test_context_manager_cleanup_on_exception(llm, beam_params):
     assert not byte_llm_ref._beam_cache
     assert byte_llm_ref._last_context is None
     assert byte_llm_ref._last_beam is None
-
-
-@pytest.mark.asyncio
-async def test_context_manager_with_smc(llm, beam_params):
-    """Test that ByteLLM context manager works correctly with SMC sampling."""
-
-    async with ByteLLM(llm, beam_params) as byte_llm:
-        byte_llm.set_prompt_from_str("The answer is:")
-
-        fsa = BoolFSA.from_regex(r" (yes|no)")
-        sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))
-
-        sequences = await sampler.smc(
-            n_particles=5,
-            max_tokens=10,
-            ess_threshold=0.5,
-            verbosity=0,
-        )
-
-        assert len(sequences) > 0
-        # Verify outputs match the constraint
-        for seq in sequences.decoded_posterior.keys():
-            assert "yes" in seq or "no" in seq
-
-    # Cleanup should have been called
-    assert not byte_llm._beam_cache
