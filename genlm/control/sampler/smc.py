@@ -12,7 +12,7 @@ from genlm.control.potential.base import burst_prefix, burst_complete
 from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
-from genlm.control.sampler.smc_record import SMCRecord, string_for_serialization
+from genlm.control.sampler.smc_record import SMCRecord
 
 
 class Population:
@@ -159,10 +159,6 @@ class Particle:
     @property
     def weight(self):
         return self._pop.logw[self._i]
-
-    def string_for_serialization(self):
-        return string_for_serialization(self._pop.contexts[self._i])
-
 
 
 class Twist:

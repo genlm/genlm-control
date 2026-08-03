@@ -52,8 +52,17 @@ SNAPSHOT = load_snapshot(SNAPSHOT_PATH)
 def _canonical_record(record_text):
     """Canonicalize a record JSON string so only structurally meaningful
     differences register: NaN compares equal, infinities normalized, finite
-    floats round-tripped through float() to erase formatting noise."""
+    floats round-tripped through float() to erase formatting noise.
+
+    A step records only the context it appended (``contents_incr``), so whole
+    contexts are rebuilt along the ancestor chain; the snapshot predates that and
+    stores ``contents`` directly, each carrying the viewer's empty highlight marker
+    that ``html/smc.html`` now adds itself. Stripping it leaves both sides on full
+    contexts, so the comparison stays byte-exact."""
     history = json.loads(record_text)
+
+    def unmark(s):
+        return s[len("<<<>>>") :] if s.startswith("<<<>>>") else s
 
     def fix(s):
         if s == "-Infinity":
@@ -68,17 +77,31 @@ def _canonical_record(record_text):
         return f
 
     out = []
+    contents = None  # previous step's whole contexts, carried down the chain
     for entry in history:
         e = {"mode": entry["mode"], "step": entry["step"]}
         if "ancestors" in entry:
             e["ancestors"] = entry["ancestors"]
+        parts = entry["particles"]
+        if contents is None:
+            parent = [""] * len(parts)
+        elif entry["mode"] == "resample":
+            parent = [contents[a] for a in entry["ancestors"]]
+        else:
+            parent = list(contents)
+        contents = [
+            unmark(p["contents"])
+            if "contents" in p
+            else (base + "|" + p["contents_incr"] if base and p["contents_incr"] else base + p["contents_incr"])
+            for base, p in zip(parent, parts)
+        ]
         e["particles"] = [
             {
-                "contents": p["contents"],
+                "contents": c,
                 "logweight": fix(p["logweight"]),
                 "weight_incr": fix(p["weight_incr"]),
             }
-            for p in entry["particles"]
+            for c, p in zip(contents, parts)
         ]
         out.append(e)
     return out
