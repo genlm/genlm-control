@@ -197,3 +197,24 @@ async def test_advance_lane_matches_consume_lane():
 
     # The point of threading the chart: dead subtrees are never consumed.
     assert fast.potential.consumed < slow.potential.consumed
+
+
+@pytest.mark.asyncio
+async def test_trie_lane_batches_sparsely():
+    """On the trie lane `logw_next` is `live_logws`, so the batch is one scattered
+    block rather than a dense row per context -- and must agree row for row."""
+    contexts = [[], [b"a"], [b"ab"]]
+    c = Coerced(
+        ChartPotential([b"abc", b"abd"], advance=True),
+        [b"a", b"ab", b"abc", b"abd", b"zz"],
+        f=b"".join,
+        prune=False,
+    )
+    assert await c.live_logws([b"a"]) is not None
+
+    batched = await c.batch_logw_next(contexts)
+    for i, context in enumerate(contexts):
+        row = await c.logw_next(context)
+        np.testing.assert_array_equal(
+            np.asarray(batched.weights[i]), np.asarray(row.weights)
+        )

@@ -38,7 +38,7 @@ class Coerced(Potential):
         WFSA/BoolFSA) AND `f` is a per-token homomorphism --
         `f(context) == concat(f([t]) for t in context)`, so each target token maps
         to a fixed symbol path -- `logw_next` takes the shared-prefix-trie fast path
-        (:meth:`_trie_logws`). Homomorphism is probed once at construction
+        (:meth:`live_logws`). Homomorphism is probed once at construction
         (`_is_homomorphic`); the usual `f=b"".join` passes. Any other `f` (which the
         contract permits) falls back to the per-extension `batch_prefix`, which makes
         no such assumption -- so a non-homomorphic `f` is correct, just not accelerated.
@@ -66,7 +66,7 @@ class Coerced(Potential):
             prune (bool): Whether to prune the coerced potential's vocabulary to only include tokens that can be mapped to the original potential's vocabulary.
                 If `False`, the coerced potential's vocabulary will include all tokens from the target vocabulary.
             homomorphic (bool | None): Whether `f` distributes over concatenation
-                (`f(xs+[t]) == f(xs)+f([t])`), which enables the `_trie_logws` fast
+                (`f(xs+[t]) == f(xs)+f([t])`), which enables the `live_logws` fast
                 path. `None` (default) probes it at construction (`b"".join` passes);
                 pass `True`/`False` to declare it explicitly and skip the probe. The
                 probe is a finite heuristic, not a proof, so a custom `f` that is only
@@ -121,7 +121,7 @@ class Coerced(Potential):
 
         super().__init__(tokens, tables=tables)
 
-        # The `_trie_logws` fast path assumes `f` distributes over token-sequence
+        # The `live_logws` fast path assumes `f` distributes over token-sequence
         # concatenation (`f(xs+[t]) == f(xs)+f([t])`); see `logw_next`. A
         # non-homomorphic `f` (which the `Coerced` contract permits) routes
         # `logw_next` to the assumption-free `batch_prefix` path instead of silently
@@ -138,7 +138,7 @@ class Coerced(Potential):
     @staticmethod
     def _is_homomorphic(f, vocab):
         """Probe whether `f` distributes over token-sequence concatenation --
-        `f(xs + [t]) == f(xs) + f([t])` -- the identity the `_trie_logws` fast
+        `f(xs + [t]) == f(xs) + f([t])` -- the identity the `live_logws` fast
         path relies on (and, by induction over the single step, all the trie
         needs). Tested over a few real vocab tokens at context lengths 0..3, so
         it catches length-/position-dependent separators that a pairwise check
@@ -172,17 +172,11 @@ class Coerced(Potential):
         return float(await self.complete(context) - await self.prefix(context))
 
     async def logw_next(self, context):
-        # Fast path: when the wrapped potential carries a memoized chart
-        # (`_consume`, i.e. a WFSA/BoolFSA), score every candidate by a shared-prefix
-        # trie walk over that cached chart -- advancing each common byte-prefix once
-        # -- instead of building and prefix-ing a coerced extension PER vocab token
-        # (the old `# slow!!` `batch_prefix` over `len(vocab)` extensions).
-        # Gated on `_f_homomorphic` (probed at construction) AND a memoized chart,
-        # since the trie keys on `f(context)+f([t])` -- only equal to the general
-        # `f(context+[t])` when `f` distributes. A non-homomorphic `f` falls
-        # through to the assumption-free `batch_prefix` path below.
-        if self._f_homomorphic and hasattr(self.potential, "_consume"):
-            return await self._trie_logws(context)
+        # The trie fast path is `live_logws`; this is the assumption-free fallback,
+        # one coerced extension prefix-ed PER vocab token.
+        live = await self.live_logws(context)
+        if live is not None:
+            return self.make_lazy_weights(self._rows_from_live([live])[0])
         Ws = self.alloc_logws()
         ctx = self.f(context)
         ctx_w = await self.potential.prefix(ctx)
@@ -191,8 +185,8 @@ class Coerced(Potential):
         Ws[:-1] = await self.potential.batch_prefix(exts) - ctx_w
         return self.make_lazy_weights(Ws)
 
-    # -- fast logw_next: a shared-prefix trie over the target vocab, scored from the
-    #    wrapped potential's MEMOIZED chart (``_consume``), no per-vocab replay --
+    # -- the trie fast path: a shared-prefix trie over the target vocab, scored from
+    #    the wrapped potential's MEMOIZED chart (``_consume``), no per-vocab replay --
 
     @staticmethod
     def build_trie(vocab, f):
@@ -200,7 +194,7 @@ class Coerced(Potential):
         dict ``{sym: child}``; tokens that END at a node are recorded under the
         sentinel key ``()`` as a list of vocab indices (a list because distinct
         target tokens can share an ``f``-image). Sharing common prefixes lets
-        :meth:`_trie_logws` score each shared prefix ONCE instead of re-prefixing
+        :meth:`live_logws` score each shared prefix ONCE instead of re-prefixing
         every token's full symbol path.
 
         A function of `(vocab, f)` alone -- build it once per vocabulary and pass it
@@ -221,24 +215,29 @@ class Coerced(Potential):
             self._sym_trie_cache = self.build_trie(self.vocab, self.f)
         return self._sym_trie_cache
 
-    async def _trie_logws(self, context):
-        """``logw_next`` via the shared-prefix trie, scoring each token from the
-        wrapped potential's MEMOIZED chart, with ``potential.prefix_logw`` at each
-        token's end node. Replaces the ``# slow!!`` ``batch_prefix`` over one coerced
-        extension PER vocab token; bit-identical.
+    async def live_logws(self, context):
+        """The vocab tokens the wrapped potential's MEMOIZED chart (``_consume``, i.e.
+        a WFSA/BoolFSA) admits, scored by one shared-prefix trie walk over that chart
+        rather than one coerced extension prefix-ed PER vocab token. ``None`` when the
+        lane is unavailable, leaving ``logw_next`` its assumption-free fallback: the
+        trie keys on ``f(context)+f([t])``, equal to ``f(context+[t])`` only when ``f``
+        distributes (`_f_homomorphic`, probed at construction).
 
         The wrapped potential may offer ``_advance(chart, sym) -> chart | None``, the
         incremental step the walk is already shaped for: the chart threads down the
         trie instead of every node re-deriving and re-consuming its full symbol path,
         and a ``None`` prunes that subtree -- sound because the potential declares the
-        branch dead, so the pruned tokens keep ``alloc_logws``'s ``-inf``. Without it
-        each node is scored from ``_consume(ctx_syms + path)``."""
+        branch dead. Without it each node is scored from ``_consume(ctx_syms + path)``.
+        """
         p = self.potential
-        Ws = self.alloc_logws()
+        if not (self._f_homomorphic and hasattr(p, "_consume")):
+            return None
         ctx_syms = tuple(self.f(context))
         ctx_chart = p._consume(ctx_syms)
         ctx_w = p.prefix_logw(ctx_chart)
-        Ws[-1] = p.complete_logw(ctx_chart) - ctx_w
+        # Read before the walk: a chart the walk mutates must not move EOS under it.
+        eos = p.complete_logw(ctx_chart) - ctx_w
+        indices, values = [], []
         advance = getattr(p, "_advance", None)
         if advance is None:
             root = ()
@@ -260,14 +259,15 @@ class Coerced(Potential):
             ends = node.get(())
             if ends is not None:
                 w = p.prefix_logw(chart_of(key)) - ctx_w
-                for idx in ends:
-                    Ws[idx] = w
+                if w != float("-inf"):  # dead tokens are the row's default
+                    indices.extend(ends)
+                    values.extend([w] * len(ends))
             for sym, child in node.items():
                 if sym != ():
                     nxt = advance(key, sym)
                     if nxt is not None:
                         stack.append((child, nxt))
-        return self.make_lazy_weights(Ws)
+        return indices, values, eos
 
     async def batch_complete(self, contexts):
         return await self.potential.batch_complete(contexts=self._batch_f(contexts))

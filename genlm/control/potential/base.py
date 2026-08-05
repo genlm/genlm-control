@@ -285,9 +285,12 @@ class Potential(ABC, PotentialOps, PotentialTests):
         `values` may be a single float when every live token shares a weight (a
         support mask). `indices` is consumed once, so a generator is fine.
 
-        Implementing this replaces the dense per-context build in `logw_next` AND
-        lets `batch_logw_next` scatter the whole population into one `alloc_rows`
-        block, so a potential that provides it must not also override `logw_next`.
+        Implementing this replaces the dense per-context build in `logw_next` AND lets
+        `batch_logw_next` scatter the whole population into one `alloc_rows` block. An
+        override of `logw_next` must consult this first (as `Coerced` does, to keep its
+        own fallback), or the scalar and batched lanes disagree. Answer `None` per
+        instance, never per context: the batched scatter is all-or-nothing, so a
+        sometimes-`None` implementation is walked a second time for the whole batch.
 
         Args:
             context (list): Sequence of tokens.

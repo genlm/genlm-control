@@ -250,7 +250,7 @@ class WFSA(Potential):
         return float(await self.complete(context) - await self.prefix(context))
 
     # -- chart-scalar accessors (a "chart" is what `_consume` returns): the
-    #    shared-prefix `Coerced._trie_logws` reads each token's prefix/complete
+    #    shared-prefix `Coerced.live_logws` reads each token's prefix/complete
     #    weight from a cached chart sync, with no `asyncio.gather` over the vocab --
 
     def prefix_logw(self, chart):
