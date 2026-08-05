@@ -47,8 +47,15 @@ class TokenSampler:
         self.token_type = self.target.token_type
 
     def supports_burst(self) -> bool:
-        """Whether this sampler can run inside the engine burst (implements
-        :meth:`burst_draw_batch`). Default ``False`` (stays on ``StepLoop``)."""
+        """Whether this sampler can run inside the engine burst -- every LM leaf on its
+        draw path is an injected view, so it never forwards. Default ``False`` (stays on
+        ``StepLoop``)."""
+        return False
+
+    def burst_draws_batched(self) -> bool:
+        """Whether the sampler draws the whole population in one op (:meth:`burst_draw_batch`).
+        Otherwise the burst runs this sampler's own ``transition`` per row as a parked task,
+        resuming it each decode step."""
         return False
 
     def burst_draw_sampler(self):
@@ -69,29 +76,13 @@ class TokenSampler:
         """Whether ``burst_draw_batch`` routes each row to its own group's sampler
         rather than group 0's. Routing lifts the batched burst's constraint-
         homogeneity requirement (``_batch_blocker`` skips that check). Default
-        ``False``."""
+        ``False``; the parked-row lane routes by construction."""
         return False
 
-    @staticmethod
-    def _row_injection(warm_batch, i):
-        """Slice batched warm ``{view: [N, V+1]}`` into particle ``i``'s per-row
-        injection ``{view: [V+1]}`` for the sequential draw."""
-        return {view: view.make_lazy_weights(W.weights[i]) for view, W in warm_batch.items()}
-
-    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
-        """Sequential engine-burst draw, one BurstDraw per particle (token grain): slice
-        each row's warm logits and run the real per-step ``transition``. `DirectTokenSampler`
-        overrides with a vectorized draw, the unit sampler for subunit accumulation."""
-
-        async def one(i, context, handle):
-            injection = self._row_injection(warm_batch, i)
-            with burst_logw_next(injection), draw_key(handle, draw_ordinal(context)):
-                to_append, logw, logp = await self.transition(context)
-            return BurstDraw(token=to_append[-1], step=(to_append, logw, logp))
-
-        return await asyncio.gather(
-            *(one(i, c, h) for i, (c, h) in enumerate(zip(contexts, handles)))
-        )
+    async def round_start(self, contexts):
+        """Population hook before a round's draws: this sampler's group's live contexts.
+        One round is one unit per row at unit grain, so this is where per-unit population
+        bookkeeping goes (the engine is idle here, so forwards are legal). Default no-op."""
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
@@ -197,6 +188,10 @@ class DirectTokenSampler(TokenSampler):
 
     def supports_burst(self) -> bool:
         # Target (and proposal) logw_next are reproduced as injected views.
+        return True
+
+    def burst_draws_batched(self) -> bool:
+        # One logsumexp + one keyed Gumbel over the whole ``[N, V+1]`` population.
         return True
 
     async def sample(self, context, draw=None):

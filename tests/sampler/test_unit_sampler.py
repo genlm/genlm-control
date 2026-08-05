@@ -634,3 +634,39 @@ async def test_weight_is_negative_infinity_on_max_subunits():
     Z = 0.4 + 0.4 + 0.2
     expected_logp = 3 * np.log(0.4 / Z)
     assert np.isclose(logp, expected_logp, atol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_round_start_receives_live_population_once_per_round():
+    """`round_start` fires once per SMC round with the group's live contexts, before
+    that round's draws -- unit start for a unit-grain sampler."""
+    vocab = [b"a", b" "]
+    logws = np.log([0.45, 0.45, 0.1])
+    subunit_sampler = DirectTokenSampler(MockPotential(vocab, logws))
+
+    class Recording(MultiTokenUnitSampler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.rounds = []
+
+        async def round_start(self, contexts):
+            self.rounds.append([list(c) for c in contexts])
+
+    unit_sampler = Recording(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=TokenSetBoundary({b" ", EOS}),
+        max_subunits_per_unit=4,
+    )
+    particles = await SMC(unit_sampler)(
+        n_particles=3, ess_threshold=0.0, max_tokens=3, accelerate="off"
+    )
+
+    assert unit_sampler.rounds, "round_start never fired"
+    # First round: every particle live, nothing drawn yet.
+    assert unit_sampler.rounds[0] == [[], [], []]
+    # Each round sees only live rows, and never more than the population.
+    assert all(1 <= len(r) <= 3 for r in unit_sampler.rounds)
+    # Fires before the round's draws: round k's contexts are shorter than round k+1's.
+    for earlier, later in zip(unit_sampler.rounds, unit_sampler.rounds[1:]):
+        assert min(len(c) for c in later) > min(len(c) for c in earlier)
+    assert len(particles) == 3

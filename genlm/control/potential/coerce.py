@@ -223,28 +223,50 @@ class Coerced(Potential):
 
     async def _trie_logws(self, context):
         """``logw_next`` via the shared-prefix trie, scoring each token from the
-        wrapped potential's MEMOIZED chart. Each node's chart is read from
-        ``potential._consume(ctx_syms + path)`` (the cache makes it incremental and
-        shares work across tokens with a common prefix), and each token's prefix
-        weight is ``potential.prefix_logw`` at its end node. Replaces the ``# slow!!``
-        ``batch_prefix`` over one coerced extension PER vocab token; bit-identical."""
+        wrapped potential's MEMOIZED chart, with ``potential.prefix_logw`` at each
+        token's end node. Replaces the ``# slow!!`` ``batch_prefix`` over one coerced
+        extension PER vocab token; bit-identical.
+
+        The wrapped potential may offer ``_advance(chart, sym) -> chart | None``, the
+        incremental step the walk is already shaped for: the chart threads down the
+        trie instead of every node re-deriving and re-consuming its full symbol path,
+        and a ``None`` prunes that subtree -- sound because the potential declares the
+        branch dead, so the pruned tokens keep ``alloc_logws``'s ``-inf``. Without it
+        each node is scored from ``_consume(ctx_syms + path)``."""
         p = self.potential
         Ws = self.alloc_logws()
         ctx_syms = tuple(self.f(context))
         ctx_chart = p._consume(ctx_syms)
         ctx_w = p.prefix_logw(ctx_chart)
         Ws[-1] = p.complete_logw(ctx_chart) - ctx_w
-        stack = [(self._sym_trie, ())]
+        advance = getattr(p, "_advance", None)
+        if advance is None:
+            root = ()
+
+            def advance(path, sym):
+                return path + (sym,)
+
+            def chart_of(path):
+                return p._consume(ctx_syms + path)
+        else:
+            root = ctx_chart
+
+            def chart_of(chart):
+                return chart
+
+        stack = [(self._sym_trie, root)]
         while stack:
-            node, path = stack.pop()
+            node, key = stack.pop()
             ends = node.get(())
             if ends is not None:
-                w = p.prefix_logw(p._consume(ctx_syms + path)) - ctx_w
+                w = p.prefix_logw(chart_of(key)) - ctx_w
                 for idx in ends:
                     Ws[idx] = w
             for sym, child in node.items():
                 if sym != ():
-                    stack.append((child, path + (sym,)))
+                    nxt = advance(key, sym)
+                    if nxt is not None:
+                        stack.append((child, nxt))
         return self.make_lazy_weights(Ws)
 
     async def batch_complete(self, contexts):

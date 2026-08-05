@@ -142,3 +142,58 @@ def test_coerced_with_token_vocab():
 
     assert len(c.vocab) == 3
     assert set(c.vocab) == {b"aa", b"bb", b"aab"}
+
+
+class ChartPotential(Potential):
+    """Byte potential on the `_consume` chart lane: the chart is the walk's landing
+    (position, alive), and the support is the set of prefixes of `words`."""
+
+    def __init__(self, words, advance=False):
+        super().__init__(sorted({b for w in words for b in w}))
+        self.words = list(words)
+        self.consumed = 0
+        if not advance:
+            self._advance = None  # coerce reads it with a default; None = no lane
+
+    def _live(self, syms):
+        return any(bytes(w).startswith(bytes(syms)) for w in self.words)
+
+    def _consume(self, syms):
+        self.consumed += 1
+        return (len(syms), self._live(syms), tuple(syms))
+
+    def _advance(self, chart, sym):
+        n, alive, syms = chart
+        nxt = syms + (sym,)
+        return (n + 1, True, nxt) if self._live(nxt) else None
+
+    def prefix_logw(self, chart):
+        return -float(chart[0]) if chart[1] else float("-inf")
+
+    def complete_logw(self, chart):
+        return -float(chart[0]) if bytes(chart[2]) in map(bytes, self.words) else float("-inf")
+
+    async def prefix(self, context):
+        return self.prefix_logw(self._consume(tuple(context)))
+
+    async def complete(self, context):
+        return self.complete_logw(self._consume(tuple(context)))
+
+
+@pytest.mark.asyncio
+async def test_advance_lane_matches_consume_lane():
+    """`_advance` threads the chart down the vocab trie and prunes dead subtrees;
+    it must produce exactly the rows the path-rebuilding walk does."""
+    words = [b"abc", b"abd", b"axy"]
+    vocab = [b"a", b"ab", b"abc", b"abd", b"ax", b"axy", b"b", b"zz", b"abz"]
+    slow = Coerced(ChartPotential(words), vocab, f=b"".join, prune=False)
+    fast = Coerced(ChartPotential(words, advance=True), vocab, f=b"".join, prune=False)
+    assert slow.potential._advance is None
+
+    for context in ([], [b"a"], [b"ab"], [b"ax"]):
+        want = await slow.logw_next(context)
+        got = await fast.logw_next(context)
+        np.testing.assert_array_equal(np.asarray(want.weights), np.asarray(got.weights))
+
+    # The point of threading the chart: dead subtrees are never consumed.
+    assert fast.potential.consumed < slow.potential.consumed

@@ -169,7 +169,8 @@ class Twist:
     Args:
         contrast (bool): twist with ``critic.score(context) - particle.logp`` (the
             log-ratio against the proposal) instead of ``critic.score(context)``.
-            Terminal scores are unaffected, so the twist still cancels at termination.
+            Terminal scores are unaffected — what lands at termination is the
+            critic's own ``complete`` (a zeroed one cancels the twist entirely).
         temperature (float): scales the twist; 0 disables twisting entirely.
         clip (tuple, optional): ``(neg, pos)`` per-token caps for the critic-LM
             contrast: the twist becomes ``temperature * sum_t clip(v_t - t_t, -neg,
@@ -289,6 +290,11 @@ class Controller:
             find_engine_lm(c) if (self.twist_with_critic and c is not None) else None
             for c in critics
         ]
+        # Per-group draw-path engine leaf (proposal if set, else target): its
+        # accumulated logp IS ``p.logp``, so its ``complete`` can be served from the
+        # bank — a terminal view scoring against the draw distribution (e.g. a
+        # tempered terminal's student side) then never forwards mid-burst.
+        self.proposal_leaves = [self._draw_leaf(s) for s in samplers]
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
 
@@ -355,17 +361,34 @@ class Controller:
     def _critic_of(self, p):
         return self.critics[self.particles.group[p._i]]
 
+    @staticmethod
+    def _draw_leaf(sampler):
+        """The engine LM leaf of ``sampler``'s draw distribution (proposal when set,
+        else target), whose accumulated logp is banked as ``p.logp``."""
+        draw = (sampler.burst_draw_sampler()
+                if hasattr(sampler, "burst_draw_sampler") else sampler)
+        pot = getattr(draw, "proposal", None)
+        if pot is None:
+            pot = getattr(draw, "target", None)
+        return find_engine_lm(pot) if pot is not None else None
+
     @contextlib.contextmanager
     def serve_row(self, p, dlogp=0.0):
-        """Serve one row's banked twist sums as its critic LM leaf's ``prefix``/
-        ``complete``. Keyed by the row's OWN group: groups carry their own critic LM,
-        so another group's leaf would miss the override and forward."""
-        leaf = self.twist_leaves[self.particles.group[p._i]]
+        """Serve one row's banked sums as its engine leaves' ``prefix``/``complete``:
+        the critic LM leaf its twist sums, the draw leaf its accumulated logp
+        (``dlogp`` covers this step's increment, not yet applied to ``p.logp``).
+        Keyed by the row's OWN group: groups carry their own leaves, so another
+        group's would miss the override and forward."""
+        g = self.particles.group[p._i]
+        leaf = self.twist_leaves[g]
         if leaf is None:
             yield
             return
         prefix = {leaf: [self.twist.served_row(p, dlogp)]}
         complete = {leaf: [self.twist.served_complete(p)]}
+        prop = self.proposal_leaves[g]
+        if prop is not None and prop is not leaf:
+            complete[prop] = [float(p.logp) + dlogp]
         with burst_prefix(prefix), burst_complete(complete):
             yield
 
@@ -378,6 +401,22 @@ class Controller:
             yield
             return
         with burst_prefix({leaf: self.twist.served_prefix(ps)}):
+            yield
+
+    @contextlib.contextmanager
+    def serve_complete(self, g, ps):
+        """Serve terminating rows ``ps`` their banked sums as ``batch_complete``:
+        group ``g``'s critic LM leaf its twist sums, the draw leaf its accumulated
+        logp (fully applied by the boundary settle)."""
+        leaf = self.twist_leaves[g]
+        if leaf is None:
+            yield
+            return
+        over = {leaf: [self.twist.served_complete(p) for p in ps]}
+        prop = self.proposal_leaves[g]
+        if prop is not None and prop is not leaf:
+            over[prop] = [float(p.logp) for p in ps]
+        with burst_complete(over):
             yield
 
     async def bank_row(self, p, to_append, logw, logp):
@@ -529,11 +568,25 @@ class Controller:
         self.twist_banked = driver.banks_twist
         await self.start()
         while any(not p.done for p in self.particles):
+            await self._round_start()
             await driver.round()
             await self.apply_critic_boundary()
             if driver.sync_boundary:
                 self.round_boundary()
         return self.particles
+
+    async def _round_start(self):
+        """Hand each group's sampler its live contexts before the round's draws. One
+        driver round is one unit per row at unit grain, so this is unit start; a
+        free-running (token-grain) burst rounds once per burst, so it fires there
+        instead. Runs with the engine idle -- a forward here is legal."""
+        by_group = {}
+        for p in self.particles:
+            if not p.done:
+                by_group.setdefault(self.particles.group[p._i], []).append(p.context)
+        await asyncio.gather(
+            *[self.samplers[g].round_start(ctxs) for g, ctxs in by_group.items()]
+        )
 
     async def apply_critic_boundary(self):
         """The deferred critic math, at the round boundary (engine drained; forwards are
@@ -555,13 +608,14 @@ class Controller:
         async def _settle(g, ps):
             critic = self.critics[g]
             contexts = [p.context for p in ps]
-            # batch_score routes non-EOS contexts to batch_prefix in list order;
-            # serve the banked sums for exactly that subset.
-            with self.serve_prefix(
-                g,
-                [p for p, ctx in zip(ps, contexts)
-                 if not (ctx and ctx[-1] == critic.eos)],
-            ):
+            # batch_score routes non-EOS contexts to batch_prefix and EOS contexts
+            # to batch_complete, each in list order; serve the banked sums for
+            # exactly those subsets.
+            live = [p for p, ctx in zip(ps, contexts)
+                    if not (ctx and ctx[-1] == critic.eos)]
+            done = [p for p, ctx in zip(ps, contexts)
+                    if ctx and ctx[-1] == critic.eos]
+            with self.serve_prefix(g, live), self.serve_complete(g, done):
                 return ps, await critic.batch_score(contexts)
 
         for ps, amts in await asyncio.gather(

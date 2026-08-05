@@ -448,6 +448,22 @@ def draw_ordinal(context):
     return n
 
 
+def flatten_units(context):
+    """Recursively flatten a (possibly unit-nested) context to a flat token list.
+    Matches the engine-prompt flatten in ``_Burst.context_ids``.
+
+    Usage:
+        potential.coerce(LLM, f=lambda ctx: b"".join(flatten_units(ctx)))
+    """
+    flattened = []
+    for item in context:
+        if isinstance(item, list):
+            flattened.extend(flatten_units(item))
+        else:
+            flattened.append(item)
+    return flattened
+
+
 @contextlib.contextmanager
 def draw_key(slot, base=0):
     """Scope the counter-based picker's key. Scalar ``slot``/``base`` (one particle): ``slot``

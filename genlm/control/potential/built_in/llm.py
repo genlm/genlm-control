@@ -7,6 +7,7 @@ from typing import NamedTuple
 from genlm.control.constant import EOS
 from genlm.control.potential.base import (
     Potential,
+    burst_serve,
     _burst_logw_next_overrides,
     _burst_prefix_overrides,
     _burst_complete_overrides,
@@ -698,6 +699,7 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
+        await burst_serve(context)
         served = self._served(_burst_logw_next_overrides)
         if served is not None:
             return served  # burst: the engine's warm logits, no forward

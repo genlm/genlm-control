@@ -63,6 +63,34 @@ def burst_complete(overrides):
         _burst_complete_overrides.reset(token)
 
 
+# A parked row's channel to the burst, bound for the whole of one row's ``transition``.
+# Set only by the burst's parked-row lane; ``None`` everywhere else.
+_burst_row: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_row", default=None
+)
+
+
+@contextlib.contextmanager
+def burst_row(channel):
+    """Bind ``channel`` for one row's ``transition`` task (the burst's parked-row lane)."""
+    token = _burst_row.set(channel)
+    try:
+        yield
+    finally:
+        _burst_row.reset(token)
+
+
+async def burst_serve(context):
+    """Park until the burst delivers this row's warm for ``context``, then inject it.
+
+    A no-op outside the parked-row lane. Every read at one context length is one decode
+    step (target and proposal share the step's warm); a read past a draw parks, with a
+    context ending in the token just drawn."""
+    channel = _burst_row.get()
+    if channel is not None:
+        _burst_logw_next_overrides.set(await channel.next_warm(context))
+
+
 class VocabTables(NamedTuple):
     """What a vocabulary determines, built once and shareable by every potential over
     it (see `Potential.build_tables`)."""
