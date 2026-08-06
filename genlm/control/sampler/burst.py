@@ -161,7 +161,7 @@ class _Burst:
         override and forward inside the engine's step."""
         return {
             rv: rv.make_lazy_weights(warm_batch[gv].weights[i])
-            for rv, gv in zip(_views_of(self.d.controller.sampler_of(p)), self.d.views)
+            for rv, gv in zip(self.d.controller.sampler_of(p).burst_views(), self.d.views)
         }
 
     def _spawn_row(self, p, row):
@@ -419,17 +419,6 @@ class _Burst:
 
 
 
-def _views_of(sampler):
-    """LM views the burst injects for ``sampler``: draw sampler's target leaf + its proposal's
-    (if any). A view is ``None`` if its potential has no single engine-burst leaf."""
-    s = sampler.burst_draw_sampler()
-    proposal = s.proposal
-    views = [find_engine_lm(s.target)]
-    if proposal is not None:
-        views.append(find_engine_lm(proposal))
-    return views
-
-
 def critic_deferred(sampler, controller):
     """Whether the critic settles at round boundaries (engine drained) rather than
     per step. False only for free-running in-burst resampling with
@@ -462,7 +451,7 @@ def burst_blocker(controller):
     # (token-grain) critic is served per step from banked twist sums, which covers
     # exactly its own engine leaf.
     for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
-        injected = set(_views_of(samp))
+        injected = set(samp.burst_views())
         draw = samp.burst_draw_sampler()
         for pot in (draw.target, draw.proposal):
             if pot is None:
@@ -495,19 +484,20 @@ def burst_blocker(controller):
 
 def _batch_blocker(samplers):
     """Why a batched burst's groups can't share one forward, or ``None`` if
-    burst-homogeneous. Groups must share sampler kind, K views, and per-view engine/
-    temperature/LoRA. They may differ in prompt, critic, and constraint -- the parked
-    lane draws each row through its OWN group's sampler."""
+    burst-homogeneous. Groups must share grain (the driver reads it off group 0 for the
+    whole population), K views, and per-view engine/temperature/LoRA. They may differ in
+    sampler kind, prompt, critic, and constraint -- the parked lane draws each row
+    through its OWN group's sampler."""
     s0 = samplers[0]
-    views0 = _views_of(s0)
+    views0 = s0.burst_views()
 
     def blocked(detail):
         return BurstBlock(BlockReason.BATCH_HETEROGENEOUS, f"group {g} {detail}")
 
     for g, s in enumerate(samplers[1:], start=1):
-        if type(s) is not type(s0):
-            return blocked(f"sampler is {type(s).__name__}, not {type(s0).__name__}")
-        views = _views_of(s)
+        if s.burst_free_running() != s0.burst_free_running():
+            return blocked("draws at a different grain from group 0")
+        views = s.burst_views()
         if len(views) != len(views0):
             return blocked(f"has {len(views)} views, not {len(views0)}")
         for vi, (v, v0) in enumerate(zip(views, views0)):
@@ -545,7 +535,7 @@ class BurstLoop:
         assert all(
             (lf is None) == (self.twist_view is None) for lf in controller.twist_leaves
         ), "batched groups must agree on having an engine-LM critic leaf"
-        self.views = _views_of(self.sampler) + (
+        self.views = self.sampler.burst_views() + (
             [self.twist_view] if self.twist_view is not None else []
         )
         # The engine LM the burst drives (run_burst + eos id); views share its model.
@@ -556,7 +546,7 @@ class BurstLoop:
         # Per-(group, view) prompt prefix, snapshotted on the main thread (``prompt_ids`` is a
         # ContextVar invisible on the ``run_burst`` worker thread).
         self.view_prefixes = [
-            [list(v.prompt_ids) for v in _views_of(s)]
+            [list(v.prompt_ids) for v in s.burst_views()]
             + ([list(lf.prompt_ids)] if lf is not None else [])
             for s, lf in zip(controller.samplers, controller.twist_leaves)
         ]
@@ -579,7 +569,9 @@ class BurstLoop:
         self.n_bursts += 1
         live = [p for p in self.controller.particles if not p.done]
         b = _Burst(self, live)
-        max_steps = self.sampler.burst_max_steps(live)
+        # Every group's budget, not group 0's: at unit grain the groups may size
+        # their units differently, and the engine cap must not cut the largest short.
+        max_steps = max(s.burst_max_steps(live) for s in self.controller.samplers)
         await loop.run_in_executor(
             None,
             lambda: self.llm.model.run_burst(control=b, max_steps=max_steps),

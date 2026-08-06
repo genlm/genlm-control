@@ -5,6 +5,7 @@ from arsenal import colors
 from arsenal.maths import log1mexp
 import warnings
 
+from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import draw_from, awrs_gumbel_keys, get_draw_seed
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
@@ -41,6 +42,17 @@ class TokenSampler:
         """The sampler whose ``target``/``proposal`` are the injected views: ``self``
         at token grain; a unit sampler delegates to its subunit."""
         return self
+
+    def burst_views(self):
+        """The LM views a burst injects for this sampler: the draw sampler's target
+        leaf, then its proposal's when it has one. The LAST is the draw distribution's
+        own leaf, whose accumulated logp is the particle's ``logp``. A slot is ``None``
+        when that potential has no single engine-burst leaf."""
+        s = self.burst_draw_sampler()
+        views = [find_engine_lm(s.target)]
+        if s.proposal is not None:
+            views.append(find_engine_lm(s.proposal))
+        return views
 
     def burst_free_running(self) -> bool:
         """``True`` = free-running (token grain): one SMC step per decode step, ESS

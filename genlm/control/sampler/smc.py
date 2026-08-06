@@ -295,11 +295,11 @@ class Controller:
             find_engine_lm(c) if (self.twist_with_critic and c is not None) else None
             for c in critics
         ]
-        # Per-group draw-path engine leaf (proposal if set, else target): its
-        # accumulated logp IS ``p.logp``, so its ``complete`` can be served from the
-        # bank — a terminal view scoring against the draw distribution (e.g. a
+        # Per-group draw-path engine leaf -- the last view a burst injects for that
+        # group. Its accumulated logp IS ``p.logp``, so its ``complete`` can be served
+        # from the bank: a terminal view scoring against the draw distribution (e.g. a
         # tempered terminal's student side) then never forwards mid-burst.
-        self.proposal_leaves = [self._draw_leaf(s) for s in samplers]
+        self.proposal_leaves = [s.burst_views()[-1] for s in samplers]
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
 
@@ -367,13 +367,6 @@ class Controller:
 
     def _critic_of(self, p):
         return self.critics[p.group]
-
-    @staticmethod
-    def _draw_leaf(sampler):
-        """The engine LM leaf of ``sampler``'s draw distribution (proposal when set,
-        else target), whose accumulated logp is banked as ``p.logp``."""
-        draw = sampler.burst_draw_sampler()
-        return find_engine_lm(draw.proposal if draw.proposal is not None else draw.target)
 
     @contextlib.contextmanager
     def serve_row(self, p, dlogp=0.0):
