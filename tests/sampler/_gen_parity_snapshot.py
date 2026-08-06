@@ -78,7 +78,7 @@ class _RefSequenceModel(Model):
             self.score(await self.unit_sampler.logw_eos(self.token_ctx))
             self.token_ctx.append(EOS)
         elif isinstance(self.unit_sampler, MultiTokenUnitSampler):
-            from genlm.control.sampler.unit import flatten_units
+            from genlm.control.util import flatten_units
 
             flat_context = flatten_units(self.token_ctx)
             unit, logw, logp = await self.unit_sampler.sample(

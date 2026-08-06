@@ -11,8 +11,10 @@ from genlm.backend.tokenization import Token
 
 
 def logsumexp(x):
-    """Numpy log-sum-exp over a 1-D array; returns ``-inf`` (not ``nan``) on all-(-inf)
-    input. CPU path; on-device weights use ``torch.logsumexp``."""
+    """Log-sum-exp over a 1-D weight array, in the array's own backend. Returns
+    ``-inf`` (not ``nan``) on all-(-inf) input."""
+    if torch.is_tensor(x):
+        return torch.logsumexp(x, 0)
     x = np.asarray(x)
     if np.all(x == -np.inf):
         return -np.inf
@@ -34,11 +36,6 @@ def stack_weights(arrays):
 def _xp(w):
     """The array module (``torch`` or ``np``) backing ``w`` -- for backend-agnostic ops."""
     return torch if torch.is_tensor(w) else np
-
-
-def _logsumexp(w):
-    """Backend-dispatched log-sum-exp over a 1-D weight array."""
-    return torch.logsumexp(w, 0) if torch.is_tensor(w) else logsumexp(w)
 
 
 class LazyWeights:
@@ -144,7 +141,7 @@ class LazyWeights:
             (LazyWeights): A new LazyWeights instance with normalized weights.
         """
         if self.is_log:
-            return self.spawn(self.weights - _logsumexp(self.weights))
+            return self.spawn(self.weights - logsumexp(self.weights))
         else:
             return self.spawn(self.weights / self.weights.sum())
 
@@ -185,7 +182,7 @@ class LazyWeights:
             (float): The sum of the weights, either in log space or regular space.
         """
         if self.is_log:
-            return float(_logsumexp(self.weights))
+            return float(logsumexp(self.weights))
         else:
             return float(self.weights.sum())
 
@@ -493,6 +490,42 @@ def set_draw_method(method):
     callable. Process-wide."""
     global _picker
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
+
+
+# A parked row's channel to the burst, bound for the whole of one row's ``transition``.
+# Set only by the burst's parked-row lane; ``None`` everywhere else.
+_burst_row: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_row", default=None
+)
+
+
+@contextlib.contextmanager
+def burst_row(channel):
+    """Bind ``channel`` for one row's ``transition`` task (the burst's parked-row lane)."""
+    token = _burst_row.set(channel)
+    try:
+        yield
+    finally:
+        _burst_row.reset(token)
+
+
+async def draw_from(lazyweights, draw=None):
+    """Normalize, draw, and read back the drawn token's log-prob: ``(token, logZ, logp)``,
+    where ``logZ`` is the row's normalizer. THE draw seam -- every sampler that draws from a
+    distribution wants exactly these three steps, so inside a burst they happen once for the
+    whole parked population rather than once per row (each is ~30x cheaper batched). A
+    sampler needing something else (AWRS's rejection over unnormalized weights) does not call
+    this. A caller-supplied ``draw`` is a user picker, so it stays per row."""
+    channel = _burst_row.get()
+    if channel is not None and draw is None:
+        slot, ctr = _DRAW_KEY.get()
+        step = ctr[0]
+        ctr[0] = step + 1
+        return await channel.draw(lazyweights, slot, step)
+    logZ = lazyweights.sum()
+    logps = lazyweights.spawn(lazyweights.weights - logZ)
+    token = select(logps) if draw is None else draw(logps.exp().materialize())
+    return token, logZ, logps[token]
 
 
 def select(lazyweights):

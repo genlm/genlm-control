@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from typing import NamedTuple
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import LazyWeights, stack_weights
+from genlm.control.util import LazyWeights, stack_weights, _burst_row
 from genlm.control.typing import TokenType, infer_vocabulary_type
 from genlm.control.potential.operators import PotentialOps
 from genlm.control.potential.testing import PotentialTests
@@ -61,23 +61,6 @@ def burst_complete(overrides):
         yield
     finally:
         _burst_complete_overrides.reset(token)
-
-
-# A parked row's channel to the burst, bound for the whole of one row's ``transition``.
-# Set only by the burst's parked-row lane; ``None`` everywhere else.
-_burst_row: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_row", default=None
-)
-
-
-@contextlib.contextmanager
-def burst_row(channel):
-    """Bind ``channel`` for one row's ``transition`` task (the burst's parked-row lane)."""
-    token = _burst_row.set(channel)
-    try:
-        yield
-    finally:
-        _burst_row.reset(token)
 
 
 async def burst_serve(context):

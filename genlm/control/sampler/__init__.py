@@ -10,8 +10,8 @@ from .unit import (
     TokenSetBoundary,
     FixedLengthBoundary,
     CFGBoundary,
-    flatten_units,
 )
+from genlm.control.util import flatten_units
 from genlm.control.potential import Potential
 
 

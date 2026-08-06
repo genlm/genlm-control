@@ -51,12 +51,6 @@ def lm_leaves(potential):
     return [lf for lf in _walk_leaves(potential) if isinstance(lf, PromptedLLM)]
 
 
-def constraint_leaf_ids(potential):
-    """``id``s of the non-(burst-LM) leaves -- the constraint identity a batched burst's
-    groups must share (counts a non-burst ``PromptedLLM``)."""
-    return frozenset(id(lf) for lf in _walk_leaves(potential) if not _is_burst_lm(lf))
-
-
 def _compat_eos_tokens(eos_byte_strings, kwargs):
     """Handle deprecated ``eos_tokens`` kwarg, forwarding to ``eos_byte_strings``."""
     old = kwargs.pop("eos_tokens", None)

@@ -3,7 +3,7 @@ from typing import Any, Iterable, Optional
 
 from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.util import flatten_units as flatten_units
+from genlm.control.util import flatten_units
 from lark import Lark
 from lark.exceptions import LarkError
 
@@ -70,10 +70,6 @@ class MultiTokenUnitSampler(TokenSampler):
         self.subunit_sampler = subunit_sampler
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
-
-    def supports_burst(self) -> bool:
-        # Rides the fast lane iff its subunit sampler can (the subunits ARE the burst draws).
-        return self.subunit_sampler.supports_burst()
 
     def burst_draw_sampler(self):
         # The subunit does the per-step draw, so recurse to its draw sampler.

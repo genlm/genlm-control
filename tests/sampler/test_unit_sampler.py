@@ -9,7 +9,7 @@ from genlm.control.sampler import (
     FixedLengthBoundary,
     BoundaryPredicate,
 )
-from genlm.control.sampler.unit import flatten_units
+from genlm.control.util import flatten_units
 from genlm.control.sampler import CFGBoundary
 from genlm.control.sampler.sequence import SMC
 from genlm.control.constant import EOS

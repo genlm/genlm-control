@@ -5,18 +5,9 @@ from arsenal import colors
 from arsenal.maths import log1mexp
 import warnings
 
-from genlm.control.util import (
-    select,
-    picker_indices,
-    draw_key,
-    draw_ordinal,
-    awrs_gumbel_keys,
-    get_draw_seed,
-)
+from genlm.control.util import draw_from, awrs_gumbel_keys, get_draw_seed
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
-from genlm.control.sampler.burst import BurstDraw
-from genlm.control.potential.base import burst_logw_next
 
 
 class TokenSampler:
@@ -46,18 +37,6 @@ class TokenSampler:
         self.target = target
         self.token_type = self.target.token_type
 
-    def supports_burst(self) -> bool:
-        """Whether this sampler can run inside the engine burst -- every LM leaf on its
-        draw path is an injected view, so it never forwards. Default ``False`` (stays on
-        ``StepLoop``)."""
-        return False
-
-    def burst_draws_batched(self) -> bool:
-        """Whether the sampler draws the whole population in one op (:meth:`burst_draw_batch`).
-        Otherwise the burst runs this sampler's own ``transition`` per row as a parked task,
-        resuming it each decode step."""
-        return False
-
     def burst_draw_sampler(self):
         """The sampler whose ``target``/``proposal`` are the injected views: ``self``
         at token grain; a unit sampler delegates to its subunit."""
@@ -71,13 +50,6 @@ class TokenSampler:
     def burst_max_steps(self, live) -> int:
         """Engine decode-step budget for one burst (token grain). The unit sampler overrides."""
         return max(p.max_tokens_left for p in live) + 1
-
-    def burst_routes_groups(self) -> bool:
-        """Whether ``burst_draw_batch`` routes each row to its own group's sampler
-        rather than group 0's. Routing lifts the batched burst's constraint-
-        homogeneity requirement (``_batch_blocker`` skips that check). Default
-        ``False``; the parked-row lane routes by construction."""
-        return False
 
     async def round_start(self, contexts):
         """Population hook before a round's draws: this sampler's group's live contexts.
@@ -186,14 +158,6 @@ class DirectTokenSampler(TokenSampler):
             _validate_proposal_vocab(potential, proposal)
         self.proposal = proposal
 
-    def supports_burst(self) -> bool:
-        # Target (and proposal) logw_next are reproduced as injected views.
-        return True
-
-    def burst_draws_batched(self) -> bool:
-        # One logsumexp + one keyed Gumbel over the whole ``[N, V+1]`` population.
-        return True
-
     async def sample(self, context, draw=None):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method.
 
@@ -215,57 +179,14 @@ class DirectTokenSampler(TokenSampler):
         """
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
-            logZ = logws.sum()  # normalizer == the weight
-            logps = logws.spawn(logws.weights - logZ)  # logws.normalize()
-            token = select(logps) if draw is None else draw(logps.exp().materialize())
-            return token, logZ, logps[token]
+            return await draw_from(logws, draw)  # the normalizer IS the weight
 
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context), self.potential.logw_next(context)
         )
-        proposal_logZ = proposal_logws.sum()
-        proposal_logps = proposal_logws.spawn(proposal_logws.weights - proposal_logZ)
-        if draw is None:
-            token = select(proposal_logps)
-        else:
-            token = draw(proposal_logps.exp().materialize())
+        token, proposal_logZ, logp = await draw_from(proposal_logws, draw)
         logw = target_logws[token] - proposal_logws[token] + proposal_logZ
-        return token, logw, proposal_logps[token]
-
-    async def burst_draw_batch(self, warm_batch, contexts, handles, burst):
-        """Vectorized engine-burst draw over the population: one logsumexp + one keyed
-        Gumbel draw + one gather over the ``[N, V+1]`` proposal. Threefry keyed by
-        ``(row, draw_ordinal)``, so byte-identical to the per-particle path."""
-        rows = torch.tensor(handles, dtype=torch.int64)
-        ordinals = torch.tensor([draw_ordinal(c) for c in contexts], dtype=torch.int64)
-        with burst_logw_next(warm_batch):
-            if self.proposal is None:
-                proposal, target = await self.potential.batch_logw_next(contexts), None
-            else:
-                proposal, target = await asyncio.gather(
-                    self.proposal.batch_logw_next(contexts),
-                    self.potential.batch_logw_next(contexts),
-                )
-            pw = proposal.weights
-            pZ = torch.logsumexp(pw, dim=-1)  # [N], == per-row .sum()
-            plogps = pw - pZ[:, None]  # normalized proposal [N, V+1]
-            with draw_key(rows, ordinals):
-                idx = picker_indices(plogps)  # [N]
-            ar = torch.arange(len(handles), device=pw.device)
-            logp, decode = plogps[ar, idx], proposal.decode
-            if target is None:
-                weight = pZ  # the normalizer is the weight
-            else:
-                tw = target.weights.to(pw.device)
-                weight = tw[ar, idx] - pw[ar, idx] + pZ  # importance weight
-        idx_l, w_l, lp_l = idx.tolist(), weight.tolist(), logp.tolist()
-        return [
-            BurstDraw(token=decode[idx_l[i]], step=([decode[idx_l[i]]], w_l[i], lp_l[i]))
-            for i in range(len(handles))
-        ]
-
-    async def cleanup(self):
-        pass  # pragma: no cover
+        return token, logw, logp
 
 
 class SetTokenSampler(TokenSampler):
@@ -282,10 +203,6 @@ class SetTokenSampler(TokenSampler):
         assert isinstance(set_sampler, SetSampler)
         super().__init__(set_sampler.target)
         self.set_sampler = set_sampler
-
-    def supports_burst(self) -> bool:
-        # The async-trie set draw runs on the main loop via the per-step hop.
-        return True
 
     async def sample(self, context, draw=None):
         """Sample a token and weight by sampling a weighted set of tokens from the `set_sampler`
@@ -313,10 +230,8 @@ class SetTokenSampler(TokenSampler):
             `SetSampler` for more details.
         """
         logws, logp = await self.set_sampler.sample_set(context, draw=draw)
-        logZ = logws.sum()  # one logsumexp, reused as the weight
-        logps = logws.spawn(logws.weights - logZ)  # == logws.normalize()
-        token = select(logps) if draw is None else draw(logps.exp().materialize())
-        return token, logZ, logp + logps[token]
+        token, logZ, tok_logp = await draw_from(logws, draw)
+        return token, logZ, logp + tok_logp
 
     async def cleanup(self):
         """Clean up the sampler.
@@ -402,11 +317,6 @@ class AWRS(TokenSampler):
         self._draw_seed = (seed if seed is not None else get_draw_seed()) & 0xFFFFFFFF
         self._draw_ctr = 0
         self._valid_idxs_cache = None
-
-    def supports_burst(self) -> bool:
-        # Rejection runs over the engine LM logits (injected), condition checked per
-        # probed token (CPU). With a proposal, both LM reads are injected views.
-        return True
 
     def _prune_logws(self, w):
         # Keep only target-vocab tokens (-inf elsewhere; mass corrected via logZ). On-device.

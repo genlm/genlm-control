@@ -62,13 +62,8 @@ class Population:
     def __iter__(self):
         return iter(self._views)
 
-    def untwist_all(self):
-        """Vectorized untwist over the whole population."""
-        self.logw -= self.twist_amount
-        self.twist_amount[:] = 0.0
-
-    def untwist_subset(self, idx):
-        """Vectorized untwist of rows ``idx`` (must be distinct)."""
+    def untwist(self, idx=slice(None)):
+        """Untwist rows ``idx`` (the whole population by default)."""
         self.logw[idx] -= self.twist_amount[idx]
         self.twist_amount[idx] = 0.0
 
@@ -148,8 +143,7 @@ class Particle:
         self._pop.logw[self._i] += amt
 
     def untwist(self):
-        self._pop.logw[self._i] -= self._pop.twist_amount[self._i]
-        self._pop.twist_amount[self._i] = 0.0
+        self._pop.untwist(self._i)
 
     def finish(self):
         self.untwist()
@@ -365,12 +359,8 @@ class Controller:
     def _draw_leaf(sampler):
         """The engine LM leaf of ``sampler``'s draw distribution (proposal when set,
         else target), whose accumulated logp is banked as ``p.logp``."""
-        draw = (sampler.burst_draw_sampler()
-                if hasattr(sampler, "burst_draw_sampler") else sampler)
-        pot = getattr(draw, "proposal", None)
-        if pot is None:
-            pot = getattr(draw, "target", None)
-        return find_engine_lm(pot) if pot is not None else None
+        draw = sampler.burst_draw_sampler()
+        return find_engine_lm(draw.proposal if draw.proposal is not None else draw.target)
 
     @contextlib.contextmanager
     def serve_row(self, p, dlogp=0.0):
@@ -647,7 +637,7 @@ class StepLoop:
         """One token for every live row."""
         c = self.controller
         if c.twist_with_critic:
-            c.particles.untwist_all()
+            c.particles.untwist()
         await asyncio.gather(*[c.step_row(p) for p in c.particles if not p.done])
 
     async def run(self):

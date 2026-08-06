@@ -43,7 +43,8 @@ if not torch.cuda.is_available():  # pragma: no cover
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
 from genlm.control.potential.coerce import Coerced  # noqa: E402
-from genlm.control.sampler.unit import MultiTokenUnitSampler, flatten_units  # noqa: E402
+from genlm.control.sampler.unit import MultiTokenUnitSampler  # noqa: E402
+from genlm.control.util import flatten_units  # noqa: E402
 from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
 from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
 

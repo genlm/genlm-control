@@ -40,7 +40,7 @@ class _FlatteningMockPotential(MockPotential):
     as a real multi-token critic would via `flatten_units` coercion."""
 
     def _logw(self, context):
-        from genlm.control.sampler.unit import flatten_units
+        from genlm.control.util import flatten_units
 
         return sum(
             self.next_token_logws[self.lookup[i]] for i in flatten_units(context)

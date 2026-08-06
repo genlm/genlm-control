@@ -8,13 +8,15 @@ from dataclasses import dataclass, replace
 import torch
 
 from genlm.control.constant import EndOfSequence, EOS
-from genlm.control.potential.base import burst_logw_next, burst_row
-from genlm.control.potential.built_in.llm import (
-    find_engine_lm,
-    constraint_leaf_ids,
-    lm_leaves,
+from genlm.control.potential.base import burst_logw_next
+from genlm.control.potential.built_in.llm import find_engine_lm, lm_leaves
+from genlm.control.util import (
+    burst_row,
+    draw_key,
+    draw_ordinal,
+    flatten_units,
+    picker_indices,
 )
-from genlm.control.util import draw_key, draw_ordinal, flatten_units
 
 
 class NotAcceleratable(Exception):
@@ -24,7 +26,6 @@ class NotAcceleratable(Exception):
 class BlockReason(enum.Enum):
     """Matchable category for why a config can't run the engine burst."""
 
-    UNSUPPORTED_SAMPLER = "sampler"
     NO_ENGINE_LEAF = "engine_leaf"
     FORWARD_NOT_INJECTABLE = "forward"
     BATCH_HETEROGENEOUS = "batch"
@@ -41,15 +42,14 @@ class BurstBlock:
 
 @dataclass
 class BurstDraw:
-    """One live row's result from ``burst_draw_batch``.
+    """One live row's result for one decode step.
 
     token: ``Token``/``EOS`` drawn this step. step: ``(to_append, logw, logp)`` or
-    ``None`` (mid-step). pop: pop the row out without terminating (unit-boundary wait).
+    ``None`` (mid-step).
     """
 
     token: object
     step: tuple | None
-    pop: bool = False
 
 
 class _RowChannel:
@@ -64,6 +64,27 @@ class _RowChannel:
         self._delivered = asyncio.Event()
         # Set while the row is parked or returned -- the burst waits on it per step.
         self.settled = asyncio.Event()
+        # The row's published draw while it waits at the picker, else ``None``.
+        self.pending = None
+        self._drawn = asyncio.Event()
+        self._result = None
+
+    async def draw(self, lazyweights, slot, step):
+        """Row side: publish this draw and wait for the burst to make it with the rest of
+        the population. ``(slot, step)`` travel with it -- the key lives in the row's own
+        task context, which the burst cannot read."""
+        self.pending = (lazyweights, slot, step)
+        self._drawn.clear()
+        self.settled.set()
+        await self._drawn.wait()
+        return self._result
+
+    def resolve(self, result):
+        """Burst side: hand back one row's ``(token, logZ, logp)`` and let it run on."""
+        self.pending = None
+        self._result = result
+        self.settled.clear()
+        self._drawn.set()
 
     async def next_warm(self, context):
         """Row side: this read's warm, parking when the step's warm is spent. Reads at one
@@ -93,7 +114,6 @@ class _Burst:
 
     def __init__(self, d, live):
         self.d = d
-        self.views = d.views
         # Adapter names snapshotted at burst start: a lora_name rebind mid-run must
         # not split this burst across adapters.
         self.view_loras = [v.lora_name for v in d.views]
@@ -136,7 +156,7 @@ class _Burst:
         self.row_handle[p._i] = h
         self.add_handles.append((
             h,
-            [self.context_ids(p, vi) for vi in range(len(self.views))],
+            [self.context_ids(p, vi) for vi in range(len(self.d.views))],
             self.view_loras,
         ))
 
@@ -146,7 +166,7 @@ class _Burst:
         override and forward inside the engine's step."""
         return {
             rv: rv.make_lazy_weights(warm_batch[gv].weights[i])
-            for rv, gv in zip(_views_of(self.d.controller._sampler_of(p)), self.views)
+            for rv, gv in zip(_views_of(self.d.controller._sampler_of(p)), self.d.views)
         }
 
     def _spawn_row(self, p, row):
@@ -172,13 +192,49 @@ class _Burst:
         if task is not None and not task.done():
             task.cancel()
 
+    async def _rendezvous(self, rows):
+        """Serve every row waiting at the picker in one op -- one logsumexp, one keyed draw,
+        one gather over the stacked ``[N, V+1]``. Loops because a resumed row may reach the
+        picker again before it parks (a sampler may draw more than once per decode step)."""
+        while True:
+            waiting = [row for row in rows if self.channels[row].pending is not None]
+            if not waiting:
+                return
+            # One batch per vocabulary: groups may carry different constraints, so their
+            # rows are different widths over different tokens and cannot stack together.
+            by_vocab = {}
+            for row in waiting:
+                by_vocab.setdefault(id(self.channels[row].pending[0].decode), []).append(row)
+            for batch in by_vocab.values():
+                self._batch_draw(batch)
+            await asyncio.gather(*(self.channels[row].settled.wait() for row in waiting))
+
+    def _batch_draw(self, batch):
+        """One vocabulary's parked rows, drawn together: one logsumexp, one keyed pick, one
+        gather. Keying makes this byte-identical to the same rows drawn one at a time."""
+        pend = [self.channels[row].pending for row in batch]
+        W = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in pend])
+        slots = torch.tensor([s for _, s, _ in pend], dtype=torch.int64)
+        steps = torch.tensor([k for _, _, k in pend], dtype=torch.int64)
+        logZ = torch.logsumexp(W, dim=-1)
+        logps = W - logZ[:, None]
+        with draw_key(slots, steps):
+            idx = picker_indices(logps)
+        ar = torch.arange(len(batch), device=W.device)
+        picked, zs, ids = logps[ar, idx].tolist(), logZ.tolist(), idx.tolist()
+        decode = pend[0][0].decode
+        for j, row in enumerate(batch):
+            self.channels[row].resolve((decode[ids[j]], zs[j], picked[j]))
+
     async def _parked_records(self, warm_batch, parts, rows):
         """One decode step through per-row parked ``transition`` tasks: deliver each row's
-        warm, then wait for it to park again (mid-unit) or return (the SMC step)."""
+        warm, serve the population's draws in one op, then wait for each row to park again
+        (mid-unit) or return (the SMC step)."""
         for i, (p, row) in enumerate(zip(parts, rows)):
             channel = self.channels.get(row) or self._spawn_row(p, row)
             channel.deliver(self._row_injection(warm_batch, i, p))
         await asyncio.gather(*(self.channels[row].settled.wait() for row in rows))
+        await self._rendezvous(rows)
         records = []
         for row in rows:
             task = self.tasks[row]
@@ -186,11 +242,7 @@ class _Burst:
                 step = task.result()
                 self._release_row(row)
                 records.append(
-                    BurstDraw(
-                        token=flatten_units(step[0])[-1],
-                        step=step,
-                        pop=self.d.sync_boundary,
-                    )
+                    BurstDraw(token=flatten_units(step[0])[-1], step=step)
                 )
             else:
                 records.append(
@@ -213,11 +265,10 @@ class _Burst:
         logits: one token per live group. Banking is deferred under free running to
         overlap the next forward; dropped groups get a placeholder token."""
         c = self.d.controller
-        sampler = self.d.sampler
         # Per view: [G, V+1] warm log-weights (device tensors, no host xfer).
         processed = [
             view._process_logw_next_batch(view._maybe_temper(logits[:, vi].float()))
-            for vi, view in enumerate(self.views)
+            for vi, view in enumerate(self.d.views)
         ]
 
         async def _step():
@@ -228,21 +279,16 @@ class _Burst:
             rows = [self.handle_row[handles[k]] for k in live_k]
             parts = [c.particles[row] for row in rows]
             if c.twist_with_critic:
-                c.particles.untwist_subset(rows)
+                c.particles.untwist(rows)
             out = [0] * len(handles)
             if rows:
                 # One batched warm per view ([N, V+1], rows-order).
                 sel = torch.tensor(live_k, dtype=torch.int64, device=logits.device)
                 warm_batch = {
                     view: view.make_lazy_weights(processed[vi][sel])
-                    for vi, view in enumerate(self.views)
+                    for vi, view in enumerate(self.d.views)
                 }
-                if sampler.burst_draws_batched():
-                    records = await sampler.burst_draw_batch(
-                        warm_batch, [p.context for p in parts], rows, self
-                    )
-                else:
-                    records = await self._parked_records(warm_batch, parts, rows)
+                records = await self._parked_records(warm_batch, parts, rows)
                 # Settle each row through the controller's own step shape. At the
                 # max_tokens boundary ``draw_step`` forces EOS via ``logw_eos``, whose
                 # injection must be keyed by THAT row's sampler's views, not group 0's:
@@ -290,7 +336,7 @@ class _Burst:
                 records = []
             # (3) Bank: free running defers (overlaps next forward); unit grain banks inline
             # (its pop-out abort must take effect this step).
-            if sampler.burst_free_running():
+            if not self.d.sync_boundary:
                 self._pending_bank = (
                     asyncio.ensure_future(self._bank_pop(parts, records)),
                     parts,
@@ -326,18 +372,18 @@ class _Burst:
         self._pending_bank = None
         await fut  # banking: score/extend/critic, sets p.done
         self._flag_after_bank(parts, rows, records)
-        if self.d.sampler.burst_free_running():
+        if not self.d.sync_boundary:
             self.resample_realize()
 
     def _flag_after_bank(self, parts, rows, records):
-        """Per banked row: evict if terminated; if pop, abort its engine group but
-        keep maps."""
+        """Per banked row: evict if terminated; at unit grain a surviving row pops out
+        of the engine (its group aborts, the maps stay) to wait for the boundary."""
         for k_i, (p, row) in enumerate(zip(parts, rows)):
             if isinstance(records[k_i].token, EndOfSequence):
                 assert p.done, "burst drew EOS for a particle that did not terminate"
             if p.done:
                 self._drop_row(row)
-            elif records[k_i].pop:
+            elif self.d.sync_boundary and records[k_i].step is not None:
                 h = self.row_handle.get(row)
                 if h is not None:
                     self.abort_handles.add(h)
@@ -361,7 +407,7 @@ class _Burst:
                 with c.serve_row(p, dlogp=rec.step[2]):
                     await c.bank_row(p, *rec.step)
         # Token grain records per step here; unit grain once per round boundary.
-        if self.d.sampler.burst_free_running() and any(r.step is not None for r in records):
+        if not self.d.sync_boundary and any(r.step is not None for r in records):
             c._record_step()
 
     def _drop_row(self, row):
@@ -407,15 +453,10 @@ def critic_deferred(sampler, controller):
 
 
 def burst_blocker(controller):
-    """Why this config can't run the engine burst, or ``None`` if it can. Needs a
-    burst-capable sampler over a target with one engine-burst LM leaf, must be forward-free,
-    and (if batched) burst-homogeneous (:func:`_batch_blocker`)."""
+    """Why this config can't run the engine burst, or ``None`` if it can. Needs a target with
+    one engine-burst LM leaf, must be forward-free, and (if batched) burst-homogeneous
+    (:func:`_batch_blocker`)."""
     s = controller.samplers[0]
-    if not s.supports_burst():
-        return BurstBlock(
-            BlockReason.UNSUPPORTED_SAMPLER,
-            f"{type(s).__name__} does not support the engine burst",
-        )
     if find_engine_lm(s.target) is None:
         return BurstBlock(
             BlockReason.NO_ENGINE_LEAF, "sampler target has no single engine-burst LM leaf"
@@ -458,14 +499,12 @@ def burst_blocker(controller):
 
 
 def _batch_blocker(samplers):
-    """Why a batched burst can't draw every group through group 0's sampler, or ``None`` if
-    burst-homogeneous. Groups must share sampler kind, K views, per-view engine/temperature/
-    LoRA, and constraint; they may differ only in prompt and critic. A sampler that
-    ``burst_routes_groups`` draws each row through its own group's sampler, so groups may
-    additionally differ in constraint."""
+    """Why a batched burst's groups can't share one forward, or ``None`` if
+    burst-homogeneous. Groups must share sampler kind, K views, and per-view engine/
+    temperature/LoRA. They may differ in prompt, critic, and constraint -- the parked
+    lane draws each row through its OWN group's sampler."""
     s0 = samplers[0]
     views0 = _views_of(s0)
-    constraint0 = constraint_leaf_ids(s0.target)
 
     def blocked(detail):
         return BurstBlock(BlockReason.BATCH_HETEROGENEOUS, f"group {g} {detail}")
@@ -483,9 +522,6 @@ def _batch_blocker(samplers):
                 return blocked(f"view {vi} temperature differs from group 0")
             if v.lora_name != v0.lora_name:
                 return blocked(f"view {vi} uses a different LoRA adapter from group 0")
-        routes = s0.burst_routes_groups() or not s0.burst_draws_batched()
-        if not routes and constraint_leaf_ids(s.target) != constraint0:
-            return blocked("has a different constraint")
     return None
 
 
@@ -508,12 +544,11 @@ class BurstLoop:
         # plus the critic's engine leaf when twisting will read it -- at the boundary
         # if deferred, per step if token-grain); the batched burst draws every group
         # through group 0's sampler.
-        self.twist_leaves = controller.twist_leaves
-        self.twist_view = self.twist_leaves[0]
+        self.twist_view = controller.twist_leaves[0]
         # The burst banks per-token twist sums whenever a twist view is injected.
         self.banks_twist = self.twist_view is not None
         assert all(
-            (lf is None) == (self.twist_view is None) for lf in self.twist_leaves
+            (lf is None) == (self.twist_view is None) for lf in controller.twist_leaves
         ), "batched groups must agree on having an engine-LM critic leaf"
         self.views = _views_of(self.sampler) + (
             [self.twist_view] if self.twist_view is not None else []
@@ -528,7 +563,7 @@ class BurstLoop:
         self.view_prefixes = [
             [list(v.prompt_ids) for v in _views_of(s)]
             + ([list(lf.prompt_ids)] if lf is not None else [])
-            for s, lf in zip(controller.samplers, self.twist_leaves)
+            for s, lf in zip(controller.samplers, controller.twist_leaves)
         ]
 
         # Engine token id committed as the placeholder for an aborted/EOS row.
