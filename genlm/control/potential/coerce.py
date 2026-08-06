@@ -35,13 +35,12 @@ class Coerced(Potential):
         This behavior can be overridden by setting `prune=False`, in which case the coerced potential's vocabulary will include all tokens from the target vocabulary.
 
         When the wrapped potential exposes a memoized chart (`_consume`, i.e. a
-        WFSA/BoolFSA) AND `f` is a per-token homomorphism --
-        `f(context) == concat(f([t]) for t in context)`, so each target token maps
-        to a fixed symbol path -- `logw_next` takes the shared-prefix-trie fast path
-        (:meth:`live_logws`). Homomorphism is probed once at construction
-        (`_is_homomorphic`); the usual `f=b"".join` passes. Any other `f` (which the
-        contract permits) falls back to the per-extension `batch_prefix`, which makes
-        no such assumption -- so a non-homomorphic `f` is correct, just not accelerated.
+        WFSA/BoolFSA) AND `f` distributes over concatenation at the context in hand
+        (`f(xs+[t]) == f(xs)+f([t])`, so each target token maps to a fixed symbol
+        path), `logw_next` takes the shared-prefix-trie fast path
+        (:meth:`live_logws`). Any other `f` -- which the contract permits -- falls
+        back to the per-extension `batch_prefix`, which makes no such assumption, so
+        a non-distributing `f` is correct, just not accelerated.
     """
 
     def __init__(
@@ -67,11 +66,9 @@ class Coerced(Potential):
                 If `False`, the coerced potential's vocabulary will include all tokens from the target vocabulary.
             homomorphic (bool | None): Whether `f` distributes over concatenation
                 (`f(xs+[t]) == f(xs)+f([t])`), which enables the `live_logws` fast
-                path. `None` (default) probes it at construction (`b"".join` passes);
-                pass `True`/`False` to declare it explicitly and skip the probe. The
-                probe is a finite heuristic, not a proof, so a custom `f` that is only
-                locally homomorphic should pass `homomorphic=False` to force the safe
-                (assumption-free) path.
+                path. `None` (default) checks the identity at each context it is
+                asked about, falling back to the assumption-free path wherever it
+                does not hold; `True`/`False` declare it and skip the check.
             trie (dict | None): The symbol trie over `(target_vocab, f)`, as built by
                 :meth:`build_trie`. It is a function of those two alone, so coercions
                 sharing a vocabulary should build it once and pass it here rather than
@@ -121,40 +118,23 @@ class Coerced(Potential):
 
         super().__init__(tokens, tables=tables)
 
-        # The `live_logws` fast path assumes `f` distributes over token-sequence
-        # concatenation (`f(xs+[t]) == f(xs)+f([t])`); see `logw_next`. A
-        # non-homomorphic `f` (which the `Coerced` contract permits) routes
-        # `logw_next` to the assumption-free `batch_prefix` path instead of silently
-        # mis-scoring on the trie. The caller may declare it (`homomorphic=`); else
-        # probe the identity once here (`b"".join` -- the only coercion shipped --
-        # passes). The probe is a heuristic, not a proof: prefer an explicit
-        # declaration for a custom `f`.
-        self._f_homomorphic = (
-            self._is_homomorphic(f, self.vocab)
-            if homomorphic is None
-            else bool(homomorphic)
-        )
+        # `None` = check the identity at each context (see `_distributes_at`); a
+        # bool is the caller's declaration and is taken as given.
+        self._f_homomorphic = None if homomorphic is None else bool(homomorphic)
 
-    @staticmethod
-    def _is_homomorphic(f, vocab):
-        """Probe whether `f` distributes over token-sequence concatenation --
-        `f(xs + [t]) == f(xs) + f([t])` -- the identity the `live_logws` fast
-        path relies on (and, by induction over the single step, all the trie
-        needs). Tested over a few real vocab tokens at context lengths 0..3, so
-        it catches length-/position-dependent separators that a pairwise check
-        would miss. Construction-time only; not a proof for arbitrary-length
-        contexts, but it auto-enables `b"".join` and routes any non-distributing
-        `f` to the safe path. Any error -> treat as non-homomorphic (fall back)."""
-        probes = vocab[:4]
-        if not probes:
-            return False
+    def _distributes_at(self, context, ctx_syms):
+        """Whether `f(context + [t]) == f(context) + f([t])` at THIS context, over a
+        couple of probe tokens -- the identity `live_logws` keys the trie on.
+
+        Checked per call rather than once at construction because the ways `f` can
+        fail to distribute are length- and position-dependent, so no fixed sample of
+        contexts settles it. One extra `f` per probe token, against a walk over the
+        whole vocabulary. Any error counts as non-distributing."""
         try:
-            for n in range(4):
-                xs = (probes * 2)[:n]
-                for t in probes:
-                    if f(xs + [t]) != f(xs) + f([t]):
-                        return False
-            return True
+            return all(
+                tuple(self.f([*context, t])) == ctx_syms + tuple(self.f([t]))
+                for t in self.vocab[:2]
+            )
         except Exception:
             return False
 
@@ -227,9 +207,11 @@ class Coerced(Potential):
         branch dead. Without it each node is scored from ``_consume(ctx_syms + path)``.
         """
         p = self.potential
-        if not (self._f_homomorphic and hasattr(p, "_consume")):
+        if self._f_homomorphic is False or not hasattr(p, "_consume"):
             return None
         ctx_syms = tuple(self.f(context))
+        if self._f_homomorphic is None and not self._distributes_at(context, ctx_syms):
+            return None
         ctx_chart = p._consume(ctx_syms)
         ctx_w = p.prefix_logw(ctx_chart)
         # Read before the walk: a chart the walk mutates must not move EOS under it.

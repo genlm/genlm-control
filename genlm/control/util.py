@@ -7,6 +7,7 @@ import torch
 from genlm.grammar import Float, Log
 
 from genlm.control.constant import EndOfSequence
+from genlm.control.burst_seam import _burst_row, burst_row  # noqa: F401 (re-export)
 from genlm.backend.tokenization import Token
 
 
@@ -203,17 +204,25 @@ class LazyWeights:
             weights=new_weights, encode=self.encode, decode=self.decode, log=log
         )
 
-    def materialize(self, top=None):
+    def materialize(self, top=None, sort=True):
         """
         Materialize the weights into a chart.
 
         Args:
             top (int, optional): The number of top weights to materialize. Defaults to None.
+            sort (bool, optional): Order the chart by descending weight. Required by
+                `top`; skip it when only the mapping is wanted, as a picker is.
 
         Returns:
             (Chart): A chart representation of the weights.
         """
         weights = self.weights
+        if not sort and top is None:
+            semiring = Log if self.is_log else Float
+            chart = semiring.chart()
+            for i, w in enumerate(weights.tolist()):
+                chart[self.decode[i]] = w
+            return chart
         order = weights.argsort()
         if top is not None:
             order = order[-int(top) :]
@@ -490,23 +499,6 @@ def set_draw_method(method):
     callable. Process-wide."""
     global _picker
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
-
-
-# A parked row's channel to the burst, bound for the whole of one row's ``transition``.
-# Set only by the burst's parked-row lane; ``None`` everywhere else.
-_burst_row: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_row", default=None
-)
-
-
-@contextlib.contextmanager
-def burst_row(channel):
-    """Bind ``channel`` for one row's ``transition`` task (the burst's parked-row lane)."""
-    token = _burst_row.set(channel)
-    try:
-        yield
-    finally:
-        _burst_row.reset(token)
 
 
 async def draw_from(lazyweights, draw=None):

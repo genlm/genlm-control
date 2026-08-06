@@ -1,77 +1,20 @@
 import asyncio
-import contextlib
-import contextvars
 import numpy as np
 import torch
 from abc import ABC, abstractmethod
 from typing import NamedTuple
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.util import LazyWeights, stack_weights, _burst_row
+from genlm.control.burst_seam import (  # noqa: F401 (seam re-export)
+    burst_logw_next,
+    burst_prefix,
+    burst_complete,
+    burst_serve,
+)
+from genlm.control.util import LazyWeights, stack_weights
 from genlm.control.typing import TokenType, infer_vocabulary_type
 from genlm.control.potential.operators import PotentialOps
 from genlm.control.potential.testing import PotentialTests
-
-
-# Per-burst override: {potential: LazyWeights} a potential's ``logw_next`` returns for
-# itself instead of computing. Read by ``PromptedLLM``.
-_burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_logw_next", default=None
-)
-
-
-@contextlib.contextmanager
-def burst_logw_next(overrides):
-    """Inject ``{potential: LazyWeights}`` for one burst step (set per particle task)."""
-    token = _burst_logw_next_overrides.set(overrides)
-    try:
-        yield
-    finally:
-        _burst_logw_next_overrides.reset(token)
-
-
-# Boundary override: {potential: values} a potential's ``batch_prefix`` returns for
-# itself (banked from the burst's warm rows) instead of re-scoring. Read by ``PromptedLLM``.
-_burst_prefix_overrides: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_prefix", default=None
-)
-
-
-@contextlib.contextmanager
-def burst_prefix(overrides):
-    """Inject ``{potential: values}`` served as that potential's ``batch_prefix`` result."""
-    token = _burst_prefix_overrides.set(overrides)
-    try:
-        yield
-    finally:
-        _burst_prefix_overrides.reset(token)
-
-
-# Same seam for ``batch_complete``: {potential: values} served instead of scoring.
-_burst_complete_overrides: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_complete", default=None
-)
-
-
-@contextlib.contextmanager
-def burst_complete(overrides):
-    """Inject ``{potential: values}`` served as that potential's ``batch_complete`` result."""
-    token = _burst_complete_overrides.set(overrides)
-    try:
-        yield
-    finally:
-        _burst_complete_overrides.reset(token)
-
-
-async def burst_serve(context):
-    """Park until the burst delivers this row's warm for ``context``, then inject it.
-
-    A no-op outside the parked-row lane. Every read at one context length is one decode
-    step (target and proposal share the step's warm); a read past a draw parks, with a
-    context ending in the token just drawn."""
-    channel = _burst_row.get()
-    if channel is not None:
-        _burst_logw_next_overrides.set(await channel.next_warm(context))
 
 
 class VocabTables(NamedTuple):

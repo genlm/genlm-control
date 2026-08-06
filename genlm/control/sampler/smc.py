@@ -8,7 +8,7 @@ import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.potential.base import burst_prefix, burst_complete
+from genlm.control.burst_seam import burst_prefix, burst_complete
 from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
@@ -90,6 +90,17 @@ class Particle:
     def __init__(self, pop, i):
         self._pop = pop
         self._i = i
+
+    @property
+    def row(self):
+        """This particle's row in the population -- its identity across a burst's
+        per-row bookkeeping, and stable under reindex."""
+        return self._i
+
+    @property
+    def group(self):
+        """The SMC problem this row belongs to; ESS/resample/log_ml are per-group."""
+        return self._pop.group[self._i]
 
     @property
     def logw(self):
@@ -321,9 +332,9 @@ class Controller:
         boundary, else the sampler's transition (closed by ``terminate_when``). The
         (slot, ordinal) draw key lets a counter-based picker match the burst draw."""
         if p.max_tokens_left == 1:
-            return await self._force_eos_step(p, self._sampler_of(p))
-        with draw_key(p._i, draw_ordinal(p.context)):
-            step = await self._sampler_of(p).transition(p.context)
+            return await self._force_eos_step(p, self.sampler_of(p))
+        with draw_key(p.row, draw_ordinal(p.context)):
+            step = await self.sampler_of(p).transition(p.context)
         return self._close_if_stopped(p, step)
 
     async def step_row(self, p):
@@ -349,11 +360,13 @@ class Controller:
         """Forced-EOS step ``(to_append, logw, logp)`` at the ``max_tokens`` boundary."""
         return [EOS], await sampler.logw_eos(p.context), 0.0
 
-    def _sampler_of(self, p):
-        return self.samplers[self.particles.group[p._i]]
+    def sampler_of(self, p):
+        """The sampler owning ``p``'s group -- a driver routes each row through its
+        own group's sampler, never group 0's."""
+        return self.samplers[p.group]
 
     def _critic_of(self, p):
-        return self.critics[self.particles.group[p._i]]
+        return self.critics[p.group]
 
     @staticmethod
     def _draw_leaf(sampler):
@@ -369,7 +382,7 @@ class Controller:
         (``dlogp`` covers this step's increment, not yet applied to ``p.logp``).
         Keyed by the row's OWN group: groups carry their own leaves, so another
         group's would miss the override and forward."""
-        g = self.particles.group[p._i]
+        g = p.group
         leaf = self.twist_leaves[g]
         if leaf is None:
             yield
@@ -448,7 +461,7 @@ class Controller:
                 # already banked it from warm rows), then twist off the served sum.
                 if not self.twist_banked:
                     self.twist.bank(
-                        self.particles, [p._i], [twist_amt - p.twist_logp], [logp]
+                        self.particles, [p.row], [twist_amt - p.twist_logp], [logp]
                     )
                 twist_amt = self.twist.served_row(p)
             p.twist(self.twist.value(p, twist_amt))
@@ -487,7 +500,7 @@ class Controller:
                     "under `prefix`, which violates the potential contract."
                 )
         for p in self.particles:
-            p.score(start_ws[self.particles.group[p._i]])
+            p.score(start_ws[p.group])
 
     def _maybe_resample(self):
         """Per-group ESS test + group-local resample. Mutates ``self.particles`` on a
@@ -544,10 +557,23 @@ class Controller:
             self.record.add_smc_step(self.particles)
         self._pending_resample = False
 
-    def round_boundary(self):
-        """Close a round: record the step, then the per-group ESS test/resample."""
-        self._record_step()
-        self._maybe_resample()
+    def round_boundary(self, record=True):
+        """Close a round: record the step, then the per-group ESS test/resample.
+
+        Returns the rows of every group that crossed, empty when none did. A driver
+        holding per-row state outside the population (the burst's engine requests)
+        must flush exactly those rows -- survivors included, since a resample rewrites
+        their contexts. ``record=False`` for a round that advanced no row: the ESS
+        test still runs, but there is no new step to put in the record."""
+        if record:
+            self._record_step()
+        groups, _ = self._maybe_resample()
+        return [self._group_rows[g] for g in groups]
+
+    def group_rows(self, g):
+        """Row indices of group ``g``, invariant across reindex (resample is
+        group-local)."""
+        return self._group_rows[g]
 
     async def run(self, driver):
         """The SMC loop, driver-agnostic: each iteration the driver turns every live
@@ -573,7 +599,7 @@ class Controller:
         by_group = {}
         for p in self.particles:
             if not p.done:
-                by_group.setdefault(self.particles.group[p._i], []).append(p.context)
+                by_group.setdefault(p.group, []).append(p.context)
         await asyncio.gather(
             *[self.samplers[g].round_start(ctxs) for g, ctxs in by_group.items()]
         )
@@ -593,7 +619,7 @@ class Controller:
         # one call per critic (groups concurrent).
         by_group = {}
         for p in parts:
-            by_group.setdefault(self.particles.group[p._i], []).append(p)
+            by_group.setdefault(p.group, []).append(p)
 
         async def _settle(g, ps):
             critic = self.critics[g]

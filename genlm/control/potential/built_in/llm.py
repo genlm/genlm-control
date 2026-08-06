@@ -5,13 +5,13 @@ import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.constant import EOS
-from genlm.control.potential.base import (
-    Potential,
+from genlm.control.burst_seam import (
     burst_serve,
     _burst_logw_next_overrides,
     _burst_prefix_overrides,
     _burst_complete_overrides,
 )
+from genlm.control.potential.base import Potential
 from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
 from genlm.backend.tokenization import Token

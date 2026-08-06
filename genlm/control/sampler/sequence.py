@@ -248,7 +248,7 @@ class SMC:
         await _drive(controller, _normalize_accelerate(accelerate))
         seqs = [
             Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
-            for rows in controller._group_rows
+            for rows in map(controller.group_rows, range(B))
         ]
         if controller.record is not None:
             for s in seqs:

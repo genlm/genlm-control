@@ -9,7 +9,8 @@ import torch
 
 from genlm.control.constant import EndOfSequence
 from genlm.control.potential.built_in.llm import find_engine_lm, lm_leaves
-from genlm.control.util import burst_row, draw_key, flatten_units, picker_indices
+from genlm.control.burst_seam import burst_row
+from genlm.control.util import draw_key, flatten_units, picker_indices
 
 
 class NotAcceleratable(Exception):
@@ -125,7 +126,7 @@ class _Burst:
     def context_ids(self, p, view_idx):
         """Engine prompt for one (particle, view) substream: per-view prefix + the particle's
         drawn token ids (EOS dropped; drawn suffix shared across views)."""
-        g = self.d.controller.particles.group[p._i]
+        g = p.group
         ids = list(self.d.view_prefixes[g][view_idx])
 
         def _emit(item):
@@ -146,8 +147,8 @@ class _Burst:
         add. Sole add path (initial population + mid-burst re-add)."""
         h = self.next_handle
         self.next_handle += 1
-        self.handle_row[h] = p._i
-        self.row_handle[p._i] = h
+        self.handle_row[h] = p.row
+        self.row_handle[p.row] = h
         self.add_handles.append((
             h,
             [self.context_ids(p, vi) for vi in range(len(self.d.views))],
@@ -160,7 +161,7 @@ class _Burst:
         override and forward inside the engine's step."""
         return {
             rv: rv.make_lazy_weights(warm_batch[gv].weights[i])
-            for rv, gv in zip(_views_of(self.d.controller._sampler_of(p)), self.d.views)
+            for rv, gv in zip(_views_of(self.d.controller.sampler_of(p)), self.d.views)
         }
 
     def _spawn_row(self, p, row):
@@ -353,8 +354,15 @@ class _Burst:
         self._pending_bank = None
         await fut  # banking: score/extend/critic, sets p.done
         self._flag_after_bank(parts, rows, records)
+        # Token grain closes its round here, mid-burst: the controller records the
+        # step and tests ESS, and hands back the rows a crossing invalidated. The ESS
+        # test runs every step; only a step that advanced a row is recorded.
         if not self.d.sync_boundary:
-            self.resample_realize()
+            self._flush(
+                self.d.controller.round_boundary(
+                    record=any(r.step is not None for r in records)
+                )
+            )
 
     def _flag_after_bank(self, parts, rows, records):
         """Per banked row: evict if terminated; at unit grain a surviving row pops out
@@ -387,9 +395,6 @@ class _Burst:
             else:
                 with c.serve_row(p, dlogp=rec.step[2]):
                     await c.bank_row(p, *rec.step)
-        # Token grain records per step here; unit grain once per round boundary.
-        if not self.d.sync_boundary and any(r.step is not None for r in records):
-            c._record_step()
 
     def _drop_row(self, row):
         """Evict a particle's engine group: abort it, drop both maps, release its task."""
@@ -399,19 +404,18 @@ class _Burst:
             self.handle_row.pop(h, None)
             self.abort_handles.add(h)
 
-    def resample_realize(self):
-        """Translate a completed per-group resample into engine abort/re-add; return whether
-        anything crossed. Every row in a crossing group is flushed (survivors too)."""
+    def _flush(self, crossed):
+        """Rebuild the engine requests of every row a resample invalidated -- survivors
+        too, since a crossing rewrites their contexts. Drop them all before re-adding
+        any: a row's handle must be gone before its replacement mints one."""
         c = self.d.controller
-        groups, _ = c._maybe_resample()
-        for g in groups:
-            for row in c._group_rows[g]:
+        for rows in crossed:
+            for row in rows:
                 self._drop_row(int(row))
-            for row in c._group_rows[g]:
+            for row in rows:
                 p = c.particles[int(row)]
                 if not p.done:
                     self._add_group(p)
-        return bool(groups)
 
 
 
