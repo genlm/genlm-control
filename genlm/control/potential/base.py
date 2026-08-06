@@ -319,7 +319,12 @@ class Potential(ABC, PotentialOps, PotentialTests):
         live = await self.live_logws(context)
         if live is not None:
             return self.make_lazy_weights(self._rows_from_live([live])[0])
+        return await self._logw_next_dense(context)
 
+    async def _logw_next_dense(self, context):
+        """The full row, computed without the sparse enumeration. Override this rather
+        than `logw_next` when the potential also implements `live_logws`, so the sparse
+        lane cannot be bypassed."""
         ctx_log_w = await self.prefix(context)
 
         if ctx_log_w == float("-inf"):
@@ -455,13 +460,16 @@ class Potential(ABC, PotentialOps, PotentialTests):
     def alloc_logws(self, default=float("-inf")):
         """Allocate a new array of log weights for the potential's vocabulary and EOS.
 
+        One row of :meth:`alloc_rows`, so a potential that overrides that to place its
+        weights on a device gets this lane too.
+
         Args:
             default (float, optional): Default log weight. Defaults to -inf.
 
         Returns:
-            (np.array): Array of length `len(self.vocab_eos)` filled with `default`.
+            Array of length `len(self.vocab_eos)` filled with `default`.
         """
-        return np.full((len(self.vocab_eos),), default)
+        return self.alloc_rows(1, default)[0]
 
     def alloc_rows(self, n, default=float("-inf")):
         """Allocate an `[n, len(vocab_eos)]` weight block. Override to place the

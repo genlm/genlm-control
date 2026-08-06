@@ -200,6 +200,31 @@ async def test_advance_lane_matches_consume_lane():
 
 
 @pytest.mark.asyncio
+async def test_trie_lane_matches_batch_prefix_lane():
+    """The trie walk must reproduce the assumption-free path it is a fast path for:
+    one coerced extension prefix-ed per vocab token. `homomorphic=False` forces that
+    path on an `f` that would otherwise qualify, so both lanes score the same
+    coercion. Dead tokens are absent from the walk and -inf from `batch_prefix`."""
+    words = [b"abc", b"abd", b"axy"]
+    vocab = [b"a", b"ab", b"abc", b"abd", b"ax", b"axy", b"b", b"zz", b"abz"]
+    fast = Coerced(ChartPotential(words, advance=True), vocab, f=b"".join, prune=False)
+    slow = Coerced(
+        ChartPotential(words), vocab, f=b"".join, prune=False, homomorphic=False
+    )
+
+    # Distinct lanes, or this compares the trie walk against itself.
+    assert await fast.live_logws([b"a"]) is not None
+    assert await slow.live_logws([b"a"]) is None
+
+    # Contexts with a non-zero prefix weight (so the `- ctx_w` shift is exercised) and
+    # one whose EOS is finite (`b"abc"` is a complete word).
+    for context in ([], [b"a"], [b"ab"], [b"ax"], [b"abc"]):
+        want = await slow.logw_next(context)
+        got = await fast.logw_next(context)
+        want.assert_equal(got, rtol=0, atol=0)
+
+
+@pytest.mark.asyncio
 async def test_trie_lane_batches_sparsely():
     """On the trie lane `logw_next` is `live_logws`, so the batch is one scattered
     block rather than a dense row per context -- and must agree row for row."""

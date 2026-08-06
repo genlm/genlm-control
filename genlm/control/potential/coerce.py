@@ -171,12 +171,9 @@ class Coerced(Potential):
         """EOS log-weight via ``complete - prefix`` on the coerced context."""
         return float(await self.complete(context) - await self.prefix(context))
 
-    async def logw_next(self, context):
-        # The trie fast path is `live_logws`; this is the assumption-free fallback,
-        # one coerced extension prefix-ed PER vocab token.
-        live = await self.live_logws(context)
-        if live is not None:
-            return self.make_lazy_weights(self._rows_from_live([live])[0])
+    async def _logw_next_dense(self, context):
+        # The assumption-free fallback to the `live_logws` trie walk: one coerced
+        # extension prefix-ed PER vocab token, assuming nothing about `f`.
         Ws = self.alloc_logws()
         ctx = self.f(context)
         ctx_w = await self.potential.prefix(ctx)

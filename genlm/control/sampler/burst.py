@@ -22,6 +22,7 @@ class BlockReason(enum.Enum):
     NO_ENGINE_LEAF = "engine_leaf"
     FORWARD_NOT_INJECTABLE = "forward"
     BATCH_HETEROGENEOUS = "batch"
+    UNBANKABLE_STEP = "unbankable"
 
 
 @dataclass(frozen=True)
@@ -437,6 +438,16 @@ def burst_blocker(controller):
     one engine-burst LM leaf, must be forward-free, and (if batched) burst-homogeneous
     (:func:`_batch_blocker`)."""
     s = controller.samplers[0]
+    # The burst banks one warm-row increment per record, and a record carries one
+    # committed item. `terminate_when` appends an EOS the sampler never drew, so that
+    # step commits two -- the drawn token and the EOS -- and one of them goes unbanked
+    # whichever way the record's token is read. Twisting is what consumes those sums.
+    if controller.terminate_when is not None and controller.twist_with_critic:
+        return BurstBlock(
+            BlockReason.UNBANKABLE_STEP,
+            "`terminate_when` closes a step with an undrawn EOS, which the per-step "
+            "twist bank cannot represent alongside the drawn token",
+        )
     if find_engine_lm(s.target) is None:
         return BurstBlock(
             BlockReason.NO_ENGINE_LEAF, "sampler target has no single engine-burst LM leaf"
