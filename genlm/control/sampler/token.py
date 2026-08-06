@@ -77,11 +77,17 @@ class TokenSampler:
         token, logw, logp = await self.sample(context)
         return [token], logw, logp
 
-    async def sample(self, context):
+    async def sample(self, context, draw=None):
         """Sample a token and weight from the `target`potential's vocabulary.
+
+        Every subclass takes ``draw`` in this position, so a wrapping sampler may
+        forward it positionally; a subclass that cannot honour a custom picker
+        raises rather than ignoring one.
 
         Args:
             context (list[int]): A sequence of tokens in the `target` potential's vocabulary.
+            draw (callable, optional): Picker over the normalized distribution,
+                replacing the configured one (`set_draw_method`).
 
         Returns:
             (token, weight, logp): A tuple containing the sampled token, weight, and log-probability of the sampled token.
@@ -359,7 +365,7 @@ class AWRS(TokenSampler):
 
         return do_accept
 
-    async def sample(self, context, verbosity=0):
+    async def sample(self, context, draw=None, verbosity=0):
         """Sample a token and weight that are properly weighted with respect to the target potential's `logw_next` method via adaptive weighted rejection sampling.
 
         With no proposal, the returned weight is the log normalizing constant of
@@ -369,7 +375,17 @@ class AWRS(TokenSampler):
 
         Returns:
             (token, weight, np.nan): A tuple containing the sampled token, weight, and a dummy value for the log-probability of the sampled token.
+
+        Raises:
+            ValueError: If `draw` is supplied. AWRS accepts or rejects tokens in
+                Gumbel-perturbed order over the *unnormalized* weights, so there is
+                no categorical draw for a picker to replace.
         """
+        if draw is not None:
+            raise ValueError(
+                "AWRS draws by rejection over the unnormalized weights; it has no "
+                "categorical draw for `draw` to replace."
+            )
         if self.proposal is None:
             logws = await self.potential.logw_next(context)
             target_logws = None

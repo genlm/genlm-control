@@ -3,20 +3,13 @@ Resample/ESS/log_ml stay Controller-owned, never in the backend."""
 
 import asyncio
 import enum
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 
-from genlm.control.constant import EndOfSequence, EOS
-from genlm.control.potential.base import burst_logw_next
+from genlm.control.constant import EndOfSequence
 from genlm.control.potential.built_in.llm import find_engine_lm, lm_leaves
-from genlm.control.util import (
-    burst_row,
-    draw_key,
-    draw_ordinal,
-    flatten_units,
-    picker_indices,
-)
+from genlm.control.util import burst_row, draw_key, flatten_units, picker_indices
 
 
 class NotAcceleratable(Exception):
@@ -170,15 +163,15 @@ class _Burst:
         }
 
     def _spawn_row(self, p, row):
-        """Start this row's real ``transition`` as a parked task. One scalar draw key for
-        the whole transition, exactly as ``Controller.draw_step`` scopes it, so a
-        multi-draw transition advances its ordinal per draw on its own."""
+        """Start this row's whole ``Controller.draw_step`` as a parked task -- the same
+        step shape the per-token driver runs, so the burst inherits the draw key, the
+        ``max_tokens`` forced EOS, and ``terminate_when`` rather than restaging them.
+        Its logits reads park on this channel like any other."""
         channel = _RowChannel()
-        sampler = self.d.controller._sampler_of(p)
 
         async def run():
-            with burst_row(channel), draw_key(row, draw_ordinal(p.context)):
-                return await sampler.transition(p.context)
+            with burst_row(channel):
+                return await self.d.controller.draw_step(p)
 
         task = asyncio.ensure_future(run())
         task.add_done_callback(lambda _: channel.settled.set())
@@ -289,19 +282,6 @@ class _Burst:
                     for vi, view in enumerate(self.d.views)
                 }
                 records = await self._parked_records(warm_batch, parts, rows)
-                # Settle each row through the controller's own step shape. At the
-                # max_tokens boundary ``draw_step`` forces EOS via ``logw_eos``, whose
-                # injection must be keyed by THAT row's sampler's views, not group 0's:
-                # a mis-keyed injection forwards inside the engine's own step (deadlock).
-                for k_i, p in enumerate(parts):
-                    if p.max_tokens_left == 1:
-                        self._release_row(rows[k_i])  # its in-flight unit is discarded
-                        with burst_logw_next(self._row_injection(warm_batch, k_i, p)):
-                            records[k_i] = BurstDraw(token=EOS, step=await c.draw_step(p))
-                    elif records[k_i].step is not None:
-                        step = c._close_if_stopped(p, records[k_i].step)
-                        if step is not records[k_i].step:
-                            records[k_i] = replace(records[k_i], step=step)
                 # Bank the twist view: the drawn token's warm-row logp per particle —
                 # the increments of the critic LM leaf's prefix (plus, under clip, the
                 # contrast against the draw target; both rows are already in hand).
