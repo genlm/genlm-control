@@ -36,6 +36,7 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "pytest-mock",
+    "pytest-xdist",
     "hypothesis==6.130.13",
     "hypothesis-jsonschema",
     "setuptools"
