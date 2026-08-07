@@ -22,7 +22,6 @@ class Population:
     __slots__ = (
         "n",
         "logw",
-        "logp",
         "lane_logp",
         "twist_amount",
         "done",
@@ -37,7 +36,6 @@ class Population:
         # Per-row group id; ESS/resample/log_ml are per-group.
         self.group = np.asarray(group, dtype=np.int64)
         self.logw = np.zeros(n)
-        self.logp = np.zeros(n)
         # ``lane_logp[l, i]``: lane ``l``'s engine LM leaf's own ``prefix`` along row
         # ``i``'s path -- one drawn-token logp per committed token, EOS included once
         # the row terminates, which makes it that leaf's ``complete``.
@@ -67,7 +65,6 @@ class Population:
         """Reindex every column by ``ancestor_indices`` (resample/fork)."""
         idx = ancestor_indices
         self.logw = self.logw[idx]
-        self.logp = self.logp[idx]
         self.lane_logp = self.lane_logp[:, idx]
         self.twist_amount = self.twist_amount[idx]
         self.done = self.done[idx]
@@ -104,14 +101,6 @@ class Particle:
     @logw.setter
     def logw(self, v):
         self._pop.logw[self._i] = v
-
-    @property
-    def logp(self):
-        return self._pop.logp[self._i]
-
-    @logp.setter
-    def logp(self, v):
-        self._pop.logp[self._i] = v
 
     @property
     def done(self):
@@ -315,9 +304,11 @@ class Controller:
         """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
         Caller untwists ``p`` before the draw. Critic-free rows (no critic, or the
         critic deferred to the round boundary) bank without awaiting; an inline
-        critic twists/reweights here."""
+        critic twists/reweights here.
+
+        ``logp`` is the step's own choice log-prob. Nothing banks it -- each engine
+        leaf's lane holds its own -- but it stays in the step tuple callers splat."""
         p.score(logw)
-        p.logp += logp
         p.context.extend(to_append)
 
         critic = self._critic_of(p)
