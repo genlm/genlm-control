@@ -198,7 +198,7 @@ class Coerced(Potential):
         rather than one coerced extension prefix-ed PER vocab token. ``None`` when the
         lane is unavailable, leaving ``logw_next`` its assumption-free fallback: the
         trie keys on ``f(context)+f([t])``, equal to ``f(context+[t])`` only when ``f``
-        distributes (`_f_homomorphic`, probed at construction).
+        distributes (`_f_homomorphic`, asserted by `homomorphic=` or probed per call).
 
         The wrapped potential may offer ``_advance(chart, sym) -> chart | None``, the
         incremental step the walk is already shaped for: the chart threads down the

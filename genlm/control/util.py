@@ -11,16 +11,18 @@ from genlm.control.burst_seam import _burst_row, burst_row  # noqa: F401 (re-exp
 from genlm.backend.tokenization import Token
 
 
-def logsumexp(x):
-    """Log-sum-exp over a 1-D weight array, in the array's own backend. Returns
-    ``-inf`` (not ``nan``) on all-(-inf) input."""
+def logsumexp(x, axis=-1, keepdims=False):
+    """Log-sum-exp along ``axis``, in the array's own backend. An all-(-inf) slice
+    reduces to ``-inf``, not ``nan``. The default reduces the last axis, so a batched
+    ``[N, V]`` block reduces per row."""
     if torch.is_tensor(x):
-        return torch.logsumexp(x, 0)
+        return torch.logsumexp(x, axis, keepdim=keepdims)
     x = np.asarray(x)
-    if np.all(x == -np.inf):
-        return -np.inf
-    m = np.max(x)
-    return np.log(np.sum(np.exp(x - m))) + m
+    m = np.max(x, axis=axis, keepdims=True)
+    m = np.where(np.isneginf(m), 0.0, m)  # all -inf: shift by 0 so the sum is 0
+    with np.errstate(divide="ignore"):
+        out = np.log(np.sum(np.exp(x - m), axis=axis, keepdims=True)) + m
+    return out if keepdims else np.squeeze(out, axis=axis)
 
 
 def to_numpy(w):
@@ -142,7 +144,7 @@ class LazyWeights:
             (LazyWeights): A new LazyWeights instance with normalized weights.
         """
         if self.is_log:
-            return self.spawn(self.weights - logsumexp(self.weights))
+            return self.spawn(self.weights - logsumexp(self.weights, keepdims=True))
         else:
             return self.spawn(self.weights / self.weights.sum())
 

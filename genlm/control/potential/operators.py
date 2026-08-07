@@ -25,6 +25,33 @@ class PotentialOps:
 
         return Product(self, other)
 
+    def __pow__(self, beta):
+        """Scale this potential's log-weights by `beta`.
+
+        See [`Tempered`][genlm.control.potential.tempered.Tempered] for more details.
+
+        Args:
+            beta (float): The exponent, `1/temperature`.
+
+        Returns:
+            (Tempered): The unnormalized `self ** beta`.
+        """
+        from genlm.control.potential.tempered import Tempered
+
+        return Tempered(self, beta)
+
+    def normalize(self):
+        """Renormalize this potential's next-token rows.
+
+        See [`Normalized`][genlm.control.potential.normalized.Normalized] for more details.
+
+        Returns:
+            (Normalized): A potential whose `logw_next` sums to one at every context.
+        """
+        from genlm.control.potential.normalized import Normalized
+
+        return Normalized(self)
+
     def coerce(self, other, f, prune=True, homomorphic=None):
         """Coerce the current potential to operate on the vocabulary of another potential.
 
