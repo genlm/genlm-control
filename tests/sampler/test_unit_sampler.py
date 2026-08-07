@@ -25,11 +25,13 @@ async def test_multi_token_unit_sampler_basic():
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
     boundary = TokenSetBoundary({b" ", b"!", EOS})
-    # Unit sampler samples words according to boundary
+    # The cap must sit far above the boundary's expected wait, or it fires instead: the
+    # non-boundary mass here is 0.7, so a cap of 10 truncates 0.7**10 ~ 3% of runs and
+    # this test fails on an unterminated buffer. Truncation has its own test below.
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
-        max_subunits_per_unit=10,
+        max_subunits_per_unit=60,
     )
     # Sample a unit
     unit, weight, _ = await unit_sampler.sample([], draw=None)

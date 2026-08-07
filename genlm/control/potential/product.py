@@ -73,7 +73,11 @@ class Product(Potential):
                 super().__init__(self.p1.vocab, token_type=token_type)
 
         else:
-            common_vocab = list(set(self.p1.vocab) & set(self.p2.vocab))
+            # Ordered by p1, NOT `list(set(...) & set(...))`: set iteration order varies
+            # with PYTHONHASHSEED, which permutes the vocabulary and flips Gumbel-max
+            # draws -- the same seed would then give different samples across runs.
+            keep = set(self.p2.vocab)
+            common_vocab = [x for x in dict.fromkeys(self.p1.vocab) if x in keep]
             if not common_vocab:
                 raise ValueError("Potentials in product must share a common vocabulary")
 
