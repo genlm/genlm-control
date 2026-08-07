@@ -5,12 +5,13 @@ import asyncio
 import enum
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from genlm.control.constant import EndOfSequence
 from genlm.control.potential.built_in.llm import find_engine_lm, lm_leaves
 from genlm.control.burst_seam import burst_row
-from genlm.control.util import draw_key, flatten_units, picker_indices
+from genlm.control.util import draw_key, flatten_units, picker_indices, to_numpy
 
 
 class NotAcceleratable(Exception):
@@ -24,6 +25,7 @@ class BlockReason(enum.Enum):
     FORWARD_NOT_INJECTABLE = "forward"
     BATCH_HETEROGENEOUS = "batch"
     UNBANKABLE_STEP = "unbankable"
+    LANE_OFF_ENGINE = "lane_engine"
 
 
 @dataclass(frozen=True)
@@ -156,12 +158,13 @@ class _Burst:
         ))
 
     def _row_injection(self, warm_batch, i, p):
-        """Row ``i``'s ``{view: [V+1]}`` slice of the batched warm, keyed by the row's OWN
-        sampler's views: groups carry their own leaves, so another group's would miss the
+        """Row ``i``'s ``{leaf: [V+1]}`` slice of the batched warm, keyed by the row's OWN
+        group's lanes: groups carry their own leaves, so another group's would miss the
         override and forward inside the engine's step."""
         return {
             rv: rv.make_lazy_weights(warm_batch[gv].weights[i])
-            for rv, gv in zip(self.d.controller.sampler_of(p).burst_views(), self.d.views)
+            for rv, gv in zip(self.d.controller.group_lanes[p.group], self.d.views)
+            if rv is not None
         }
 
     def _spawn_row(self, p, row):
@@ -245,6 +248,31 @@ class _Burst:
                 )
         return records
 
+    def _bank_lanes(self, warm_batch, records, rows):
+        """Add this step's drawn-token logp to every lane, from the warm row each lane's
+        leaf already produced. That running sum IS the leaf's own ``prefix``, and a
+        terminating row's EOS increment closes it into its ``complete`` -- so a leaf
+        reached inside the burst reads a banked number rather than forwarding."""
+        L = self.d.controller.particles.lane_logp
+        drawn = [k for k, r in enumerate(records)
+                 if not isinstance(r.token, EndOfSequence)]
+        eos = [k for k, r in enumerate(records) if isinstance(r.token, EndOfSequence)]
+        if not drawn and not eos:
+            return
+        drawn_rows = np.array([rows[k] for k in drawn], dtype=np.int64)
+        eos_rows = np.array([rows[k] for k in eos], dtype=np.int64)
+        for lane, view in enumerate(self.d.views):
+            W = warm_batch[view].weights  # [N, V+1] device tensor
+            if drawn:
+                lk = view.lookup
+                ks = torch.tensor(drawn, device=W.device)
+                idx = torch.tensor(
+                    [lk[records[k].token] for k in drawn], device=W.device
+                )
+                L[lane, drawn_rows] += to_numpy(W[ks, idx])
+            if eos:
+                L[lane, eos_rows] += to_numpy(W[eos, -1])
+
     def drain_aborts(self):
         handles = self.abort_handles
         self.abort_handles = set()
@@ -284,31 +312,7 @@ class _Burst:
                     for vi, view in enumerate(self.d.views)
                 }
                 records = await self._parked_records(warm_batch, parts, rows)
-                # Bank the twist view: the drawn token's warm-row logp per particle —
-                # the increments of the critic LM leaf's prefix (plus, under clip, the
-                # contrast against the draw target; both rows are already in hand).
-                if self.d.twist_view is not None:
-                    tw = warm_batch[self.d.twist_view].weights  # [N, V+1] device tensor
-                    lk = self.d.twist_view.lookup
-                    ks = [k for k, r in enumerate(records)
-                          if not isinstance(r.token, EndOfSequence)]
-                    if ks:
-                        rows_t = torch.tensor(ks, device=tw.device)
-                        idx = torch.tensor([lk[records[k].token] for k in ks],
-                                           device=tw.device)
-                        tvals = None
-                        if c.twist.clip is not None:
-                            tvals = warm_batch[self.d.views[0]].weights[rows_t, idx].tolist()
-                        c.twist.bank(c.particles, [rows[k] for k in ks],
-                                     tw[rows_t, idx].tolist(), tvals)
-                    # A terminating row's EOS increment completes the sum, so
-                    # ``served_complete`` covers the full sequence in either lane --
-                    # inline (token grain) or at the round boundary (deferred).
-                    eos_ks = [k for k, r in enumerate(records)
-                              if isinstance(r.token, EndOfSequence)]
-                    if eos_ks:
-                        c.twist.bank_eos(c.particles, [rows[k] for k in eos_ks],
-                                         tw[eos_ks, -1].tolist())
+                self._bank_lanes(warm_batch, records, rows)
                 for k, rec in zip(live_k, records):
                     tok = rec.token
                     out[k] = (
@@ -384,8 +388,8 @@ class _Burst:
 
     async def _bank_pop(self, parts, records):
         """Bank one step's records into the population (score/extend/critic; sets
-        p.done). A token-grain critic's LM leaf is served from the banked twist
-        sums (prefix and complete) -- it must not forward mid-burst."""
+        p.done). A token-grain critic's LM leaf is served from its lane's banked sum --
+        it must not forward mid-burst."""
         c = self.d.controller
         for p, rec in zip(parts, records):
             if rec.step is None:
@@ -393,7 +397,7 @@ class _Burst:
             if self.d.defers_critic:  # settles at the boundary, nothing to serve
                 await c.bank_row(p, *rec.step)
             else:
-                with c.serve_row(p, dlogp=rec.step[2]):
+                with c.serve_lanes(p.group, [p], [p]):
                     await c.bank_row(p, *rec.step)
 
     def _drop_row(self, row):
@@ -439,19 +443,31 @@ def burst_blocker(controller):
         return BurstBlock(
             BlockReason.UNBANKABLE_STEP,
             "`terminate_when` closes a step with an undrawn EOS, which the per-step "
-            "twist bank cannot represent alongside the drawn token",
+            "lane bank cannot represent alongside the drawn token",
         )
     if find_engine_lm(s.target) is None:
         return BurstBlock(
             BlockReason.NO_ENGINE_LEAF, "sampler target has no single engine-burst LM leaf"
         )
     # Forward-free invariant: every LM leaf on a group's per-step draw path (target/
-    # proposal) must be an injected view, or it would forward inside the burst (which
+    # proposal) must be an injected lane, or it would forward inside the burst (which
     # can't supply it). A deferred critic scores at the drain; a non-deferred
-    # (token-grain) critic is served per step from banked twist sums, which covers
+    # (token-grain) critic is served per step from its lane's bank, which covers
     # exactly its own engine leaf.
-    for g, (samp, crit) in enumerate(zip(controller.samplers, controller.critics)):
-        injected = set(samp.burst_views())
+    for g, (samp, crit, lanes) in enumerate(
+        zip(controller.samplers, controller.critics, controller.group_lanes)
+    ):
+        # Every lane is an engine request advanced by the drawn token ids and banked at
+        # the drawn token's index, so a lane's leaf must sit on the draw path's own
+        # engine. One over another tokenizer would be fed ids that mean something else.
+        engine = lanes[0].model if lanes[0] is not None else None
+        if engine is None or any(lf is None or lf.model is not engine for lf in lanes):
+            return BurstBlock(
+                BlockReason.LANE_OFF_ENGINE,
+                f"group {g}: a lane's LM leaf is not on the draw path's engine, so the "
+                "drawn token ids do not index its vocabulary",
+            )
+        injected = set(lanes)
         draw = samp.burst_draw_sampler()
         for pot in (draw.target, draw.proposal):
             if pot is None:
@@ -460,53 +476,53 @@ def burst_blocker(controller):
                 return BurstBlock(
                     BlockReason.FORWARD_NOT_INJECTABLE,
                     f"group {g}: a draw-path LM leaf would forward inside the burst "
-                    "(it is not an injected view)",
+                    "(it is not an injected lane)",
                 )
         if crit is not None and not critic_deferred(samp, controller):
-            servable = {find_engine_lm(crit)}
-            if any(lm not in servable for lm in lm_leaves(crit)):
+            if any(lm not in injected for lm in lm_leaves(crit)):
                 return BurstBlock(
                     BlockReason.FORWARD_NOT_INJECTABLE,
                     f"group {g}: the token-grain critic has an LM leaf beyond its own "
-                    "engine leaf; it cannot be served from banked twist sums",
+                    "lane; it cannot be served from a banked sum",
                 )
     if len(controller.samplers) > 1:
-        # The burst serves one twist view per group, present for all or none; mixed
+        # The burst serves one critic lane per group, present for all or none; mixed
         # batches fall back to the per-token loop.
         if len({c is None for c in controller.critics}) != 1:
             return BurstBlock(
                 BlockReason.BATCH_HETEROGENEOUS,
                 "groups mix critic-present and critic-free problems",
             )
-        return _batch_blocker(controller.samplers)
+        return _batch_blocker(controller)
     return None
 
 
-def _batch_blocker(samplers):
+def _batch_blocker(controller):
     """Why a batched burst's groups can't share one forward, or ``None`` if
     burst-homogeneous. Groups must share grain (the driver reads it off group 0 for the
-    whole population), K views, and per-view engine/temperature/LoRA. They may differ in
-    sampler kind, prompt, critic, and constraint -- the parked lane draws each row
-    through its OWN group's sampler."""
-    s0 = samplers[0]
-    views0 = s0.burst_views()
+    whole population) and per-lane temperature/LoRA -- one engine request serves lane
+    ``l`` for every group at once. They may differ in sampler kind, prompt, critic, and
+    constraint: the parked lane draws each row through its OWN group's sampler."""
+    samplers = controller.samplers
+    s0, lanes0 = samplers[0], controller.group_lanes[0]
 
     def blocked(detail):
         return BurstBlock(BlockReason.BATCH_HETEROGENEOUS, f"group {g} {detail}")
 
-    for g, s in enumerate(samplers[1:], start=1):
+    for g, (s, lanes) in enumerate(
+        zip(samplers[1:], controller.group_lanes[1:]), start=1
+    ):
         if s.burst_free_running() != s0.burst_free_running():
             return blocked("draws at a different grain from group 0")
-        views = s.burst_views()
-        if len(views) != len(views0):
-            return blocked(f"has {len(views)} views, not {len(views0)}")
-        for vi, (v, v0) in enumerate(zip(views, views0)):
-            if v is None or v.model is not v0.model:
-                return blocked(f"view {vi} uses a different engine")
+        if len(lanes) != len(lanes0):
+            return blocked(f"has {len(lanes)} lanes, not {len(lanes0)}")
+        for li, (v, v0) in enumerate(zip(lanes, lanes0)):
+            if v.model is not v0.model:
+                return blocked(f"lane {li} uses a different engine")
             if getattr(v, "temperature", None) != getattr(v0, "temperature", None):
-                return blocked(f"view {vi} temperature differs from group 0")
+                return blocked(f"lane {li} temperature differs from group 0")
             if v.lora_name != v0.lora_name:
-                return blocked(f"view {vi} uses a different LoRA adapter from group 0")
+                return blocked(f"lane {li} uses a different LoRA adapter from group 0")
     return None
 
 
@@ -525,30 +541,19 @@ class BurstLoop:
         # round boundary — engine drained, its LM leaves may forward there.
         self.defers_critic = critic_deferred(self.sampler, controller)
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
-        # views: LM leaves whose warm logits the burst injects (group 0's target+proposal,
-        # plus the critic's engine leaf when twisting will read it -- at the boundary
-        # if deferred, per step if token-grain); the batched burst draws every group
-        # through group 0's sampler.
-        self.twist_view = controller.twist_leaves[0]
-        # The burst banks per-token twist sums whenever a twist view is injected.
-        self.banks_twist = self.twist_view is not None
-        assert all(
-            (lf is None) == (self.twist_view is None) for lf in controller.twist_leaves
-        ), "batched groups must agree on having an engine-LM critic leaf"
-        self.views = self.sampler.burst_views() + (
-            [self.twist_view] if self.twist_view is not None else []
-        )
+        # views: group 0's engine lanes, one request each -- the batched burst draws
+        # every group through group 0's sampler. ``_batch_blocker`` is what guarantees
+        # every group agrees on lane count; a lane's leaf still differs per group.
+        self.views = controller.group_lanes[0]
         # The engine LM the burst drives (run_burst + eos id); views share its model.
         self.llm = self.views[0]
         if self.llm is None:  # pragma: no cover - guarded by burst_blocker
             raise ValueError("sampler target has no single engine-burst LM leaf")
 
-        # Per-(group, view) prompt prefix, snapshotted on the main thread (``prompt_ids`` is a
-        # ContextVar invisible on the ``run_burst`` worker thread).
+        # Per-(group, lane) prompt prefix, snapshotted on the main thread (``prompt_ids``
+        # is a ContextVar invisible on the ``run_burst`` worker thread).
         self.view_prefixes = [
-            [list(v.prompt_ids) for v in s.burst_views()]
-            + ([list(lf.prompt_ids)] if lf is not None else [])
-            for s, lf in zip(controller.samplers, controller.twist_leaves)
+            [list(v.prompt_ids) for v in lanes] for lanes in controller.group_lanes
         ]
 
         # Engine token id committed as the placeholder for an aborted/EOS row.

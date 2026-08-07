@@ -23,8 +23,7 @@ class Population:
         "n",
         "logw",
         "logp",
-        "twist_logp",
-        "twist_clip_sum",
+        "lane_logp",
         "twist_amount",
         "done",
         "max_tokens_left",
@@ -33,19 +32,16 @@ class Population:
         "_views",
     )
 
-    def __init__(self, n, max_tokens, group=None):
+    def __init__(self, n, max_tokens, group, n_lanes):
         self.n = n
         # Per-row group id; ESS/resample/log_ml are per-group.
-        self.group = (
-            np.zeros(n, dtype=np.int64) if group is None
-            else np.asarray(group, dtype=np.int64)
-        )
+        self.group = np.asarray(group, dtype=np.int64)
         self.logw = np.zeros(n)
         self.logp = np.zeros(n)
-        # Critic LM leaf's banked per-token logp sum, and the clipped contrast sum
-        # used under ``Twist(clip=...)``. Written only by ``Twist``.
-        self.twist_logp = np.zeros(n)
-        self.twist_clip_sum = np.zeros(n)
+        # ``lane_logp[l, i]``: lane ``l``'s engine LM leaf's own ``prefix`` along row
+        # ``i``'s path -- one drawn-token logp per committed token, EOS included once
+        # the row terminates, which makes it that leaf's ``complete``.
+        self.lane_logp = np.zeros((n_lanes, n))
         self.twist_amount = np.zeros(n)
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
@@ -72,8 +68,7 @@ class Population:
         idx = ancestor_indices
         self.logw = self.logw[idx]
         self.logp = self.logp[idx]
-        self.twist_logp = self.twist_logp[idx]
-        self.twist_clip_sum = self.twist_clip_sum[idx]
+        self.lane_logp = self.lane_logp[:, idx]
         self.twist_amount = self.twist_amount[idx]
         self.done = self.done[idx]
         self.max_tokens_left = self.max_tokens_left[idx]
@@ -119,18 +114,6 @@ class Particle:
         self._pop.logp[self._i] = v
 
     @property
-    def twist_amount(self):
-        return self._pop.twist_amount[self._i]
-
-    @property
-    def twist_logp(self):
-        return self._pop.twist_logp[self._i]
-
-    @property
-    def twist_clip_sum(self):
-        return self._pop.twist_clip_sum[self._i]
-
-    @property
     def done(self):
         return self._pop.done[self._i]
 
@@ -166,73 +149,6 @@ class Particle:
         return self._pop.logw[self._i]
 
 
-class Twist:
-    """Critic-twist policy: the twist value formula plus the burst-banked per-token
-    serving sums. The columns live in :class:`Population`; every formula that reads
-    or writes them lives here.
-
-    Args:
-        contrast (bool): twist with ``critic.score(context) - particle.logp`` (the
-            log-ratio against the proposal) instead of ``critic.score(context)``.
-            Terminal scores are unaffected — what lands at termination is the
-            critic's own ``complete`` (a zeroed one cancels the twist entirely).
-        temperature (float): scales the twist; 0 disables twisting entirely.
-        clip (tuple, optional): ``(neg, pos)`` per-token caps for the critic-LM
-            contrast: the twist becomes ``temperature * sum_t clip(v_t - t_t, -neg,
-            +pos)`` over per-token critic/target logp increments, in both lanes.
-            Terminal scores stay unclipped.
-    """
-
-    def __init__(self, contrast=False, temperature=1.0, clip=None):
-        assert clip is None or contrast, "clip requires contrast"
-        self.contrast = contrast
-        self.temperature = temperature
-        self.clip = clip
-
-    def value(self, p, amt):
-        """The twist applied for critic score ``amt`` on particle ``p``."""
-        if self.contrast:
-            amt -= p.logp
-        return self.temperature * amt
-
-    def served_row(self, p, dlogp=0.0):
-        """One particle's banked prefix sum, served as the critic LM leaf's
-        ``prefix``. Under clip, ``logp`` is folded back in so the contrast
-        subtraction in :meth:`value` yields the clipped sum; ``dlogp`` covers a
-        step increment not yet applied to ``p.logp``."""
-        if self.clip is not None:
-            return p.logp + dlogp + p.twist_clip_sum
-        return p.twist_logp
-
-    def served_complete(self, p):
-        """One particle's banked sum (EOS increment included) served as the critic
-        LM leaf's ``complete``. Never clipped."""
-        return p.twist_logp
-
-    def served_prefix(self, ps):
-        """Banked warm-row sums served as the critic LM leaf's ``batch_prefix``."""
-        return np.array([self.served_row(p) for p in ps])
-
-    def bank(self, pop, rows, vals, tvals):
-        """Accumulate one step's drawn-token increments: the critic leaf's logp per
-        row (``vals``), and under ``clip`` the clipped contrast against the draw
-        target's logp (``tvals``)."""
-        if self.clip is None:
-            for row, v in zip(rows, vals):
-                pop.twist_logp[row] += v
-        else:
-            neg, pos = self.clip
-            for row, v, t in zip(rows, vals, tvals):
-                pop.twist_logp[row] += v
-                pop.twist_clip_sum[row] += min(max(v - t, -neg), pos)
-
-    def bank_eos(self, pop, rows, vals):
-        """Accumulate terminating rows' EOS logp increments (completes the sum
-        :meth:`served_complete` serves; the clip column is terminal-irrelevant)."""
-        for row, v in zip(rows, vals):
-            pop.twist_logp[row] += v
-
-
 class Controller:
     """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. Every
     sampler collapses to one per-step ``transition``. The population is B independent
@@ -248,8 +164,6 @@ class Controller:
         ess_threshold (float): per-group ESS fraction below which that group resamples.
         max_tokens (int): per-particle token budget.
         twist_with_critic (bool): whether the critic twists during stepping.
-        twist (Twist, optional): the twist policy (contrast/temperature/clip);
-            defaults to the bare critic score.
         terminate_when (callable, optional): ``context -> bool`` stop condition. When it
             fires, EOS closes the sequence in that same step. The context is in the
             sampler's own representation, so unit nesting is the caller's business.
@@ -266,7 +180,6 @@ class Controller:
         ess_threshold,
         max_tokens,
         twist_with_critic,
-        twist=None,
         terminate_when=None,
         resampling_method="multinomial",
         record=False,
@@ -282,31 +195,36 @@ class Controller:
         self.n_resamples = 0
         self.ess_threshold = ess_threshold
         self.twist_with_critic = twist_with_critic
-        self.twist = twist if twist is not None else Twist()
         self.terminate_when = terminate_when
         # A terminal-only critic has no per-step signal: reweight only at termination.
         if twist_with_critic and all(
             c is not None and c.is_terminal_only() for c in critics
         ):
             self.twist_with_critic = False
-        # Per-group critic LM leaf, served from banked twist sums instead of forwarding.
-        # ``None`` where that group's critic has no engine leaf (or isn't twisting).
-        self.twist_leaves = [
-            find_engine_lm(c) if (self.twist_with_critic and c is not None) else None
-            for c in critics
+        # Engine lanes, per group: the LM leaves a burst injects for that group --
+        # the draw path's, then the critic's when it twists through one. Slot ``l`` is
+        # one engine lane across every group, and ``lane_logp[l]`` banks that slot's
+        # leaf's own per-token logp, which is what serves its ``prefix``/``complete``
+        # inside a burst instead of a forward.
+        self.group_lanes = [
+            s.burst_views() + [lf for lf in [self._critic_lane(c)] if lf is not None]
+            for s, c in zip(samplers, critics)
         ]
-        # Per-group draw-path engine leaf -- the last view a burst injects for that
-        # group. Its accumulated logp IS ``p.logp``, so its ``complete`` can be served
-        # from the bank: a terminal view scoring against the draw distribution (e.g. a
-        # tempered terminal's student side) then never forwards mid-burst.
-        self.proposal_leaves = [s.burst_views()[-1] for s in samplers]
         self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
 
         group = np.concatenate(
             [np.full(ng, g, dtype=np.int64) for g, ng in enumerate(group_sizes)]
         )
-        self.particles = Population(n_particles, max_tokens, group=group)
+        # Groups that disagree on lane count cannot share a burst (``_batch_blocker``
+        # says so and the run falls back), but the column block is sized before the
+        # driver is chosen, so it covers the widest group.
+        self.particles = Population(
+            n_particles,
+            max_tokens,
+            group=group,
+            n_lanes=max(len(lanes) for lanes in self.group_lanes),
+        )
         # Per-group row indices (invariant across reindex; resample is group-local).
         self._group_rows = [
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
@@ -315,9 +233,6 @@ class Controller:
         # True when critic math defers to the round boundary (``bank_row`` pends
         # instead of awaiting; ``apply_critic_boundary`` settles). Set by ``run``.
         self.defer_critic = False
-        # Whether the driver banks the per-token twist sums itself (the burst's
-        # warm rows); False means the inline clip path banks from critic scores.
-        self.twist_banked = False
         self._critic_pending: list = []
         # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
         self._pending_resample = False
@@ -326,6 +241,14 @@ class Controller:
         # log(ess_threshold); the per-group ESS test adds log(group_size).
         with np.errstate(divide="ignore"):
             self._log_ess_threshold = np.log(ess_threshold)
+
+    def _critic_lane(self, critic):
+        """A twisting critic's own engine lane, or ``None``: no critic, no twisting, or
+        no single engine leaf to bank (a multi-LM critic scores by forwarding at a
+        boundary instead)."""
+        if not self.twist_with_critic or critic is None:
+            return None
+        return find_engine_lm(critic)
 
     async def draw_step(self, p):
         """One row's step ``(to_append, logw, logp)``: forced EOS at the ``max_tokens``
@@ -369,50 +292,23 @@ class Controller:
         return self.critics[p.group]
 
     @contextlib.contextmanager
-    def serve_row(self, p, dlogp=0.0):
-        """Serve one row's banked sums as its engine leaves' ``prefix``/``complete``:
-        the critic LM leaf its twist sums, the draw leaf its accumulated logp
-        (``dlogp`` covers this step's increment, not yet applied to ``p.logp``).
-        Keyed by the row's OWN group: groups carry their own leaves, so another
-        group's would miss the override and forward."""
-        g = p.group
-        leaf = self.twist_leaves[g]
-        if leaf is None:
-            yield
-            return
-        prefix = {leaf: [self.twist.served_row(p, dlogp)]}
-        complete = {leaf: [self.twist.served_complete(p)]}
-        prop = self.proposal_leaves[g]
-        if prop is not None and prop is not leaf:
-            complete[prop] = [float(p.logp) + dlogp]
-        with burst_prefix(prefix), burst_complete(complete):
-            yield
+    def serve_lanes(self, g, live, done):
+        """Serve group ``g``'s lanes their own banked sums as their leaves'
+        ``batch_prefix`` (rows ``live``) and ``batch_complete`` (rows ``done``).
 
-    @contextlib.contextmanager
-    def serve_prefix(self, g, ps):
-        """Serve rows ``ps`` their banked prefix sums as group ``g``'s critic LM leaf's
-        ``batch_prefix``."""
-        leaf = self.twist_leaves[g]
-        if leaf is None:
-            yield
-            return
-        with burst_prefix({leaf: self.twist.served_prefix(ps)}):
-            yield
+        Values are positional against the contexts the caller scores, so ``live`` and
+        ``done`` must be the same lists in the same order. Keyed by the group's OWN
+        lanes: another group's leaves would miss the override and forward."""
+        L, lanes = self.particles.lane_logp, self.group_lanes[g]
 
-    @contextlib.contextmanager
-    def serve_complete(self, g, ps):
-        """Serve terminating rows ``ps`` their banked sums as ``batch_complete``:
-        group ``g``'s critic LM leaf its twist sums, the draw leaf its accumulated
-        logp (fully applied by the boundary settle)."""
-        leaf = self.twist_leaves[g]
-        if leaf is None:
-            yield
-            return
-        over = {leaf: [self.twist.served_complete(p) for p in ps]}
-        prop = self.proposal_leaves[g]
-        if prop is not None and prop is not leaf:
-            over[prop] = [float(p.logp) for p in ps]
-        with burst_complete(over):
+        def over(ps):
+            return {
+                leaf: [float(L[lane, p.row]) for p in ps]
+                for lane, leaf in enumerate(lanes)
+                if leaf is not None
+            }
+
+        with burst_prefix(over(live)), burst_complete(over(done)):
             yield
 
     async def bank_row(self, p, to_append, logw, logp):
@@ -449,15 +345,7 @@ class Controller:
                 p.score(twist_amt)
                 p.finish()
                 return
-            if self.twist.clip is not None and not self._is_terminal(p):
-                # Clip lives on per-token increments: bank this step's (the burst
-                # already banked it from warm rows), then twist off the served sum.
-                if not self.twist_banked:
-                    self.twist.bank(
-                        self.particles, [p.row], [twist_amt - p.twist_logp], [logp]
-                    )
-                twist_amt = self.twist.served_row(p)
-            p.twist(self.twist.value(p, twist_amt))
+            p.twist(twist_amt)
 
         if self.verbosity > 0:
             print(self._repr_particle(p))
@@ -574,7 +462,6 @@ class Controller:
         for the engine driver), then deferred critic math settles and the round
         boundary runs. The driver owns scheduling; the controller owns the math."""
         self.defer_critic = driver.defers_critic
-        self.twist_banked = driver.banks_twist
         await self.start()
         while any(not p.done for p in self.particles):
             await self._round_start()
@@ -624,7 +511,7 @@ class Controller:
                     if not (ctx and ctx[-1] == critic.eos)]
             done = [p for p, ctx in zip(ps, contexts)
                     if ctx and ctx[-1] == critic.eos]
-            with self.serve_prefix(g, live), self.serve_complete(g, done):
+            with self.serve_lanes(g, live, done):
                 return ps, await critic.batch_score(contexts)
 
         for ps, amts in await asyncio.gather(
@@ -638,7 +525,7 @@ class Controller:
                     p.score(amt)
                     p.finish()
                 else:
-                    p.twist(self.twist.value(p, amt))
+                    p.twist(amt)
 
 
 class StepLoop:
@@ -647,7 +534,6 @@ class StepLoop:
 
     sync_boundary = True
     defers_critic = False
-    banks_twist = False
 
     def __init__(self, controller):
         self.controller = controller
