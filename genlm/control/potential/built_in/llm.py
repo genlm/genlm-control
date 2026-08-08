@@ -543,12 +543,6 @@ class PromptedLLM(Potential):
         """
         return await self.log_probability(context)
 
-    def _lane_sums(self, done):
-        """The banked sums a burst boundary injects for this leaf -- ``complete`` when
-        ``done``, else ``prefix``. ``None`` outside a boundary."""
-        sums = _burst_lane_sums.get()
-        return None if sums is None else sums[1 if done else 0]
-
     def _served(self, override, n=None):
         """This LM's injected value from the ``{leaf: values}`` map ``override``, or
         ``None`` to compute it.
@@ -571,7 +565,8 @@ class PromptedLLM(Potential):
     async def batch_prefix(self, contexts):
         """Batched ``prefix``. At a burst boundary the controller serves the banked
         warm-row sums instead of re-scoring every context."""
-        vals = self._served(self._lane_sums(done=False), len(contexts))
+        sums = _burst_lane_sums.get()
+        vals = self._served(sums.prefix if sums else None, len(contexts))
         if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_prefix(contexts)
@@ -579,7 +574,8 @@ class PromptedLLM(Potential):
     async def batch_complete(self, contexts):
         """Batched ``complete``. A burst serves the banked warm-row sums instead of
         scoring."""
-        vals = self._served(self._lane_sums(done=True), len(contexts))
+        sums = _burst_lane_sums.get()
+        vals = self._served(sums.complete if sums else None, len(contexts))
         if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_complete(contexts)
@@ -711,8 +707,8 @@ class PromptedLLM(Potential):
     async def batch_logw_next(self, contexts):
         """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
         (`.weights` shape `[N, V+1]`). In a batched burst the engine's warm `[N, V+1]` batch
-        is injected via the `burst_logw_next` override (same ContextVar as the scalar path,
-        value batched) -- served directly, no forward.
+        is served directly off the burst's warm override (the same ContextVar as the
+        scalar path, value batched) -- no forward.
 
         Args:
             contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.

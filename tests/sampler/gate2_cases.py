@@ -155,10 +155,8 @@ S6 = (1234, 7, 99, 2024, 555, 31)
 S12 = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)
 S_AEIOU = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
 
-# ``match_floor`` values below were measured, then cut to roughly two thirds so GPU
-# nondeterminism cannot trip them. Two cases carry NO floor because they are not
-# RNG-matched to the reference at all, and their no-bias assertions are therefore
-# unpaired Monte Carlo checks rather than tight ones:
+# Two cases carry NO ``match_floor`` because they are not RNG-matched to the reference at
+# all, so their no-bias assertions are unpaired Monte Carlo checks rather than tight ones:
 #   awrs (1/96 matched) -- AWRS draws by rejection over its own per-instance threefry
 #     stream, and the walk order amplifies the warm-KV logit residual.
 #   set  (0/32 matched) -- `sample_set` draws each subtoken through `sample_dict` over a
