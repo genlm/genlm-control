@@ -155,18 +155,26 @@ S6 = (1234, 7, 99, 2024, 555, 31)
 S12 = (1234, 7, 99, 2024, 555, 31, 8, 17, 42, 123, 271, 314)
 S_AEIOU = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
 
+# ``match_floor`` values below were measured, then cut to roughly two thirds so GPU
+# nondeterminism cannot trip them. Two cases carry NO floor because they are not
+# RNG-matched to the reference at all, and their no-bias assertions are therefore
+# unpaired Monte Carlo checks rather than tight ones:
+#   awrs (1/96 matched) -- AWRS draws by rejection over its own per-instance threefry
+#     stream, and the walk order amplifies the warm-KV logit residual.
+#   set  (0/32 matched) -- `sample_set` draws each subtoken through `sample_dict` over a
+#     Float chart, which is not the keyed picker, so nothing pairs the two runs.
 CASES = {
     c.label: c
     for c in [
         Case("unconstrained", 8, 0.0, 12, (1234, 7, 99, 2024, 31, 53, 71, 97), "steploop_cached",
-             lambda llm, seed: DirectTokenSampler(llm)),
+             lambda llm, seed: DirectTokenSampler(llm), match_floor=24),
         Case("constrained-boolfsa[a-z ]+", 16, 0.0, 12, (1234, 7), "steploop_cached",
-             lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[a-z ]+"))),
+             lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[a-z ]+")), match_floor=12),
         Case("boolfsa[aeiou ]+", 16, 0.5, 10, S_AEIOU, "steploop_cached",
-             lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[aeiou ]+"))),
+             lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[aeiou ]+")), match_floor=4),
         Case("terminal-critic", 16, 0.0, 12, S6, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
-             lambda llm: TerminalContainsCritic(llm.vocab)),
+             lambda llm: TerminalContainsCritic(llm.vocab), match_floor=28),
         # Terminal-only critic WITH resampling. A terminal critic forces
         # `twist_with_critic` off, so before this case the only critic the burst ever
         # settled mid-burst was a twisting one, and the only terminal critic ran at
@@ -174,14 +182,14 @@ CASES = {
         # could land after the resample that should have consumed it.
         Case("terminal-critic-resample", 16, 0.5, 12, S6, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
-             lambda llm: TerminalContainsCritic(llm.vocab)),
+             lambda llm: TerminalContainsCritic(llm.vocab), match_floor=14),
         Case("twist-critic", 16, 0.5, 12, S12, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
-             lambda llm: SoftVowelCritic(llm.vocab)),
+             lambda llm: SoftVowelCritic(llm.vocab), match_floor=34),
         Case("multitoken-boolfsa[a-z ]+", 8, 0.5, 6, S12, "steploop_cached",
              lambda llm, seed: MultiTokenUnitSampler(
                  DirectTokenSampler(boolfsa(llm, r"[a-z ]+")),
-                 ByteLengthBoundary(5), max_subunits_per_unit=6)),
+                 ByteLengthBoundary(5), max_subunits_per_unit=6), match_floor=15),
         Case("awrs[a-z ]+", 16, 0.0, 12, S6, "steploop_cached",
              lambda llm, seed: AWRS(llm, _condition(llm, r"[a-z ]+"), seed=seed)),
         Case("set[a-z ]+", 8, 0.0, 8, (1234, 7, 99, 2024), "steploop_cached",
