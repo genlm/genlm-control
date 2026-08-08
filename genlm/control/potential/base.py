@@ -17,6 +17,14 @@ from genlm.control.potential.operators import PotentialOps
 from genlm.control.potential.testing import PotentialTests
 
 
+def _as_ints(idx, dtype):
+    """An index run as an integer array, without a per-element pass when it already is
+    one. `np.fromiter` and not `torch.tensor(list)`, which is several times slower."""
+    if isinstance(idx, np.ndarray):
+        return idx.astype(dtype, copy=False)
+    return np.fromiter(idx, dtype=dtype)
+
+
 class VocabTables(NamedTuple):
     """What a vocabulary determines, built once and shareable by every potential over
     it (see `Potential.build_tables`)."""
@@ -208,8 +216,10 @@ class Potential(ABC, PotentialOps, PotentialTests):
         carrying finite weight, their weights, and the EOS weight -- or `None` when
         this potential has no sparse enumeration.
 
-        `values` may be a single float when every live token shares a weight (a
-        support mask). `indices` is consumed once, so a generator is fine.
+        `indices` and `values` may be any array-like; a numpy array reaches the scatter
+        without a per-element pass, anything else is consumed once. `values` may instead
+        be a single float when every live token shares a weight (a support mask), which
+        is written as a scalar and builds no value array at all.
 
         Implementing this replaces the dense per-context build in `logw_next` AND lets
         `batch_logw_next` scatter the whole population into one `alloc_rows` block. An
@@ -232,22 +242,37 @@ class Potential(ABC, PotentialOps, PotentialTests):
         never a dense row per context."""
         V1 = len(self.vocab_eos)
         W = self.alloc_rows(len(lives))
-        flat, vals = [], []
+        # Flat indices run to `len(lives) * V1`, which int32 carries for any real
+        # vocabulary -- half of what crosses to a device block. Both backends index
+        # from it directly, so nothing widens on the way in.
+        dtype = np.int32 if len(lives) * V1 < 2**31 else np.int64
+        idxs, vals = [], []
         for j, (idx, val, eos) in enumerate(lives):
-            n0 = len(flat)
-            flat.extend(j * V1 + int(i) for i in idx)
-            if isinstance(val, (int, float)):
-                vals.extend([float(val)] * (len(flat) - n0))
-            else:
-                vals.extend(float(v) for v in val)
+            idxs.append(_as_ints(idx, dtype) + j * V1)
+            vals.append(val)
             W[j, -1] = eos
-        if flat:
-            if torch.is_tensor(W):
-                W.view(-1)[torch.tensor(flat, device=W.device)] = torch.tensor(
-                    vals, dtype=W.dtype, device=W.device
-                )
-            else:
-                W.reshape(-1)[np.asarray(flat)] = np.asarray(vals)
+        if not any(len(a) for a in idxs):
+            return W
+        flat = np.concatenate(idxs) if len(idxs) > 1 else idxs[0]
+        # One shared weight over the whole block (a support mask) writes as a scalar:
+        # no value array is built and none is shipped to the device.
+        if all(isinstance(v, (int, float)) for v in vals) and len(set(vals)) == 1:
+            packed = float(vals[0])
+        else:
+            packed = np.concatenate(
+                [
+                    np.full(len(a), float(v))
+                    if isinstance(v, (int, float))
+                    else np.asarray(v, dtype=np.float64)
+                    for a, v in zip(idxs, vals)
+                ]
+            )
+        if torch.is_tensor(W):
+            if not isinstance(packed, float):
+                packed = torch.from_numpy(packed).to(dtype=W.dtype, device=W.device)
+            W.view(-1)[torch.from_numpy(flat).to(W.device)] = packed
+        else:
+            W.reshape(-1)[flat] = packed
         return W
 
     async def logw_next(self, context):

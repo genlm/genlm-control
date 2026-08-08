@@ -157,6 +157,8 @@ class Coerced(Potential):
         Ws = self.alloc_logws()
         ctx = self.f(context)
         ctx_w = await self.potential.prefix(ctx)
+        if ctx_w == float("-inf"):
+            raise ValueError(f"Context {context!r} has weight zero under `prefix`.")
         Ws[-1] = await self.potential.complete(ctx) - ctx_w
         exts = [self.f(chain(context, [x])) for x in self.vocab]  # slow!!
         Ws[:-1] = await self.potential.batch_prefix(exts) - ctx_w
@@ -214,6 +216,11 @@ class Coerced(Potential):
             return None
         ctx_chart = p._consume(ctx_syms)
         ctx_w = p.prefix_logw(ctx_chart)
+        if ctx_w == float("-inf"):
+            # A zero-weight context has no live row -- scoring it would divide the
+            # walk by `-inf` and hand back `+inf` weights under a `nan` EOS. The one
+            # per-context `None`, and the batch it drops to the dense path raises there.
+            return None
         # Read before the walk: a chart the walk mutates must not move EOS under it.
         eos = p.complete_logw(ctx_chart) - ctx_w
         indices, values = [], []
