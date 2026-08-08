@@ -119,6 +119,11 @@ class Case:
     reference: str  # "steploop_cached" (tight, default) | "ref" (original anchor) | "steploop" (live)
     make_sampler: Callable  # (llm, seed) -> TokenSampler
     make_critic: Optional[Callable] = None  # (llm) -> Potential | None
+    # Least `n_particles * len(seeds)` contexts that must match the reference EXACTLY.
+    # The no-bias check is sem-scaled, so it silently loosens if the burst stops drawing
+    # the reference's threefry keys; this is the floor that catches that. Set from a
+    # measured run with margin, `None` to skip.
+    match_floor: Optional[int] = None
 
     def sampler(self, llm, seed):
         return self.make_sampler(llm, seed)

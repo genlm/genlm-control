@@ -5,12 +5,7 @@ from abc import ABC, abstractmethod
 from typing import NamedTuple
 
 from genlm.control.constant import EOS, EndOfSequence
-from genlm.control.burst_seam import (  # noqa: F401 (seam re-export)
-    burst_logw_next,
-    burst_prefix,
-    burst_complete,
-    burst_serve,
-)
+from genlm.control.burst_seam import burst_serve  # noqa: F401 (seam re-export)
 from genlm.control.util import LazyWeights, stack_weights
 from genlm.control.typing import TokenType, infer_vocabulary_type
 from genlm.control.potential.operators import PotentialOps

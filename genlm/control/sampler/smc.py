@@ -8,7 +8,7 @@ import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.burst_seam import burst_prefix, burst_complete
+from genlm.control.burst_seam import burst_lane_sums
 from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
@@ -301,7 +301,7 @@ class Controller:
                 if leaf is not None
             }
 
-        with burst_prefix(over(live)), burst_complete(over(done)):
+        with burst_lane_sums(over(live), over(done)):
             yield
 
     async def bank_row(self, p, to_append, logw, logp):

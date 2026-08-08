@@ -1,33 +1,29 @@
 """The burst's serving seam: the ContextVars a burst writes and a potential reads.
 
-Four variables, one protocol. A driver parks a row on ``_burst_row`` and answers its
-logits reads from the engine's warm batch; the three override maps let it hand a
-potential a precomputed ``logw_next``/``batch_prefix``/``batch_complete`` instead of a
-forward. This module imports nothing from ``potential`` or ``sampler`` so both sides
-can depend on it.
+Three variables, one protocol. A driver parks a row on ``_burst_row`` and answers its
+logits reads from the engine's warm batch; ``_burst_lane_sums`` hands a potential its
+banked per-token sums instead of re-scoring. This module imports nothing from
+``potential`` or ``sampler`` so both sides can depend on it.
 """
 
 import contextlib
 import contextvars
 
 # Per-burst override: {potential: LazyWeights} a potential's ``logw_next`` returns for
-# itself instead of computing. Read by ``PromptedLLM``.
+# itself instead of computing. Written by ``burst_serve``, read by ``PromptedLLM``.
 _burst_logw_next_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_burst_logw_next", default=None
 )
 
-# Boundary override: {potential: values} a potential's ``batch_prefix`` returns for
-# itself (banked from the burst's warm rows) instead of re-scoring.
-_burst_prefix_overrides: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_prefix", default=None
+# Boundary override: ``(prefix, complete)``, each a {potential: values} map served as
+# that potential's ``batch_prefix``/``batch_complete`` instead of scoring. One pair and
+# not two variables: the split is live rows vs terminated ones, and a caller that knows
+# either always knows both.
+_burst_lane_sums: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_burst_lane_sums", default=None
 )
 
-# Same seam for ``batch_complete``: {potential: values} served instead of scoring.
-_burst_complete_overrides: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_burst_complete", default=None
-)
-
-# A parked row's channel to the burst, bound for the whole of one row's step.
+# A parked row's lane to the burst, bound for the whole of one row's step.
 # Set only by the burst's parked-row lane; ``None`` everywhere else.
 _burst_row: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_burst_row", default=None
@@ -35,43 +31,30 @@ _burst_row: contextvars.ContextVar = contextvars.ContextVar(
 
 
 @contextlib.contextmanager
-def burst_logw_next(overrides):
-    """Inject ``{potential: LazyWeights}`` for one burst step (set per particle task)."""
-    token = _burst_logw_next_overrides.set(overrides)
+def burst_lane_sums(prefix, complete):
+    """Inject each leaf's banked sums: served as ``batch_prefix`` for the live rows and
+    ``batch_complete`` for the terminated ones, in the caller's context order."""
+    token = _burst_lane_sums.set((prefix, complete))
     try:
         yield
     finally:
-        _burst_logw_next_overrides.reset(token)
+        _burst_lane_sums.reset(token)
 
 
 @contextlib.contextmanager
-def burst_prefix(overrides):
-    """Inject ``{potential: values}`` served as that potential's ``batch_prefix`` result."""
-    token = _burst_prefix_overrides.set(overrides)
+def burst_row(lane):
+    """Bind ``lane`` for one row's step, over a fresh warm-override scope.
+
+    The scope is per STEP even though the row's coroutine spans the whole burst:
+    ``burst_serve`` sets the override without a reset token, so without this the previous
+    step's warm would still be readable by a ``batch_logw_next`` at the top of the next."""
+    tok_lane = _burst_row.set(lane)
+    tok_warm = _burst_logw_next_overrides.set(None)
     try:
         yield
     finally:
-        _burst_prefix_overrides.reset(token)
-
-
-@contextlib.contextmanager
-def burst_complete(overrides):
-    """Inject ``{potential: values}`` served as that potential's ``batch_complete`` result."""
-    token = _burst_complete_overrides.set(overrides)
-    try:
-        yield
-    finally:
-        _burst_complete_overrides.reset(token)
-
-
-@contextlib.contextmanager
-def burst_row(channel):
-    """Bind ``channel`` for one row's step task (the burst's parked-row lane)."""
-    token = _burst_row.set(channel)
-    try:
-        yield
-    finally:
-        _burst_row.reset(token)
+        _burst_logw_next_overrides.reset(tok_warm)
+        _burst_row.reset(tok_lane)
 
 
 async def burst_serve(context):
@@ -80,6 +63,6 @@ async def burst_serve(context):
     A no-op outside the parked-row lane. Every read at one context length is one decode
     step (target and proposal share the step's warm); a read past a draw parks, with a
     context ending in the token just drawn."""
-    channel = _burst_row.get()
-    if channel is not None:
-        _burst_logw_next_overrides.set(await channel.next_warm(context))
+    lane = _burst_row.get()
+    if lane is not None:
+        _burst_logw_next_overrides.set(await lane.next_warm(context))

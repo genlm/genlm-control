@@ -8,8 +8,7 @@ from genlm.control.constant import EOS
 from genlm.control.burst_seam import (
     burst_serve,
     _burst_logw_next_overrides,
-    _burst_prefix_overrides,
-    _burst_complete_overrides,
+    _burst_lane_sums,
 )
 from genlm.control.potential.base import Potential
 from genlm.control.potential.coerce import Coerced
@@ -544,13 +543,19 @@ class PromptedLLM(Potential):
         """
         return await self.log_probability(context)
 
-    def _served(self, overrides, n=None):
-        """This LM's injected value from ``overrides``, or ``None`` to compute it.
+    def _lane_sums(self, done):
+        """The banked sums a burst boundary injects for this leaf -- ``complete`` when
+        ``done``, else ``prefix``. ``None`` outside a boundary."""
+        sums = _burst_lane_sums.get()
+        return None if sums is None else sums[1 if done else 0]
+
+    def _served(self, override, n=None):
+        """This LM's injected value from the ``{leaf: values}`` map ``override``, or
+        ``None`` to compute it.
 
         A miss while a burst owns the engine raises: the forward would re-enter the
         burst's decode loop, so this leaf should have been among its injected views
         (see ``burst_blocker``)."""
-        override = overrides.get()
         if override is not None and self in override:
             vals = override[self]
             if n is not None and len(vals) != n:
@@ -565,16 +570,16 @@ class PromptedLLM(Potential):
 
     async def batch_prefix(self, contexts):
         """Batched ``prefix``. At a burst boundary the controller serves the banked
-        warm-row sums via ``burst_prefix`` instead of re-scoring every context."""
-        vals = self._served(_burst_prefix_overrides, len(contexts))
+        warm-row sums instead of re-scoring every context."""
+        vals = self._served(self._lane_sums(done=False), len(contexts))
         if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_prefix(contexts)
 
     async def batch_complete(self, contexts):
-        """Batched ``complete``. A burst serves the banked warm-row sums via
-        ``burst_complete`` instead of scoring."""
-        vals = self._served(_burst_complete_overrides, len(contexts))
+        """Batched ``complete``. A burst serves the banked warm-row sums instead of
+        scoring."""
+        vals = self._served(self._lane_sums(done=True), len(contexts))
         if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_complete(contexts)
@@ -694,7 +699,7 @@ class PromptedLLM(Potential):
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
         await burst_serve(context)
-        served = self._served(_burst_logw_next_overrides)
+        served = self._served(_burst_logw_next_overrides.get())
         if served is not None:
             return served  # burst: the engine's warm logits, no forward
         context_ids = self.encode_tokens(context)
@@ -715,7 +720,7 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
-        served = self._served(_burst_logw_next_overrides)
+        served = self._served(_burst_logw_next_overrides.get())
         if served is not None:
             return served  # burst: the engine's warm [N, V+1] batch, no forward
         context_ids_batch = [self.encode_tokens(context) for context in contexts]

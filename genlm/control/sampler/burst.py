@@ -37,37 +37,34 @@ class BurstBlock:
     detail: str
 
 
-@dataclass
-class BurstDraw:
-    """One live row's result for one decode step.
+class _RowLane:
+    """One particle's seat in the burst. Its coroutine reads the engine's warm through
+    this lane and publishes its draw here; the burst delivers, picks, banks, releases.
 
-    token: ``Token``/``EOS`` drawn this step. step: ``(to_append, logw, logp)`` or
-    ``None`` (mid-step).
-    """
-
-    token: object
-    step: tuple | None
-
-
-class _RowChannel:
-    """One parked row's handoff with the burst. The burst delivers a decode step's warm;
-    the row's ``transition`` consumes it, draws, and parks at its next logits read. The
-    context it parks with ends in the token it just drew."""
+    The lane exists because the engine owns iteration: a row advances only when its next
+    warm arrives, and it must be parked -- not merely slow -- when the burst looks."""
 
     def __init__(self):
         self._warm = None
         self._served_len = None  # None until this step's warm has been read
-        self.context = None
         self._delivered = asyncio.Event()
-        # Set while the row is parked or returned -- the burst waits on it per step.
+        # Set when the row is done with this step's warm: parked at the picker, parked
+        # for the next subunit's warm, or returned. The burst's quiescence signal, and
+        # derived rather than maintained -- which is why a row that never draws is free.
         self.settled = asyncio.Event()
         # The row's published draw while it waits at the picker, else ``None``.
         self.pending = None
+        # The step a row returned WITHOUT drawing (a forced EOS at ``max_tokens``, every
+        # AWRS row): the burst still owes the engine a token and takes it off the step.
+        self.returned = None
         # One committed draw per delivered warm: the burst reads this step's token off
         # the pick, so a second draw would have nowhere to go.
         self._drawn = False
         self._resolved = asyncio.Event()
         self._result = None
+        # Set once the burst has banked this step's lane increments. A row must not reach
+        # ``bank_row`` before then -- an inline critic's ``serve_lanes`` reads those sums.
+        self.banked = asyncio.Event()
 
     async def draw(self, lazyweights, slot, step):
         """Row side: publish this draw and wait for the burst to make it with the rest of
@@ -98,7 +95,6 @@ class _RowChannel:
         context length are the same decode step (target and proposal share it), so only a
         read past a draw parks."""
         if self._warm is None or self._served_len not in (None, len(context)):
-            self.context = context
             self._warm = None
             self._delivered.clear()
             self.settled.set()
@@ -106,49 +102,108 @@ class _RowChannel:
         self._served_len = len(context)
         return self._warm
 
+    def finish(self, step):
+        """Row side: this SMC step is over. ``step`` is read only when the row never drew
+        -- the burst is still owed a token and takes it off the last item."""
+        self.returned = None if self._drawn else step
+        self.settled.set()
+
     def deliver(self, warm):
         """Burst side: hand this row the step's warm and let it run."""
         self.settled.clear()
         self._warm = warm
         self._served_len = None
         self._drawn = False
+        self.returned = None
         self._delivered.set()
 
 
+class RoundGate:
+    """The population barrier a free-running burst's round closes on: every row the engine
+    advanced this step banks, then the last arrival runs the round boundary (record +
+    per-group ESS test + resample) and releases the rest.
+
+    Membership is re-derived from the population at every close, never carried: a resample
+    reindexes over a group's WHOLE row set, finished rows included, so a done row can
+    inherit a live ancestor and needs its engine requests and its coroutine back."""
+
+    def __init__(self, burst):
+        self.b = burst
+        self.expected = 0
+        self.arrived = 0
+        self.open = asyncio.Event()
+
+    def arm(self, rows):
+        """Burst side: the rows that owe this round an arrival. Called with every row
+        parked, so no arrival can race the arming."""
+        self.expected = len(rows)
+        self.arrived = 0
+        self.open.clear()
+
+    async def arrive(self):
+        """Row side: this row banked its step. The last arrival closes the round. Every
+        row the engine advanced arrives, terminating ones included -- a row that returned
+        without arriving would leave the round one short forever."""
+        self.arrived += 1
+        if self.arrived < self.expected:
+            await self.open.wait()
+            return
+        self._close()
+
+    def _close(self):
+        """Close the round, then restore the population's engine state: rebuild whatever
+        a crossing invalidated and give every revived row a coroutine again.
+
+        Every arriving row advanced (a free-running step is one SMC step per row), so the
+        boundary always has a step to record."""
+        b = self.b
+        b._flush(b.d.controller.round_boundary(record=True))
+        for p in b.d.controller.particles:
+            if not p.done and p.row not in b.tasks:
+                b._spawn_row(p)
+        self.open.set()
+
+
 class _Burst:
-    """Per-burst engine state for one ``run_burst``. ``draw``/``drain_*``/``context_ids``/
-    ``on_burst_end`` are the engine seam (the backend drives the control through them).
-    One engine group per particle: K view requests the backend keeps in lockstep."""
+    """Per-burst engine state for one ``run_burst``. ``draw``/``drain_*``/``on_burst_end``
+    are the engine seam (the backend drives the control through them). One engine group
+    per particle: K view requests the backend keeps in lockstep."""
 
     def __init__(self, d, live):
         self.d = d
         # Adapter names snapshotted at burst start: a lora_name rebind mid-run must
         # not split this burst across adapters.
         self.view_loras = [v.lora_name for v in d.views]
-        # The drain streams are written by ``_settle`` on the main loop while the engine
-        # forwards, and read from the engine thread's ``_drain``.
+        # The drain streams are written by the row coroutines on the main loop while the
+        # engine forwards, and read from the engine thread's ``_drain``.
         self._drain_lock = threading.Lock()
         self.abort_handles = set()
         self.add_handles = []
         self.handle_row = {}  # engine group handle -> particle row
         self.row_handle = {}  # particle row -> engine group handle
         self.next_handle = 0
-        self.channels = {}  # particle row -> _RowChannel (parked-row lane)
-        self.tasks = {}  # particle row -> its in-flight transition Task
+        self.lanes = {}  # particle row -> _RowLane
+        self.tasks = {}  # particle row -> its coroutine, one per row for the whole burst
+        self.gate = RoundGate(self)
+        # A lane slot is one engine request across every group, so every group's lane
+        # count is the burst's. `_batch_blocker` is what keeps that true; assert it once
+        # here rather than on every injection, and loudly -- the positional pairing of a
+        # group's leaves against the warm blocks would otherwise truncate in silence.
+        for g, lanes in enumerate(d.controller.group_lanes):
+            if len(lanes) != len(d.views):
+                raise RuntimeError(
+                    f"group {g} has {len(lanes)} engine lanes but the burst serves "
+                    f"{len(d.views)}; a lane slot must mean the same engine request in "
+                    "every group (see _batch_blocker)"
+                )
         for p in live:
             self._add_group(p)
-            # Started here, not on delivery: a row's first potential walk then runs
-            # against the engine's prefill, and ``draw`` never has to spawn -- a row
-            # advances iff it already has a transition in flight.
-            self._spawn_row(p, p.row)
-        # The previous step's tail, in flight against the current forward.
-        self._pending_settle = None
+            self._spawn_row(p)
 
     def context_ids(self, p, view_idx):
         """Engine prompt for one (particle, view) substream: per-view prefix + the particle's
         drawn token ids (EOS dropped; drawn suffix shared across views)."""
-        g = p.group
-        ids = list(self.d.view_prefixes[g][view_idx])
+        ids = list(self.d.view_prefixes[p.group][view_idx])
 
         def _emit(item):
             if isinstance(item, EndOfSequence):
@@ -178,49 +233,79 @@ class _Burst:
         with self._drain_lock:
             self.add_handles.append(entry)
 
-    def _row_injection(self, warm_batch, i, p):
-        """Row ``i``'s ``{leaf: [V+1]}`` slice of the batched warm, keyed by the row's OWN
-        group's lanes: groups carry their own leaves, so another group's would miss the
+    def _row_injection(self, warm, i, p):
+        """Row ``i``'s ``{leaf: [V+1]}`` slice of the step's warm, one entry per engine
+        lane, keyed by the row's OWN group's leaf -- another group's would miss the
         override and forward inside the engine's step."""
         return {
-            rv: rv.make_lazy_weights(warm_batch[gv].weights[i])
-            for rv, gv in zip(self.d.controller.group_lanes[p.group], self.d.views)
-            if rv is not None
+            leaf: leaf.make_lazy_weights(warm[lane][i])
+            for lane, leaf in enumerate(self.d.controller.group_lanes[p.group])
+            if leaf is not None
         }
 
-    def _spawn_row(self, p, row):
-        """Start this row's whole ``Controller.draw_step`` as a parked task -- the same
-        step shape the per-token driver runs, so the burst inherits the draw key, the
-        ``max_tokens`` forced EOS, and ``terminate_when`` rather than restaging them.
-        Its logits reads park on this channel like any other."""
-        channel = _RowChannel()
+    def _spawn_row(self, p):
+        """Start this row's coroutine: one task for the whole burst, stepping the same
+        ``Controller.draw_step`` the per-token driver runs, so the burst inherits the draw
+        key, the ``max_tokens`` forced EOS, and ``terminate_when`` rather than restaging
+        them. Its logits reads park on this row's lane like any other."""
+        lane = _RowLane()
+        self.lanes[p.row], self.tasks[p.row] = lane, asyncio.ensure_future(
+            self._run_row(p, lane)
+        )
 
-        async def run():
-            with burst_row(channel):
-                return await self.d.controller.draw_step(p)
+    async def _run_row(self, p, lane):
+        """One particle's whole burst: draw a step, bank it, close the round, repeat.
 
-        task = asyncio.ensure_future(run())
-        task.add_done_callback(lambda _: channel.settled.set())
-        self.channels[row], self.tasks[row] = channel, task
-        return channel
-
-    def _release_row(self, row):
-        """Drop a row's parked task, cancelling it if it is still mid-transition."""
-        task = self.tasks.pop(row, None)
-        self.channels.pop(row, None)
-        if task is not None and not task.done():
-            task.cancel()
+        Everything past the pick runs while the engine forwards the next step -- that is
+        the overlap. The row walks its next step's context-only potentials there too, so
+        it is already parked at its logits read when the next warm lands."""
+        c, row = self.d.controller, p.row
+        while True:
+            # The row owns its own per-step lane state, so no burst-side clear can race
+            # a row that has not yet woken from the previous step.
+            lane.banked.clear()
+            if c.twist_with_critic:
+                c.particles.untwist(row)
+            # Scoped to the draw ONLY: a bank-path potential that reached the seam would
+            # park on a warm nobody will deliver instead of raising.
+            with burst_row(lane):
+                step = await c.draw_step(p)
+            lane.finish(step)
+            await lane.banked.wait()
+            if self.d.defers_critic:  # settles at the boundary, nothing to serve
+                await c.bank_row(p, *step)
+            else:
+                with c.serve_lanes(p.group, [p], [p]):
+                    await c.bank_row(p, *step)
+            if self.d.sync_boundary:
+                # Unit grain: one unit per round. The row leaves the engine at its unit
+                # boundary and the controller runs the boundary once the whole burst has
+                # drained -- there is no round here for a gate to close.
+                self._leave(row)
+                return
+            if p.done:
+                # Leave BEFORE arriving: the round is still one arrival short and this
+                # row owes it, but the next step must not deliver a warm to a row that
+                # will never read it.
+                self._leave(row)
+                await self.gate.arrive()
+                return
+            await self.gate.arrive()
+            if p.done:  # a crossing handed this row a finished ancestor
+                self._retire(row)  # `_flush` already dropped its handle
+                return
 
     def _pick(self, rows):
-        """Draw every row waiting at the picker and return ``{row: token}``. One pass:
-        a row commits one draw per delivered warm (``_RowChannel.draw`` enforces it), so
-        no row can reach the picker twice in a step."""
-        waiting = [row for row in rows if self.channels[row].pending is not None]
+        """Draw every row waiting at the picker, returning ``{row: (token, logZ, logp)}``
+        WITHOUT releasing them -- the lane bank has to land first. One pass: a row commits
+        one draw per delivered warm (``_RowLane.draw`` enforces it), so no row can reach
+        the picker twice in a step."""
+        waiting = [row for row in rows if self.lanes[row].pending is not None]
         # One batch per vocabulary: groups may carry different constraints, so their
         # rows are different widths over different tokens and cannot stack together.
         by_vocab = {}
         for row in waiting:
-            by_vocab.setdefault(id(self.channels[row].pending[0].decode), []).append(row)
+            by_vocab.setdefault(id(self.lanes[row].pending[0].decode), []).append(row)
         picked = {}
         for batch in by_vocab.values():
             picked.update(self._batch_draw(batch))
@@ -229,7 +314,7 @@ class _Burst:
     def _batch_draw(self, batch):
         """One vocabulary's parked rows, drawn together: one logsumexp, one keyed pick, one
         gather. Keying makes this byte-identical to the same rows drawn one at a time."""
-        pend = [self.channels[row].pending for row in batch]
+        pend = [self.lanes[row].pending for row in batch]
         W = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in pend])
         slots = torch.tensor([s for _, s, _ in pend], dtype=torch.int64)
         steps = torch.tensor([k for _, _, k in pend], dtype=torch.int64)
@@ -240,74 +325,59 @@ class _Burst:
         ar = torch.arange(len(batch), device=W.device)
         picked, zs, ids = logps[ar, idx].tolist(), logZ.tolist(), idx.tolist()
         decode = pend[0][0].decode
-        tokens = {}
-        for j, row in enumerate(batch):
-            tokens[row] = decode[ids[j]]
-            self.channels[row].resolve((tokens[row], zs[j], picked[j]))
-        return tokens
+        return {
+            row: (decode[ids[j]], zs[j], picked[j]) for j, row in enumerate(batch)
+        }
 
-    def _running(self, rows):
-        """Rows whose transition is still in flight. A finished one is read straight off
-        its task: delivering to it would clear a ``settled`` nothing will set again."""
-        return [row for row in rows if not self.tasks[row].done()]
-
-    async def _deliver_and_pick(self, warm_batch, parts, rows):
-        """Hand each running row this step's warm and draw the whole population in one
-        op. Returns as soon as ``{row: token}`` exists -- carrying the rows past their
-        draw is :meth:`_collect`'s job, and the engine is blocked until this returns."""
-        running = self._running(rows)
-        for i, (p, row) in enumerate(zip(parts, rows)):
-            if row in self.channels and not self.tasks[row].done():
-                self.channels[row].deliver(self._row_injection(warm_batch, i, p))
-        await asyncio.gather(*(self.channels[row].settled.wait() for row in running))
-        return self._pick(running)
-
-    async def _collect(self, rows):
-        """Carry every row from its draw to its next park -- mid-unit, that park is the
-        next subunit's potentials -- or to its return, the SMC step. One record each.
-
-        This is the row work the overlap buys: it runs against the engine's next
-        forward instead of inside the draw callback."""
-        await asyncio.gather(
-            *(self.channels[row].settled.wait() for row in self._running(rows))
-        )
-        records = []
+    def _committed(self, rows, picked):
+        """The item each row commits this step: the one it drew, or -- for a step that
+        returned without reading the picker (a forced EOS at ``max_tokens``, AWRS) -- the
+        last item of the step it returned."""
+        out = {}
         for row in rows:
-            task = self.tasks[row]
-            if task.done():
-                step = task.result()
-                self._release_row(row)
-                records.append(BurstDraw(token=flatten_units(step[0])[-1], step=step))
-            else:
-                records.append(
-                    BurstDraw(token=self.channels[row].context[-1], step=None)
+            drawn = picked.get(row)
+            if drawn is not None:
+                out[row] = drawn[0]
+                continue
+            step = self.lanes[row].returned
+            if step is None:
+                raise RuntimeError(
+                    f"burst row {row} took a warm without drawing or returning; it "
+                    "would run ahead of the engine's lockstep"
                 )
-        return records
+            out[row] = flatten_units(step[0])[-1]
+        return out
 
-    def _bank_lanes(self, warm_batch, records, rows):
-        """Add this step's drawn-token logp to every lane, from the warm row each lane's
-        leaf already produced. That running sum IS the leaf's own ``prefix``, and a
+    def _bank_lanes(self, warm, committed, rows):
+        """Add this step's committed-token logp to every lane, from the warm row each
+        lane's leaf already produced. That running sum IS the leaf's own ``prefix``, and a
         terminating row's EOS increment closes it into its ``complete`` -- so a leaf
-        reached inside the burst reads a banked number rather than forwarding."""
-        L = self.d.controller.particles.lane_logp
-        drawn = [k for k, r in enumerate(records)
-                 if not isinstance(r.token, EndOfSequence)]
-        eos = [k for k, r in enumerate(records) if isinstance(r.token, EndOfSequence)]
-        if not drawn and not eos:
-            return
-        drawn_rows = np.array([rows[k] for k in drawn], dtype=np.int64)
-        eos_rows = np.array([rows[k] for k in eos], dtype=np.int64)
-        for lane, view in enumerate(self.d.views):
-            W = warm_batch[view].weights  # [N, V+1] device tensor
-            if drawn:
-                lk = view.lookup
-                ks = torch.tensor(drawn, device=W.device)
-                idx = torch.tensor(
-                    [lk[records[k].token] for k in drawn], device=W.device
-                )
-                L[lane, drawn_rows] += to_numpy(W[ks, idx])
-            if eos:
-                L[lane, eos_rows] += to_numpy(W[eos, -1])
+        reached inside the burst reads a banked number rather than forwarding.
+
+        Batched per (group, lane): one device->host transfer per block, not per row."""
+        parts = self.d.controller.particles
+        L = parts.lane_logp
+        pos = {row: i for i, row in enumerate(rows)}  # row -> its slot in the warm block
+        by_group = {}
+        for row in rows:
+            by_group.setdefault(parts[row].group, []).append(row)
+        for g, grows in by_group.items():
+            lanes = self.d.controller.group_lanes[g]
+            drawn = [r for r in grows if not isinstance(committed[r], EndOfSequence)]
+            eos = [r for r in grows if isinstance(committed[r], EndOfSequence)]
+            for lane, leaf in enumerate(lanes):
+                if leaf is None:
+                    continue
+                W = warm[lane]  # [N, V+1] device tensor, rows-order
+                if drawn:
+                    ks = torch.tensor([pos[r] for r in drawn], device=W.device)
+                    idx = torch.tensor(
+                        [leaf.lookup[committed[r]] for r in drawn], device=W.device
+                    )
+                    L[lane, np.array(drawn, dtype=np.int64)] += to_numpy(W[ks, idx])
+                if eos:
+                    ks = torch.tensor([pos[r] for r in eos], device=W.device)
+                    L[lane, np.array(eos, dtype=np.int64)] += to_numpy(W[ks, -1])
 
     def drain_aborts(self):
         with self._drain_lock:
@@ -324,149 +394,96 @@ class _Burst:
     def draw(self, logits, handles):
         """Engine per-step callback over the complete groups' ``[G, K, vocab]`` logits:
         one token per live group. The engine thread blocks here, so the step owes it
-        nothing but the tokens -- everything after the draw is deferred to
-        :meth:`_settle` and runs against the next forward. Dropped groups get a
-        placeholder token."""
+        nothing but the tokens -- every row's bank and the round boundary run afterwards,
+        on the main loop, against the next forward. Dropped groups get a placeholder."""
         c = self.d.controller
-        # Per view: [G, V+1] warm log-weights (device tensors, no host xfer).
-        processed = [
+        # Per lane: [G, V+1] warm log-weights (device tensors, no host xfer). Indexed by
+        # engine lane slot, not by a leaf -- a lane is one engine request across groups.
+        warm = [
             view._process_logw_next_batch(view._maybe_temper(logits[:, vi].float()))
             for vi, view in enumerate(self.d.views)
         ]
 
         async def _step():
-            await self._join_settle()
-            # A row advances iff it has a transition in flight. Anything else in
-            # ``handles`` is popped out or dying and gets the placeholder token.
+            # A row advances iff it has a coroutine. Anything else in ``handles`` is
+            # popped out or dying and gets the placeholder token.
             live_k = [
                 k
                 for k, h in enumerate(handles)
                 if h in self.handle_row and self.handle_row[h] in self.tasks
             ]
             rows = [self.handle_row[handles[k]] for k in live_k]
-            parts = [c.particles[row] for row in rows]
-            if c.twist_with_critic:
-                c.particles.untwist(rows)
             out = [0] * len(handles)
-            warm_batch = {}
-            if rows:
-                # One batched warm per view ([N, V+1], rows-order).
-                sel = torch.tensor(live_k, dtype=torch.int64, device=logits.device)
-                warm_batch = {
-                    view: view.make_lazy_weights(processed[vi][sel])
-                    for vi, view in enumerate(self.d.views)
-                }
-                picked = await self._deliver_and_pick(warm_batch, parts, rows)
-                for k, row in zip(live_k, rows):
-                    out[k] = self._committed_id(row, picked)
-            self._pending_settle = asyncio.ensure_future(
-                self._settle(warm_batch, parts, rows)
-            )
+            if not rows:
+                return out
+            sel = torch.tensor(live_k, dtype=torch.int64, device=logits.device)
+            step_warm = [w[sel] for w in warm]
+            for i, row in enumerate(rows):
+                p = c.particles[row]
+                self.lanes[row].deliver(self._row_injection(step_warm, i, p))
+            # Quiescence: every row has consumed this step's warm and is parked at the
+            # picker or has returned. Blocks until the PREVIOUS round closed, since a row
+            # held at the gate has not reached its next logits read.
+            await asyncio.gather(*(self.lanes[row].settled.wait() for row in rows))
+            picked = self._pick(rows)
+            committed = self._committed(rows, picked)
+            self._bank_lanes(step_warm, committed, rows)
+            # Armed with every row parked, so no arrival can race it.
+            if not self.d.sync_boundary:
+                self.gate.arm(rows)
+            for row in rows:
+                self.lanes[row].banked.set()
+                if row in picked:
+                    self.lanes[row].resolve(picked[row])
+            for k, row in zip(live_k, rows):
+                tok = committed[row]
+                out[k] = self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
             return out
 
         out = self._on_main(_step())
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
     def on_burst_end(self):
-        """Engine lifecycle hook: decode loop drained, so join the last step's tail --
-        no next ``draw`` will. Rows still parked at the drain (mid-unit, or started
-        ahead for a step the engine never ran) are cancelled with their partial work --
-        on the main loop, since Tasks are not touchable from this worker thread."""
+        """Engine lifecycle hook: decode loop drained, so cancel whatever is still parked
+        -- mid-unit rows, and rows waiting on a round the engine will not run. On the main
+        loop, since Tasks are not touchable from this worker thread."""
 
         async def _end():
-            await self._join_settle()
             for row in list(self.tasks):
                 self._release_row(row)
 
         self._on_main(_end())
 
-    def _committed_id(self, row, picked):
-        """The engine token id this row commits: the one it drew, or -- for a transition
-        that returned without reading logits, e.g. a forced EOS at ``max_tokens`` -- the
-        last item of the step it returned."""
-        tok = picked.get(row)
-        if tok is None:
-            task = self.tasks[row]
-            if not task.done():
-                raise RuntimeError(
-                    f"burst row {row} took a warm without drawing or returning; it "
-                    "would run ahead of the engine's lockstep"
-                )
-            tok = flatten_units(task.result()[0])[-1]
-        return self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
+    def _retire(self, row):
+        """Forget a row's coroutine WITHOUT cancelling it -- a row retires itself as its
+        last act, and cancelling would raise inside the caller."""
+        self.tasks.pop(row, None)
+        self.lanes.pop(row, None)
 
-    async def _settle(self, warm_batch, parts, rows):
-        """One step's whole tail: carry the rows past their draw, bank the lanes and the
-        population, evict, and at token grain close the round and start the next
-        transitions.
+    def _leave(self, row):
+        """A row's last act: abort its engine group and retire its coroutine. One
+        operation for both reasons a row stops -- it terminated, or it finished the unit
+        this round asked for -- because a burst never outlives a round boundary, so
+        nothing reads a departed row's handle either way."""
+        self._evict_handle(row)
+        self._retire(row)
 
-        Both grains run this off the engine's critical path -- the engine already has
-        its tokens. That is what overlaps the row work: a row walks its context-only
-        potentials (the next subunit's, mid-unit) against the next forward. Only the
-        round close is token-grain-only; unit grain's round is the controller's, run
-        between bursts."""
-        records = await self._collect(rows)
-        # Before ``_bank_pop``: an inline critic's ``serve_lanes`` reads these sums.
-        self._bank_lanes(warm_batch, records, rows)
-        await self._bank_pop(parts, records)  # score/extend/critic, sets p.done
-        self._flag_after_bank(parts, rows, records)
-        if self.d.sync_boundary:
-            return
-        # ESS is tested every step, but only a step that advanced a row is recorded.
-        # ``round_boundary`` returns the rows a crossing invalidated.
-        self._flush(
-            self.d.controller.round_boundary(
-                record=any(r.step is not None for r in records)
-            )
-        )
-        for row in list(self.row_handle):  # survivors + whatever a crossing re-added
-            if row not in self.tasks:
-                self._spawn_row(self.d.controller.particles[row], row)
-
-    async def _join_settle(self):
-        """Await the previous step's tail, so this step draws over a banked, resampled
-        population. No-op if none pending."""
-        if self._pending_settle is None:
-            return
-        fut, self._pending_settle = self._pending_settle, None
-        await fut
-
-    def _flag_after_bank(self, parts, rows, records):
-        """Per banked row: evict if terminated; at unit grain a surviving row pops out
-        of the engine (its group aborts, the maps stay) to wait for the boundary."""
-        for k_i, (p, row) in enumerate(zip(parts, rows)):
-            if isinstance(records[k_i].token, EndOfSequence):
-                assert p.done, "burst drew EOS for a particle that did not terminate"
-            if p.done:
-                self._drop_row(row)
-            elif self.d.sync_boundary and records[k_i].step is not None:
-                h = self.row_handle.get(row)
-                if h is not None:
-                    with self._drain_lock:
-                        self.abort_handles.add(h)
+    def _release_row(self, row):
+        """Retire a row's coroutine from outside it, cancelling it if still mid-step."""
+        task = self.tasks.get(row)
+        self._retire(row)
+        if task is not None and not task.done():
+            task.cancel()
 
     def _on_main(self, coro):
         """Run ``coro`` on the main loop (parked in ``run_in_executor``) from the burst
         worker thread, blocking for its result."""
         return asyncio.run_coroutine_threadsafe(coro, self.d.main_loop).result()
 
-    async def _bank_pop(self, parts, records):
-        """Bank one step's records into the population (score/extend/critic; sets
-        p.done). A token-grain critic's LM leaf is served from its lane's banked sum --
-        it must not forward mid-burst."""
-        c = self.d.controller
-        for p, rec in zip(parts, records):
-            if rec.step is None:
-                continue
-            if self.d.defers_critic:  # settles at the boundary, nothing to serve
-                await c.bank_row(p, *rec.step)
-            else:
-                with c.serve_lanes(p.group, [p], [p]):
-                    await c.bank_row(p, *rec.step)
-
-    def _drop_row(self, row):
-        """Evict a particle's engine group: abort it, drop both maps, release its task."""
-        self._release_row(row)
+    def _evict_handle(self, row):
+        """Abort a row's engine group and forget its handle. Touches no coroutine: a
+        reindexed row keeps its own, since a crossing rewrites its context but not its
+        identity."""
         h = self.row_handle.pop(row, None)
         if h is not None:
             self.handle_row.pop(h, None)
@@ -480,12 +497,11 @@ class _Burst:
         c = self.d.controller
         for rows in crossed:
             for row in rows:
-                self._drop_row(int(row))
+                self._evict_handle(int(row))
             for row in rows:
                 p = c.particles[int(row)]
                 if not p.done:
                     self._add_group(p)
-
 
 
 def critic_deferred(sampler, controller):
@@ -507,10 +523,10 @@ def burst_blocker(controller):
     one engine-burst LM leaf, must be forward-free, and (if batched) burst-homogeneous
     (:func:`_batch_blocker`)."""
     s = controller.samplers[0]
-    # The burst banks one warm-row increment per record, and a record carries one
-    # committed item. `terminate_when` appends an EOS the sampler never drew, so that
-    # step commits two -- the drawn token and the EOS -- and one of them goes unbanked
-    # whichever way the record's token is read. Twisting is what consumes those sums.
+    # The burst banks one warm-row increment per committed item, and a step commits one.
+    # `terminate_when` appends an EOS the sampler never drew, so that step commits two --
+    # the drawn token and the EOS -- and one of them goes unbanked whichever way the
+    # committed item is read. Twisting is what consumes those sums.
     if controller.terminate_when is not None and controller.twist_with_critic:
         return BurstBlock(
             BlockReason.UNBANKABLE_STEP,
@@ -574,7 +590,7 @@ def _batch_blocker(controller):
     burst-homogeneous. Groups must share grain (the driver reads it off group 0 for the
     whole population) and per-lane temperature/LoRA -- one engine request serves lane
     ``l`` for every group at once. They may differ in sampler kind, prompt, critic, and
-    constraint: the parked lane draws each row through its OWN group's sampler."""
+    constraint: each row is drawn, injected and banked through its OWN group's lanes."""
     samplers = controller.samplers
     s0, lanes0 = samplers[0], controller.group_lanes[0]
 
@@ -613,17 +629,15 @@ class BurstLoop:
         # round boundary — engine drained, its LM leaves may forward there.
         self.defers_critic = critic_deferred(self.sampler, controller)
         self.n_bursts = 0  # bursts opened -- for verifying the burst path ran
-        # views: group 0's engine lanes, one request each -- the batched burst draws
-        # every group through group 0's sampler. ``_batch_blocker`` is what guarantees
-        # every group agrees on lane count; a lane's leaf still differs per group.
+        # views: group 0's engine lanes, one request each. A lane slot is one engine
+        # request across every group; ``_batch_blocker`` is what guarantees every group
+        # agrees on lane count, and a row is always served through its own group's leaf.
         self.views = controller.group_lanes[0]
         # The engine LM the burst drives (run_burst + eos id); views share its model.
         self.llm = self.views[0]
-        if self.llm is None:  # pragma: no cover - guarded by burst_blocker
-            raise ValueError("sampler target has no single engine-burst LM leaf")
 
-        # Per-(group, lane) prompt prefix, snapshotted on the main thread (``prompt_ids``
-        # is a ContextVar invisible on the ``run_burst`` worker thread).
+        # Per-(group, lane) prompt prefix, snapshotted on the main thread: ``prompt_ids``
+        # is a ContextVar, and a task the worker thread schedules does not inherit it.
         self.view_prefixes = [
             [list(v.prompt_ids) for v in lanes] for lanes in controller.group_lanes
         ]

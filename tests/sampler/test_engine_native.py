@@ -295,7 +295,7 @@ def _nobias(label, llm, *, ml_floor=0.3, ml_k=2.5, len_bound=None, len_k=None,
     assert can_burst(
         _controller(lambda: c.sampler(llm, c.seeds[0]), c.n_particles, c.ess, c.max_tokens, mkc)
     )
-    diffs, len_gaps = [], []
+    diffs, len_gaps, matches = [], [], 0
     any_resample, max_bursts = False, 0
     for seed in c.seeds:
         make = lambda s=seed: c.sampler(llm, s)  # noqa: E731
@@ -309,9 +309,22 @@ def _nobias(label, llm, *, ml_floor=0.3, ml_k=2.5, len_bound=None, len_k=None,
         s = _compare(c.label, c.ess, c.n_particles, slow, burst)
         diffs.append(s["log_ml_diff"])
         len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
+        matches += s["n_match"]
         any_resample = any_resample or s["n_resamples"] > 0
         max_bursts = max(max_bursts, s["n_bursts"])
     assert max_bursts > 0, f"{c.label}: burst never opened (n_bursts==0)"
+    total = c.n_particles * len(c.seeds)
+    _log(f"{c.label}: contexts matching the reference {matches}/{total}")
+    if c.match_floor is not None:
+        # The no-bias check LOOSENS as the comparison degrades: it is `|mean| <=
+        # max(floor, k*sem)`, and its tightness comes entirely from the burst drawing
+        # the same threefry keys as the cached reference. Lose the pairing and `sem`
+        # inflates until any mean passes. This floor is what notices.
+        assert matches >= c.match_floor, (
+            f"{c.label}: only {matches}/{total} contexts match the reference "
+            f"(floor {c.match_floor}) -- the paired comparison has come apart, so the "
+            "no-bias assertion above is no longer tight"
+        )
     if need_resample:
         assert any_resample, f"{c.label}: ESS never crossed -- resample path unexercised"
     if need_rounds:
