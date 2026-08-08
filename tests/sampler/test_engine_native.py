@@ -375,6 +375,13 @@ def test_terminal_critic_burst_vs_slow(llm):
     _nobias("terminal-critic", llm, ml_floor=0.3, ml_k=2.0)
 
 
+def test_terminal_critic_resample_burst_vs_slow(llm):
+    """The same terminal critic at ess=0.5. A terminal critic forces `twist_with_critic`
+    off, so this is the only config where a critic settles mid-burst AND a resample can
+    cross it -- the score has to land before the ESS test that consumes it."""
+    _nobias("terminal-critic-resample", llm, ml_floor=0.3, ml_k=2.0, need_resample=True)
+
+
 def test_twisting_critic_burst_vs_slow(llm):
     """DirectTokenSampler(llm) + a soft content-dependent critic at ess=0.5 -- the per-step
     twist regime. Exercises untwist/twist accumulation + ESS resampling on TWISTED weights;
