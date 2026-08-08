@@ -3,6 +3,7 @@ Resample/ESS/log_ml stay Controller-owned, never in the backend."""
 
 import asyncio
 import enum
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,7 +35,6 @@ class BurstBlock:
 
     reason: BlockReason
     detail: str
-
 
 
 @dataclass
@@ -114,6 +114,9 @@ class _Burst:
         # Adapter names snapshotted at burst start: a lora_name rebind mid-run must
         # not split this burst across adapters.
         self.view_loras = [v.lora_name for v in d.views]
+        # The drain streams are written by ``_settle`` on the main loop while the engine
+        # forwards, and read from the engine thread's ``_drain``.
+        self._drain_lock = threading.Lock()
         self.abort_handles = set()
         self.add_handles = []
         self.handle_row = {}  # engine group handle -> particle row
@@ -123,7 +126,8 @@ class _Burst:
             self._add_group(p)
         self.channels = {}  # particle row -> _RowChannel (parked-row lane)
         self.tasks = {}  # particle row -> its in-flight transition Task
-        self._pending_bank = None  # last step's deferred bank Future (overlaps next forward)
+        # The previous step's tail, in flight against the current forward.
+        self._pending_settle = None
 
     def context_ids(self, p, view_idx):
         """Engine prompt for one (particle, view) substream: per-view prefix + the particle's
@@ -151,11 +155,13 @@ class _Burst:
         self.next_handle += 1
         self.handle_row[h] = p.row
         self.row_handle[p.row] = h
-        self.add_handles.append((
+        entry = (
             h,
             [self.context_ids(p, vi) for vi in range(len(self.d.views))],
             self.view_loras,
-        ))
+        )
+        with self._drain_lock:
+            self.add_handles.append(entry)
 
     def _row_injection(self, warm_batch, i, p):
         """Row ``i``'s ``{leaf: [V+1]}`` slice of the batched warm, keyed by the row's OWN
@@ -202,7 +208,9 @@ class _Burst:
             # rows are different widths over different tokens and cannot stack together.
             by_vocab = {}
             for row in waiting:
-                by_vocab.setdefault(id(self.channels[row].pending[0].decode), []).append(row)
+                by_vocab.setdefault(
+                    id(self.channels[row].pending[0].decode), []
+                ).append(row)
             for batch in by_vocab.values():
                 self._batch_draw(batch)
             await asyncio.gather(*(self.channels[row].settled.wait() for row in waiting))
@@ -229,6 +237,8 @@ class _Burst:
         warm, serve the population's draws in one op, then wait for each row to park again
         (mid-unit) or return (the SMC step)."""
         for i, (p, row) in enumerate(zip(parts, rows)):
+            # Already running unless this is the burst's first step, or the engine got
+            # one more step out of a row whose abort has not drained yet.
             channel = self.channels.get(row) or self._spawn_row(p, row)
             channel.deliver(self._row_injection(warm_batch, i, p))
         await asyncio.gather(*(self.channels[row].settled.wait() for row in rows))
@@ -239,9 +249,7 @@ class _Burst:
             if task.done():
                 step = task.result()
                 self._release_row(row)
-                records.append(
-                    BurstDraw(token=flatten_units(step[0])[-1], step=step)
-                )
+                records.append(BurstDraw(token=flatten_units(step[0])[-1], step=step))
             else:
                 records.append(
                     BurstDraw(token=self.channels[row].context[-1], step=None)
@@ -274,19 +282,23 @@ class _Burst:
                 L[lane, eos_rows] += to_numpy(W[eos, -1])
 
     def drain_aborts(self):
-        handles = self.abort_handles
-        self.abort_handles = set()
+        with self._drain_lock:
+            handles = self.abort_handles
+            self.abort_handles = set()
         return list(handles)
 
     def drain_adds(self):
-        adds = self.add_handles
-        self.add_handles = []
+        with self._drain_lock:
+            adds = self.add_handles
+            self.add_handles = []
         return adds
 
     def draw(self, logits, handles):
-        """Engine per-step callback over the complete groups' ``[G, K, vocab]``
-        logits: one token per live group. Banking is deferred under free running to
-        overlap the next forward; dropped groups get a placeholder token."""
+        """Engine per-step callback over the complete groups' ``[G, K, vocab]`` logits:
+        one token per live group. The engine thread blocks here, so the step owes it
+        nothing but the tokens -- everything after the draw is deferred to
+        :meth:`_settle` and runs against the next forward. Dropped groups get a
+        placeholder token."""
         c = self.d.controller
         # Per view: [G, V+1] warm log-weights (device tensors, no host xfer).
         processed = [
@@ -295,9 +307,7 @@ class _Burst:
         ]
 
         async def _step():
-            # (1) Join prior deferred bank so select draws over the resampled population.
-            await self._join_pending_bank()
-            # (2) live groups still in handle_row.
+            await self._join_settle()
             live_k = [k for k, h in enumerate(handles) if h in self.handle_row]
             rows = [self.handle_row[handles[k]] for k in live_k]
             parts = [c.particles[row] for row in rows]
@@ -320,53 +330,59 @@ class _Burst:
                     )
             else:  # no live groups this step (all drained/terminated)
                 records = []
-            # (3) Bank: free running defers (overlaps next forward); unit grain banks inline
-            # (its pop-out abort must take effect this step).
-            if not self.d.sync_boundary:
-                self._pending_bank = (
-                    asyncio.ensure_future(self._bank_pop(parts, records)),
-                    parts,
-                    rows,
-                    records,
-                )
-            else:
+            if self.d.sync_boundary:
+                # Unit grain settles in the block: a surviving row's pop-out abort has
+                # to reach the engine's drain for THIS step, and there is no round to
+                # close mid-burst -- the controller runs it between bursts.
                 await self._bank_pop(parts, records)
                 self._flag_after_bank(parts, rows, records)
+            else:
+                self._pending_settle = asyncio.ensure_future(
+                    self._settle(parts, rows, records)
+                )
             return out
 
         out = self._on_main(_step())
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
 
     def on_burst_end(self):
-        """Engine lifecycle hook: decode loop drained, join the final deferred bank +
-        resample (no next ``draw`` to do it). Rows still parked mid-unit at the drain
-        (the engine hit ``burst_max_steps``) are cancelled with their partial unit --
+        """Engine lifecycle hook: decode loop drained, so join the last step's tail --
+        no next ``draw`` will. Rows still parked at the drain (mid-unit, or started
+        ahead for a step the engine never ran) are cancelled with their partial work --
         on the main loop, since Tasks are not touchable from this worker thread."""
 
         async def _end():
-            await self._join_pending_bank()
+            await self._join_settle()
             for row in list(self.tasks):
                 self._release_row(row)
 
         self._on_main(_end())
 
-    async def _join_pending_bank(self):
-        """Await the deferred bank, then flag its rows and resample. No-op if none pending."""
-        if self._pending_bank is None:
-            return
-        fut, parts, rows, records = self._pending_bank
-        self._pending_bank = None
-        await fut  # banking: score/extend/critic, sets p.done
+    async def _settle(self, parts, rows, records):
+        """One step's whole tail, off the engine's critical path: bank, evict, close the
+        round, start every live row's next transition. Starting them here is what
+        overlaps them -- a row walks its context-only potentials against the next
+        forward and is parked at its logits read before that warm lands."""
+        await self._bank_pop(parts, records)  # score/extend/critic, sets p.done
         self._flag_after_bank(parts, rows, records)
-        # Token grain closes its round here, mid-burst: the controller records the
-        # step and tests ESS, and hands back the rows a crossing invalidated. The ESS
-        # test runs every step; only a step that advanced a row is recorded.
-        if not self.d.sync_boundary:
-            self._flush(
-                self.d.controller.round_boundary(
-                    record=any(r.step is not None for r in records)
-                )
+        # Token grain closes its round mid-burst: ESS is tested every step, but only a
+        # step that advanced a row is recorded. Returns the rows a crossing invalidated.
+        self._flush(
+            self.d.controller.round_boundary(
+                record=any(r.step is not None for r in records)
             )
+        )
+        for row in list(self.row_handle):  # survivors + whatever a crossing re-added
+            if row not in self.tasks:
+                self._spawn_row(self.d.controller.particles[row], row)
+
+    async def _join_settle(self):
+        """Await the previous step's tail, so this step draws over a banked, resampled
+        population. No-op if none pending."""
+        if self._pending_settle is None:
+            return
+        fut, self._pending_settle = self._pending_settle, None
+        await fut
 
     def _flag_after_bank(self, parts, rows, records):
         """Per banked row: evict if terminated; at unit grain a surviving row pops out
@@ -379,7 +395,8 @@ class _Burst:
             elif self.d.sync_boundary and records[k_i].step is not None:
                 h = self.row_handle.get(row)
                 if h is not None:
-                    self.abort_handles.add(h)
+                    with self._drain_lock:
+                        self.abort_handles.add(h)
 
     def _on_main(self, coro):
         """Run ``coro`` on the main loop (parked in ``run_in_executor``) from the burst
@@ -406,7 +423,8 @@ class _Burst:
         h = self.row_handle.pop(row, None)
         if h is not None:
             self.handle_row.pop(h, None)
-            self.abort_handles.add(h)
+            with self._drain_lock:
+                self.abort_handles.add(h)
 
     def _flush(self, crossed):
         """Rebuild the engine requests of every row a resample invalidated -- survivors

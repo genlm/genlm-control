@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 
 import numpy as np
 
@@ -131,6 +132,66 @@ def scenario_build(args, model) -> Built:
     cfg = {"model": args.model, "scenario": s, "N": args.n_particles,
            "max_tokens": args.max_tokens, "ess": args.ess_threshold}
 
+    if s == "synth":
+        # A context-only potential with a DIAL on its per-call cost. Sweeping that
+        # against a fixed forward is what places a real potential on the curve: the
+        # burst can only hide host work behind the GPU, so the ratio is the whole
+        # story. Pure-Python burn, because genlm's real potentials (trie/WFSA walks)
+        # hold the GIL the same way.
+        from genlm.control.potential.base import Potential, VocabTables
+
+        class SynthPotential(Potential):
+            def __init__(self, llm, micros):
+                self.micros = micros
+                self._row = np.zeros(len(llm.vocab) + 1)
+                super().__init__(
+                    llm.vocab,
+                    tables=VocabTables(
+                        llm.token_type, llm.eos, llm.vocab_eos, llm.lookup
+                    ),
+                )
+
+            def _burn(self):
+                t_end = time.perf_counter() + self.micros / 1e6
+                x = 0
+                while time.perf_counter() < t_end:
+                    for _ in range(256):
+                        x += 1
+                return x
+
+            async def prefix(self, context):
+                return 0.0
+
+            async def complete(self, context):
+                return 0.0
+
+            async def logw_next(self, context):
+                self._burn()
+                return self.make_lazy_weights(self._row.copy())
+
+        llm = PromptedLLM(model, eos_byte_strings=_eos_bytes(model, args.eos))
+        llm.set_prompt_from_str(args.prompt)
+        sampler = DirectTokenSampler(llm * SynthPotential(llm, args.potential_us))
+        critic = None if args.no_critic else _terminal_critic(llm.vocab)
+        cfg.update(potential_us=args.potential_us, eos=args.eos,
+                   critic=not args.no_critic)
+        return Built(sampler, critic, llm.prompt_ids, cfg)
+
+    if s == "product":
+        # Direct sampler over a PRODUCT target: the constraint is a factor of the
+        # distribution being drawn from, not a rejection test, so its `logw_next` is a
+        # dense per-step CPU walk that depends only on the context.
+        from genlm.control.potential.built_in.wfsa import BoolFSA
+
+        llm = PromptedLLM(model, eos_byte_strings=_eos_bytes(model, args.eos))
+        llm.set_prompt_from_str(args.prompt)
+        fsa = BoolFSA.from_regex(CONSTRAINTS[args.constraint]).coerce(llm, f=b"".join)
+        sampler = DirectTokenSampler(llm * fsa)
+        critic = None if args.no_critic else _terminal_critic(llm.vocab)
+        cfg.update(constraint=args.constraint, eos=args.eos,
+                   critic=not args.no_critic)
+        return Built(sampler, critic, llm.prompt_ids, cfg)
+
     if s in ("direct", "awrs", "set"):
         llm = PromptedLLM(model, eos_byte_strings=_eos_bytes(model, args.eos))
         llm.set_prompt_from_str(args.prompt)
@@ -208,7 +269,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scenario",
-                   choices=["direct", "awrs", "set", "lora", "cot", "ds1000"],
+                   choices=["direct", "synth", "product", "awrs", "set", "lora", "cot", "ds1000"],
                    default="direct")
     p.add_argument("--model", default="gpt2")
     p.add_argument("--label", default="dev",
@@ -229,6 +290,8 @@ def parse_args():
     p.add_argument("--no-critic", action="store_true")
     p.add_argument("--no-prefix-cache", action="store_true")
     p.add_argument("--constraint", choices=["alpha", "json"], default="alpha")
+    p.add_argument("--potential-us", type=int, default=500,
+                   help="synth scenario: per-call cost of the CPU potential, microseconds")
     p.add_argument("--lora-adapter", default=LORA_ADAPTER,
                    help="HF LoRA adapter for the lora scenario (base model + rank read from it)")
     p.add_argument("--draw", default="gumbel_max",
