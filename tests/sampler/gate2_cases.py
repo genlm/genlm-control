@@ -162,6 +162,14 @@ CASES = {
         Case("terminal-critic", 16, 0.0, 12, S6, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: TerminalContainsCritic(llm.vocab)),
+        # Terminal-only critic WITH resampling. A terminal critic forces
+        # `twist_with_critic` off, so before this case the only critic the burst ever
+        # settled mid-burst was a twisting one, and the only terminal critic ran at
+        # ess=0 where no resample crosses. That gap is where a deferred terminal score
+        # could land after the resample that should have consumed it.
+        Case("terminal-critic-resample", 16, 0.5, 12, S6, "steploop_cached",
+             lambda llm, seed: DirectTokenSampler(llm),
+             lambda llm: TerminalContainsCritic(llm.vocab)),
         Case("twist-critic", 16, 0.5, 12, S12, "steploop_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: SoftVowelCritic(llm.vocab)),

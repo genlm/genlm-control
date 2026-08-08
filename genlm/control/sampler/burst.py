@@ -63,17 +63,27 @@ class _RowChannel:
         self.settled = asyncio.Event()
         # The row's published draw while it waits at the picker, else ``None``.
         self.pending = None
-        self._drawn = asyncio.Event()
+        # One committed draw per delivered warm: the burst reads this step's token off
+        # the pick, so a second draw would have nowhere to go.
+        self._drawn = False
+        self._resolved = asyncio.Event()
         self._result = None
 
     async def draw(self, lazyweights, slot, step):
         """Row side: publish this draw and wait for the burst to make it with the rest of
         the population. ``(slot, step)`` travel with it -- the key lives in the row's own
         task context, which the burst cannot read."""
+        if self._drawn:
+            raise RuntimeError(
+                "burst row drew twice from one warm. The burst commits one token per "
+                "decode step, so the second draw could not be committed; read fresh "
+                'logits between draws, or run with accelerate="off".'
+            )
+        self._drawn = True
         self.pending = (lazyweights, slot, step)
-        self._drawn.clear()
+        self._resolved.clear()
         self.settled.set()
-        await self._drawn.wait()
+        await self._resolved.wait()
         return self._result
 
     def resolve(self, result):
@@ -81,7 +91,7 @@ class _RowChannel:
         self.pending = None
         self._result = result
         self.settled.clear()
-        self._drawn.set()
+        self._resolved.set()
 
     async def next_warm(self, context):
         """Row side: this read's warm, parking when the step's warm is spent. Reads at one
@@ -101,6 +111,7 @@ class _RowChannel:
         self.settled.clear()
         self._warm = warm
         self._served_len = None
+        self._drawn = False
         self._delivered.set()
 
 
@@ -122,10 +133,14 @@ class _Burst:
         self.handle_row = {}  # engine group handle -> particle row
         self.row_handle = {}  # particle row -> engine group handle
         self.next_handle = 0
-        for p in live:
-            self._add_group(p)
         self.channels = {}  # particle row -> _RowChannel (parked-row lane)
         self.tasks = {}  # particle row -> its in-flight transition Task
+        for p in live:
+            self._add_group(p)
+            # Started here, not on delivery: a row's first potential walk then runs
+            # against the engine's prefill, and ``draw`` never has to spawn -- a row
+            # advances iff it already has a transition in flight.
+            self._spawn_row(p, p.row)
         # The previous step's tail, in flight against the current forward.
         self._pending_settle = None
 
@@ -196,24 +211,20 @@ class _Burst:
         if task is not None and not task.done():
             task.cancel()
 
-    async def _rendezvous(self, rows):
-        """Serve every row waiting at the picker in one op -- one logsumexp, one keyed draw,
-        one gather over the stacked ``[N, V+1]``. Loops because a resumed row may reach the
-        picker again before it parks (a sampler may draw more than once per decode step)."""
-        while True:
-            waiting = [row for row in rows if self.channels[row].pending is not None]
-            if not waiting:
-                return
-            # One batch per vocabulary: groups may carry different constraints, so their
-            # rows are different widths over different tokens and cannot stack together.
-            by_vocab = {}
-            for row in waiting:
-                by_vocab.setdefault(
-                    id(self.channels[row].pending[0].decode), []
-                ).append(row)
-            for batch in by_vocab.values():
-                self._batch_draw(batch)
-            await asyncio.gather(*(self.channels[row].settled.wait() for row in waiting))
+    def _pick(self, rows):
+        """Draw every row waiting at the picker and return ``{row: token}``. One pass:
+        a row commits one draw per delivered warm (``_RowChannel.draw`` enforces it), so
+        no row can reach the picker twice in a step."""
+        waiting = [row for row in rows if self.channels[row].pending is not None]
+        # One batch per vocabulary: groups may carry different constraints, so their
+        # rows are different widths over different tokens and cannot stack together.
+        by_vocab = {}
+        for row in waiting:
+            by_vocab.setdefault(id(self.channels[row].pending[0].decode), []).append(row)
+        picked = {}
+        for batch in by_vocab.values():
+            picked.update(self._batch_draw(batch))
+        return picked
 
     def _batch_draw(self, batch):
         """One vocabulary's parked rows, drawn together: one logsumexp, one keyed pick, one
@@ -229,20 +240,37 @@ class _Burst:
         ar = torch.arange(len(batch), device=W.device)
         picked, zs, ids = logps[ar, idx].tolist(), logZ.tolist(), idx.tolist()
         decode = pend[0][0].decode
+        tokens = {}
         for j, row in enumerate(batch):
-            self.channels[row].resolve((decode[ids[j]], zs[j], picked[j]))
+            tokens[row] = decode[ids[j]]
+            self.channels[row].resolve((tokens[row], zs[j], picked[j]))
+        return tokens
 
-    async def _parked_records(self, warm_batch, parts, rows):
-        """One decode step through per-row parked ``transition`` tasks: deliver each row's
-        warm, serve the population's draws in one op, then wait for each row to park again
-        (mid-unit) or return (the SMC step)."""
+    def _running(self, rows):
+        """Rows whose transition is still in flight. A finished one is read straight off
+        its task: delivering to it would clear a ``settled`` nothing will set again."""
+        return [row for row in rows if not self.tasks[row].done()]
+
+    async def _deliver_and_pick(self, warm_batch, parts, rows):
+        """Hand each running row this step's warm and draw the whole population in one
+        op. Returns as soon as ``{row: token}`` exists -- carrying the rows past their
+        draw is :meth:`_collect`'s job, and the engine is blocked until this returns."""
+        running = self._running(rows)
         for i, (p, row) in enumerate(zip(parts, rows)):
-            # Already running unless this is the burst's first step, or the engine got
-            # one more step out of a row whose abort has not drained yet.
-            channel = self.channels.get(row) or self._spawn_row(p, row)
-            channel.deliver(self._row_injection(warm_batch, i, p))
-        await asyncio.gather(*(self.channels[row].settled.wait() for row in rows))
-        await self._rendezvous(rows)
+            if row in self.channels and not self.tasks[row].done():
+                self.channels[row].deliver(self._row_injection(warm_batch, i, p))
+        await asyncio.gather(*(self.channels[row].settled.wait() for row in running))
+        return self._pick(running)
+
+    async def _collect(self, rows):
+        """Carry every row from its draw to its next park -- mid-unit, that park is the
+        next subunit's potentials -- or to its return, the SMC step. One record each.
+
+        This is the row work the overlap buys: it runs against the engine's next
+        forward instead of inside the draw callback."""
+        await asyncio.gather(
+            *(self.channels[row].settled.wait() for row in self._running(rows))
+        )
         records = []
         for row in rows:
             task = self.tasks[row]
@@ -308,12 +336,19 @@ class _Burst:
 
         async def _step():
             await self._join_settle()
-            live_k = [k for k, h in enumerate(handles) if h in self.handle_row]
+            # A row advances iff it has a transition in flight. Anything else in
+            # ``handles`` is popped out or dying and gets the placeholder token.
+            live_k = [
+                k
+                for k, h in enumerate(handles)
+                if h in self.handle_row and self.handle_row[h] in self.tasks
+            ]
             rows = [self.handle_row[handles[k]] for k in live_k]
             parts = [c.particles[row] for row in rows]
             if c.twist_with_critic:
                 c.particles.untwist(rows)
             out = [0] * len(handles)
+            warm_batch = {}
             if rows:
                 # One batched warm per view ([N, V+1], rows-order).
                 sel = torch.tensor(live_k, dtype=torch.int64, device=logits.device)
@@ -321,25 +356,12 @@ class _Burst:
                     view: view.make_lazy_weights(processed[vi][sel])
                     for vi, view in enumerate(self.d.views)
                 }
-                records = await self._parked_records(warm_batch, parts, rows)
-                self._bank_lanes(warm_batch, records, rows)
-                for k, rec in zip(live_k, records):
-                    tok = rec.token
-                    out[k] = (
-                        self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
-                    )
-            else:  # no live groups this step (all drained/terminated)
-                records = []
-            if self.d.sync_boundary:
-                # Unit grain settles in the block: a surviving row's pop-out abort has
-                # to reach the engine's drain for THIS step, and there is no round to
-                # close mid-burst -- the controller runs it between bursts.
-                await self._bank_pop(parts, records)
-                self._flag_after_bank(parts, rows, records)
-            else:
-                self._pending_settle = asyncio.ensure_future(
-                    self._settle(parts, rows, records)
-                )
+                picked = await self._deliver_and_pick(warm_batch, parts, rows)
+                for k, row in zip(live_k, rows):
+                    out[k] = self._committed_id(row, picked)
+            self._pending_settle = asyncio.ensure_future(
+                self._settle(warm_batch, parts, rows)
+            )
             return out
 
         out = self._on_main(_step())
@@ -358,15 +380,40 @@ class _Burst:
 
         self._on_main(_end())
 
-    async def _settle(self, parts, rows, records):
-        """One step's whole tail, off the engine's critical path: bank, evict, close the
-        round, start every live row's next transition. Starting them here is what
-        overlaps them -- a row walks its context-only potentials against the next
-        forward and is parked at its logits read before that warm lands."""
+    def _committed_id(self, row, picked):
+        """The engine token id this row commits: the one it drew, or -- for a transition
+        that returned without reading logits, e.g. a forced EOS at ``max_tokens`` -- the
+        last item of the step it returned."""
+        tok = picked.get(row)
+        if tok is None:
+            task = self.tasks[row]
+            if not task.done():
+                raise RuntimeError(
+                    f"burst row {row} took a warm without drawing or returning; it "
+                    "would run ahead of the engine's lockstep"
+                )
+            tok = flatten_units(task.result()[0])[-1]
+        return self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
+
+    async def _settle(self, warm_batch, parts, rows):
+        """One step's whole tail: carry the rows past their draw, bank the lanes and the
+        population, evict, and at token grain close the round and start the next
+        transitions.
+
+        Both grains run this off the engine's critical path -- the engine already has
+        its tokens. That is what overlaps the row work: a row walks its context-only
+        potentials (the next subunit's, mid-unit) against the next forward. Only the
+        round close is token-grain-only; unit grain's round is the controller's, run
+        between bursts."""
+        records = await self._collect(rows)
+        # Before ``_bank_pop``: an inline critic's ``serve_lanes`` reads these sums.
+        self._bank_lanes(warm_batch, records, rows)
         await self._bank_pop(parts, records)  # score/extend/critic, sets p.done
         self._flag_after_bank(parts, rows, records)
-        # Token grain closes its round mid-burst: ESS is tested every step, but only a
-        # step that advanced a row is recorded. Returns the rows a crossing invalidated.
+        if self.d.sync_boundary:
+            return
+        # ESS is tested every step, but only a step that advanced a row is recorded.
+        # ``round_boundary`` returns the rows a crossing invalidated.
         self._flush(
             self.d.controller.round_boundary(
                 record=any(r.step is not None for r in records)
@@ -442,10 +489,17 @@ class _Burst:
 
 
 def critic_deferred(sampler, controller):
-    """Whether the critic settles at round boundaries (engine drained) rather than
-    per step. False only for free-running in-burst resampling with
-    ``twist_with_critic`` (it consumes twists mid-burst); true otherwise."""
-    return not (sampler.burst_free_running() and controller.twist_with_critic)
+    """Whether the critic settles at round boundaries (engine drained) rather than per
+    step.
+
+    A free-running burst resamples mid-burst, so anything the critic puts into ``logw``
+    must land before that resample -- ground truth settles the critic before every ESS
+    test (``Controller.run`` orders ``apply_critic_boundary`` ahead of
+    ``round_boundary``). Deferring is therefore only safe when nothing consumes the
+    critic mid-burst: no twisting, and no resample that can cross."""
+    if not sampler.burst_free_running():
+        return True
+    return not (controller.twist_with_critic or controller.ess_threshold > 0)
 
 
 def burst_blocker(controller):

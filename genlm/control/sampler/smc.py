@@ -232,10 +232,14 @@ class Controller:
             self._log_ess_threshold = np.log(ess_threshold)
 
     def _critic_lane(self, critic):
-        """A twisting critic's own engine lane, or ``None``: no critic, no twisting, or
-        no single engine leaf to bank (a multi-LM critic scores by forwarding at a
-        boundary instead)."""
-        if not self.twist_with_critic or critic is None:
+        """A per-step critic's own engine lane, or ``None``: no critic, nothing that
+        consumes it mid-burst, or no single engine leaf to bank (a multi-LM critic
+        scores by forwarding at a boundary instead).
+
+        A twist consumes the critic every step; so does a resample, which reweights on
+        sums the critic has to be inside. Either way the leaf must be servable from a
+        bank rather than a forward."""
+        if critic is None or not (self.twist_with_critic or self.ess_threshold > 0):
             return None
         return find_engine_lm(critic)
 
@@ -345,7 +349,10 @@ class Controller:
         if p.max_tokens_left == 0 or self._is_terminal(p):
             p.finish()
             if not self.twist_with_critic:
-                twist_amt = await critic.score(p.context)
+                # batch_score, like the twist branch: the scalar `score` dispatches to
+                # `complete`/`prefix`, which `serve_lanes` does not override, so a
+                # burst-served critic leaf would forward here instead of reading its bank.
+                twist_amt = float((await critic.batch_score([p.context]))[0])
             p.score(twist_amt)
 
     def _is_terminal(self, p):
