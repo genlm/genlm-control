@@ -2,7 +2,7 @@ import asyncio
 from typing import NamedTuple, Callable
 from collections import defaultdict
 
-from genlm.control.potential.base import Potential
+from genlm.control.potential.base import Potential, VocabTables
 from genlm.control.util import LazyWeights
 
 
@@ -32,7 +32,17 @@ class AutoBatchedPotential(Potential):
         self.potential = potential
         self.background_loop = AsyncBatchLoop(potential)
         self.background_loop.start()
-        super().__init__(potential.vocab)
+        # The wrapped potential's own tables: a wrapper indexes the same vocabulary,
+        # so rebuilding them would cost O(len(vocab)) per wrap for an identical result.
+        super().__init__(
+            potential.vocab,
+            tables=VocabTables(
+                potential.token_type,
+                potential.eos,
+                potential.vocab_eos,
+                potential.lookup,
+            ),
+        )
 
     async def complete(self, context):
         return await self.background_loop.queue_request(
@@ -53,6 +63,11 @@ class AutoBatchedPotential(Potential):
         return await self.background_loop.queue_request(
             "batch_logw_next", lambda args: ([*args[0], context],)
         )
+
+    async def logw_eos(self, context):
+        # No batch form to queue against, and the wrapped potential may answer it far
+        # more cheaply than the default read off a whole `logw_next` row.
+        return await self.potential.logw_eos(context)
 
     async def batch_complete(self, contexts):
         return await self.potential.batch_complete(contexts)
