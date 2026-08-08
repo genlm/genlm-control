@@ -50,8 +50,10 @@ docs = [
     "mkdocs-section-index",
 ]
 mlx = [
-    "mlx",
-    "mlx-lm"
+    # Mirrors genlm-backend's [mlx] bound: mlx-lm >=0.30 requires transformers>=5,
+    # which genlm-backend forbids.
+    "mlx>=0.29.2,<0.33",
+    "mlx-lm>=0.29.1,<0.30",
 ]
 
 [tool.setuptools.packages.find]
