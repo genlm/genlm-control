@@ -55,6 +55,11 @@ lane.context -> list[int]        # prompt + fed tokens; reads verify against it
 - **Liveness**: feed-or-close promptly. vLLM steps all resident lanes together; one
   withheld feed stalls the batch. A lane pausing past a step (unit boundary, resample
   crossing) closes; reopening is `open_lane(old.context)` — priced by prefix cache.
+- **Lanes are owned.** A lane belongs to the task that opened it; the owner's exit or
+  exception auto-closes its lanes (async-context/RAII). A crashed row therefore
+  releases the feed barrier and surfaces as a group error instead of stalling the
+  engine. The barrier is the design's one hang surface; it is a single named wait
+  and reports the owing lanes on timeout.
 - **`close` is a first-class answer to a step.** The engine needs a feed only to
   compute the step after it; committed tokens live control-side. A row whose drawn
   token ends its participation (unit end, EOS, `terminate_when`, `max_tokens`
