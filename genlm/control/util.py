@@ -79,22 +79,6 @@ class LazyWeights:
         self.decode = decode
         self.is_log = log
 
-    def gap_at(self, other, token):
-        """``self[token] - other[token]``, read back from the weights ONCE.
-
-        Reading each operand and subtracting in python widens both to float64 first,
-        so the operands are widened here before the subtraction rather than after --
-        the difference is the same double, at one host read instead of two. On a
-        device that is one synchronisation per draw rather than two.
-
-        `other` must index the same vocabulary (samplers validate this).
-        """
-        i = self.encode[token]
-        a, b = self.weights[i], other.weights[i]
-        if torch.is_tensor(a) and torch.is_tensor(b):
-            return float(a.double() - b.double())
-        return float(np.float64(a) - np.float64(b))
-
     def __getitem__(self, token):
         """
         Retrieve the weight for a given token.

@@ -208,7 +208,7 @@ class DirectTokenSampler(TokenSampler):
             self.proposal.logw_next(context), self.potential.logw_next(context)
         )
         token, proposal_logZ, logp = await draw_from(proposal_logws, draw)
-        logw = target_logws.gap_at(proposal_logws, token) + proposal_logZ
+        logw = target_logws[token] - proposal_logws[token] + proposal_logZ
         return token, logw, logp
 
 
