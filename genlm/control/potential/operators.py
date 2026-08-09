@@ -52,7 +52,7 @@ class PotentialOps:
 
         return Normalized(self)
 
-    def coerce(self, other, f, prune=True, homomorphic=None):
+    def coerce(self, other, f, prune=True, homomorphic=None, trie=None, tables=None):
         """Coerce the current potential to operate on the vocabulary of another potential.
 
         See [`Coerced`][genlm.control.potential.coerce.Coerced] for more details.
@@ -65,13 +65,28 @@ class PotentialOps:
             homomorphic (bool | None): Whether `f` distributes over concatenation
                 (enables the trie fast path). `None` probes it; pass `True`/`False`
                 to declare it explicitly. See `Coerced`.
+            trie (dict | None): The symbol trie over `(other.vocab, f)`, as built by
+                `Coerced.build_trie`.
+            tables (VocabTables | None): Prebuilt tables for `other.vocab`, as built
+                by `Potential.build_tables`. Both are functions of `other`'s
+                vocabulary alone, so coercions onto the same one should build each
+                once and pass it here rather than each paying for its own. Both are
+                incompatible with `prune=True`, which narrows that vocabulary.
 
         Returns:
             (Coerced): A Potential that operates on the vocabulary of `other`.
         """
         from genlm.control.potential.coerce import Coerced
 
-        return Coerced(self, other.vocab, f=f, prune=prune, homomorphic=homomorphic)
+        return Coerced(
+            self,
+            other.vocab,
+            f=f,
+            prune=prune,
+            homomorphic=homomorphic,
+            trie=trie,
+            tables=tables,
+        )
 
     def to_autobatched(self):
         """Create a new potential instance that automatically batches concurrent requests to the instance methods.
