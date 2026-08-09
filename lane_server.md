@@ -29,6 +29,13 @@ Contract:
 - `next()` resolves once per engine step the lane was scheduled in. A second `next()`
   before `feed()` raises; `feed()` without a pending `next()` raises; any call on a
   closed lane raises. Violations are immediate exceptions at the seam, not races.
+- **`close` is a first-class answer to a step.** A row that will not read the next warm
+  closes *instead of feeding its final token* — the engine only ever needed the feed to
+  compute the step after it, and committed tokens live control-side. This kills, by
+  construction: the placeholder commit, the one-wasted-forward-per-row-per-unit
+  residual (today the abort races the drain and lands a step late), and the
+  `terminate_when` blocker reason (a step appending `[tok, EOS]` closes at EOS; nothing
+  is ever committed engine-side that control didn't bank).
 - **Liveness**: feed-or-close promptly. vLLM steps all resident lanes together, so one
   withheld feed stalls every lane. A lane pausing past a step (unit boundary, group
   resample) must `close`; reopen with `open_lane(prefix + committed)` — prefix cache
@@ -122,10 +129,19 @@ Same contract, own loop. We own the scheduler, so:
   picked indices, killing the per-row `.item()` sync in DirectTokenSampler
   (`logw = target[token] - logp`; the proposal lookup is algebraically the returned
   `logp`, bit-identical).
-- Grain is only "decode steps per round". Unit rows close lanes at the unit boundary,
-  the group settles, lanes reopen. Token-grain lanes stay open across boundaries; a
-  resample crossing closes + reopens the crossed group's lanes (today's `_flush`,
-  per group). No other group notices either event.
+- **Device discipline** (the `__getitem__` rule): `LazyWeights.__getitem__` ends in
+  `.item()` — a blocking device→host sync per bracket read. That is a cold-path
+  convenience, banned from the step path. Hot-path reads are batched gathers crossing
+  to host once per step per direction (tokens in, picked scalars out); the picker's
+  three `.tolist()` transfers collapse to one; lane banking gathers its per-lane
+  increments in the same crossing. A step that round-trips per row is a bug.
+- **One seam variable.** The row's per-task binding (row → its lanes) is the only
+  ContextVar; boundary lane-sum serving rides the same binding instead of a second var.
+- Grain is only "decode steps per round" — **this is the step-lock fix, the motivating
+  deliverable**: unit rows close lanes at the unit boundary, the group settles, lanes
+  reopen; no group ever waits on another group's unit cadence. Token-grain lanes stay
+  open across boundaries; a resample crossing closes + reopens the crossed group's
+  lanes (today's `_flush`, per group). No other group notices either event.
 - Critic: an engine-lane critic serves from banked lane sums (unchanged math, unchanged
   EOS-increment handling). A critic needing a real forward scores by `score_prompt`
   one-shots at its group's boundary — no drain, no blocker, no B=1 special case.
