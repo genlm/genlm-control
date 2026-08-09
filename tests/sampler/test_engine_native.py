@@ -10,7 +10,7 @@ Two references, chosen per case (the ``reference`` field of ``gate2_cases.CASES`
 - ``"ref"`` -- the genuine ORIGINAL genlm-control (main + llamppl ``smc_standard``), cached
   in ``gate2_snapshot.json`` by ``gen_original_reference.py`` and loaded via ``_ref``. The
   strongest anchor (independent of our StepLoop); used wherever a cached key exists.
-- ``"steploop"`` -- a live ``accelerate="off"`` StepLoop at the same seed (``_run_steploop``),
+- ``"steploop"`` -- a live ``accelerate="off"`` StepLoop at the same seed (``run_steploop``),
   for configs with no cached original (multi-view, multitoken-multiview, batched). This is
   RNG-matched, so the paired diff is tight.
 
@@ -45,10 +45,19 @@ from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
 from genlm.control.potential.coerce import Coerced  # noqa: E402
 from genlm.control.sampler.unit import MultiTokenUnitSampler  # noqa: E402
 from genlm.control.util import flatten_units  # noqa: E402
-from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
-from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
+from genlm.control.sampler.burst import burst_blocker  # noqa: E402
 
-from _harness import seed_all, ctx_ids, load_snapshot, assert_unbiased  # noqa: E402
+from _harness import (  # noqa: E402
+    seed_all,
+    load_snapshot,
+    log,
+    make_controller,
+    assert_case_unbiased,
+    run_burst,
+    run_steploop,
+    compare_runs,
+    threefry_draw,  # noqa: F401 -- autouse fixture, armed by importing it
+)
 from gate2_cases import (  # noqa: E402
     CASES,
     MODEL,
@@ -58,27 +67,6 @@ from gate2_cases import (  # noqa: E402
     ByteLengthBoundary,
     boolfsa,
 )
-from genlm.control.util import set_draw_method  # noqa: E402
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _threefry_draw():
-    """Gate-2 RNG-matches burst<->StepLoop via the counter-based picker (device-agnostic),
-    so each comparison is a tight paired check (warm-KV residual only) instead of
-    divergent-path MC noise. Scoped + restored so it can't leak into gate-1 (whose llamppl
-    reference can't set draw keys, so it must stay gumbel_max)."""
-    set_draw_method("threefry_gumbel")
-    yield
-    set_draw_method("gumbel_max")
-
-
-_T0 = time.perf_counter()
-
-
-def _log(msg):
-    """Flushed, timestamped progress line. Streams live under ``pytest -s`` so a long
-    gate-2 run shows constant progress (per-run wall, bursts) instead of going dark."""
-    print(f"[{time.perf_counter() - _T0:7.1f}s] {msg}", flush=True)
 
 
 def can_burst(controller):
@@ -103,21 +91,6 @@ try:
     _STEPLOOP_SNAP = load_snapshot(_STEPLOOP_PATH, CONFIG)
 except FileNotFoundError:  # pragma: no cover
     _STEPLOOP_SNAP = {}
-
-
-def _controller(make_sampler, n_particles, ess_threshold, max_tokens, make_critic=None):
-    # `make_sampler`/`make_critic` are factories so each burst run gets a fresh
-    # sampler/critic (an AWRS carries its own RNG; a fresh one per run keeps it
-    # seeded by `seed_all` + its own seed). `twist_with_critic` mirrors SMC.__call__
-    # exactly (per-step twist iff ess_threshold > 0).
-    return Controller(
-        samplers=[make_sampler()],
-        critics=[make_critic() if make_critic is not None else None],
-        group_sizes=[n_particles],
-        ess_threshold=ess_threshold,
-        max_tokens=max_tokens,
-        twist_with_critic=ess_threshold > 0,
-    )
 
 
 def _key(label, n_particles, ess_threshold, max_tokens, seed):
@@ -149,112 +122,6 @@ def _steploop_cached(label, n_particles, ess_threshold, max_tokens, seed):
     return _STEPLOOP_SNAP[key]
 
 
-def _run_burst(
-    make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
-):
-    from genlm.control.sampler.sequence import Sequences, _unpack_particles
-
-    seed_all(seed)
-    controller = _controller(
-        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
-    )
-    driver = BurstLoop(controller)
-    t0 = time.perf_counter()
-    parts = asyncio.run(driver.run())
-    dt = time.perf_counter() - t0
-    seq = Sequences(*_unpack_particles(parts))
-    return {
-        "contexts": [ctx_ids(p.context) for p in parts],
-        "logw": [float(p.logw) for p in parts],
-        "log_ml": float(seq.log_ml),
-        "wall": dt,
-        "n_bursts": driver.n_bursts,
-        "n_resamples": controller.n_resamples,
-    }
-
-
-def _run_steploop(
-    make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
-):
-    """Same as ``_run_burst`` but the byte-exact StepLoop (``accelerate="off"``
-    ground truth, gate-1-pinned == original) -- the reference for configs with no
-    cached original snapshot (e.g. multi-view proposal)."""
-    from genlm.control.sampler.sequence import Sequences, _unpack_particles
-
-    seed_all(seed)
-    controller = _controller(
-        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
-    )
-    parts = asyncio.run(StepLoop(controller).run())
-    seq = Sequences(*_unpack_particles(parts))
-    return {
-        "contexts": [ctx_ids(p.context) for p in parts],
-        "logw": [float(p.logw) for p in parts],
-        "log_ml": float(seq.log_ml),
-        "wall": 0.0,
-        "n_bursts": 0,
-        "n_resamples": controller.n_resamples,
-    }
-
-
-def _compare(label, ess_threshold, n_particles, ref, burst):
-    """Burst-vs-cached-original stats + report. ``ref`` is the loaded original
-    reference (``_ref``), ``burst`` the live engine-native run (``_run_burst``).
-    Named ``slow``/``burst`` internally for the original report wording."""
-    _log(
-        f"{label} ess={ess_threshold} N={n_particles}: wall={burst['wall']:.1f}s "
-        f"bursts={burst['n_bursts']} resamples={burst['n_resamples']} log_ml={burst['log_ml']:.3f}"
-    )
-    slow = ref
-    slow_ctx, burst_ctx = slow["contexts"], burst["contexts"]
-    slow_w = np.array(slow["logw"])
-    burst_w = np.array(burst["logw"])
-
-    n_match = sum(a == b for a, b in zip(slow_ctx, burst_ctx))
-    slow_lens = [len(c) for c in slow_ctx]
-    burst_lens = [len(c) for c in burst_ctx]
-    # First-divergence step per particle: isolates single-flip-then-cascade
-    # (the warm-KV signature) from a step-1 wiring bug.
-    first_div = []
-    for a, b in zip(slow_ctx, burst_ctx):
-        k = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), None)
-        first_div.append(k if k is not None else min(len(a), len(b)))
-
-    matched = [
-        abs(slow_w[i] - burst_w[i])
-        for i in range(n_particles)
-        if slow_ctx[i] == burst_ctx[i]
-    ]
-    signed = burst_w - slow_w
-    finite = signed[np.isfinite(signed)]
-
-    lines = [
-        f"=== {label}  ess={ess_threshold}  N={n_particles} (slow cached) ===",
-        f"contexts match: {n_match}/{n_particles}",
-        f"first-divergence step per particle: {first_div}",
-        f"mean len slow={np.mean(slow_lens):.3f} burst={np.mean(burst_lens):.3f}",
-        f"max |logw diff| over matched contexts: "
-        f"{max(matched) if matched else float('nan'):.4e}",
-        f"signed logw diff (burst-slow): mean={np.mean(finite):+.4e} "
-        f"std={np.std(finite):.4e} n={len(finite)}",
-        f"slow log_ml={slow['log_ml']:.6f}  burst log_ml={burst['log_ml']:.6f}  "
-        f"diff={burst['log_ml'] - slow['log_ml']:+.6f}",
-        f"burst wall={burst['wall']:.2f}s  bursts opened={burst['n_bursts']}",
-    ]
-    print("\n" + "\n".join(lines))
-
-    return {
-        "n_bursts": burst["n_bursts"],
-        "n_resamples": burst["n_resamples"],
-        "n_match": n_match,
-        "log_ml_diff": float(burst["log_ml"] - slow["log_ml"]),
-        "slow_log_ml": float(slow["log_ml"]),
-        "burst_log_ml": float(burst["log_ml"]),
-        "mean_len_slow": float(np.mean(slow_lens)),
-        "mean_len_burst": float(np.mean(burst_lens)),
-    }
-
-
 @pytest.fixture(scope="module")
 def llm():
     from genlm.backend.llm import AsyncVirtualLM
@@ -264,7 +131,7 @@ def llm():
     wid = os.environ.get("PYTEST_XDIST_WORKER")
     if wid:
         time.sleep(int(wid[2:]) * 10)
-    _log(f"loading {MODEL} vLLM engine ...")
+    log(f"loading {MODEL} vLLM engine ...")
     t0 = time.perf_counter()
     model = AsyncVirtualLM.from_name(
         MODEL,
@@ -275,71 +142,25 @@ def llm():
             "enforce_eager": True,  # skip CUDA-graph capture -> faster startup for tests
         },
     )
-    _log(f"engine ready in {time.perf_counter() - t0:.1f}s")
+    log(f"engine ready in {time.perf_counter() - t0:.1f}s")
     return PromptedLLM(model, eos_byte_strings=EOS_BYTES)
 
 
-def _nobias(label, llm, *, ml_floor=0.3, ml_k=2.5, len_bound=None, len_k=None,
-            need_resample=False, need_rounds=False):
-    """Drive a homogeneous CASES no-bias case and assert the burst is unbiased.
-
-    Per seed: burst vs reference (cached original ``_ref`` or live StepLoop, per
-    ``case.reference``), accumulate the log_ml + length diffs, then assert the MEAN
-    log_ml diff is within sampling noise of 0 (``assert_unbiased``). ``len_bound``
-    bounds the mean length gap (sem-aware if ``len_k`` given, else absolute).
-    ``need_resample`` / ``need_rounds`` guard that the resample / per-unit-round path
-    actually fired (no vacuous pass); a ``n_bursts>0`` guard always runs."""
-    c = CASES[label]
-    llm.set_prompt_from_str(PROMPT)
-    mkc = (lambda: c.critic(llm)) if c.make_critic is not None else None
-    assert can_burst(
-        _controller(lambda: c.sampler(llm, c.seeds[0]), c.n_particles, c.ess, c.max_tokens, mkc)
-    )
-    diffs, len_gaps, matches = [], [], 0
-    any_resample, max_bursts = False, 0
-    for seed in c.seeds:
-        make = lambda s=seed: c.sampler(llm, s)  # noqa: E731
-        if c.reference == "ref":
-            slow = _ref(c.label, c.n_particles, c.ess, c.max_tokens, seed)
-        elif c.reference == "steploop_cached":
-            slow = _steploop_cached(c.label, c.n_particles, c.ess, c.max_tokens, seed)
-        else:
-            slow = _run_steploop(make, c.n_particles, c.ess, c.max_tokens, seed, mkc)
-        burst = _run_burst(make, c.n_particles, c.ess, c.max_tokens, seed, mkc)
-        s = _compare(c.label, c.ess, c.n_particles, slow, burst)
-        diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
-        matches += s["n_match"]
-        any_resample = any_resample or s["n_resamples"] > 0
-        max_bursts = max(max_bursts, s["n_bursts"])
-    assert max_bursts > 0, f"{c.label}: burst never opened (n_bursts==0)"
-    total = c.n_particles * len(c.seeds)
-    _log(f"{c.label}: contexts matching the reference {matches}/{total}")
-    if c.match_floor is not None:
-        # The no-bias check LOOSENS as the comparison degrades: it is `|mean| <=
-        # max(floor, k*sem)`, and its tightness comes entirely from the burst drawing
-        # the same threefry keys as the cached reference. Lose the pairing and `sem`
-        # inflates until any mean passes. This floor is what notices.
-        assert matches >= c.match_floor, (
-            f"{c.label}: only {matches}/{total} contexts match the reference "
-            f"(floor {c.match_floor}) -- the paired comparison has come apart, so the "
-            "no-bias assertion above is no longer tight"
+def _resolve_ref(case, seed, make, mkc):
+    """This gate's reference per case: the cached original where one exists, the cached
+    RNG-matched StepLoop where that is the anchor, else a live StepLoop."""
+    if case.reference == "ref":
+        return _ref(case.label, case.n_particles, case.ess, case.max_tokens, seed)
+    if case.reference == "steploop_cached":
+        return _steploop_cached(
+            case.label, case.n_particles, case.ess, case.max_tokens, seed
         )
-    if need_resample:
-        assert any_resample, f"{c.label}: ESS never crossed -- resample path unexercised"
-    if need_rounds:
-        assert max_bursts > 1, f"{c.label}: single unit round -- per-unit loop unexercised"
-    m, sem = assert_unbiased(diffs, floor=ml_floor, k=ml_k, label=f"{c.label} log_ml")
-    _log(f"{c.label}: log_ml diff mean={m:+.4f} sem={sem:.4f}")
-    if len_bound is not None:
-        if len_k is None:
-            lg = np.asarray(len_gaps, float)
-            assert abs(lg.mean()) <= len_bound, (
-                f"{c.label}: length biased -- mean gap {lg.mean():+.3f} > {len_bound}"
-            )
-        else:
-            assert_unbiased(len_gaps, floor=len_bound, k=len_k, label=f"{c.label} length")
-    return np.array(diffs), np.array(len_gaps)
+    return run_steploop(make, case.n_particles, case.ess, case.max_tokens, seed, mkc)
+
+
+def _nobias(label, llm, **kwargs):
+    """Drive a homogeneous CASES no-bias case against this gate's references."""
+    return assert_case_unbiased(CASES[label], llm, PROMPT, _resolve_ref, **kwargs)
 
 
 # ----- gate 2a: unconstrained (no-bias over seeds; the force-EOS boundary weight +
@@ -423,11 +244,11 @@ def test_lm_critic_burst_legality(llm):
         return DirectTokenSampler(llm)
 
     lm_critic = PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
-    assert burst_blocker(_controller(make, 8, 0.5, 8, make_critic=lambda: lm_critic)) is None
-    assert burst_blocker(_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic)) is None
+    assert burst_blocker(make_controller(make, 8, 0.5, 8, make_critic=lambda: lm_critic)) is None
+    assert burst_blocker(make_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic)) is None
 
     composite = lm_critic * PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
-    reason = burst_blocker(_controller(make, 8, 0.5, 8, make_critic=lambda: composite))
+    reason = burst_blocker(make_controller(make, 8, 0.5, 8, make_critic=lambda: composite))
     assert reason is not None and reason.reason is BlockReason.FORWARD_NOT_INJECTABLE, reason
 
 
@@ -454,15 +275,15 @@ def test_lm_critic_twist_token_burst_vs_steploop(llm):
             eos_byte_strings=EOS_BYTES,
         )
 
-    assert can_burst(_controller(make, 8, 0.5, 8, make_critic=make_critic))
+    assert can_burst(make_controller(make, 8, 0.5, 8, make_critic=make_critic))
 
     llm.set_prompt_from_str(PROMPT)
     seeds = (1234, 7, 99, 2024, 555, 31, 42, 271, 828, 1618)
     diffs, n_bursts = [], 0
     for seed in seeds:
-        slow = _run_steploop(make, 8, 0.5, 8, seed, make_critic=make_critic)
-        burst = _run_burst(make, 8, 0.5, 8, seed, make_critic=make_critic)
-        s = _compare("lm-critic-twist-token", 0.5, 8, slow, burst)
+        slow = run_steploop(make, 8, 0.5, 8, seed, make_critic=make_critic)
+        burst = run_burst(make, 8, 0.5, 8, seed, make_critic=make_critic)
+        s = compare_runs("lm-critic-twist-token", 0.5, 8, slow, burst)
         diffs.append(s["log_ml_diff"])
         n_bursts = max(n_bursts, s["n_bursts"])
     diffs = np.array(diffs)
@@ -497,9 +318,9 @@ def test_lm_critic_terminal_burst_vs_steploop(llm):
     seeds = (1234, 7, 99, 2024, 555, 31)
     diffs, n_bursts = [], 0
     for seed in seeds:
-        slow = _run_steploop(make, 8, 0.0, 8, seed, make_critic=make_critic)
-        burst = _run_burst(make, 8, 0.0, 8, seed, make_critic=make_critic)
-        s = _compare("lm-critic-terminal", 0.0, 8, slow, burst)
+        slow = run_steploop(make, 8, 0.0, 8, seed, make_critic=make_critic)
+        burst = run_burst(make, 8, 0.0, 8, seed, make_critic=make_critic)
+        s = compare_runs("lm-critic-terminal", 0.0, 8, slow, burst)
         diffs.append(s["log_ml_diff"])
         n_bursts = max(n_bursts, s["n_bursts"])
     diffs = np.array(diffs)
@@ -538,15 +359,15 @@ def test_lm_critic_twist_unit_burst_vs_steploop(llm):
         )
         return Coerced(lm, lm.vocab, f=flatten_units, prune=False)
 
-    assert can_burst(_controller(make, 8, 0.5, 6, make_critic=make_critic))
+    assert can_burst(make_controller(make, 8, 0.5, 6, make_critic=make_critic))
 
     llm.set_prompt_from_str(PROMPT)
     seeds = (1234, 7, 99, 2024, 555, 31)
     diffs, n_bursts = [], 0
     for seed in seeds:
-        slow = _run_steploop(make, 8, 0.5, 6, seed, make_critic=make_critic)
-        burst = _run_burst(make, 8, 0.5, 6, seed, make_critic=make_critic)
-        s = _compare("lm-critic-twist-unit", 0.5, 8, slow, burst)
+        slow = run_steploop(make, 8, 0.5, 6, seed, make_critic=make_critic)
+        burst = run_burst(make, 8, 0.5, 6, seed, make_critic=make_critic)
+        s = compare_runs("lm-critic-twist-unit", 0.5, 8, slow, burst)
         diffs.append(s["log_ml_diff"])
         n_bursts = max(n_bursts, s["n_bursts"])
     diffs = np.array(diffs)
@@ -584,7 +405,7 @@ def test_multiview_proposal_burst_vs_steploop(llm):
         p0 = PromptedLLM(base, prompt_ids=p0_ids, eos_byte_strings=EOS_BYTES)
         return DirectTokenSampler(potential=p0, proposal=q)
 
-    assert can_burst(_controller(make, 8, 0.0, 10))  # K=2 multi-view rides the fast lane
+    assert can_burst(make_controller(make, 8, 0.0, 10))  # K=2 multi-view rides the fast lane
 
     # The K=2 multiview log_ml estimator is high-variance: a flat proposal ("Once upon a")
     # makes the burst's warm-KV draws diverge from StepLoop on many tokens, and N=8 marginal
@@ -595,9 +416,9 @@ def test_multiview_proposal_burst_vs_steploop(llm):
     seeds = tuple(range(24))
     diffs, n_bursts = [], 0
     for seed in seeds:
-        slow = _run_steploop(make, 8, 0.0, 10, seed)
-        burst = _run_burst(make, 8, 0.0, 10, seed)
-        s = _compare("multiview-q/p0", 0.0, 8, slow, burst)
+        slow = run_steploop(make, 8, 0.0, 10, seed)
+        burst = run_burst(make, 8, 0.0, 10, seed)
+        s = compare_runs("multiview-q/p0", 0.0, 8, slow, burst)
         diffs.append(s["log_ml_diff"])
         n_bursts = max(n_bursts, s["n_bursts"])
     diffs = np.array(diffs)
@@ -634,7 +455,7 @@ def test_batched_multiview_burst_unbiased(llm):
         return DirectTokenSampler(potential=p0, proposal=q)
 
     refs = np.array(
-        [_run_steploop(lambda pp=p: make_group(pp), 8, 0.0, 10, SEED)["log_ml"] for p in prompts]
+        [run_steploop(lambda pp=p: make_group(pp), 8, 0.0, 10, SEED)["log_ml"] for p in prompts]
     )
 
     seed_all(SEED)
@@ -700,14 +521,14 @@ def test_multitoken_multiview_burst_vs_steploop(llm):
             boundary_predicate=ByteLengthBoundary(3),
         )
 
-    assert can_burst(_controller(make, 8, 0.5, 6))  # unit-grain multi-view fast lane
+    assert can_burst(make_controller(make, 8, 0.5, 6))  # unit-grain multi-view fast lane
 
     seeds = (1234, 7, 99, 2024, 555, 31)
     diffs, n_bursts = [], 0
     for seed in seeds:
-        slow = _run_steploop(make, 8, 0.5, 6, seed)
-        burst = _run_burst(make, 8, 0.5, 6, seed)
-        s = _compare("multitoken-multiview", 0.5, 8, slow, burst)
+        slow = run_steploop(make, 8, 0.5, 6, seed)
+        burst = run_burst(make, 8, 0.5, 6, seed)
+        s = compare_runs("multitoken-multiview", 0.5, 8, slow, burst)
         diffs.append(s["log_ml_diff"])
         n_bursts = max(n_bursts, s["n_bursts"])
     diffs = np.array(diffs)
@@ -783,13 +604,13 @@ def test_batched_smc_burst_unbiased(llm):
         burst = group_mean(s, "require")
         slow = group_mean(s, "off")
         diffs.append(burst - slow)
-        _log(
+        log(
             f"SMC.batched B={B} seed={s}: {time.perf_counter() - t0:.1f}s  "
             f"burst group-mean={burst:+.4f} slow={slow:+.4f} diff={burst - slow:+.4f}"
         )
     diffs = np.array(diffs)
     sem = diffs.std() / np.sqrt(len(diffs))
-    _log(
+    log(
         f"SMC.batched burst-vs-StepLoop (paired): group-mean log_ml diff "
         f"mean={diffs.mean():+.4f} sem={sem:.4f}"
     )
@@ -840,13 +661,13 @@ def test_batched_per_group_lm_critic_burst_vs_steploop(llm):
         burst = group_mean(s, "require")
         slow = group_mean(s, "off")
         diffs.append(burst - slow)
-        _log(
+        log(
             f"per-group LM critic B={B} seed={s}: {time.perf_counter() - t0:.1f}s  "
             f"burst group-mean={burst:+.4f} slow={slow:+.4f} diff={burst - slow:+.4f}"
         )
     diffs = np.array(diffs)
     sem = diffs.std() / np.sqrt(len(diffs))
-    _log(
+    log(
         f"batched per-group LM critic (paired): group-mean log_ml diff "
         f"mean={diffs.mean():+.4f} sem={sem:.4f}"
     )

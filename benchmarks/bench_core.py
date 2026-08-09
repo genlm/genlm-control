@@ -80,10 +80,12 @@ def env_tag() -> dict:
 # --------------------------------------------------------------------------- #
 # Engine + seeding                                                             #
 # --------------------------------------------------------------------------- #
-def build_engine(model: str, engine_opts: dict):
-    from genlm.backend.llm import AsyncVirtualLM
+def build_engine(model: str, engine_opts: dict, backend: str = "vllm"):
+    """The engine under test. ``engine_opts`` are vLLM's; other backends take none."""
+    from genlm.backend.llm import load_model_by_name
 
-    return AsyncVirtualLM.from_name(model, engine_opts=engine_opts)
+    opts = {"engine_opts": engine_opts} if backend == "vllm" else {}
+    return load_model_by_name(model, backend=backend, llm_opts=opts)
 
 
 def seed_all(seed: int) -> None:
@@ -129,7 +131,12 @@ async def run_smc(sampler, critic, *, path: str, n_particles: int, max_tokens: i
 
 def raw_ceiling(model, prompt_ids, *, n_particles: int, max_tokens: int) -> float:
     """Stock vLLM batch decode of N sequences -- no SMC, no control callback. The
-    engine's native decode floor; (burst - raw) is the residual control-CPU cost."""
+    engine's native decode floor; (burst - raw) is the residual control-CPU cost.
+
+    vLLM only: no other backend exposes a batched no-control decode, so elsewhere the
+    matrix is off vs require alone."""
+    if not hasattr(model, "llm_engine"):
+        raise _Unsupported(f"raw ceiling needs a vLLM engine, not {type(model).__name__}")
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 

@@ -14,7 +14,7 @@ import argparse
 import json
 import os
 
-import test_engine_native as T  # _run_steploop (no module skip on box)
+from _harness import run_steploop
 from gate2_cases import CASES, MODEL, PROMPT, EOS_BYTES, CONFIG
 from genlm.control.potential.built_in.llm import PromptedLLM
 from genlm.control.util import set_draw_method
@@ -54,7 +54,7 @@ def main():
         mkc = (lambda: case.critic(llm)) if case.make_critic is not None else None
         for seed in case.seeds:
             make = lambda s=seed: case.sampler(llm, s)  # noqa: E731
-            r = T._run_steploop(make, case.n_particles, case.ess, case.max_tokens, seed, mkc)
+            r = run_steploop(make, case.n_particles, case.ess, case.max_tokens, seed, mkc)
             key = _key(label, case.n_particles, case.ess, case.max_tokens, seed)
             snap[key] = {"contexts": r["contexts"], "logw": r["logw"], "log_ml": r["log_ml"]}
             print(f"  {key}: log_ml={r['log_ml']:.6f} n={len(r['contexts'])}", flush=True)

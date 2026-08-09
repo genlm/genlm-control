@@ -272,6 +272,8 @@ def parse_args():
                    choices=["direct", "synth", "product", "awrs", "set", "lora", "cot", "ds1000"],
                    default="direct")
     p.add_argument("--model", default="gpt2")
+    p.add_argument("--backend", default="vllm", choices=["vllm", "mlx", "hf"],
+                   help="engine under test; only vllm has a raw ceiling")
     p.add_argument("--label", default="dev",
                    help="version key for the results store (main/speedup-old/speedup-now)")
     p.add_argument("--store", default="bench", help="results store name (results/<store>.jsonl)")
@@ -324,7 +326,7 @@ async def main():
 
     model_name, engine_opts, post_engine = scenario_engine(args)
     args.model = model_name  # so cfg/tokenizer use the resolved (lora base) name
-    model = bc.build_engine(model_name, engine_opts)
+    model = bc.build_engine(model_name, engine_opts, args.backend)
     if post_engine:
         post_engine(model)
 
