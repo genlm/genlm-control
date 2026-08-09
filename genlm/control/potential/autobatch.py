@@ -124,12 +124,21 @@ class AsyncBatchLoop:
                 req = await self.q.get()
                 method_groups[req.batch_method_name].append(req)
 
-                try:
-                    while True:
-                        req = self.q.get_nowait()
-                        method_groups[req.batch_method_name].append(req)
-                except asyncio.QueueEmpty:
-                    pass
+                # Callers reach their request at different depths of a `gather` tree,
+                # and each level is another scheduler turn, so what is queued when this
+                # wakes is one turn's arrivals rather than the population's. Yield until
+                # a turn adds nothing: bounded by the callers' depth, and every turn
+                # waited on was going to happen anyway.
+                while True:
+                    try:
+                        while True:
+                            req = self.q.get_nowait()
+                            method_groups[req.batch_method_name].append(req)
+                    except asyncio.QueueEmpty:
+                        pass
+                    await asyncio.sleep(0)
+                    if self.q.empty():
+                        break
 
                 for method_name, requests in method_groups.items():
                     try:
