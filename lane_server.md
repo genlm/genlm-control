@@ -122,9 +122,13 @@ Same contract, own loop. We own the scheduler, so:
   PromptedLLM processes its own pulled logits (temperature, EOS fold) — the
   `_maybe_temper`/`_process_logw_next_batch` reach-in from burst.py dies with the push
   delivery.
-- **Pick rendezvous survives** (measured 1.64×): rows parked at the picker draw in one
-  op per vocabulary, threefry-keyed (batch-composition-independent by construction).
-  Trigger: every row holding open lanes has parked. Companion gather rides it:
+- **The pick is an emergent collector, not a barrier** (batching survives, measured
+  1.64×): the keyed picker makes draw results batch-composition-independent, so
+  batching the pick is purely a performance choice. One engine step resolves all warms
+  in one loop pass, so the step cohort parks together; the collector fires when the
+  loop drains and draws whoever is parked, one op per vocabulary. No membership
+  bookkeeping; a straggler splits the pick with identical results. Companion gather
+  rides it:
   `draw_reweighted(proposal_logws, target_logws)` batches the target lookup at the
   picked indices, killing the per-row `.item()` sync in DirectTokenSampler
   (`logw = target[token] - logp`; the proposal lookup is algebraically the returned
