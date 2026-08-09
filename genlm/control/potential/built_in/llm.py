@@ -5,11 +5,7 @@ import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.constant import EOS
-from genlm.control.burst_seam import (
-    burst_serve,
-    _burst_logw_next_overrides,
-    _burst_lane_sums,
-)
+from genlm.control.burst_seam import burst_serve, _burst_lane_sums
 from genlm.control.potential.base import Potential
 from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
@@ -694,8 +690,7 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
-        await burst_serve(context)
-        served = self._served(_burst_logw_next_overrides.get())
+        served = self._served(await burst_serve(context))
         if served is not None:
             return served  # burst: the engine's warm logits, no forward
         context_ids = self.encode_tokens(context)
@@ -706,9 +701,9 @@ class PromptedLLM(Potential):
 
     async def batch_logw_next(self, contexts):
         """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
-        (`.weights` shape `[N, V+1]`). In a batched burst the engine's warm `[N, V+1]` batch
-        is served directly off the burst's warm override (the same ContextVar as the
-        scalar path, value batched) -- no forward.
+        (`.weights` shape `[N, V+1]`). Inside a burst this parks on the row's seat exactly
+        as the scalar path does and is served the same warm -- a burst row is one context,
+        so the batch is the row's own.
 
         Args:
             contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.
@@ -716,9 +711,10 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
-        served = self._served(_burst_logw_next_overrides.get())
-        if served is not None:
-            return served  # burst: the engine's warm [N, V+1] batch, no forward
+        if contexts:
+            served = self._served(await burst_serve(contexts[0]))
+            if served is not None:
+                return served  # burst: the engine's warm row, no forward
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
             await self._fwd.batch_next_token_logprobs(

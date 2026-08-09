@@ -59,8 +59,7 @@ class _RowSeat:
         # One committed draw per delivered warm: the burst reads this step's token off
         # the pick, so a second draw would have nowhere to go.
         self._drawn = False
-        self._resolved = asyncio.Event()
-        self._result = None
+        self._resolved = None  # the parked draw's future, resolved by the pick
         # Set once the burst has banked this step's lane increments. A row must not reach
         # ``bank_row`` before then -- an inline critic's ``serve_lanes`` reads those sums.
         self.banked = asyncio.Event()
@@ -77,22 +76,31 @@ class _RowSeat:
             )
         self._drawn = True
         self.pending = (lazyweights, slot, step)
-        self._resolved.clear()
+        self._resolved = asyncio.get_running_loop().create_future()
         self.settled.set()
-        await self._resolved.wait()
-        return self._result
+        return await self._resolved
 
     def resolve(self, result):
         """Burst side: hand back one row's ``(token, logZ, logp)`` and let it run on."""
         self.pending = None
-        self._result = result
         self.settled.clear()
-        self._resolved.set()
+        self._resolved.set_result(result)
 
     async def next_warm(self, context):
         """Row side: this read's warm, parking when the step's warm is spent. Reads at one
         context length are the same decode step (target and proposal share it), so only a
-        read past a draw parks."""
+        read past a draw parks.
+
+        A seat serves one row forward: its context only grows, and a revived row gets a
+        fresh seat. So a read behind the last one served can never be a future step, and
+        parking on it would wait for a warm the burst will never deliver."""
+        if self._served_len is not None and len(context) < self._served_len:
+            raise RuntimeError(
+                f"burst row read logits at context length {len(context)} after being "
+                f"served at {self._served_len}. The burst only delivers forward, so this "
+                'read would park forever; score prefixes outside the burst, or run with '
+                'accelerate="off".'
+            )
         if self._warm is None or self._served_len not in (None, len(context)):
             self._warm = None
             self._delivered.clear()
@@ -117,50 +125,6 @@ class _RowSeat:
         self._delivered.set()
 
 
-class _RoundGate:
-    """The population barrier a free-running burst's round closes on: every row the engine
-    advanced this step banks, then the last arrival runs the round boundary (record +
-    per-group ESS test + resample) and releases the rest.
-
-    Membership is re-derived from the population at every close, never carried: a resample
-    reindexes over a group's WHOLE row set, finished rows included, so a done row can
-    inherit a live ancestor and needs its engine requests and its coroutine back."""
-
-    def __init__(self, burst):
-        self.b = burst
-        self.remaining = 0
-        self.open = asyncio.Event()
-
-    def arm(self, rows):
-        """Burst side: how many rows owe this round an arrival. Called with every row
-        parked, so no arrival can race it."""
-        self.remaining = len(rows)
-        self.open.clear()
-
-    async def arrive(self):
-        """Row side: this row banked its step; the last arrival closes the round. Every
-        row the engine advanced must arrive, terminating ones included -- one that
-        returned without arriving would leave the round short forever."""
-        self.remaining -= 1
-        if self.remaining > 0:
-            await self.open.wait()
-            return
-        self._close()
-
-    def _close(self):
-        """Close the round, then restore the population's engine state: rebuild whatever
-        a crossing invalidated and give every revived row a coroutine again.
-
-        ``record=True`` unconditionally: a free-running step is one SMC step per row, so
-        every arriving row advanced."""
-        b = self.b
-        b._flush(b.d.controller.round_boundary(record=True))
-        for p in b.d.controller.particles:
-            if not p.done and p.row not in b.tasks:
-                b._spawn_row(p)
-        self.open.set()
-
-
 class _Burst:
     """Per-burst engine state for one ``run_burst``. ``draw``/``drain_*``/``on_burst_end``
     are the engine seam (the backend drives the control through them). One engine group
@@ -181,7 +145,8 @@ class _Burst:
         self.next_handle = 0
         self.seats = {}  # particle row -> _RowSeat
         self.tasks = {}  # particle row -> its coroutine, one per row for the whole burst
-        self.gate = _RoundGate(self)
+        self._round_left = 0  # arrivals this round still owes
+        self._round_open = asyncio.Event()
         self._tail = None  # the previous step's burst-side tail, in flight
         for p in live:
             self._add_group(p)
@@ -249,8 +214,6 @@ class _Burst:
             # The row owns its own per-step seat state: a burst-side clear could race
             # a row that has not yet woken from the previous step.
             seat.banked.clear()
-            if c.twist_with_critic:
-                c.particles.untwist(row)
             # Scoped to the draw ONLY: a bank-path potential that reached the seam would
             # park on a warm nobody will deliver instead of raising.
             with burst_row(seat):
@@ -265,7 +228,7 @@ class _Burst:
             if self.d.sync_boundary:
                 # Unit grain: one unit per round. The row leaves the engine at its unit
                 # boundary and the controller runs the boundary once the whole burst has
-                # drained -- there is no round here for a gate to close.
+                # drained -- there is no round for the burst itself to close.
                 self._leave(row)
                 return
             if p.done:
@@ -273,12 +236,40 @@ class _Burst:
                 # row owes it, but the next step must not deliver a warm to a row that
                 # will never read it.
                 self._leave(row)
-                await self.gate.arrive()
+                await self._arrive()
                 return
-            await self.gate.arrive()
+            await self._arrive()
             if p.done:  # a crossing handed this row a finished ancestor
                 self._leave(row)  # `_flush` already dropped the handle; the evict no-ops
                 return
+
+    def _arm_round(self, rows):
+        """How many rows owe this round an arrival. Called with every row parked, so no
+        arrival can race it."""
+        self._round_left = len(rows)
+        self._round_open.clear()
+
+    async def _arrive(self):
+        """The population barrier a free-running burst's round closes on: every row the
+        engine advanced this step banks, then the last arrival runs the round boundary
+        and restores the engine state a crossing invalidated.
+
+        Every row the engine advanced must arrive, terminating ones included -- one that
+        returned without arriving would leave the round short forever. Membership is
+        re-derived from the population, never carried: a resample reindexes over a
+        group's WHOLE row set, finished rows included, so a done row can inherit a live
+        ancestor and needs its engine requests and its coroutine back."""
+        self._round_left -= 1
+        if self._round_left > 0:
+            await self._round_open.wait()
+            return
+        # ``record=True`` unconditionally: a free-running step is one SMC step per row,
+        # so every arriving row advanced.
+        self._flush(self.d.controller.round_boundary(record=True))
+        for p in self.d.controller.particles:
+            if not p.done and p.row not in self.tasks:
+                self._spawn_row(p)
+        self._round_open.set()
 
     def _pick(self, rows):
         """Draw every row waiting at the picker, returning ``{row: (token, logZ, logp)}``
@@ -339,29 +330,26 @@ class _Burst:
         terminating row's EOS increment closes it into its ``complete`` -- so a leaf
         reached inside the burst reads a banked number rather than forwarding.
 
-        Two device->host transfers per lane for the whole population. The group only
-        picks the leaf whose vocabulary indexes the committed token, so it resolves per
-        row rather than splitting the batch."""
+        One device->host transfer per lane for the whole population: a terminating row
+        banks the warm's last column, which is where the fold puts EOS, so every row is
+        one gather. The group picks the leaf whose vocabulary indexes the committed
+        token, so the column resolves per row rather than splitting the batch."""
         parts = self.d.controller.particles
         L, gl = parts.lane_logp, self.d.controller.group_lanes
-        drawn = [(i, r) for i, r in enumerate(rows)
-                 if not isinstance(committed[r], EndOfSequence)]
-        eos = [(i, r) for i, r in enumerate(rows)
-               if isinstance(committed[r], EndOfSequence)]
-        drawn_rows = np.array([r for _, r in drawn], dtype=np.int64)
-        eos_rows = np.array([r for _, r in eos], dtype=np.int64)
+        rows_np = np.array(rows, dtype=np.int64)
+        ks = torch.arange(len(rows), device=warm[0].device)
         for lane in range(len(self.d.views)):
             W = warm[lane]  # [N, V+1] device tensor, rows-order
-            if drawn:
-                ks = torch.tensor([i for i, _ in drawn], device=W.device)
-                idx = torch.tensor(
-                    [gl[parts.group[r]][lane].lookup[committed[r]] for _, r in drawn],
-                    device=W.device,
-                )
-                L[lane, drawn_rows] += to_numpy(W[ks, idx])
-            if eos:
-                ks = torch.tensor([i for i, _ in eos], device=W.device)
-                L[lane, eos_rows] += to_numpy(W[ks, -1])
+            idx = torch.tensor(
+                [
+                    W.shape[1] - 1
+                    if isinstance(committed[r], EndOfSequence)
+                    else gl[parts.group[r]][lane].lookup[committed[r]]
+                    for r in rows
+                ],
+                device=W.device,
+            )
+            L[lane, rows_np] += to_numpy(W[ks, idx])
 
     def drain_aborts(self):
         with self._drain_lock:
@@ -380,52 +368,54 @@ class _Burst:
         one token per live group. The engine thread blocks here, so the step owes it
         nothing but the tokens -- every row's bank and the round boundary run afterwards,
         on the main loop, against the next forward. Dropped groups get a placeholder."""
-        c = self.d.controller
         # Per lane: [G, V+1] warm log-weights (device tensors, no host xfer). Indexed by
         # engine lane slot, not by a leaf -- a lane is one engine request across groups.
         warm = [
             view._process_logw_next_batch(view._maybe_temper(logits[:, vi].float()))
             for vi, view in enumerate(self.d.views)
         ]
-
-        async def _step():
-            await self._join_tail()
-            # A row advances iff it has a coroutine. Anything else in ``handles`` is
-            # popped out or dying and gets the placeholder token.
-            live_k = [
-                k
-                for k, h in enumerate(handles)
-                if h in self.handle_row and self.handle_row[h] in self.tasks
-            ]
-            rows = [self.handle_row[handles[k]] for k in live_k]
-            out = [0] * len(handles)
-            if not rows:
-                return out
-            if len(live_k) == len(handles):
-                step_warm = warm  # already in ``handles`` order; the gather would copy
-            else:
-                sel = torch.tensor(live_k, dtype=torch.int64, device=logits.device)
-                step_warm = [w[sel] for w in warm]
-            for i, row in enumerate(rows):
-                self.seats[row].deliver(self._row_injection(step_warm, i, c.particles[row]))
-            # Quiescence: every row has consumed this step's warm and is parked at the
-            # picker or has returned.
-            await asyncio.gather(*(self.seats[row].settled.wait() for row in rows))
-            picked = self._pick(rows)
-            committed = self._committed(rows, picked)
-            # Armed with every row parked, so no arrival can race it.
-            if not self.d.sync_boundary:
-                self.gate.arm(rows)
-            for k, row in zip(live_k, rows):
-                tok = committed[row]
-                out[k] = self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
-            self._tail = asyncio.ensure_future(
-                self._release(step_warm, committed, picked, rows)
-            )
-            return out
-
-        out = self._on_main(_step())
+        out = self._on_main(self._step(warm, handles))
         return torch.tensor(out, dtype=torch.int64, device=logits.device)
+
+    async def _step(self, warm, handles):
+        """The main-loop half of one engine step: deliver the warm, wait for quiescence,
+        pick. Returns at the pick -- everything the tokens do not depend on goes to
+        :meth:`_release`, behind the engine's release."""
+        c = self.d.controller
+        await self._join_tail()
+        # A row advances iff it has a coroutine. Anything else in ``handles`` is
+        # popped out or dying and gets the placeholder token.
+        live_k = [
+            k
+            for k, h in enumerate(handles)
+            if h in self.handle_row and self.handle_row[h] in self.tasks
+        ]
+        rows = [self.handle_row[handles[k]] for k in live_k]
+        out = [0] * len(handles)
+        if not rows:
+            return out
+        if len(live_k) == len(handles):
+            step_warm = warm  # already in ``handles`` order; the gather would copy
+        else:
+            sel = torch.tensor(live_k, dtype=torch.int64, device=warm[0].device)
+            step_warm = [w[sel] for w in warm]
+        for i, row in enumerate(rows):
+            self.seats[row].deliver(self._row_injection(step_warm, i, c.particles[row]))
+        # Quiescence: every row has consumed this step's warm and is parked at the
+        # picker or has returned.
+        await asyncio.gather(*(self.seats[row].settled.wait() for row in rows))
+        picked = self._pick(rows)
+        committed = self._committed(rows, picked)
+        # Armed with every row parked, so no arrival can race it.
+        if not self.d.sync_boundary:
+            self._arm_round(rows)
+        for k, row in zip(live_k, rows):
+            tok = committed[row]
+            out[k] = self.d.eos_id if isinstance(tok, EndOfSequence) else tok.token_id
+        self._tail = asyncio.ensure_future(
+            self._release(step_warm, committed, picked, rows)
+        )
+        return out
 
     async def _release(self, warm, committed, picked, rows):
         """One step's burst-side tail: bank the lanes, then let every row run on.

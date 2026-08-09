@@ -246,7 +246,11 @@ class Controller:
     async def draw_step(self, p):
         """One row's step ``(to_append, logw, logp)``: forced EOS at the ``max_tokens``
         boundary, else the sampler's transition (closed by ``terminate_when``). The
-        (slot, ordinal) draw key lets a counter-based picker match the burst draw."""
+        (slot, ordinal) draw key lets a counter-based picker match the burst draw.
+
+        Untwists ``p`` first: a twist is a bet on the resample the row has now passed."""
+        if self.twist_with_critic:
+            self.particles.untwist(p.row)
         if p.max_tokens_left == 1:
             return await self._force_eos_step(p, self.sampler_of(p))
         with draw_key(p.row, draw_ordinal(p.context)):
@@ -306,9 +310,8 @@ class Controller:
 
     async def bank_row(self, p, to_append, logw, logp):
         """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
-        Caller untwists ``p`` before the draw. Critic-free rows (no critic, or the
-        critic deferred to the round boundary) bank without awaiting; an inline
-        critic twists/reweights here.
+        Critic-free rows (no critic, or the critic deferred to the round boundary) bank
+        without awaiting; an inline critic twists/reweights here.
 
         ``logp`` is the step's own choice log-prob. Nothing banks it -- each engine
         leaf's lane holds its own -- but it stays in the step tuple callers splat."""
@@ -485,8 +488,8 @@ class Controller:
     async def apply_critic_boundary(self):
         """The deferred critic math, at the round boundary (engine drained; forwards are
         legal). Same math as the inline path: a finished particle scores ``complete``
-        permanently; a live one twists for the upcoming resample (the caller untwists at
-        the next round's draw)."""
+        permanently; a live one twists for the upcoming resample (``draw_step`` untwists
+        it at the next round)."""
         parts, self._critic_pending = self._critic_pending, []
         if not parts:
             return
@@ -539,8 +542,6 @@ class StepLoop:
     async def round(self):
         """One token for every live row."""
         c = self.controller
-        if c.twist_with_critic:
-            c.particles.untwist()
         await asyncio.gather(*[c.step_row(p) for p in c.particles if not p.done])
 
     async def run(self):
