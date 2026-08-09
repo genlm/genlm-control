@@ -21,7 +21,7 @@ the id ledger, and the capture router. Lifetime = process; there is no burst beg
 await server.next_token_logprobs(ids: list[int]) -> Tensor[V]     # main's surface
 await server.score_prompt(ids: list[int]) -> Tensor[len(ids)-1]   # logp(ids[t] | ids[:t])
 server.open_lane(prompt_ids: list[int], *, lora_name: str | None = None,
-                 group: GroupHandle) -> Lane
+                 row: RowHandle) -> Lane
 ```
 
 One-shots are stateless awaits, submittable at any time, lanes resident or not
@@ -34,11 +34,15 @@ dict consumed on read, replacing the single overwrite-on-call capture slot.
 A resident decode request. State machine, all transitions raising on violation:
 
 ```
-OPEN ──(engine schedules; sampler publishes row)──> WARM
+OPEN ──(sampler publishes the lane's row)──> WARM
 WARM ──feed(tok)──> OPEN        # context += tok; warm cleared; engine may step
 WARM ──close()───> CLOSED       # instead of feeding: engine never forwards again
-OPEN ──close()───> CLOSED       # e.g. forced EOS: close without reading
+OPEN ──close()───> CLOSED       # boundary eviction of an unread lane
 ```
+
+A forced-EOS row (`max_tokens`) is WARM → close: it reads its warm — `logw_eos` is
+`logw_next(context)[EOS]`, a lane read — takes the EOS column, and closes without
+feeding.
 
 ```python
 await lane.next() -> Tensor[V]   # this step's post-processor float32 logits row,
@@ -59,7 +63,10 @@ lane.context -> list[int]        # prompt + fed tokens; reads verify against it
   exception auto-closes its lanes (async-context/RAII). A crashed row therefore
   releases the feed barrier and surfaces as a group error instead of stalling the
   engine. The barrier is the design's one hang surface; it is a single named wait
-  and reports the owing lanes on timeout.
+  and reports the owing lanes on timeout. Two outer nets replace `run_burst`'s
+  `finally`: `Controller.run` closes every lane it opened on any exit, and each lane
+  carries an engine-side `max_tokens` backstop (its row's remaining budget) behind
+  the control-side rejects.
 - **`close` is a first-class answer to a step.** The engine needs a feed only to
   compute the step after it; committed tokens live control-side. A row whose drawn
   token ends its participation (unit end, EOS, `terminate_when`, `max_tokens`
@@ -68,13 +75,17 @@ lane.context -> list[int]        # prompt + fed tokens; reads verify against it
   ever forwarded, no wasted step exists. (Today both exist: the abort races the
   drain and lands a step late.)
 
-### Group handle
+### Row handle
 
-`K` lanes opened under one handle are atomic: the backend never resolves a step for a
-partial group. vLLM's scheduler may schedule a subset of a group's requests in a step
-(physics — backend vllm.py:296-309); the backend absorbs this by stalling the group
-(flush + re-add at `lane.context`), invisible above. On MLX, we own the scheduler and
-the situation is inexpressible.
+The `K` lanes of one particle (its view-set) open under one **row handle** — the
+atomicity domain. Not the SMC group: a group of N particles holds N handles. The
+backend never publishes a partial view-set: the sampler assembles complete handles
+*before* resolving any future; an incomplete handle's rows are stalled (flush +
+re-add at `lane.context`) with nothing published, so control cannot observe a
+partial step. vLLM's scheduler may split a handle across steps (physics — backend
+vllm.py:296-309); a stall mints fresh rids under the *same* `Lane` objects — the
+swap is backend-internal, control's references survive. On MLX, we own the
+scheduler and a split is inexpressible.
 
 ### Engine thread (vLLM)
 
@@ -82,11 +93,19 @@ The one place that blocks. Loop (spike P1/P2):
 
 ```
 drain adds/aborts → no live requests? park on submit-event
-                  → engine.step() → sampler publishes rows to lane futures (by rid,
-                    via call_soon_threadsafe) → blocks until every scheduled resident
-                    lane is FED or CLOSED → returns fed tokens (closed rows get an
-                    engine-side placeholder that the post-step drain retires unforwarded)
+                  → engine.step() → sampler assembles complete row handles, stalls
+                    the rest → publishes the step's rows in ONE threadsafe callback
+                    → blocks until every published lane is FED or CLOSED → returns
+                    fed tokens (closed rows get an engine-side placeholder that the
+                    post-step drain retires unforwarded)
 ```
+
+The barrier is over *published* lanes, not scheduled ones — chunked prefill can
+schedule a reopening lane for several steps before it reaches its sampling position
+and produces a row; until then it owes nothing. The single-callback publish is
+load-bearing for the collector: callbacks queued mid-iteration run on the *next*
+loop pass, so per-lane publishes could split the step cohort; one callback delivers
+the whole step atomically.
 
 Data crosses the thread boundary (futures out, feed queue in); control flow never
 does. The sampler install remains `model_runner.sampler = ...` through the private
@@ -104,12 +123,15 @@ internal, adds per-row hops), the deprecated de-randomization env flag.
 
 ### MLX
 
-Same contract, own loop, two simplifications: the step batch is assembled from
-FED lanes only (true subset-stepping — pausing lanes are simply absent, no
-close/reopen dance required, though the contract permits it), and one-shots run
-between decode steps in the same loop, so `burst_active` mutual exclusion has no
-referent. `_Ledger`/`_GroupTable` collapse to one ledger with two engine bindings.
-Metal thread affinity and no-float64 unchanged.
+Same contract, own loop. One-shots run between decode steps in the same loop, so
+`burst_active` mutual exclusion has no referent. Subset-stepping (step only the FED
+lanes; a pausing lane stays resident) is expressible because we own the scheduler,
+but it is not free: today's `_SlotPool.advance` is rectangular — every kept row
+extends by the same delta and an omitted source is *dropped* — so holding a lane
+without stepping it needs a slot-hold primitive the pool does not yet have. Until
+that lands, MLX lanes pause by close/reopen exactly as vLLM's do; the contract is
+identical either way. `_Ledger`/`_GroupTable` collapse to one ledger with two
+engine bindings. Metal thread affinity and no-float64 unchanged.
 
 ### Version
 
@@ -128,10 +150,13 @@ Three, all on the main loop:
 - **Row coroutine** (one per particle): `while not done: draw → bank → arrive`.
   Draw runs the sampler's real `transition`; leaf reads route through the binding.
   A row that terminates closes its lanes and arrives one last time.
-- **Group coroutine** (one per group): awaits its rows' arrivals, then runs the
-  boundary — critic settle, ESS/resample, membership re-derivation (a done row can
-  inherit a live ancestor: respawn its coroutine, reopen its lanes), lane lifecycle
-  for crossed rows (close + reopen at rewritten contexts) — and releases the round.
+- **Group coroutine** (one per group): owns a per-round barrier — an arrival counter
+  armed at round release, when every member row is parked and none can arrive early
+  (today's `_arm_round` guarantee, group-scoped). Membership is re-derived from the
+  population at every release, never carried: terminations shrink it, a resample can
+  revive a done row into a live ancestor (respawn its coroutine, reopen its lanes).
+  Last arrival wakes the group: critic settle, ESS/resample, lane lifecycle for
+  crossed rows (close + reopen at rewritten contexts), re-arm, release.
 - **`Controller.run`** = `gather(group(g) for g)` after `start()`. No structure spans
   groups. The math is already per-group (`_maybe_resample`, `apply_critic_boundary`,
   `_round_start`, `serve_lanes`, `lane_logp`); the global while-loop was the only
@@ -153,12 +178,18 @@ Deleted with the push-delivery seam: the `[G, K, vocab]` injection block,
 
 ### The draw collector
 
-The pick batches emergently, not at a barrier. One engine step resolves all warms in
-one loop pass, so the step cohort parks together: the first park schedules a fire via
-`loop.call_soon`; parks landing in the same pass join it; the fire stacks per
-vocabulary, draws with the threefry picker (keyed `(row, ordinal)` — results are
-batch-composition-independent, so a straggler splitting the cohort changes nothing),
-and resolves the parked futures. No membership state.
+The pick batches emergently, not at a barrier. The engine publishes a step's warms in
+one callback (§ engine thread), so rows whose read path is synchronous from warm to
+park land in one loop pass: the first park schedules a fire via `loop.call_soon`;
+parks in the same pass join it; the fire stacks per vocabulary, draws with the
+threefry picker (keyed `(row, ordinal)` — results are batch-composition-independent),
+and resolves the parked futures. No membership state. A row that awaits something
+real between warm and park — an autobatched context potential, a multi-leaf gather
+that isn't already resolved — falls into a later fire; the split costs one extra
+kernel launch and changes no draw. Samplers with their own draw machinery ride the
+generic seams unchanged: AWRS (per-instance rejection stream) reads warms and feeds
+without the collector; `SetTokenSampler`'s final `draw_from` over its aggregated set
+weights enters the collector like any other draw, batched by its own vocabulary.
 
 **One host crossing per fire**: picked token ids, their logps and logZs, companion
 gathers, and per-lane bank increments at the fed ids leave the device together.
@@ -173,15 +204,23 @@ warms and feed without the collector; nothing requires it.
 ### Grain
 
 Grain is only "decode steps per round" — **the step-lock fix, the motivating
-deliverable**: no group ever waits on another group's cadence.
+deliverable**: no group ever waits on another group's *round or unit cadence*. What
+remains shared on vLLM is step pacing: resident lanes advance together, so the
+slowest feed gates each step — a batch-physics fact, per-step scale, not per-unit.
 
 - Token grain: a row feeds every step; the group boundary runs every round; lanes
-  stay open across boundaries. A resample crossing closes + reopens the crossed
-  group's lanes (today's `_flush`, scoped to that group).
+  stay open across boundaries — sound because a token-grain boundary is pure host
+  math (resample, banked-sum settles) that overlaps the forward. A resample crossing
+  closes + reopens the crossed group's lanes (today's `_flush`, scoped to that group).
 - Unit grain: a row loops subunit draws inside one round, feeding each, and closes
   instead of feeding its unit-final token; the group settles; lanes reopen for the
   next round. Intra-group waiting at the boundary is the resample's data dependency,
   not scheduling.
+- **Rule: a boundary that does engine work keeps no lanes open.** One-shot scoring at
+  a boundary is legal only when that group's lanes are closed — true by construction
+  at unit boundaries and terminal settles, and statically excluded per-step (blocker).
+  An open lane may never wait on a slow boundary, so no group's boundary can stall
+  another group's steps.
 
 ### Critic
 
@@ -190,15 +229,25 @@ deliverable**: no group ever waits on another group's cadence.
   the bank must agree, as today); boundary serving reads banked sums. Math unchanged.
 - Forward critic (no single engine leaf): `score_prompt` one-shots at its group's
   boundary. No drain, no engine-idle requirement, no B=1 special case.
+- `terminate_when` appends an EOS the sampler never drew; the closing row's lane has
+  no next warm to bank that increment from. The row's terminal `complete` is settled
+  by a `score_prompt` one-shot at the boundary instead of from the bank — one
+  one-shot per such termination, and the old blocker reason dies rather than
+  narrowing.
 - The static blocker shrinks to its per-step half: every LM leaf on a group's
   per-step path must be a lane (a per-row scoring round-trip per token would
-  serialize the decode loop — latency bound, not a mode), plus engine homogeneity
-  across groups. Boundary reasons and the `terminate_when` reason are dead.
+  serialize the decode loop — latency bound, not a mode), plus **server homogeneity**:
+  all groups' lanes on one `Server`. That is the whole homogeneity requirement —
+  LoRA is per-request (vLLM serves mixed-adapter batches natively) and temperature
+  is control-side leaf processing, so per-group adapters and temperatures are legal
+  and today's lora/temperature homogeneity blockers die.
 
 ### Record & RNG
 
 Record is per group: `SMCRecord.step_num` is one counter with no notion of
-interleaved cadences, so each group records its own stream; viz rebuilds per group.
+interleaved cadences, so each group records its own stream; viz rebuilds per group;
+`SMC.batched` attaches each returned `Sequences` its own group's record (today all B
+share one whole-batch record).
 Draw keys stay `(row, ordinal)` — cadence-independent. gate-1's byte pin is to draw
 *order*, an implementation convention; the reference regenerates against the new
 loop's order.
@@ -210,9 +259,9 @@ loop's order.
 `EngineControl`; `_Burst`, `_RowSeat`, `burst_serve`, both seam ContextVars, the
 injection block; the executor hop, `_on_main`, `_drain_lock`, `on_burst_end`,
 `view_prefixes` snapshots; the placeholder-token commit and the
-one-wasted-forward-per-unit-row residual; `burst_active` (MLX); the boundary and
-`terminate_when` blocker reasons. The old shape stays reachable in git only — no
-in-tree fallback, no legacy flag.
+one-wasted-forward-per-unit-row residual; `burst_active` (MLX); the boundary,
+`terminate_when`, LoRA-homogeneity, and temperature-homogeneity blocker reasons.
+The old shape stays reachable in git only — no in-tree fallback, no legacy flag.
 
 ## 4. Acceptance
 
