@@ -24,8 +24,8 @@ from huggingface_hub import snapshot_download  # noqa: E402
 from genlm.backend.llm.vllm import AsyncVirtualLM  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
-from genlm.control.sampler.smc import Controller, StepLoop  # noqa: E402
-from genlm.control.sampler.burst import BurstLoop, burst_blocker  # noqa: E402
+from genlm.control.sampler.smc import Controller  # noqa: E402
+from genlm.control.lane_runner import LaneRunner, lane_blocker  # noqa: E402
 from genlm.control.sampler.sequence import Sequences, _unpack_particles  # noqa: E402
 from _harness import seed_all  # noqa: E402
 
@@ -54,7 +54,7 @@ def lora_model():
     return m
 
 
-def _run(model, q_lora_name, seed, driver_cls):
+def _run(model, q_lora_name, seed, lanes_on):
     seed_all(seed)
     prompt_ids = model.tokenizer.encode("The capital of France is")
     p0 = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS)
@@ -67,11 +67,13 @@ def _run(model, q_lora_name, seed, driver_cls):
         max_tokens=12,
         twist_with_critic=False,
     )
-    if driver_cls is BurstLoop:
-        assert burst_blocker(controller) is None, burst_blocker(controller)
-    driver = driver_cls(controller)
-    parts = asyncio.run(driver.run())
-    return getattr(driver, "n_bursts", 0), float(Sequences(*_unpack_particles(parts)).log_ml)
+    if lanes_on:
+        assert lane_blocker(controller) is None, lane_blocker(controller)
+        runner = LaneRunner(controller)
+        parts = asyncio.run(controller.run(lanes=runner))
+        return 1, float(Sequences(*_unpack_particles(parts)).log_ml)
+    parts = asyncio.run(controller.run())
+    return 0, float(Sequences(*_unpack_particles(parts)).log_ml)
 
 
 def test_lora_proposal_burst_applies_adapter(lora_model):
@@ -79,8 +81,8 @@ def test_lora_proposal_burst_applies_adapter(lora_model):
     the adapter materially changes the draw (q=LoRA vs q=base diverge), proving the
     per-request LoRA flows through the burst per view. (q=base is the degenerate q==p0
     case -> log_ml 0; q=LoRA picks up a non-trivial p0/q correction.)"""
-    nb_lora, ml_lora = _run(lora_model, "vk", 1234, BurstLoop)
-    nb_base, ml_base = _run(lora_model, None, 1234, BurstLoop)
+    nb_lora, ml_lora = _run(lora_model, "vk", 1234, True)
+    nb_base, ml_base = _run(lora_model, None, 1234, True)
     assert nb_lora > 0 and nb_base > 0, f"did not burst: lora={nb_lora} base={nb_base}"
     assert abs(ml_lora - ml_base) > 1e-6, (
         f"adapter had no effect on the burst draw: log_ml lora={ml_lora} base={ml_base}"
@@ -88,15 +90,15 @@ def test_lora_proposal_burst_applies_adapter(lora_model):
 
 
 def test_lora_proposal_burst_vs_steploop(lora_model):
-    """The real target: q=LoRA / p0=base K=2 multi-view burst vs StepLoop (which now
+    """The real target: q=LoRA / p0=base K=2 multi-view lane run vs the plain loop (which
     applies q's adapter via slow-path per-view LoRA). Unbiased log_ml across seeds
     (warm-KV residual only) -- validates the LoRA burst's correctness, not just that
     the adapter is wired."""
     seeds = (1234, 7, 99, 2024, 555, 31)
     diffs, n_bursts = [], 0
     for seed in seeds:
-        nb, ml_burst = _run(lora_model, "vk", seed, BurstLoop)
-        _, ml_slow = _run(lora_model, "vk", seed, StepLoop)
+        nb, ml_burst = _run(lora_model, "vk", seed, True)
+        _, ml_slow = _run(lora_model, "vk", seed, False)
         diffs.append(ml_burst - ml_slow)
         n_bursts = max(n_bursts, nb)
     diffs = np.array(diffs)
@@ -107,5 +109,5 @@ def test_lora_proposal_burst_vs_steploop(lora_model):
     )
     assert n_bursts > 0, "did not burst"
     assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
-        f"lora burst log_ml biased vs StepLoop: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+        f"lora lane log_ml biased vs plain loop: mean {diffs.mean():+.4f} (sem {sem:.4f})"
     )

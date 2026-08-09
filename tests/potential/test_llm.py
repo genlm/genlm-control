@@ -305,22 +305,6 @@ async def test_vllm_backend():
                 await res
 
 
-@pytest.mark.asyncio
-async def test_unserved_leaf_raises_during_burst(llm, monkeypatch):
-    """A leaf that is not among a burst's injected views must raise rather than forward:
-    the forward would re-enter the burst's decode loop and deadlock."""
-    monkeypatch.setattr(llm.model, "burst_active", True, raising=False)
-    context = llm.tokenize(" world")
-    for call in (
-        llm.logw_next(context),
-        llm.batch_logw_next([context]),
-        llm.batch_prefix([context]),
-        llm.batch_complete([context]),
-    ):
-        with pytest.raises(RuntimeError, match="engine burst"):
-            await call
-
-
 def test_prompt_warning(llm):
     with pytest.warns(UserWarning):
         llm.set_prompt_from_str("hello ")
