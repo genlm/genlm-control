@@ -61,7 +61,12 @@ class RowBinding:
         delta beyond the lane's context (banking its processed log-prob into the
         lane — the leaf's own running ``prefix``), then await the warm. A context
         that is not the lane's plus at most one new token cannot be served — the
-        lane stepped past it or never held it."""
+        lane stepped past it or never held it.
+
+        A row's lanes walk one path, so the delta feeds every sibling lane that
+        is behind — without this, a lane nobody reads this round (the draw lane
+        during a critic's advance, the critic's during a draw) would hold the
+        engine's step and deadlock the round."""
         lane = self._lanes[id(leaf)]
         held = len(lane.context)
         delta = list(engine_context_ids[held:])
@@ -72,9 +77,14 @@ class RowBinding:
                 "context; a lane serves one step per read"
             )
         if delta:
-            if lane.stash is not None:
-                lane.bank += lane.stash[leaf.token_maps.decode[delta[0]]]
-            lane.feed(delta[0])
+            row_len = len(engine_context_ids) - lane.prompt_len
+            for sibling in self._lanes.values():
+                if len(sibling.context) - sibling.prompt_len < row_len:
+                    if sibling.stash is not None:
+                        sibling.bank += sibling.stash[
+                            leaf.token_maps.decode[delta[0]]
+                        ]
+                    sibling.feed(delta[0])
         return await lane.next()
 
     def close(self):
