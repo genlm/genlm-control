@@ -38,11 +38,20 @@ async def _drive(controller, mode):
     ("off"). Acceleration is whether rows hold engine lanes; the loop is the
     same either way."""
     if mode != "off":
-        # Lane runner pending: the lane servers land engine-side first.
+        from genlm.control.lane_runner import LaneRunner, lane_blocker
+
+        reason = lane_blocker(controller)
+        if reason is None:
+            if mode == "auto":
+                logger.info("running with engine lanes.")
+            return await controller.run(lanes=LaneRunner(controller))
         if mode == "require":
-            raise NotAcceleratable("the lane runner is not wired yet")
+            raise NotAcceleratable(reason)
         logger.info(
-            "running without engine lanes -- the lane runner is not wired yet."
+            "running without engine lanes -- %s. "
+            'Pass accelerate="off" to silence, or accelerate="require" to make '
+            "this an error.",
+            reason,
         )
     return await controller.run()
 

@@ -9,7 +9,6 @@ import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.lane_seam import lane_sums
 from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
@@ -23,7 +22,6 @@ class Population:
     __slots__ = (
         "n",
         "logw",
-        "lane_logp",
         "twist_amount",
         "done",
         "max_tokens_left",
@@ -32,15 +30,11 @@ class Population:
         "_views",
     )
 
-    def __init__(self, n, max_tokens, group, n_lanes):
+    def __init__(self, n, max_tokens, group):
         self.n = n
         # Per-row group id; ESS/resample/log_ml are per-group.
         self.group = np.asarray(group, dtype=np.int64)
         self.logw = np.zeros(n)
-        # ``lane_logp[l, i]``: lane ``l``'s engine LM leaf's own ``prefix`` along row
-        # ``i``'s path -- one drawn-token logp per committed token, EOS included once
-        # the row terminates, which makes it that leaf's ``complete``.
-        self.lane_logp = np.zeros((n_lanes, n))
         self.twist_amount = np.zeros(n)
         self.done = np.zeros(n, dtype=bool)
         self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
@@ -66,7 +60,6 @@ class Population:
         """Reindex every column by ``ancestor_indices`` (resample/fork)."""
         idx = ancestor_indices
         self.logw = self.logw[idx]
-        self.lane_logp = self.lane_logp[:, idx]
         self.twist_amount = self.twist_amount[idx]
         self.done = self.done[idx]
         self.max_tokens_left = self.max_tokens_left[idx]
@@ -191,11 +184,9 @@ class Controller:
             c is not None and c.is_terminal_only() for c in critics
         ):
             self.twist_with_critic = False
-        # Engine lanes, per group: the LM leaves a burst injects for that group --
-        # the draw path's, then the critic's when it twists through one. Slot ``l`` is
-        # one engine lane across every group, and ``lane_logp[l]`` banks that slot's
-        # leaf's own per-token logp, which is what serves its ``prefix``/``complete``
-        # inside a burst instead of a forward.
+        # Engine lane leaves, per group: the draw path's views, then the critic's
+        # when the run consumes one. Each leaf's lane banks its own per-token
+        # logp, which serves that leaf's ``prefix``/``complete`` without a forward.
         self.group_lanes = [
             s.lane_views() + [lf for lf in [self._critic_lane(c)] if lf is not None]
             for s, c in zip(samplers, critics)
@@ -206,15 +197,7 @@ class Controller:
         group = np.concatenate(
             [np.full(ng, g, dtype=np.int64) for g, ng in enumerate(group_sizes)]
         )
-        # Groups that disagree on lane count cannot share a burst (``_batch_blocker``
-        # says so and the run falls back), but the column block is sized before the
-        # driver is chosen, so it covers the widest group.
-        self.particles = Population(
-            n_particles,
-            max_tokens,
-            group=group,
-            n_lanes=max(len(lanes) for lanes in self.group_lanes),
-        )
+        self.particles = Population(n_particles, max_tokens, group=group)
         # Per-group row indices (invariant across reindex; resample is group-local).
         self._group_rows = [
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
@@ -226,6 +209,9 @@ class Controller:
         ]
         # Group-local ancestors a crossing leaves for the next ``_record_step``.
         self._pending_resample: list = [None] * len(group_sizes)
+        # Terminal-only critic settles, deferred to the row's round end (the
+        # dying row's lanes must release the engine before the critic forwards).
+        self._terminal_pending: list = [[] for _ in group_sizes]
 
         # log(ess_threshold); the per-group ESS test adds log(group_size).
         with np.errstate(divide="ignore"):
@@ -288,26 +274,6 @@ class Controller:
     def _critic_of(self, p):
         return self.critics[p.group]
 
-    @contextlib.contextmanager
-    def serve_lanes(self, g, live, done):
-        """Serve group ``g``'s lanes their own banked sums as their leaves'
-        ``batch_prefix`` (rows ``live``) and ``batch_complete`` (rows ``done``).
-
-        Values are positional against the contexts the caller scores, so ``live`` and
-        ``done`` must be the same lists in the same order. Keyed by the group's OWN
-        lanes: another group's leaves would miss the override and forward."""
-        L, lanes = self.particles.lane_logp, self.group_lanes[g]
-
-        def over(ps):
-            return {
-                leaf: [float(L[lane, p.row]) for p in ps]
-                for lane, leaf in enumerate(lanes)
-                if leaf is not None
-            }
-
-        with lane_sums(over(live), over(done)):
-            yield
-
     async def bank_row(self, p, to_append, logw, logp):
         """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
         Critic-free rows bank without awaiting; an inline critic twists/reweights
@@ -350,10 +316,11 @@ class Controller:
         if p.max_tokens_left == 0 or self._is_terminal(p):
             p.finish()
             if not self.twist_with_critic:
-                # batch_score, like the twist branch: the scalar `score` dispatches to
-                # `complete`/`prefix`, which `serve_lanes` does not override, so a
-                # burst-served critic leaf would forward here instead of reading its bank.
-                twist_amt = float((await critic.batch_score([p.context]))[0])
+                # Terminal-only settle. Under lanes it defers to the round's end:
+                # the critic may forward (one-shot), and the dying row's lanes
+                # must release the engine before anything awaits one.
+                self._terminal_pending[p.group].append(p)
+                return
             p.score(twist_amt)
 
     def _is_terminal(self, p):
@@ -444,26 +411,62 @@ class Controller:
         group-local)."""
         return self._group_rows[g]
 
-    async def run(self):
+    async def run(self, lanes=None):
         """The SMC loop: one coroutine per group, gathered. Each group paces its
         own rounds — draw + bank every live row, then its boundary — and no
-        structure spans groups."""
+        structure spans groups. ``lanes`` (a ``LaneRunner``) is the only
+        difference between accelerated and plain runs: rows hold engine lanes,
+        and the boundary reconciles them."""
         await self.start()
-        await asyncio.gather(
-            *[self._run_group(g) for g in range(len(self._group_rows))]
-        )
+        try:
+            if lanes is not None:
+                for p in self.particles:
+                    if not p.done:
+                        lanes.open_row(p)
+            await asyncio.gather(
+                *[self._run_group(g, lanes) for g in range(len(self._group_rows))]
+            )
+        finally:
+            if lanes is not None:
+                lanes.close_all()
         return self.particles
 
-    async def _run_group(self, g):
+    async def _run_group(self, g, lanes=None):
         rows = self._group_rows[g]
         sampler = self.samplers[g]
         while True:
             live = [self.particles[i] for i in rows if not self.particles.done[i]]
             if not live:
+                await self._settle_terminals(g, lanes)
                 return
             await sampler.round_start([p.context for p in live])
-            await asyncio.gather(*[self.step_row(p) for p in live])
-            self.round_boundary(g)
+            await asyncio.gather(*[self._step_row(p, lanes) for p in live])
+            await self._settle_terminals(g, lanes)
+            crossed = self.round_boundary(g)
+            if lanes is not None:
+                lanes.after_round(g, crossed)
+
+    async def _settle_terminals(self, g, lanes):
+        """Settle deferred terminal-only critic scores for group ``g``'s newly
+        finished rows, after their lanes release the engine. One batched score
+        per round."""
+        parts, self._terminal_pending[g] = self._terminal_pending[g], []
+        if not parts:
+            return
+        if lanes is not None:
+            for p in parts:
+                lanes.close_row(p)
+        amts = await self.critics[g].batch_score([p.context for p in parts])
+        for p, amt in zip(parts, amts):
+            p.score(float(amt))
+
+    async def _step_row(self, p, lanes):
+        if lanes is None:
+            return await self.step_row(p)
+        from genlm.control.lane_seam import row_binding
+
+        with row_binding(lanes.binding_of(p)):
+            await self.step_row(p)
 
 
 

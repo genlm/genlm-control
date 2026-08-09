@@ -45,7 +45,7 @@ from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
 from genlm.control.potential.coerce import Coerced  # noqa: E402
 from genlm.control.sampler.unit import MultiTokenUnitSampler  # noqa: E402
 from genlm.control.util import flatten_units  # noqa: E402
-from genlm.control.sampler.burst import burst_blocker  # noqa: E402
+from genlm.control.lane_runner import lane_blocker  # noqa: E402
 
 from _harness import (  # noqa: E402
     seed_all,
@@ -70,8 +70,8 @@ from gate2_cases import (  # noqa: E402
 
 
 def can_burst(controller):
-    """Test-local: can this config run the engine burst (no blocker reason)?"""
-    return burst_blocker(controller) is None
+    """Test-local: can this config run with engine lanes (no blocker reason)?"""
+    return lane_blocker(controller) is None
 
 
 SEED = 1234  # single-seed default (unconstrained); per-case seeds come from CASES
@@ -238,18 +238,16 @@ def test_lm_critic_burst_legality(llm):
     """A pure LM critic is burst-legal at every grain: deferred at ess=0 (boundary),
     served from banked twist sums at token grain (ess>0). A critic with an LM leaf
     beyond its own engine leaf cannot be served and stays blocked."""
-    from genlm.control.sampler.burst import BlockReason
-
     def make():
         return DirectTokenSampler(llm)
 
     lm_critic = PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
-    assert burst_blocker(make_controller(make, 8, 0.5, 8, make_critic=lambda: lm_critic)) is None
-    assert burst_blocker(make_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic)) is None
+    assert lane_blocker(make_controller(make, 8, 0.5, 8, make_critic=lambda: lm_critic)) is None
+    assert lane_blocker(make_controller(make, 8, 0.0, 8, make_critic=lambda: lm_critic)) is None
 
     composite = lm_critic * PromptedLLM(llm.model, eos_byte_strings=EOS_BYTES)
-    reason = burst_blocker(make_controller(make, 8, 0.5, 8, make_critic=lambda: composite))
-    assert reason is not None and reason.reason is BlockReason.FORWARD_NOT_INJECTABLE, reason
+    reason = lane_blocker(make_controller(make, 8, 0.5, 8, make_critic=lambda: composite))
+    assert reason is not None, "a multi-LM critic has no single lane leaf"
 
 
 def test_lm_critic_twist_token_burst_vs_steploop(llm):

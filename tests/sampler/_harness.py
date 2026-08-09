@@ -139,7 +139,7 @@ def make_controller(make_sampler, n_particles, ess_threshold, max_tokens, make_c
     )
 
 
-def _result(controller, parts, wall, n_bursts):
+def _result(controller, parts, wall, n_lane_rows):
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     seq = Sequences(*_unpack_particles(parts))
@@ -148,42 +148,51 @@ def _result(controller, parts, wall, n_bursts):
         "logw": [float(p.logw) for p in parts],
         "log_ml": float(seq.log_ml),
         "wall": wall,
-        "n_bursts": n_bursts,
+        "n_bursts": n_lane_rows,  # lane rows opened; >0 proves the lane path ran
         "n_resamples": controller.n_resamples,
     }
 
 
 def run_burst(make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None):
-    """One engine-accelerated run at ``seed``."""
+    """One engine-accelerated (lanes-on) run at ``seed``."""
     import asyncio
 
-    from genlm.control.sampler.burst import BurstLoop
+    from genlm.control.lane_runner import LaneRunner, lane_blocker
 
     seed_all(seed)
     controller = make_controller(
         make_sampler, n_particles, ess_threshold, max_tokens, make_critic
     )
-    driver = BurstLoop(controller)
+    reason = lane_blocker(controller)
+    assert reason is None, f"lane path unavailable: {reason}"
+    runner = LaneRunner(controller)
+    opened = 0
+    _open = runner.open_row
+
+    def counting_open(p):
+        nonlocal opened
+        opened += 1
+        _open(p)
+
+    runner.open_row = counting_open
     t0 = time.perf_counter()
-    parts = asyncio.run(driver.run())
-    return _result(controller, parts, time.perf_counter() - t0, driver.n_bursts)
+    parts = asyncio.run(controller.run(lanes=runner))
+    return _result(controller, parts, time.perf_counter() - t0, opened)
 
 
 def run_steploop(
     make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
 ):
-    """Same as :func:`run_burst` but the byte-exact StepLoop (``accelerate="off"`` ground
-    truth, gate-1-pinned == original) -- the live reference for configs with no cached
-    snapshot, and RNG-matched to the burst so the paired diff is tight."""
+    """Same as :func:`run_burst` but lanes-off (``accelerate="off"`` ground truth,
+    gate-1-pinned == original) -- the live reference for configs with no cached
+    snapshot, and RNG-matched to the lane path so the paired diff is tight."""
     import asyncio
-
-    from genlm.control.sampler.smc import StepLoop
 
     seed_all(seed)
     controller = make_controller(
         make_sampler, n_particles, ess_threshold, max_tokens, make_critic
     )
-    parts = asyncio.run(StepLoop(controller).run())
+    parts = asyncio.run(controller.run())
     return _result(controller, parts, 0.0, 0)
 
 
@@ -230,13 +239,13 @@ def assert_case_unbiased(
     ``resolve_ref`` is the only engine-specific part: vLLM reads cached snapshots where it
     has them, everything else runs live.
     """
-    from genlm.control.sampler.burst import burst_blocker
+    from genlm.control.lane_runner import lane_blocker
 
     c = case
     floor = c.match_floor
     llm.set_prompt_from_str(prompt)
     mkc = (lambda: c.critic(llm)) if c.make_critic is not None else None
-    blocker = burst_blocker(
+    blocker = lane_blocker(
         make_controller(
             lambda: c.sampler(llm, c.seeds[0]), c.n_particles, c.ess, c.max_tokens, mkc
         )

@@ -102,12 +102,11 @@ async def test_with_llm_and_critic_no_twist(llm):
 
     class MockCritic(Potential):
         async def prefix(self, context):
+            nonlocal n_calls
+            n_calls += 1
             return 0
 
         async def complete(self, context):
-            return 0
-
-        async def score(self, context):
             nonlocal n_calls
             n_calls += 1
             return 0

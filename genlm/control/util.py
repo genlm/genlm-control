@@ -511,14 +511,11 @@ async def draw_from(lazyweights, draw=None):
     this. A caller-supplied ``draw`` is a user picker, so it stays per row."""
     from genlm.control.lane_seam import collector, current_binding
 
-    binding = current_binding()
-    if binding is not None and draw is None:
+    if current_binding() is not None and draw is None:
         slot, ctr = _DRAW_KEY.get()
         step = ctr[0]
         ctr[0] = step + 1
-        token, logZ, logp = await collector().submit(lazyweights, slot, step)
-        binding.commit(token)
-        return token, logZ, logp
+        return await collector().submit(lazyweights, slot, step)
     logZ = lazyweights.sum()
     logps = lazyweights.spawn(lazyweights.weights - logZ)
     token = select(logps) if draw is None else draw(logps.exp().materialize())
@@ -533,15 +530,13 @@ async def draw_reweighted(proposal_logws, target_logws, draw=None):
     gather; no per-row device sync."""
     from genlm.control.lane_seam import collector, current_binding
 
-    binding = current_binding()
-    if binding is not None and draw is None:
+    if current_binding() is not None and draw is None:
         slot, ctr = _DRAW_KEY.get()
         step = ctr[0]
         ctr[0] = step + 1
-        token, logZ, logp, tval = await collector().submit(
+        token, _, logp, tval = await collector().submit(
             proposal_logws, slot, step, companion=target_logws
         )
-        binding.commit(token)
         return token, tval - logp, logp
     token, _, logp = await draw_from(proposal_logws, draw)
     return token, target_logws[token] - logp, logp

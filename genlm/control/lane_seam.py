@@ -1,9 +1,10 @@
-"""Lane-serving seam: one ContextVar binds a row's step to its engine lanes.
+"""Lane-serving seam: ContextVars bind a row's step to its engine lanes and a
+group boundary to its banked sums.
 
-``RowBinding`` maps LM leaves to lanes. Reads pull the leaf's log-probability row
-from its lane; feeds are lazy — ``commit`` records the step's token, and each
-lane flushes it on its next read, so a row that never reads again (unit end, EOS)
-closes without feeding and the engine never forwards the dead step.
+``RowBinding`` maps LM leaves to lanes. Reads pull the leaf's log-probability
+row; the feed is the context delta between reads, so a row that never reads
+again (EOS, a crossing) closes without feeding and the engine never forwards
+the dead step.
 
 The collector batches draws emergently: picks submitted in one loop pass fire as
 one keyed device op per vocabulary, and everything scalar leaves the device in a
@@ -13,45 +14,13 @@ single crossing per fire.
 import asyncio
 import contextlib
 import contextvars
-from typing import NamedTuple
 
 import torch
-
-from genlm.control.constant import EndOfSequence
 
 # The RowBinding in scope for one row's step; None outside a lane run.
 _row_binding: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_row_binding", default=None
 )
-
-
-class LaneSums(NamedTuple):
-    """Banked per-token sums a group boundary serves in place of scoring:
-    ``prefix`` for the live rows, ``complete`` for the terminated ones. Each is
-    ``{potential: values}``, positional against the contexts the caller scores."""
-
-    prefix: dict
-    complete: dict
-
-
-# The LaneSums in scope at a group boundary, else None.
-_lane_sums: contextvars.ContextVar = contextvars.ContextVar(
-    "genlm_control_lane_sums", default=None
-)
-
-
-@contextlib.contextmanager
-def lane_sums(prefix, complete):
-    """Inject each leaf's banked sums for one boundary's scoring calls."""
-    token = _lane_sums.set(LaneSums(prefix, complete))
-    try:
-        yield
-    finally:
-        _lane_sums.reset(token)
-
-
-def current_lane_sums():
-    return _lane_sums.get()
 
 
 @contextlib.contextmanager
@@ -68,17 +37,14 @@ def current_binding():
 
 
 class RowBinding:
-    """One particle's ``{leaf: lane}`` map plus its lazy feed state.
-
-    ``commit(item)`` records the step's drawn token; each lane feeds it on that
-    lane's next read. ``commit(EOS)`` (or ``close()``) discards the pending feed:
-    the engine only needs a feed to compute the step after it.
-    """
+    """One particle's ``{leaf: lane}`` map. The feed is the context delta: each
+    read carries the caller's engine-id context, and the tokens it holds beyond
+    the lane's are fed before awaiting the warm — so a committed token reaches
+    the engine only when the row reads again, and a row that never reads again
+    (EOS, unit end into a crossing) closes without feeding its dead step."""
 
     def __init__(self, lanes):
         self._lanes = dict(lanes)  # id(leaf) -> Lane
-        self._pending: dict[int, int] = {}  # rid -> engine token id
-        self.closing = False
 
     def has(self, leaf) -> bool:
         return id(leaf) in self._lanes
@@ -91,27 +57,27 @@ class RowBinding:
         return list(self._lanes.values())
 
     async def read(self, leaf, engine_context_ids):
-        """The leaf's log-probability row for this step: flush the lane's pending
-        feed, verify the context, await the warm."""
+        """The leaf's raw log-probability row at ``engine_context_ids``: feed the
+        delta beyond the lane's context (banking its processed log-prob into the
+        lane — the leaf's own running ``prefix``), then await the warm. A context
+        that is not the lane's plus at most one new token cannot be served — the
+        lane stepped past it or never held it."""
         lane = self._lanes[id(leaf)]
-        pend = self._pending.pop(lane.rid, None)
-        if pend is not None:
-            lane.feed(pend)
-        lane.verify(engine_context_ids)
+        held = len(lane.context)
+        delta = list(engine_context_ids[held:])
+        lane.verify(engine_context_ids[:held])
+        if len(delta) > 1:
+            raise RuntimeError(
+                f"lane {lane.rid} was read {len(delta)} tokens ahead of its "
+                "context; a lane serves one step per read"
+            )
+        if delta:
+            if lane.stash is not None:
+                lane.bank += lane.stash[leaf.token_maps.decode[delta[0]]]
+            lane.feed(delta[0])
         return await lane.next()
 
-    def commit(self, item):
-        """Record the step's committed item. EOS marks the row closing instead of
-        pending a feed."""
-        if isinstance(item, EndOfSequence):
-            self.closing = True
-            return
-        token_id = getattr(item, "token_id", item)
-        for lane in self._lanes.values():
-            self._pending[lane.rid] = int(token_id)
-
     def close(self):
-        self._pending.clear()
         for lane in self._lanes.values():
             lane.close()
 

@@ -5,7 +5,7 @@ import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.constant import EOS
-from genlm.control.lane_seam import current_binding, current_lane_sums
+from genlm.control.lane_seam import current_binding
 from genlm.control.potential.base import Potential
 from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
@@ -31,13 +31,13 @@ def _walk_leaves(potential):
         yield from _walk_leaves(child)
 
 
-def _is_burst_lm(p):
-    return isinstance(p, PromptedLLM) and p.model.supports_burst
+def _is_lane_lm(p):
+    return isinstance(p, PromptedLLM) and getattr(p.model, "supports_lanes", False)
 
 
 def find_engine_lm(potential):
-    """The single burst-capable engine LM leaf, or ``None`` if not exactly one."""
-    lms = [lf for lf in _walk_leaves(potential) if _is_burst_lm(lf)]
+    """The single lane-capable engine LM leaf, or ``None`` if not exactly one."""
+    lms = [lf for lf in _walk_leaves(potential) if _is_lane_lm(lf)]
     return lms[0] if len(lms) == 1 else None
 
 
@@ -539,41 +539,48 @@ class PromptedLLM(Potential):
         """
         return await self.log_probability(context)
 
-    def _served(self, override, n=None):
-        """This LM's injected value from the ``{leaf: values}`` map ``override``, or
-        ``None`` to compute it."""
-        if override is not None and self in override:
-            vals = override[self]
-            if n is not None and len(vals) != n:
-                raise ValueError(f"lane served {len(vals)} values for {n} contexts")
-            return vals
-        return None
-
-    async def batch_prefix(self, contexts):
-        """Batched ``prefix``. At a group boundary the controller serves the banked
-        lane sums instead of re-scoring every context."""
-        sums = current_lane_sums()
-        vals = self._served(sums.prefix if sums else None, len(contexts))
-        if vals is not None:
-            return np.asarray(vals, dtype=float)
-        return await super().batch_prefix(contexts)
-
-    async def batch_complete(self, contexts):
-        """Batched ``complete``. A group boundary serves the banked lane sums
-        instead of scoring."""
-        sums = current_lane_sums()
-        vals = self._served(sums.complete if sums else None, len(contexts))
-        if vals is not None:
-            return np.asarray(vals, dtype=float)
-        return await super().batch_complete(contexts)
-
     async def _lane_logw_next(self, binding, context):
-        """This leaf's next-token weights pulled from its lane: flush the pending
-        feed, verify the context, read the warm, then process the row exactly as a
-        fresh forward would (temper + EOS fold)."""
+        """This leaf's next-token weights pulled from its lane: feed the delta,
+        read the warm, then process the row exactly as a fresh forward would
+        (temper + EOS fold). The processed weights are stashed on the lane —
+        they price the next fed token's bank increment and serve ``complete``'s
+        EOS fold."""
         context_ids = self.encode_tokens(context)
         logps = await binding.read(self, self.prompt_ids + context_ids)
-        return self._process_logw_next(self._maybe_temper(logps))
+        lw = self._process_logw_next(self._maybe_temper(logps))
+        binding.lane(self).stash = lw
+        return lw
+
+    async def _lane_score(self, binding, context, *, complete):
+        """This leaf's ``prefix`` (or ``complete``) along its lane's own path:
+        the banked fed-token sum, plus the stashed row's column for a token
+        drawn but not yet fed, plus the EOS fold for ``complete``.
+
+        A live lane one token behind advances (feed + read) after pricing — a
+        critic leaf's scores ARE its consumption, and the advance is what keeps
+        its lane feeding the engine's step."""
+        lane = binding.lane(self)
+        ids = self.prompt_ids + self.encode_tokens(context)
+        held = len(lane.context)
+        if len(ids) == held + 1:
+            if lane.stash is None:
+                raise RuntimeError(f"{self!r} lane has no stashed row to price")
+            val = lane.bank + lane.stash[context[-1]]
+            if not complete:
+                if not lane.closed:
+                    await self._lane_logw_next(binding, context)
+                return val
+            await self._lane_logw_next(binding, context)
+            return val + lane.stash[self.eos]
+        if len(ids) != held:
+            raise RuntimeError(
+                f"{self!r} lane holds {held} tokens; cannot score {len(ids)}"
+            )
+        if not complete:
+            return lane.bank
+        if lane.stash is None:
+            await self._lane_logw_next(binding, context)
+        return lane.bank + lane.stash[self.eos]
 
     async def complete(self, context):
         """
