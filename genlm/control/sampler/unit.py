@@ -71,16 +71,12 @@ class MultiTokenUnitSampler(TokenSampler):
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
 
-    def burst_draw_sampler(self):
+    def lane_draw_sampler(self):
         # The subunit does the per-step draw, so recurse to its draw sampler.
-        return self.subunit_sampler.burst_draw_sampler()
+        return self.subunit_sampler.lane_draw_sampler()
 
-    def burst_free_running(self) -> bool:
-        # Synchronized (unit grain): one SMC step is one whole unit, with ESS tested once
-        # per unit round at the synced boundary (not per subunit decode step).
-        return False
 
-    def burst_max_steps(self, live) -> int:
+    def lane_max_steps(self, live) -> int:
         # One unit's worth of subunit decode steps (+1 margin); the control-side reject at
         # ``max_subunits_per_unit`` fires before this engine cap.
         return self.max_subunits_per_unit + 1

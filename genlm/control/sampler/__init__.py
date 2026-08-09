@@ -1,9 +1,6 @@
 from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
-from .sequence import SMC
-from .burst import (
-    NotAcceleratable,
-)
+from .sequence import SMC, NotAcceleratable
 from .unit import (
     MultiTokenUnitSampler,
     BoundaryPredicate,

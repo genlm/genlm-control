@@ -8,10 +8,14 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.smc import Controller, StepLoop
-from genlm.control.sampler.burst import BurstLoop, burst_blocker, NotAcceleratable
+from genlm.control.sampler.smc import Controller
 
 logger = logging.getLogger("genlm.control")
+
+
+class NotAcceleratable(Exception):
+    """Raised by ``accelerate="require"`` when the configuration cannot run with
+    engine lanes."""
 
 
 def _normalize_accelerate(accelerate):
@@ -30,26 +34,17 @@ def _normalize_accelerate(accelerate):
 
 
 async def _drive(controller, mode):
-    """Select and run the SMC driver for ``mode`` ('off'/'auto'/'require'),
-    returning the final particle population. Shared by :meth:`SMC.__call__` and
-    :meth:`SMC.batched` so the burst-capability check, ``require`` raise, and
-    ``auto`` fallback logging stay in one place."""
+    """Run the controller's loop, with lanes ("auto"/"require") or without
+    ("off"). Acceleration is whether rows hold engine lanes; the loop is the
+    same either way."""
     if mode != "off":
-        reason = burst_blocker(controller)
-        if mode == "require" and reason is not None:
-            raise NotAcceleratable(reason.detail)
-        if reason is None:
-            if mode == "auto":
-                logger.info("running the engine-accelerated burst path.")
-            return await BurstLoop(controller).run()
-        if mode == "auto":
-            logger.info(
-                "running the exact per-token path -- acceleration unavailable: %s. "
-                'Pass accelerate="off" to silence, or accelerate="require" to make '
-                "this an error.",
-                reason.detail,
-            )
-    return await StepLoop(controller).run()
+        # Lane runner pending: the lane servers land engine-side first.
+        if mode == "require":
+            raise NotAcceleratable("the lane runner is not wired yet")
+        logger.info(
+            "running without engine lanes -- the lane runner is not wired yet."
+        )
+    return await controller.run()
 
 
 class SMC:
@@ -250,9 +245,9 @@ class SMC:
             Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
             for rows in map(controller.group_rows, range(B))
         ]
-        if controller.record is not None:
-            for s in seqs:
-                s.record = controller.record  # whole-batch SMCRecord (global slots)
+        for s, record in zip(seqs, controller.records):
+            if record is not None:
+                s.record = record  # this group's own record stream
         return seqs
 
 

@@ -7,7 +7,6 @@ import torch
 from genlm.grammar import Float, Log
 
 from genlm.control.constant import EndOfSequence
-from genlm.control.burst_seam import _burst_row
 from genlm.backend.tokenization import Token
 
 
@@ -520,12 +519,6 @@ async def draw_from(lazyweights, draw=None):
         token, logZ, logp = await collector().submit(lazyweights, slot, step)
         binding.commit(token)
         return token, logZ, logp
-    seat = _burst_row.get()
-    if seat is not None and draw is None:
-        slot, ctr = _DRAW_KEY.get()
-        step = ctr[0]
-        ctr[0] = step + 1
-        return await seat.draw(lazyweights, slot, step)
     logZ = lazyweights.sum()
     logps = lazyweights.spawn(lazyweights.weights - logZ)
     token = select(logps) if draw is None else draw(logps.exp().materialize())

@@ -43,12 +43,12 @@ class TokenSampler:
         self.target = target
         self.token_type = self.target.token_type
 
-    def burst_draw_sampler(self):
+    def lane_draw_sampler(self):
         """The sampler whose ``target``/``proposal`` are the injected views: ``self``
         at token grain; a unit sampler delegates to its subunit."""
         return self
 
-    def burst_views(self):
+    def lane_views(self):
         """The LM views a burst injects for this sampler: the draw sampler's target
         leaf, then its proposal's when it has one. The LAST is the draw distribution's
         own leaf, whose accumulated logp is the particle's ``logp``. A slot is ``None``
@@ -58,18 +58,14 @@ class TokenSampler:
         ``PromptedLLM`` are one engine request serving both reads, never two identical
         ones. Distinct instances over the same model still get a lane each -- their
         prompts and adapters are per-instance."""
-        s = self.burst_draw_sampler()
+        s = self.lane_draw_sampler()
         views = [find_engine_lm(s.target)]
         if s.proposal is not None:
             views.append(find_engine_lm(s.proposal))
         return list(dict.fromkeys(views))
 
-    def burst_free_running(self) -> bool:
-        """``True`` = free-running (token grain): one SMC step per decode step, ESS
-        every step. ``False`` = synchronized (unit grain): one step per unit."""
-        return True
 
-    def burst_max_steps(self, live) -> int:
+    def lane_max_steps(self, live) -> int:
         """Engine decode-step budget for one burst (token grain). The unit sampler overrides."""
         return max(p.max_tokens_left for p in live) + 1
 

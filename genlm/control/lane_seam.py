@@ -13,6 +13,7 @@ single crossing per fire.
 import asyncio
 import contextlib
 import contextvars
+from typing import NamedTuple
 
 import torch
 
@@ -22,6 +23,35 @@ from genlm.control.constant import EndOfSequence
 _row_binding: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_row_binding", default=None
 )
+
+
+class LaneSums(NamedTuple):
+    """Banked per-token sums a group boundary serves in place of scoring:
+    ``prefix`` for the live rows, ``complete`` for the terminated ones. Each is
+    ``{potential: values}``, positional against the contexts the caller scores."""
+
+    prefix: dict
+    complete: dict
+
+
+# The LaneSums in scope at a group boundary, else None.
+_lane_sums: contextvars.ContextVar = contextvars.ContextVar(
+    "genlm_control_lane_sums", default=None
+)
+
+
+@contextlib.contextmanager
+def lane_sums(prefix, complete):
+    """Inject each leaf's banked sums for one boundary's scoring calls."""
+    token = _lane_sums.set(LaneSums(prefix, complete))
+    try:
+        yield
+    finally:
+        _lane_sums.reset(token)
+
+
+def current_lane_sums():
+    return _lane_sums.get()
 
 
 @contextlib.contextmanager

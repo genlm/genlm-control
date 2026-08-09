@@ -5,7 +5,7 @@ import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.constant import EOS
-from genlm.control.burst_seam import burst_serve, _burst_lane_sums
+from genlm.control.lane_seam import current_binding, current_lane_sums
 from genlm.control.potential.base import Potential
 from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
@@ -541,40 +541,39 @@ class PromptedLLM(Potential):
 
     def _served(self, override, n=None):
         """This LM's injected value from the ``{leaf: values}`` map ``override``, or
-        ``None`` to compute it.
-
-        A miss while a burst owns the engine raises: the forward would re-enter the
-        burst's decode loop, so this leaf should have been among its injected views
-        (see ``burst_blocker``)."""
+        ``None`` to compute it."""
         if override is not None and self in override:
             vals = override[self]
             if n is not None and len(vals) != n:
-                raise ValueError(f"burst served {len(vals)} values for {n} contexts")
+                raise ValueError(f"lane served {len(vals)} values for {n} contexts")
             return vals
-        if self.model.burst_active:
-            raise RuntimeError(
-                f"{self!r} would forward while an engine burst is running: it is not "
-                "among the burst's injected views, so it cannot be served."
-            )
         return None
 
     async def batch_prefix(self, contexts):
-        """Batched ``prefix``. At a burst boundary the controller serves the banked
-        warm-row sums instead of re-scoring every context."""
-        sums = _burst_lane_sums.get()
+        """Batched ``prefix``. At a group boundary the controller serves the banked
+        lane sums instead of re-scoring every context."""
+        sums = current_lane_sums()
         vals = self._served(sums.prefix if sums else None, len(contexts))
         if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_prefix(contexts)
 
     async def batch_complete(self, contexts):
-        """Batched ``complete``. A burst serves the banked warm-row sums instead of
-        scoring."""
-        sums = _burst_lane_sums.get()
+        """Batched ``complete``. A group boundary serves the banked lane sums
+        instead of scoring."""
+        sums = current_lane_sums()
         vals = self._served(sums.complete if sums else None, len(contexts))
         if vals is not None:
             return np.asarray(vals, dtype=float)
         return await super().batch_complete(contexts)
+
+    async def _lane_logw_next(self, binding, context):
+        """This leaf's next-token weights pulled from its lane: flush the pending
+        feed, verify the context, read the warm, then process the row exactly as a
+        fresh forward would (temper + EOS fold)."""
+        context_ids = self.encode_tokens(context)
+        logps = await binding.read(self, self.prompt_ids + context_ids)
+        return self._process_logw_next(self._maybe_temper(logps))
 
     async def complete(self, context):
         """
@@ -690,9 +689,9 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
-        served = self._served(await burst_serve(context))
-        if served is not None:
-            return served  # burst: the engine's warm logits, no forward
+        binding = current_binding()
+        if binding is not None and binding.has(self):
+            return await self._lane_logw_next(binding, context)
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
             await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
@@ -711,10 +710,15 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
-        if contexts:
-            served = self._served(await burst_serve(contexts[0]))
-            if served is not None:
-                return served  # burst: the engine's warm row, no forward
+        binding = current_binding()
+        if contexts and binding is not None and binding.has(self):
+            # A lane row's batch is its own context; a wider batch has no lane.
+            if len(contexts) != 1:
+                raise RuntimeError(
+                    f"{self!r} is lane-bound but was asked to batch "
+                    f"{len(contexts)} contexts; a lane serves one row."
+                )
+            return await self._lane_logw_next(binding, contexts[0])
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
             await self._fwd.batch_next_token_logprobs(

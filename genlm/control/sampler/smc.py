@@ -1,5 +1,6 @@
-"""SMC population, the ``Controller`` (algorithm owner), and ``StepLoop`` (per-token
-driver). Engine acceleration lives in ``burst.py``."""
+"""SMC population and the ``Controller``: algorithm owner and the per-group run
+loop. Engine acceleration is whether rows hold lanes (``lane_seam``); the loop is
+the same either way."""
 
 import asyncio
 import contextlib
@@ -8,7 +9,7 @@ import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.burst_seam import burst_lane_sums
+from genlm.control.lane_seam import lane_sums
 from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
 from genlm.control.sampler.resampling import get_resampling_fn
@@ -196,7 +197,7 @@ class Controller:
         # leaf's own per-token logp, which is what serves its ``prefix``/``complete``
         # inside a burst instead of a forward.
         self.group_lanes = [
-            s.burst_views() + [lf for lf in [self._critic_lane(c)] if lf is not None]
+            s.lane_views() + [lf for lf in [self._critic_lane(c)] if lf is not None]
             for s, c in zip(samplers, critics)
         ]
         self.resample_fn = get_resampling_fn(resampling_method)
@@ -218,14 +219,13 @@ class Controller:
         self._group_rows = [
             np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
         ]
-        self.record = SMCRecord(n_particles) if record else None
-        # True when critic math defers to the round boundary (``bank_row`` pends
-        # instead of awaiting; ``apply_critic_boundary`` settles). Set by ``run``.
-        self.defer_critic = False
-        self._critic_pending: list = []
-        # ``_maybe_resample`` sets these so the next ``_record_step`` tags ``add_resample``.
-        self._pending_resample = False
-        self._pending_ancestors = list(range(n_particles))
+        # One record stream per group: cadences are independent, so there is no
+        # meaningful global step counter to share.
+        self.records = [
+            SMCRecord(ng) if record else None for ng in group_sizes
+        ]
+        # Group-local ancestors a crossing leaves for the next ``_record_step``.
+        self._pending_resample: list = [None] * len(group_sizes)
 
         # log(ess_threshold); the per-group ESS test adds log(group_size).
         with np.errstate(divide="ignore"):
@@ -305,13 +305,13 @@ class Controller:
                 if leaf is not None
             }
 
-        with burst_lane_sums(over(live), over(done)):
+        with lane_sums(over(live), over(done)):
             yield
 
     async def bank_row(self, p, to_append, logw, logp):
         """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
-        Critic-free rows (no critic, or the critic deferred to the round boundary) bank
-        without awaiting; an inline critic twists/reweights here.
+        Critic-free rows bank without awaiting; an inline critic twists/reweights
+        here.
 
         ``logp`` is the step's own choice log-prob. Nothing banks it -- each engine
         leaf's lane holds its own -- but it stays in the step tuple callers splat."""
@@ -319,7 +319,7 @@ class Controller:
         p.context.extend(to_append)
 
         critic = self._critic_of(p)
-        if critic is None or self.defer_critic:
+        if critic is None:
             if p.logw == float("-inf"):
                 p.finish()
             else:
@@ -328,8 +328,6 @@ class Controller:
                 p.max_tokens_left -= 1
                 if p.max_tokens_left == 0 or self._is_terminal(p):
                     p.finish()
-            if critic is not None and (p.done or self.twist_with_critic):
-                self._critic_pending.append(p)
             return
 
         if p.logw == float("-inf"):
@@ -384,167 +382,88 @@ class Controller:
         for p in self.particles:
             p.score(start_ws[p.group])
 
-    def _maybe_resample(self):
-        """Per-group ESS test + group-local resample. Mutates ``self.particles`` on a
-        resample. Returns ``(crossing_groups, ancestors)`` or ``([], None)``."""
-        W = self.particles.logw
-        crossings = []  # (g, rows, local_ancestors, reset_logw) per crossing group
-        for g, rows in enumerate(self._group_rows):
-            Wg = W[rows]
-            if np.all(Wg == -np.inf):
-                continue
-            w_sum = logsumexp(Wg)
-            nw = Wg - w_sum
-            if -logsumexp(nw * 2) < self._log_ess_threshold + np.log(len(rows)):
-                probs = np.exp(nw)
-                probs /= probs.sum()  # np.random.choice is strict on sum==1
-                local = np.asarray(self.resample_fn(probs))  # ancestors in 0..ng-1
-                if self.record is not None:
-                    local = np.sort(local)  # reproducible record
-                crossings.append((g, rows, local, w_sum - np.log(len(rows))))
-
-        if not crossings:
-            return [], None
-
+    def _maybe_resample(self, g):
+        """Group ``g``'s ESS test + group-local resample. Mutates the group's rows
+        of ``self.particles`` in place (other groups untouched). Returns ``True``
+        on a crossing."""
+        rows = self._group_rows[g]
+        Wg = self.particles.logw[rows]
+        if np.all(Wg == -np.inf):
+            return False
+        w_sum = logsumexp(Wg)
+        nw = Wg - w_sum
+        if not (-logsumexp(nw * 2) < self._log_ess_threshold + np.log(len(rows))):
+            return False
+        probs = np.exp(nw)
+        probs /= probs.sum()  # np.random.choice is strict on sum==1
+        local = np.asarray(self.resample_fn(probs))  # ancestors in 0..ng-1
+        if self.records[g] is not None:
+            local = np.sort(local)  # reproducible record
         ancestors = np.arange(self.n_particles)
-        for _g, rows, local, _t in crossings:
-            ancestors[rows] = rows[local]  # group-local -> global rows
+        ancestors[rows] = rows[local]  # group-local -> global rows
         self.n_resamples += 1
         self.particles.reindex(ancestors)
-        for _g, rows, _l, target in crossings:
-            self.particles.logw[rows] = target
-        ancestors = ancestors.tolist()
-        if self.record is not None:
-            self._pending_resample = True
-            self._pending_ancestors = ancestors
-        return [c[0] for c in crossings], ancestors
+        self.particles.logw[rows] = w_sum - np.log(len(rows))
+        if self.records[g] is not None:
+            self._pending_resample[g] = local.tolist()
+        return True
 
     def save_record(self, json_path):
-        if self.record is None:
+        """Write group 0's record (the whole run for a single-problem ``SMC``)."""
+        if self.records[0] is None:
             return
         with open(json_path, "w") as f:
-            f.write(self.record.to_json())
+            f.write(self.records[0].to_json())
         print(f"Saved record to {json_path}")
 
-    def _record_step(self):
-        """Record one completed step: ``add_init`` first, ``add_resample`` if one
-        preceded it, else ``add_smc_step``."""
-        if self.record is None:
+    def _record_step(self, g):
+        """Record one of group ``g``'s completed steps: ``add_init`` first,
+        ``add_resample`` if one preceded it, else ``add_smc_step``."""
+        record = self.records[g]
+        if record is None:
             return
-        if len(self.record.history) == 0:
-            self.record.add_init(self.particles)
-        elif self._pending_resample:
-            self.record.add_resample(self._pending_ancestors, self.particles)
+        group = [self.particles[i] for i in self._group_rows[g]]
+        if len(record.history) == 0:
+            record.add_init(group)
+        elif self._pending_resample[g] is not None:
+            record.add_resample(self._pending_resample[g], group)
         else:
-            self.record.add_smc_step(self.particles)
-        self._pending_resample = False
+            record.add_smc_step(group)
+        self._pending_resample[g] = None
 
-    def round_boundary(self, record=True):
-        """Close a round: record the step, then the per-group ESS test/resample.
-
-        Returns the rows of every group that crossed, empty when none did. A driver
-        holding per-row state outside the population (the burst's engine requests)
-        must flush exactly those rows -- survivors included, since a resample rewrites
-        their contexts. ``record=False`` for a round that advanced no row: the ESS
-        test still runs, but there is no new step to put in the record."""
-        if record:
-            self._record_step()
-        groups, _ = self._maybe_resample()
-        return [self._group_rows[g] for g in groups]
+    def round_boundary(self, g):
+        """Close one of group ``g``'s rounds: record the step, then the ESS
+        test/resample. Returns ``True`` on a crossing — a caller holding per-row
+        state outside the population (open lanes) must rebuild the group's rows,
+        survivors included, since a resample rewrites their contexts."""
+        self._record_step(g)
+        return self._maybe_resample(g)
 
     def group_rows(self, g):
         """Row indices of group ``g``, invariant across reindex (resample is
         group-local)."""
         return self._group_rows[g]
 
-    async def run(self, driver):
-        """The SMC loop, driver-agnostic: each iteration the driver turns every live
-        row's next step (one token per round for the per-token driver, a whole burst
-        for the engine driver), then deferred critic math settles and the round
-        boundary runs. The driver owns scheduling; the controller owns the math."""
-        self.defer_critic = driver.defers_critic
+    async def run(self):
+        """The SMC loop: one coroutine per group, gathered. Each group paces its
+        own rounds — draw + bank every live row, then its boundary — and no
+        structure spans groups."""
         await self.start()
-        while any(not p.done for p in self.particles):
-            await self._round_start()
-            await driver.round()
-            await self.apply_critic_boundary()
-            if driver.sync_boundary:
-                self.round_boundary()
+        await asyncio.gather(
+            *[self._run_group(g) for g in range(len(self._group_rows))]
+        )
         return self.particles
 
-    async def _round_start(self):
-        """Hand each group's sampler its live contexts before the round's draws. One
-        driver round is one unit per row at unit grain, so this is unit start; a
-        free-running (token-grain) burst rounds once per burst, so it fires there
-        instead. Runs with the engine idle -- a forward here is legal."""
-        by_group = {}
-        for p in self.particles:
-            if not p.done:
-                by_group.setdefault(p.group, []).append(p.context)
-        await asyncio.gather(
-            *[self.samplers[g].round_start(ctxs) for g, ctxs in by_group.items()]
-        )
+    async def _run_group(self, g):
+        rows = self._group_rows[g]
+        sampler = self.samplers[g]
+        while True:
+            live = [self.particles[i] for i in rows if not self.particles.done[i]]
+            if not live:
+                return
+            await sampler.round_start([p.context for p in live])
+            await asyncio.gather(*[self.step_row(p) for p in live])
+            self.round_boundary(g)
 
-    async def apply_critic_boundary(self):
-        """The deferred critic math, at the round boundary (engine drained; forwards are
-        legal). Same math as the inline path: a finished particle scores ``complete``
-        permanently; a live one twists for the upcoming resample (``draw_step`` untwists
-        it at the next round)."""
-        parts, self._critic_pending = self._critic_pending, []
-        if not parts:
-            return
-        # One settle per particle per boundary: a duplicate entry would re-run the
-        # terminal critic (an exec, or an LM forward) on the same context.
-        assert len({id(p) for p in parts}) == len(parts)
-        # Score the whole pending population through each critic's batched path,
-        # one call per critic (groups concurrent).
-        by_group = {}
-        for p in parts:
-            by_group.setdefault(p.group, []).append(p)
-
-        async def _settle(g, ps):
-            critic = self.critics[g]
-            contexts = [p.context for p in ps]
-            # batch_score routes non-EOS contexts to batch_prefix and EOS contexts
-            # to batch_complete, each in list order; serve the banked sums for
-            # exactly those subsets.
-            live = [p for p, ctx in zip(ps, contexts)
-                    if not (ctx and ctx[-1] == critic.eos)]
-            done = [p for p, ctx in zip(ps, contexts)
-                    if ctx and ctx[-1] == critic.eos]
-            with self.serve_lanes(g, live, done):
-                return ps, await critic.batch_score(contexts)
-
-        for ps, amts in await asyncio.gather(
-            *[_settle(g, ps) for g, ps in by_group.items()]
-        ):
-            for p, amt in zip(ps, amts):
-                amt = float(amt)
-                if p.done:
-                    p.score(amt)
-                elif amt == float("-inf"):
-                    p.score(amt)
-                    p.finish()
-                else:
-                    p.twist(amt)
-
-
-class StepLoop:
-    """Per-token driver (byte-exact ground truth): each round draws + banks every live
-    row concurrently, recomputing logprobs from the full context every step."""
-
-    sync_boundary = True
-    defers_critic = False
-
-    def __init__(self, controller):
-        self.controller = controller
-
-    async def round(self):
-        """One token for every live row."""
-        c = self.controller
-        await asyncio.gather(*[c.step_row(p) for p in c.particles if not p.done])
-
-    async def run(self):
-        return await self.controller.run(self)
 
 
