@@ -49,10 +49,9 @@ class TokenSampler:
         return self
 
     def lane_views(self):
-        """The LM views a burst injects for this sampler: the draw sampler's target
-        leaf, then its proposal's when it has one. The LAST is the draw distribution's
-        own leaf, whose accumulated logp is the particle's ``logp``. A slot is ``None``
-        when that potential has no single engine-burst leaf.
+        """The LM views that hold lanes for this sampler: the draw sampler's target
+        leaf, then its proposal's when it has one. A slot is ``None`` when that
+        potential has no single lane-capable engine leaf.
 
         One lane per DISTINCT leaf: target and proposal built over the same
         ``PromptedLLM`` are one engine request serving both reads, never two identical
@@ -66,7 +65,7 @@ class TokenSampler:
 
 
     def lane_max_steps(self, live) -> int:
-        """Engine decode-step budget for one burst (token grain). The unit sampler overrides."""
+        """Engine decode-step budget for one row's run. The unit sampler overrides."""
         return max(p.max_tokens_left for p in live) + 1
 
     async def round_start(self, contexts):

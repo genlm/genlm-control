@@ -79,8 +79,8 @@ class Particle:
 
     @property
     def row(self):
-        """This particle's row in the population -- its identity across a burst's
-        per-row bookkeeping, and stable under reindex."""
+        """This particle's row in the population -- its identity across per-row
+        bookkeeping (lanes, draw keys), and stable under reindex."""
         return self._i
 
     @property
@@ -218,13 +218,13 @@ class Controller:
             self._log_ess_threshold = np.log(ess_threshold)
 
     def _critic_lane(self, critic):
-        """A per-step critic's own engine lane, or ``None``: no critic, nothing that
-        consumes it mid-burst, or no single engine leaf to bank (a multi-LM critic
-        scores by forwarding at a boundary instead).
+        """A consumed critic's own engine lane leaf, or ``None``: no critic, nothing
+        that consumes it mid-run, or no single engine leaf (a multi-LM critic scores
+        by one-shot forwards at a boundary instead).
 
         A twist consumes the critic every step; so does a resample, which reweights on
-        sums the critic has to be inside. Either way the leaf must be servable from a
-        bank rather than a forward."""
+        sums the critic has to be inside. Either way the leaf must serve from its
+        lane's bank rather than a forward."""
         if critic is None or not (self.twist_with_critic or self.ess_threshold > 0):
             return None
         return find_engine_lm(critic)
@@ -232,7 +232,7 @@ class Controller:
     async def draw_step(self, p):
         """One row's step ``(to_append, logw, logp)``: forced EOS at the ``max_tokens``
         boundary, else the sampler's transition (closed by ``terminate_when``). The
-        (slot, ordinal) draw key lets a counter-based picker match the burst draw.
+        (slot, ordinal) draw key makes a counter-based picker batch-independent.
 
         Untwists ``p`` first: a twist is a bet on the resample the row has now passed."""
         if self.twist_with_critic:
@@ -301,7 +301,7 @@ class Controller:
             return
 
         if self.twist_with_critic:
-            # batch_score so a burst-served critic LM leaf reads its overrides.
+            # batch_score so a lane-served critic LM leaf reads its bank.
             twist_amt = float((await critic.batch_score([p.context]))[0])
             if twist_amt == float("-inf"):
                 p.score(twist_amt)

@@ -276,6 +276,10 @@ The old shape stays reachable in git only — no in-tree fallback, no legacy fla
 - **Perf re-measured** (`benchmarks/bench.py`, off/require/raw): pick batching,
   forward-overlap, burst wall-clock vs current shape, and the motivating scenario —
   B groups × ragged unit lengths.
+- **Known perf debt (vLLM, post-correctness)**: the port publishes lane rows
+  ``.cpu()`` ([V] copy per row per step). End state: device-resident publish,
+  temper/EOS-fold on device, bank increments and picked scalars leaving in the
+  collector's single crossing, `_lane_score` syncing once per boundary serve.
 
 ## 5. Sequencing
 

@@ -357,7 +357,7 @@ def inverse_cdf(logps):
 
 # --- counter-based (device/order-independent) noise ---
 # Picker noise is a pure function of an explicit (seed, slot, step) key, not a shared RNG
-# stream: threefry-2x32 in torch int64 is bit-identical CPU/CUDA, so burst (GPU) and StepLoop
+# stream: threefry-2x32 in torch int64 is bit-identical CPU/CUDA, so lane (GPU) and plain
 # (CPU) draw the SAME noise. Key in scope via the ``draw_key`` ContextVar; unkeyed -> torch.rand.
 
 _DRAW_KEY = contextvars.ContextVar("draw_key", default=None)  # (slot, [next_ordinal]) | None
@@ -505,8 +505,8 @@ def set_draw_method(method):
 async def draw_from(lazyweights, draw=None):
     """Normalize, draw, and read back the drawn token's log-prob: ``(token, logZ, logp)``,
     where ``logZ`` is the row's normalizer. THE draw seam -- every sampler that draws from a
-    distribution wants exactly these three steps, so inside a burst they happen once for the
-    whole parked population rather than once per row (each is ~30x cheaper batched). A
+    distribution wants exactly these three steps, so under a lane binding they happen once
+    for the collector's parked cohort rather than once per row (~30x cheaper batched). A
     sampler needing something else (AWRS's rejection over unnormalized weights) does not call
     this. A caller-supplied ``draw`` is a user picker, so it stays per row."""
     from genlm.control.lane_seam import collector, current_binding

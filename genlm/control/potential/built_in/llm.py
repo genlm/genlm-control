@@ -344,11 +344,11 @@ class PromptedLLM(Potential):
 
     @property
     def lora_name(self):
-        """LoRA adapter this view forwards under (``None`` = base model). The burst
-        tags each substream with it; the slow lane forwards through ``_fwd``, an
-        adapter-bound view of the engine, so both lanes apply the adapter
+        """LoRA adapter this view forwards under (``None`` = base model). Lanes open
+        under it (per-request LoRA); one-shot forwards go through ``_fwd``, an
+        adapter-bound view of the engine, so both paths apply the adapter
         consistently. Assigning rebinds ``_fwd`` -- rebind between SMC runs,
-        never mid-burst (the burst snapshots adapter names at start)."""
+        never mid-run."""
         return self._lora_name
 
     @lora_name.setter
@@ -582,6 +582,26 @@ class PromptedLLM(Potential):
             await self._lane_logw_next(binding, context)
         return lane.bank + lane.stash[self.eos]
 
+    async def batch_prefix(self, contexts):
+        """Batched ``prefix``. Under a lane binding, served from the lane's own
+        banked path (no forward)."""
+        binding = current_binding()
+        if binding is not None and binding.has(self) and len(contexts) == 1:
+            return np.asarray(
+                [await self._lane_score(binding, contexts[0], complete=False)]
+            )
+        return await super().batch_prefix(contexts)
+
+    async def batch_complete(self, contexts):
+        """Batched ``complete``. Under a lane binding, served from the lane's own
+        banked path plus the stashed EOS fold."""
+        binding = current_binding()
+        if binding is not None and binding.has(self) and len(contexts) == 1:
+            return np.asarray(
+                [await self._lane_score(binding, contexts[0], complete=True)]
+            )
+        return await super().batch_complete(contexts)
+
     async def complete(self, context):
         """
         Compute the log probability of `context` and the eos tokens given the prompt.
@@ -707,9 +727,9 @@ class PromptedLLM(Potential):
 
     async def batch_logw_next(self, contexts):
         """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
-        (`.weights` shape `[N, V+1]`). Inside a burst this parks on the row's seat exactly
-        as the scalar path does and is served the same warm -- a burst row is one context,
-        so the batch is the row's own.
+        (`.weights` shape `[N, V+1]`). Under a lane binding this is served the row's
+        own warm exactly as the scalar path is -- a lane row is one context, so the
+        batch is the row's own.
 
         Args:
             contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.
