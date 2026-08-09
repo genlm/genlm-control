@@ -26,9 +26,14 @@ await lane.close()            # abort the engine request; lane is dead
 
 Contract:
 
-- `next()` resolves once per engine step the lane was scheduled in. A second `next()`
-  before `feed()` raises; `feed()` without a pending `next()` raises; any call on a
-  closed lane raises. Violations are immediate exceptions at the seam, not races.
+- `next()` resolves once per engine step the lane was scheduled in and is **idempotent
+  until `feed()`** — re-reads within a step return the same warm (a shared leaf is read
+  by several views; a product's branches read the same LM). Reading past an unfed step
+  raises; `feed()` without a resolved `next()` raises; any call on a closed lane raises.
+  Violations are immediate exceptions at the seam, not races.
+- The lane knows its context (prompt + fed tokens); reads verify against it. A
+  shorter-context read (a `Normalized` critic walking proper prefixes) mismatches and
+  raises — the seat's ordinal guard, made direct.
 - **`close` is a first-class answer to a step.** A row that will not read the next warm
   closes *instead of feeding its final token* — the engine only ever needed the feed to
   compute the step after it, and committed tokens live control-side. This kills, by
@@ -117,11 +122,14 @@ Same contract, own loop. We own the scheduler, so:
   `_drain_lock`, the burst-end settling, `view_prefixes`/ContextVar snapshotting for
   the worker thread.
 - Row coroutines keep their shape: draw → bank → group barrier → repeat. Inside a run,
-  `PromptedLLM.logw_next` routes to the row's lane (per-task binding, as the seam does
-  today); `accelerate="off"` opens no lanes — every call is a one-shot, main's behavior.
+  `PromptedLLM.logw_next` routes through the row's `{leaf → lane}` binding (built by the
+  controller from `group_lanes`' identity dedup, carried in the one seam var);
+  `accelerate="off"` opens no lanes — every call is a one-shot, main's behavior.
   PromptedLLM processes its own pulled logits (temperature, EOS fold) — the
   `_maybe_temper`/`_process_logw_next_batch` reach-in from burst.py dies with the push
-  delivery.
+  delivery, and with it the `[G, K, vocab]` injection block, `_row_injection`, and the
+  `EngineControl.draw` contract. Lane-bank increments (non-drawn views, the critic
+  lane) gather at the fed token ids in the step's single host crossing.
 - **The pick is an emergent collector, not a barrier** (batching survives, measured
   1.64×): the keyed picker makes draw results batch-composition-independent, so
   batching the pick is purely a performance choice. One engine step resolves all warms
