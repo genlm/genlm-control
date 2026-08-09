@@ -510,6 +510,16 @@ async def draw_from(lazyweights, draw=None):
     whole parked population rather than once per row (each is ~30x cheaper batched). A
     sampler needing something else (AWRS's rejection over unnormalized weights) does not call
     this. A caller-supplied ``draw`` is a user picker, so it stays per row."""
+    from genlm.control.lane_seam import collector, current_binding
+
+    binding = current_binding()
+    if binding is not None and draw is None:
+        slot, ctr = _DRAW_KEY.get()
+        step = ctr[0]
+        ctr[0] = step + 1
+        token, logZ, logp = await collector().submit(lazyweights, slot, step)
+        binding.commit(token)
+        return token, logZ, logp
     seat = _burst_row.get()
     if seat is not None and draw is None:
         slot, ctr = _DRAW_KEY.get()
@@ -520,6 +530,28 @@ async def draw_from(lazyweights, draw=None):
     logps = lazyweights.spawn(lazyweights.weights - logZ)
     token = select(logps) if draw is None else draw(logps.exp().materialize())
     return token, logZ, logps[token]
+
+
+async def draw_reweighted(proposal_logws, target_logws, draw=None):
+    """Importance-sampling draw: sample from ``proposal_logws``, weight by
+    target/proposal — ``(token, logw, logp)`` with ``logw = target[token] - logp``
+    (the proposal lookup is algebraically the returned ``logp``). Under a lane
+    binding the target lookup rides the collector's crossing as a companion
+    gather; no per-row device sync."""
+    from genlm.control.lane_seam import collector, current_binding
+
+    binding = current_binding()
+    if binding is not None and draw is None:
+        slot, ctr = _DRAW_KEY.get()
+        step = ctr[0]
+        ctr[0] = step + 1
+        token, logZ, logp, tval = await collector().submit(
+            proposal_logws, slot, step, companion=target_logws
+        )
+        binding.commit(token)
+        return token, tval - logp, logp
+    token, _, logp = await draw_from(proposal_logws, draw)
+    return token, target_logws[token] - logp, logp
 
 
 def select(lazyweights):

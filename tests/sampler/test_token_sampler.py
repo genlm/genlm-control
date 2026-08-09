@@ -91,8 +91,8 @@ async def test_direct_token_sampler_with_proposal_swor(params):
             assert tid == forced_idx
 
             expected_logw = target_logws[tid] - proposal_logws[tid] + log_Z_proposal
-            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10)
-            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10)
+            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10, atol=1e-12)
     finally:
         await sampler.cleanup()
 
@@ -228,8 +228,8 @@ async def test_direct_token_sampler_proposal_different_distributions():
                 - proposal_logws_ctx.weights[tid]
                 + proposal_log_Z
             )
-            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10)
-            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10)
+            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10, atol=1e-12)
 
 
 @pytest.mark.asyncio
@@ -289,7 +289,7 @@ async def test_sis_with_proposal_weights_match_manual_computation(
                 expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
 
         np.testing.assert_allclose(
-            actual_logw, expected_logw, rtol=1e-10,
+            actual_logw, expected_logw, rtol=1e-10, atol=1e-12,
             err_msg=f"Weight mismatch for sequence {ctx}",
         )
 

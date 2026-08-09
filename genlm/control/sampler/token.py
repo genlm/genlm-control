@@ -6,7 +6,12 @@ from arsenal.maths import log1mexp
 import warnings
 
 from genlm.control.potential.built_in.llm import find_engine_lm
-from genlm.control.util import draw_from, awrs_gumbel_keys, get_draw_seed
+from genlm.control.util import (
+    draw_from,
+    draw_reweighted,
+    awrs_gumbel_keys,
+    get_draw_seed,
+)
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 
@@ -207,9 +212,7 @@ class DirectTokenSampler(TokenSampler):
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context), self.potential.logw_next(context)
         )
-        token, proposal_logZ, logp = await draw_from(proposal_logws, draw)
-        logw = target_logws[token] - proposal_logws[token] + proposal_logZ
-        return token, logw, logp
+        return await draw_reweighted(proposal_logws, target_logws, draw)
 
 
 class SetTokenSampler(TokenSampler):
