@@ -240,33 +240,42 @@ class Potential(ABC, PotentialOps, PotentialTests):
         # vocabulary -- half of what crosses to a device block. Both backends index
         # from it directly, so nothing widens on the way in.
         dtype = np.int32 if len(lives) * V1 < 2**31 else np.int64
-        idxs, vals = [], []
-        for j, (idx, val, eos) in enumerate(lives):
-            idxs.append(_as_ints(idx, dtype) + j * V1)
+        idxs, vals, eoss = [], [], []
+        for idx, val, eos in lives:
+            idxs.append(_as_ints(idx, dtype) + len(idxs) * V1)
             vals.append(val)
-            W[j, -1] = eos
-        if not any(len(a) for a in idxs):
-            return W
-        flat = np.concatenate(idxs) if len(idxs) > 1 else idxs[0]
-        # One shared weight over the whole block (a support mask) writes as a scalar:
-        # no value array is built and none is shipped to the device.
-        if all(isinstance(v, (int, float)) for v in vals) and len(set(vals)) == 1:
-            packed = float(vals[0])
-        else:
-            packed = np.concatenate(
-                [
-                    np.full(len(a), float(v))
-                    if isinstance(v, (int, float))
-                    else np.asarray(v, dtype=np.float64)
-                    for a, v in zip(idxs, vals)
-                ]
-            )
+            eoss.append(eos)
+        eos_col = np.asarray(eoss, dtype=np.float64)
+        flat = packed = None
+        if any(len(a) for a in idxs):
+            flat = np.concatenate(idxs) if len(idxs) > 1 else idxs[0]
+            # One shared weight over the whole block (a support mask) writes as a
+            # scalar: no value array is built and none is shipped to the device.
+            if all(isinstance(v, (int, float)) for v in vals) and len(set(vals)) == 1:
+                packed = float(vals[0])
+            else:
+                packed = np.concatenate(
+                    [
+                        np.full(len(a), float(v))
+                        if isinstance(v, (int, float))
+                        else np.asarray(v, dtype=np.float64)
+                        for a, v in zip(idxs, vals)
+                    ]
+                )
+        # Every write to the block happens here, the EOS column in one go rather than
+        # one store per row -- on a device block those are a store apiece.
         if torch.is_tensor(W):
-            if not isinstance(packed, float):
-                packed = torch.from_numpy(packed).to(dtype=W.dtype, device=W.device)
-            W.view(-1)[torch.from_numpy(flat).to(W.device)] = packed
+            W[:, -1] = torch.from_numpy(eos_col).to(dtype=W.dtype, device=W.device)
+            if flat is not None:
+                if not isinstance(packed, float):
+                    packed = torch.from_numpy(packed).to(
+                        dtype=W.dtype, device=W.device
+                    )
+                W.view(-1)[torch.from_numpy(flat).to(W.device)] = packed
         else:
-            W.reshape(-1)[flat] = packed
+            W[:, -1] = eos_col
+            if flat is not None:
+                W.reshape(-1)[flat] = packed
         return W
 
     async def logw_next(self, context):
