@@ -28,9 +28,6 @@ class TokenSampler:
     \\textsf{target.logw_next}(x_n | x_1, \\ldots, x_{n-1})
     $$
 
-    Collapses to a single per-step :meth:`transition` the controller calls,
-    mapping a particle context to ``(to_append, logw, logp)``.
-
     Args:
         target (Potential): The potential that samples are properly weighted with respect to.
     """
@@ -42,11 +39,6 @@ class TokenSampler:
         self.target = target
         self.token_type = self.target.token_type
 
-    async def round_start(self, contexts):
-        """Population hook before a round's draws: this sampler's group's live contexts.
-        One round is one unit per row at unit grain, so this is where per-unit population
-        bookkeeping goes. Default no-op."""
-
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""
         return await self.target.prefix([])
@@ -54,19 +46,6 @@ class TokenSampler:
     async def logw_eos(self, context):
         """EOS log-weight at the ``max_tokens`` boundary, used to force termination."""
         return await self.target.logw_eos(context)
-
-    async def transition(self, context):
-        """Controller-facing per-step transition.
-
-        Args:
-            context (list): The particle's current token context.
-
-        Returns:
-            (to_append, logw, logp): items to append (``[token]``, or more for a
-                multi-token unit), the weight increment, and the choice log-prob.
-        """
-        token, logw, logp = await self.sample(context)
-        return [token], logw, logp
 
     async def sample(self, context, draw=None):
         """Sample a token and weight from the `target`potential's vocabulary.

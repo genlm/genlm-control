@@ -192,7 +192,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
         ``complete`` (equivalently, ``score`` at EOS). Indicator critics like
         ``1[f(z) == y]`` are the canonical example.
 
-        When used as an SMC critic, returning ``True`` lets the Controller skip
+        When used as an SMC critic, returning ``True`` lets the SMC loop skip
         the per-step critic twist and reweight
         only at termination. In a batched run this fires only when EVERY group's
         critic is terminal-only (the flag is population-wide). Default ``False``;

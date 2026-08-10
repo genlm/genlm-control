@@ -1,6 +1,8 @@
-"""SMC population and the ``Controller``: algorithm owner and the per-group run
-loop. Engine serving lives entirely below the potential layer; the loop never
-sees it."""
+"""Sequential Monte Carlo: ``smc_standard`` (the algorithm, a free function) over
+``SequenceModel`` particles. Engine serving lives entirely below the potential
+layer; nothing here knows an engine exists. Batching B problems is plain
+concurrency: ``asyncio.gather(smc_a(...), smc_b(...))`` — concurrent asks meet
+below the potential seam."""
 
 import asyncio
 
@@ -8,399 +10,233 @@ import numpy as np
 from arsenal import colors
 
 from genlm.control.constant import EOS
-from genlm.control.util import logsumexp, draw_key, draw_ordinal, escape
+from genlm.control.util import logsumexp, escape
 from genlm.control.sampler.resampling import get_resampling_fn
 from genlm.control.sampler.smc_record import SMCRecord
 
 
-class Population:
-    """Columnar SMC particle store: scalars are parallel numpy arrays, ``contexts``
-    are Python lists. Indexing yields :class:`Particle` row views."""
+class SequenceModel:
+    """One particle: a candidate sequence's state and its per-step semantics.
 
-    __slots__ = (
-        "n",
-        "logw",
-        "twist_amount",
-        "done",
-        "max_tokens_left",
-        "contexts",
-        "group",
-        "_views",
-    )
-
-    def __init__(self, n, max_tokens, group):
-        self.n = n
-        # Per-row group id; ESS/resample/log_ml are per-group.
-        self.group = np.asarray(group, dtype=np.int64)
-        self.logw = np.zeros(n)
-        self.twist_amount = np.zeros(n)
-        self.done = np.zeros(n, dtype=bool)
-        self.max_tokens_left = np.full(n, max_tokens, dtype=np.int64)
-        self.contexts = [[] for _ in range(n)]
-        # Views reused: reindex mutates arrays in place so row i stays valid.
-        self._views = [Particle(self, i) for i in range(n)]
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, i):
-        return self._views[i]
-
-    def __iter__(self):
-        return iter(self._views)
-
-    def untwist(self, idx=slice(None)):
-        """Untwist rows ``idx`` (the whole population by default)."""
-        self.logw[idx] -= self.twist_amount[idx]
-        self.twist_amount[idx] = 0.0
-
-    def reindex(self, ancestor_indices):
-        """Reindex every column by ``ancestor_indices`` (resample/fork)."""
-        idx = ancestor_indices
-        self.logw = self.logw[idx]
-        self.twist_amount = self.twist_amount[idx]
-        self.done = self.done[idx]
-        self.max_tokens_left = self.max_tokens_left[idx]
-        self.contexts = [list(self.contexts[i]) for i in idx]
-        self.group = self.group[idx]
-
-
-class Particle:
-    """A view onto one row of a :class:`Population`; reads/writes pass through to the
-    population arrays."""
-
-    __slots__ = ("_pop", "_i")
-
-    def __init__(self, pop, i):
-        self._pop = pop
-        self._i = i
-
-    @property
-    def row(self):
-        """This particle's row in the population -- its identity across per-row
-        bookkeeping (draw keys), and stable under reindex."""
-        return self._i
-
-    @property
-    def group(self):
-        """The SMC problem this row belongs to; ESS/resample/log_ml are per-group."""
-        return self._pop.group[self._i]
-
-    @property
-    def logw(self):
-        return self._pop.logw[self._i]
-
-    @logw.setter
-    def logw(self, v):
-        self._pop.logw[self._i] = v
-
-    @property
-    def done(self):
-        return self._pop.done[self._i]
-
-    @property
-    def max_tokens_left(self):
-        return self._pop.max_tokens_left[self._i]
-
-    @max_tokens_left.setter
-    def max_tokens_left(self, v):
-        self._pop.max_tokens_left[self._i] = v
-
-    @property
-    def context(self):
-        return self._pop.contexts[self._i]
-
-    def score(self, amt):
-        self._pop.logw[self._i] += amt
-
-    def twist(self, amt):
-        self._pop.twist_amount[self._i] += amt
-        self._pop.logw[self._i] += amt
-
-    def untwist(self):
-        self._pop.untwist(self._i)
-
-    def finish(self):
-        self.untwist()
-        self._pop.done[self._i] = True
-
-    # record viz adapter
-    @property
-    def weight(self):
-        return self._pop.logw[self._i]
-
-
-class Controller:
-    """Owns the SMC algorithm: population, transition, ESS, resample, log_ml. Every
-    sampler collapses to one per-step ``transition``. The population is B independent
-    SMC problems ("groups") in one flat row space — ESS/resample/log_ml are per-group,
-    and B=1 is the plain single-problem case.
+    Holds the mutable run state (``context``, ``weight``, ``twist_amount``,
+    ``max_tokens``, ``done``) and shares the sampler/critic/config with its
+    siblings — ``clone`` copies only the state, so resampling never copies a
+    sampler.
 
     Args:
-        samplers (list[TokenSampler]): per-group sampler producing
-            ``(to_append, logw, logp)`` per step.
-        critics (list[Potential | None]): per-group critic reweighting/twisting
-            that group's particles.
-        group_sizes (list[int]): particles per group.
-        ess_threshold (float): per-group ESS fraction below which that group resamples.
-        max_tokens (int): per-particle token budget.
-        twist_with_critic (bool): whether the critic twists during stepping.
-        terminate_when (callable, optional): ``context -> bool`` stop condition. When it
-            fires, EOS closes the sequence in that same step. The context is in the
-            sampler's own representation, so unit nesting is the caller's business.
-        resampling_method (str): multinomial/stratified/systematic/residual.
-        record (bool): build an :class:`SMCRecord`.
-        verbosity (int): 0 silent, 1 prints particles per step.
+        unit_sampler (TokenSampler): draws one unit per step via ``sample``.
+        critic (Potential, optional): reweights/twists the particle.
+        max_tokens (int): per-particle token budget; EOS is forced at the boundary.
+        twist_with_critic (bool): whether the critic twists during stepping
+            (vs. scoring once at termination).
+        terminate_when (callable, optional): ``context -> bool`` stop condition;
+            when it fires, EOS closes the sequence in that same step.
+        verbosity (int): 0 silent, 1 prints the particle per step.
     """
 
     def __init__(
         self,
-        samplers,
-        critics,
-        group_sizes,
-        ess_threshold,
-        max_tokens,
-        twist_with_critic,
+        unit_sampler,
+        critic=None,
+        max_tokens=float("inf"),
+        twist_with_critic=True,
         terminate_when=None,
-        resampling_method="multinomial",
-        record=False,
         verbosity=0,
     ):
-        assert max_tokens > 0
-        assert len(samplers) == len(critics) == len(group_sizes) > 0
-        n_particles = sum(group_sizes)
-
-        self.samplers = samplers
-        self.critics = critics
-        self.n_particles = n_particles
-        self.n_resamples = 0
-        self.ess_threshold = ess_threshold
+        self.unit_sampler = unit_sampler
+        self.critic = critic
+        self.max_tokens = max_tokens
         self.twist_with_critic = twist_with_critic
         self.terminate_when = terminate_when
-        # A terminal-only critic has no per-step signal: reweight only at termination.
-        if twist_with_critic and all(
-            c is not None and c.is_terminal_only() for c in critics
-        ):
-            self.twist_with_critic = False
-        self.resample_fn = get_resampling_fn(resampling_method)
         self.verbosity = verbosity
 
-        group = np.concatenate(
-            [np.full(ng, g, dtype=np.int64) for g, ng in enumerate(group_sizes)]
+        self.context = []
+        self.weight = 0.0
+        self.twist_amount = 0.0
+        self.done = False
+
+    def clone(self):
+        """A particle with copied state and shared sampler/critic."""
+        new = SequenceModel(
+            unit_sampler=self.unit_sampler,
+            critic=self.critic,
+            max_tokens=self.max_tokens,
+            twist_with_critic=self.twist_with_critic,
+            terminate_when=self.terminate_when,
+            verbosity=self.verbosity,
         )
-        self.particles = Population(n_particles, max_tokens, group=group)
-        # Per-group row indices (invariant across reindex; resample is group-local).
-        self._group_rows = [
-            np.nonzero(self.particles.group == g)[0] for g in range(len(group_sizes))
-        ]
-        # One record stream per group: cadences are independent, so there is no
-        # meaningful global step counter to share.
-        self.records = [
-            SMCRecord(ng) if record else None for ng in group_sizes
-        ]
-        # Group-local ancestors a crossing leaves for the next ``_record_step``.
-        self._pending_resample: list = [None] * len(group_sizes)
-        # log(ess_threshold); the per-group ESS test adds log(group_size).
-        with np.errstate(divide="ignore"):
-            self._log_ess_threshold = np.log(ess_threshold)
+        new.context = list(self.context)
+        new.weight = self.weight
+        new.twist_amount = self.twist_amount
+        new.done = self.done
+        return new
 
-    async def draw_step(self, p):
-        """One row's step ``(to_append, logw, logp)``: forced EOS at the ``max_tokens``
-        boundary, else the sampler's transition (closed by ``terminate_when``). The
-        (slot, ordinal) draw key makes a counter-based picker batch-independent.
+    # -- weight accounting ------------------------------------------------
 
-        Untwists ``p`` first: a twist is a bet on the resample the row has now passed."""
-        if self.twist_with_critic:
-            self.particles.untwist(p.row)
-        if p.max_tokens_left == 1:
-            return await self._force_eos_step(p, self.sampler_of(p))
-        with draw_key(p.row, draw_ordinal(p.context)):
-            step = await self.sampler_of(p).transition(p.context)
-        return self._close_if_stopped(p, step)
+    def score(self, amt):
+        self.weight += amt
 
-    async def step_row(self, p):
-        """Draw + bank one live row: a per-token driver's whole per-row step."""
-        await self.bank_row(p, *(await self.draw_step(p)))
+    def twist(self, amt):
+        """A bet on the upcoming resample; taken back by ``untwist``."""
+        self.twist_amount += amt
+        self.weight += amt
 
-    def _close_if_stopped(self, p, step):
-        """``step`` with EOS appended if ``terminate_when`` fires on the context it
-        produces, so the particle terminates in the step that wrote the stop.
+    def untwist(self):
+        self.weight -= self.twist_amount
+        self.twist_amount = 0.0
 
-        No ``logw_eos``: the stop condition defines what a complete sequence *is*,
-        not a deviation from the proposal, so charging it would penalize exactly
-        the particles that close."""
-        to_append, logw, logp = step
-        if self.terminate_when is None or not to_append:
-            return step
-        context = p.context + list(to_append)
-        if context[-1] is EOS or not self.terminate_when(context):
-            return step
-        return [*to_append, EOS], logw, logp
+    def finish(self):
+        self.untwist()
+        self.done = True
 
-    async def _force_eos_step(self, p, sampler):
-        """Forced-EOS step ``(to_append, logw, logp)`` at the ``max_tokens`` boundary."""
-        return [EOS], await sampler.logw_eos(p.context), 0.0
+    # -- the step ----------------------------------------------------------
 
-    def sampler_of(self, p):
-        """The sampler owning ``p``'s group -- a driver routes each row through its
-        own group's sampler, never group 0's."""
-        return self.samplers[p.group]
+    async def start(self):
+        """Score the empty sequence's prefix weight."""
+        start_w = await self.unit_sampler.start_weight()
+        if start_w == float("-inf"):
+            raise ValueError(
+                "Start weight is -inf (log(0)). This is likely because a potential "
+                "assigns zero weight to the empty sequence under `prefix`, which "
+                "violates the potential contract."
+            )
+        self.score(start_w)
 
-    def _critic_of(self, p):
-        return self.critics[p.group]
+    async def step(self):
+        """Advance by one unit: draw (or force EOS at the budget boundary),
+        score, critic-twist, terminate."""
+        self.untwist()
 
-    async def bank_row(self, p, to_append, logw, logp):
-        """Post-draw SMC math: score, advance, critic-twist, reweight + terminate.
-        Critic-free rows bank without awaiting; an inline critic twists/reweights
-        here.
+        if self.max_tokens == 1:
+            logw = await self.unit_sampler.logw_eos(self.context)
+            unit = EOS
+        else:
+            unit, logw, _ = await self.unit_sampler.sample(self.context)
 
-        ``logp`` is the step's own choice log-prob; it stays in the step tuple
-        callers splat."""
-        p.score(logw)
-        p.context.extend(to_append)
+        self.score(logw)
+        self._append(unit)
 
-        critic = self._critic_of(p)
-        if critic is None:
-            if p.logw == float("-inf"):
-                p.finish()
-            else:
-                if self.verbosity > 0:
-                    print(self._repr_particle(p))
-                p.max_tokens_left -= 1
-                if p.max_tokens_left == 0 or self._is_terminal(p):
-                    p.finish()
+        if self.weight == float("-inf"):
+            self.finish()
             return
 
-        if p.logw == float("-inf"):
-            p.finish()
-            return
-
-        if self.twist_with_critic:
-            twist_amt = float(await critic.score(p.context))
+        twist_amt = None
+        if self.critic is not None and self.twist_with_critic:
+            twist_amt = float(await self.critic.score(self.context))
             if twist_amt == float("-inf"):
-                p.score(twist_amt)
-                p.finish()
+                self.score(twist_amt)
+                self.finish()
                 return
-            p.twist(twist_amt)
+            self.twist(twist_amt)
 
         if self.verbosity > 0:
-            print(self._repr_particle(p))
+            print(self.__repr__())
 
-        p.max_tokens_left -= 1
-        if p.max_tokens_left == 0 or self._is_terminal(p):
-            p.finish()
-            if not self.twist_with_critic:
-                # Terminal-only critic: reweight once, at termination.
-                p.score(float(await critic.score(p.context)))
+        self.max_tokens -= 1
+        if self.max_tokens == 0 or self.context[-1] is EOS:
+            self.finish()
+            if self.critic is None:
                 return
-            p.score(twist_amt)
+            if twist_amt is None:
+                # Terminal-only critic: reweight once, at termination.
+                self.score(float(await self.critic.score(self.context)))
+            else:
+                # The twist was taken back by finish(); at termination the
+                # critic's score is real weight.
+                self.score(twist_amt)
 
-    def _is_terminal(self, p):
-        return bool(p.context) and p.context[-1] is EOS
+    def _append(self, unit):
+        """Extend the context by one drawn unit. A multi-token unit ending in
+        EOS is split so ``context[-1] is EOS`` — the terminal check's contract.
+        ``terminate_when`` closes the sequence in the step that satisfied it;
+        the stop condition defines what a complete sequence *is*, so it carries
+        no weight correction."""
+        if isinstance(unit, list) and unit and unit[-1] is EOS:
+            if len(unit) > 1:
+                self.context.append(unit[:-1])
+            self.context.append(EOS)
+        else:
+            self.context.append(unit)
+        if (
+            self.terminate_when is not None
+            and self.context[-1] is not EOS
+            and self.terminate_when(self.context)
+        ):
+            self.context.append(EOS)
 
-    def _repr_particle(self, p):
+    def __repr__(self):
         return (
-            f"{p.logw:.2f}:\t"
+            f"{self.weight:.2f}:\t"
             + colors.magenta % "["
-            + (colors.magenta % "|").join(escape(y) for y in p.context)
+            + (colors.magenta % "|").join(escape(y) for y in self.context)
             + colors.magenta % "]"
         )
 
-    # controller-owned SMC primitives the drivers turn
 
-    async def start(self):
-        """Score every particle by its group's empty-sequence prefix weight."""
-        start_ws = [await s.start_weight() for s in self.samplers]
-        for g, start_w in enumerate(start_ws):
-            if start_w == float("-inf"):
-                raise ValueError(
-                    f"Start weight is -inf (log(0)) for group {g}. This is likely "
-                    "because a potential assigns zero weight to the empty sequence "
-                    "under `prefix`, which violates the potential contract."
-                )
-        for p in self.particles:
-            p.score(start_ws[p.group])
+async def smc_standard(
+    model,
+    n_particles,
+    ess_threshold=0.5,
+    resampling_method="multinomial",
+    json_path=None,
+):
+    """Standard SMC over clones of ``model``: step every live particle, test
+    ESS, resample when it dips. One call is one SMC problem; run several
+    concurrently to batch them (their asks meet below the potential layer).
 
-    def _maybe_resample(self, g):
-        """Group ``g``'s ESS test + group-local resample. Mutates the group's rows
-        of ``self.particles`` in place (other groups untouched). Returns ``True``
-        on a crossing."""
-        rows = self._group_rows[g]
-        Wg = self.particles.logw[rows]
-        if np.all(Wg == -np.inf):
-            return False
-        w_sum = logsumexp(Wg)
-        nw = Wg - w_sum
-        if not (-logsumexp(nw * 2) < self._log_ess_threshold + np.log(len(rows))):
-            return False
+    Args:
+        model (SequenceModel): the particle template; cloned ``n_particles`` times.
+        n_particles (int): number of particles.
+        ess_threshold (float): resample when ESS falls below this fraction of
+            ``n_particles``.
+        resampling_method (str): multinomial/stratified/systematic/residual.
+        json_path (str, optional): where to write the inference record
+            (viewable with ``InferenceVisualizer``).
+
+    Returns:
+        (list[SequenceModel]): the completed particles.
+    """
+    resample_fn = get_resampling_fn(resampling_method)
+    particles = [model.clone() for _ in range(n_particles)]
+    await asyncio.gather(*[p.start() for p in particles])
+
+    record = SMCRecord(n_particles) if json_path is not None else None
+    ancestor_indices = None
+
+    while any(not p.done for p in particles):
+        await asyncio.gather(*[p.step() for p in particles if not p.done])
+
+        if record is not None:
+            if not record.history:
+                record.add_init(particles)
+            elif ancestor_indices is not None:
+                record.add_resample(ancestor_indices, particles)
+            else:
+                record.add_smc_step(particles)
+
+        ancestor_indices = None
+        W = np.array([p.weight for p in particles])
+        if np.all(W == -np.inf):
+            continue
+        w_sum = logsumexp(W)
+        nw = W - w_sum
+        with np.errstate(divide="ignore"):
+            if -logsumexp(nw * 2) >= np.log(ess_threshold) + np.log(n_particles):
+                continue
+
         probs = np.exp(nw)
         probs /= probs.sum()  # np.random.choice is strict on sum==1
-        local = np.asarray(self.resample_fn(probs))  # ancestors in 0..ng-1
-        if self.records[g] is not None:
-            local = np.sort(local)  # reproducible record
-        ancestors = np.arange(self.n_particles)
-        ancestors[rows] = rows[local]  # group-local -> global rows
-        self.n_resamples += 1
-        self.particles.reindex(ancestors)
-        self.particles.logw[rows] = w_sum - np.log(len(rows))
-        if self.records[g] is not None:
-            self._pending_resample[g] = local.tolist()
-        return True
+        ancestor_indices = list(resample_fn(probs))
+        if record is not None:
+            ancestor_indices.sort()  # reproducible record
+        avg_weight = w_sum - np.log(n_particles)
+        particles = [particles[i].clone() for i in ancestor_indices]
+        for p in particles:
+            p.weight = avg_weight
 
-    def save_record(self, json_path):
-        """Write group 0's record (the whole run for a single-problem ``SMC``)."""
-        if self.records[0] is None:
-            return
+    if json_path is not None:
         with open(json_path, "w") as f:
-            f.write(self.records[0].to_json())
+            f.write(record.to_json())
         print(f"Saved record to {json_path}")
 
-    def _record_step(self, g):
-        """Record one of group ``g``'s completed steps: ``add_init`` first,
-        ``add_resample`` if one preceded it, else ``add_smc_step``."""
-        record = self.records[g]
-        if record is None:
-            return
-        group = [self.particles[i] for i in self._group_rows[g]]
-        if len(record.history) == 0:
-            record.add_init(group)
-        elif self._pending_resample[g] is not None:
-            record.add_resample(self._pending_resample[g], group)
-        else:
-            record.add_smc_step(group)
-        self._pending_resample[g] = None
-
-    def round_boundary(self, g):
-        """Close one of group ``g``'s rounds: record the step, then the ESS
-        test/resample. Returns ``True`` on a crossing."""
-        self._record_step(g)
-        return self._maybe_resample(g)
-
-    def group_rows(self, g):
-        """Row indices of group ``g``, invariant across reindex (resample is
-        group-local)."""
-        return self._group_rows[g]
-
-    async def run(self):
-        """The SMC loop: one coroutine per group, gathered. Each group paces its
-        own rounds — draw + bank every live row, then its boundary — and no
-        structure spans groups."""
-        await self.start()
-        await asyncio.gather(
-            *[self._run_group(g) for g in range(len(self._group_rows))]
-        )
-        return self.particles
-
-    async def _run_group(self, g):
-        rows = self._group_rows[g]
-        sampler = self.samplers[g]
-        while True:
-            live = [self.particles[i] for i in rows if not self.particles.done[i]]
-            if not live:
-                return
-            await sampler.round_start([p.context for p in live])
-            await asyncio.gather(*[self.step_row(p) for p in live])
-            self.round_boundary(g)
-
-
-
+    return particles

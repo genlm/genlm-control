@@ -80,40 +80,7 @@ class MultiTokenUnitSampler(TokenSampler):
         on the flattened context."""
         return await self.subunit_sampler.logw_eos(flatten_units(context))
 
-    async def transition(self, context):
-        """The controller-facing per-step transition for multi-token units.
-
-        Samples one multi-token unit and returns the list of items to append to
-        the particle context, the importance-weight increment, and the
-        log-probability of the random choices.
-
-        The context passed by the controller is the structured (possibly nested) unit
-        context; it is flattened before sampling so the subunit sampler sees a flat token
-        list. The trailing-EOS split (when a unit ends with EOS) is done by ``_to_append``.
-
-        Args:
-            context (list): The particle's structured unit context.
-
-        Returns:
-            (to_append, logw, logp): items to extend the context with, the
-                weight increment, and the log-probability of random choices.
-        """
-        flat_context = flatten_units(context)
-        unit, logw, logp = await self.sample(
-            flat_context, unit_context=context, draw=None
-        )
-        return self._to_append(unit), logw, logp
-
-    @staticmethod
-    def _to_append(unit):
-        """Controller ``to_append`` from a completed unit: if the unit ends with
-        EOS, split the content off and append EOS separately so ``context[-1] is
-        EOS`` (the terminal check fires); otherwise the unit is a single item."""
-        if unit and unit[-1] is EOS:
-            return ([unit[:-1]] if len(unit) > 1 else []) + [EOS]
-        return [unit]
-
-    async def sample(self, flat_token_context, unit_context=None, draw=None):
+    async def sample(self, context, draw=None):
         """Sample a multi-token unit by running sequence sampling for $\\varphi_{\\bm{x}}$.
         SIS for the localized potential:
 
@@ -122,10 +89,9 @@ class MultiTokenUnitSampler(TokenSampler):
         3. Return $(\\bm{s}, w)$ where $\\bm{s} \\in \\mathcal{B}^*$ forms unit $x \\in \\mathcal{A}$
 
         Args:
-            flat_token_context (list): Flat sequence of all previously sampled tokens.
-                This is pre-flattened by transition() to ensure compatibility with potentials.
-            unit_context (list, optional): Structured sequence of previously sampled units.
-                Used by boundary predicates that need context. Defaults to [].
+            context (list): The particle's structured (possibly nested) unit context.
+                It is flattened here so the subunit sampler sees a flat token list;
+                the structured form feeds the boundary predicate.
             draw (callable, optional): Sampling function passed to subunit_sampler
 
         Returns:
@@ -135,17 +101,15 @@ class MultiTokenUnitSampler(TokenSampler):
                     weighted w.r.t. $\\psi(x \\mid \\bm{x})$
                 - logp: Sum of log-probabilities of sampling choices
         """
-        if unit_context is None:
-            unit_context = []
+        unit_context = context
+        flat_context = list(flatten_units(context))
 
         buffer, logw, logp = [], 0.0, 0.0
-        context = list(flat_token_context)
-
         for _ in range(self.max_subunits_per_unit):
             subunit, logw_i, logp_i = await self.subunit_sampler.sample(
-                context, draw=draw
+                flat_context, draw=draw
             )
-            context.append(subunit)
+            flat_context.append(subunit)
             buffer.append(subunit)
             logw += logw_i
             logp += logp_i

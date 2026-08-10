@@ -1,4 +1,3 @@
-import logging
 import numpy as np
 from genlm.grammar import Float
 from genlm.control.util import logsumexp
@@ -8,10 +7,7 @@ from dataclasses import dataclass
 from genlm.control.potential import Potential
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.smc import Controller
-
-logger = logging.getLogger("genlm.control")
-
+from genlm.control.sampler.smc import SequenceModel, smc_standard
 
 class SMC:
     """This class implements sequential Monte Carlo (SMC) inference for controlled text generation.
@@ -80,7 +76,8 @@ class SMC:
         *,
         verbosity=0,
         json_path=None,
-        **kwargs,
+        resampling_method="multinomial",
+        terminate_when=None,
     ):
         """Generate sequences using sequential Monte Carlo inference.
 
@@ -101,30 +98,38 @@ class SMC:
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
-            **kwargs (dict): Additional keyword arguments to pass to the SMC controller.
-                Currently ``resampling_method`` (one of 'multinomial', 'stratified',
-                'systematic', 'residual'; defaults to 'multinomial').
+            resampling_method (str, optional): One of 'multinomial', 'stratified',
+                'systematic', 'residual'. Defaults to 'multinomial'.
+            terminate_when (callable, optional): ``context -> bool`` stop condition.
+                When it fires, EOS closes the sequence in that same step.
 
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
-        controller = Controller(
-            samplers=[self.unit_sampler],
-            critics=[self.critic],
-            group_sizes=[n_particles],
-            ess_threshold=ess_threshold,
+        assert max_tokens > 0
+        # A terminal-only critic has no per-step signal: reweight only at termination.
+        twist_with_critic = (
+            ess_threshold > 0
+            and self.critic is not None
+            and not self.critic.is_terminal_only()
+        )
+        model = SequenceModel(
+            unit_sampler=self.unit_sampler,
+            critic=self.critic,
             max_tokens=max_tokens,
-            twist_with_critic=ess_threshold > 0,
-            record=json_path is not None,
+            twist_with_critic=twist_with_critic,
+            terminate_when=terminate_when,
             verbosity=verbosity,
-            **kwargs,
         )
 
-        particles = await controller.run()
-
-        if json_path is not None:
-            controller.save_record(json_path)
+        particles = await smc_standard(
+            model=model,
+            n_particles=n_particles,
+            ess_threshold=ess_threshold,
+            resampling_method=resampling_method,
+            json_path=json_path,
+        )
 
         return Sequences(*_unpack_particles(particles))
 
@@ -146,50 +151,6 @@ class SMC:
         if self.critic:
             await self.critic.cleanup()
 
-    @classmethod
-    async def batched(
-        cls,
-        smcs,
-        n_particles,
-        ess_threshold,
-        max_tokens,
-        *,
-        verbosity=0,
-        **kwargs,
-    ):
-        """Run ``B = len(smcs)`` :class:`SMC` problems as one batched population.
-
-        ``smcs`` is a list of :class:`SMC` instances (each its own
-        ``unit_sampler`` + ``critic``). They run as B independent sub-populations
-        ("groups") of ``n_particles`` each in one ``Controller``; ESS / resample /
-        log_ml are computed per-group, so each group is statistically identical to
-        running that ``SMC`` alone (no cross-group coupling). Returns a list of B
-        :class:`Sequences`, one per problem, in ``smcs`` order.
-
-        Run params carry the same meaning as :meth:`__call__`.
-        """
-        B = len(smcs)
-        controller = Controller(
-            samplers=[s.unit_sampler for s in smcs],
-            critics=[s.critic for s in smcs],
-            group_sizes=[n_particles] * B,
-            ess_threshold=ess_threshold,
-            max_tokens=max_tokens,
-            twist_with_critic=ess_threshold > 0,
-            verbosity=verbosity,
-            **kwargs,
-        )
-        await controller.run()
-        seqs = [
-            Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
-            for rows in map(controller.group_rows, range(B))
-        ]
-        for s, record in zip(seqs, controller.records):
-            if record is not None:
-                s.record = record  # this group's own record stream
-        return seqs
-
-
 @dataclass
 class Sequences:
     """Container for sequence samples with their weights and probabilities.
@@ -200,7 +161,6 @@ class Sequences:
 
     Attributes:
         size (int): Number of sequences in the container.
-        logp (float): Sum of log probabilities across all sequences.
         log_total (float): Log of the sum of importance weights.
         log_ml (float): Log marginal likelihood estimate.
         log_normalized_weights (list): Log weights normalized to sum to 1.
@@ -316,7 +276,7 @@ def _unpack_particles(particles):
         list,
         zip(
             *[
-                (p.context, float("-inf") if np.isnan(p.logw) else p.logw)
+                (p.context, float("-inf") if np.isnan(p.weight) else p.weight)
                 for p in particles
             ]
         ),
