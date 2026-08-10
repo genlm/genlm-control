@@ -1,8 +1,8 @@
 """Per-scenario plots from a results store -> one SVG each.
 
 Reads ``results/<store>.jsonl`` (written by bench.py), and for every scenario draws
-a grouped bar chart: x = control version, bars = off / require / raw wall-clock,
-with the step/burst speedup annotated. Writes ``results/<store>__<scenario>.svg``.
+a grouped bar chart: x = control version, bars = smc / raw wall-clock, with the
+cross-version speedup annotated. Writes ``results/<store>__<scenario>.svg``.
 
     python benchmarks/plot_bench.py [store]   # default store: bench
 """
@@ -23,7 +23,7 @@ import numpy as np  # noqa: E402
 RESULTS = Path(__file__).resolve().parent / "results"
 VERSION_ORDER = ["main", "speedup-old", "speedup-now", "now-torch", "now-icdf",
                  "now-ondevice"]
-PATHS = ["off", "require", "raw"]
+PATHS = ["smc", "raw"]
 PATH_LABEL = {"off": "off (per-token)", "require": "require (burst)",
               "raw": "raw (vLLM ceiling)"}
 PATH_COLOR = {"off": "#7a7a7a", "require": "#2c7fb8", "raw": "#cccccc"}

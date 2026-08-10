@@ -13,49 +13,6 @@ from genlm.control.sampler.smc import Controller
 logger = logging.getLogger("genlm.control")
 
 
-class NotAcceleratable(Exception):
-    """Raised by ``accelerate="require"`` when the configuration cannot run with
-    engine lanes."""
-
-
-def _normalize_accelerate(accelerate):
-    """Map ``accelerate`` to the canonical "auto"/"off"/"require"; ``True``/``False``
-    alias "auto"/"off"."""
-    if accelerate is True:
-        return "auto"
-    if accelerate is False:
-        return "off"
-    if accelerate in ("auto", "off", "require"):
-        return accelerate
-    raise ValueError(
-        f"`accelerate` must be one of 'auto', 'off', 'require' (or True/False); "
-        f"got {accelerate!r}"
-    )
-
-
-async def _drive(controller, mode):
-    """Run the controller's loop, with lanes ("auto"/"require") or without
-    ("off"). Acceleration is whether rows hold engine lanes; the loop is the
-    same either way."""
-    if mode != "off":
-        from genlm.control.lane_runner import LaneRunner, lane_blocker
-
-        reason = lane_blocker(controller)
-        if reason is None:
-            if mode == "auto":
-                logger.info("running with engine lanes.")
-            return await controller.run(lanes=LaneRunner(controller))
-        if mode == "require":
-            raise NotAcceleratable(reason)
-        logger.info(
-            "running without engine lanes -- %s. "
-            'Pass accelerate="off" to silence, or accelerate="require" to make '
-            "this an error.",
-            reason,
-        )
-    return await controller.run()
-
-
 class SMC:
     """This class implements sequential Monte Carlo (SMC) inference for controlled text generation.
     The generation process works as follows:
@@ -121,7 +78,6 @@ class SMC:
         ess_threshold,
         max_tokens,
         *,
-        accelerate="auto",
         verbosity=0,
         json_path=None,
         **kwargs,
@@ -141,21 +97,6 @@ class SMC:
                 Sequences that haven't naturally sampled EOS by the boundary have EOS
                 deterministically appended, with an importance-weight correction so the
                 particles target the length-conditioned distribution.
-            accelerate (str | bool, optional): The single engine-acceleration knob,
-                keyword-only. One of:\n
-                - ``"auto"`` (default, also ``True``): run the engine-accelerated
-                  `BurstLoop` when the configuration is burst-capable, else the
-                  exact per-token `StepLoop`. Logs (INFO) which path ran, and on
-                  fallback the reason it was not accelerated.\n
-                - ``"off"`` (also ``False``): always run the exact per-token
-                  `StepLoop`, byte-reproducible given a seed.\n
-                - ``"require"``: run the engine path, or raise
-                  `NotAcceleratable` with the reason if not burst-capable.\n
-                Acceleration is vLLM-only for now; the engine is derived from the
-                sampler's `PromptedLLM`. The burst is statistically identical to
-                `"off"` (same target, unbiased weights) but not byte-identical
-                (warm-KV residual + batched-draw RNG); use `"off"` for exact
-                reproducibility.
             verbosity (int, optional): Verbosity level for the SMC algorithm. 0 is silent, 1 prints the
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
@@ -167,13 +108,7 @@ class SMC:
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
-
-        Raises:
-            NotAcceleratable: If ``accelerate="require"`` but the configuration is
-                not burst-capable.
         """
-        mode = _normalize_accelerate(accelerate)
-
         controller = Controller(
             samplers=[self.unit_sampler],
             critics=[self.critic],
@@ -186,7 +121,7 @@ class SMC:
             **kwargs,
         )
 
-        particles = await _drive(controller, mode)
+        particles = await controller.run()
 
         if json_path is not None:
             controller.save_record(json_path)
@@ -219,7 +154,6 @@ class SMC:
         ess_threshold,
         max_tokens,
         *,
-        accelerate="auto",
         verbosity=0,
         **kwargs,
     ):
@@ -232,11 +166,7 @@ class SMC:
         running that ``SMC`` alone (no cross-group coupling). Returns a list of B
         :class:`Sequences`, one per problem, in ``smcs`` order.
 
-        Run params and ``accelerate`` carry the same meaning as
-        :meth:`__call__`; the burst lane needs the batch to be burst-homogeneous
-        (one shared forward over all B*N rows -- see
-        :func:`~genlm.control.sampler.burst._batch_blocker`), else it falls
-        back to the exact per-token loop.
+        Run params carry the same meaning as :meth:`__call__`.
         """
         B = len(smcs)
         controller = Controller(
@@ -249,7 +179,7 @@ class SMC:
             verbosity=verbosity,
             **kwargs,
         )
-        await _drive(controller, _normalize_accelerate(accelerate))
+        await controller.run()
         seqs = [
             Sequences(*_unpack_particles([controller.particles[i] for i in rows]))
             for rows in map(controller.group_rows, range(B))

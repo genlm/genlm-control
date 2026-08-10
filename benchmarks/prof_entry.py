@@ -1,9 +1,9 @@
 """cProfile a single scenario's SMC run -> merged .pstats -> gprof2dot call-graph SVG.
 
 Reuses bench.py's scenario builders (direct/awrs/set/lora/cot/ds1000), so the
-profiled path is exactly the benchmarked one. Captures BOTH threads and merges:
-the burst's vLLM decode loop runs in a worker thread (``run_burst``) that a plain
-main-thread cProfile would miss; the SMC driver + awaited critics run on the loop.
+profiled path is exactly the benchmarked one. Captures every thread and merges:
+the engine crank turns on a worker thread that a plain main-thread cProfile would
+miss; the SMC loop + awaited critics run on the event loop.
 
 CAVEAT: CUDA is async -- the engine forward queues on the GPU stream and returns;
 its time is attributed to whichever CPU frame first synchronizes on the result
@@ -11,8 +11,8 @@ its time is attributed to whichever CPU frame first synchronizes on the result
 
 Run on the box (writes <out>.pstats and, unless --no-svg, <out>.svg):
   VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-    python benchmarks/prof_entry.py --scenario direct --mode burst \
-      --model Qwen/Qwen2.5-7B-Instruct --out results/prof__direct__burst
+    python benchmarks/prof_entry.py --scenario direct \
+      --model Qwen/Qwen2.5-7B-Instruct --out results/prof__direct
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ import argparse
 import asyncio
 import cProfile
 import pstats
-import shutil
 import subprocess
+import threading
 
 import bench
 import bench_core as bc
@@ -34,7 +34,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scenario",
                    choices=["direct", "awrs", "set", "lora", "cot", "ds1000"],
                    default="direct")
-    p.add_argument("--mode", choices=["burst", "step"], default="burst")
     p.add_argument("--out", required=True, help="output path stem (.pstats/.svg appended)")
     p.add_argument("--no-svg", action="store_true", help="write .pstats only")
     # scenario knobs (mirror bench.py; the sampler/critic LOGIC is reused from bench)
@@ -80,44 +79,46 @@ def main() -> None:
     if post_engine:
         post_engine(model)
     built = bench.scenario_build(args, model)
-    accelerate = "require" if args.mode == "burst" else "off"
 
     async def run():
         bc.seed_all(args.seed)
         await SMC(built.sampler, critic=built.critic)(
             n_particles=args.n_particles, ess_threshold=args.ess_threshold,
-            max_tokens=args.max_tokens, accelerate=accelerate)
+            max_tokens=args.max_tokens)
 
     asyncio.run(run())  # warmup (untimed, unprofiled): cold prefill / CUDA graphs
 
-    # worker-thread profiler: the burst decode loop runs in the run_burst executor target
-    worker_prof = cProfile.Profile()
-    if args.mode == "burst":
-        _orig = model.run_burst
+    # Every worker thread the run spawns gets its own profiler; the engine crank
+    # lives on one of them, and threading.setprofile only affects threads started
+    # after it is installed.
+    worker_profs: list[cProfile.Profile] = []
+    lock = threading.Lock()
 
-        def _wrapped(*a, **k):
-            worker_prof.enable()
-            try:
-                return _orig(*a, **k)
-            finally:
-                worker_prof.disable()
+    def profile_thread(*_):
+        prof = cProfile.Profile()
+        with lock:
+            worker_profs.append(prof)
+        prof.enable()
+        threading.settrace(None)
 
-        model.run_burst = _wrapped
+    threading.setprofile(profile_thread)
 
     main_prof = cProfile.Profile()
     main_prof.enable()
     asyncio.run(run())
     main_prof.disable()
+    threading.setprofile(None)
+    for prof in worker_profs:
+        prof.disable()
 
     main_prof.dump_stats(args.out + ".main.pstats")
-    if args.mode == "burst":
-        worker_prof.dump_stats(args.out + ".worker.pstats")
-        merged = pstats.Stats(args.out + ".main.pstats")
-        merged.add(args.out + ".worker.pstats")
-        merged.dump_stats(args.out + ".pstats")
-    else:
-        shutil.copy(args.out + ".main.pstats", args.out + ".pstats")
-    print(f"wrote {args.out}.pstats")
+    merged = pstats.Stats(args.out + ".main.pstats")
+    for i, prof in enumerate(worker_profs):
+        path = f"{args.out}.worker{i}.pstats"
+        prof.dump_stats(path)
+        merged.add(path)
+    merged.dump_stats(args.out + ".pstats")
+    print(f"wrote {args.out}.pstats ({len(worker_profs)} worker threads merged)")
 
     asyncio.run(built.sampler.cleanup())
 

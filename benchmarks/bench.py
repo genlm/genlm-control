@@ -1,10 +1,10 @@
 """Unified speedup benchmark: one modular harness over every SMC pattern the
-engine-native burst targets, with neatly persisted per-version results.
+engine-served SMC, with neatly persisted per-version results.
 
-Supersedes the scattered scripts (``bench_burst.py`` direct/awrs/set + raw ceiling;
+Supersedes the scattered scripts (direct/awrs/set + raw ceiling;
 genlm-latent's ``bench_latent_estep.py`` CoT and ``bench_ds1000_estep.py`` exec
 critic) and adds the previously-unbenchmarked LoRA K=2 multi-view scenario. Each
-scenario plugs a (sampler, critic, prompt) into the shared off/require/raw matrix
+scenario plugs a (sampler, critic, prompt) into the shared smc/raw matrix
 in ``bench_core``; nothing scenario-specific lives in the harness.
 
 Scenarios
@@ -50,7 +50,7 @@ LORA_ADAPTER = "qiaw99/Qwen2.5-7B-Instruct-LogiQA-DPO-D"
 def _terminal_critic(vocab):
     """Synthetic 0/-inf terminal indicator (completed text contains a space) -- a
     cheap, deterministic stand-in for a real answer/exec critic, all weight at
-    termination (the ess=0 regime the burst is built for)."""
+    termination (the ess=0 regime engine serving is built for)."""
     from genlm.control.constant import EndOfSequence
     from genlm.control.potential import Potential
 
@@ -134,10 +134,10 @@ def scenario_build(args, model) -> Built:
 
     if s == "synth":
         # A context-only potential with a DIAL on its per-call cost. Sweeping that
-        # against a fixed forward is what places a real potential on the curve: the
-        # burst can only hide host work behind the GPU, so the ratio is the whole
-        # story. Pure-Python burn, because genlm's real potentials (trie/WFSA walks)
-        # hold the GIL the same way.
+        # against a fixed forward is what places a real potential on the curve:
+        # engine serving can only hide host work behind the GPU, so the ratio is the
+        # whole story. Pure-Python burn, because genlm's real potentials (trie/WFSA
+        # walks) hold the GIL the same way.
         from genlm.control.potential.base import Potential, VocabTables
 
         class SynthPotential(Potential):
@@ -277,8 +277,8 @@ def parse_args():
     p.add_argument("--label", default="dev",
                    help="version key for the results store (main/speedup-old/speedup-now)")
     p.add_argument("--store", default="bench", help="results store name (results/<store>.jsonl)")
-    p.add_argument("--paths", default="off,require,raw",
-                   help="comma list of off|require|raw to run")
+    p.add_argument("--paths", default="smc,raw",
+                   help="comma list of smc|raw to run")
     p.add_argument("--n-particles", type=int, default=16)
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--ess-threshold", type=float, default=0.0)
@@ -298,9 +298,9 @@ def parse_args():
                    help="HF LoRA adapter for the lora scenario (base model + rank read from it)")
     p.add_argument("--draw", default="gumbel_max",
                    choices=["gumbel_max", "multinomial", "inverse_cdf"],
-                   help="token picker (set_draw_method); process-wide, affects off + burst")
+                   help="token picker (set_draw_method); process-wide")
     p.add_argument("--critic-split", action="store_true",
-                   help="extra no-critic require run -> isolate critic vs rollout time")
+                   help="extra no-critic run -> isolate critic vs rollout time")
     # cot / ds1000
     p.add_argument("--question", default=(
         "Natalia sold clips to 48 of her friends in April, and then she sold half "
@@ -322,7 +322,7 @@ async def main():
     if args.draw != "gumbel_max":
         from genlm.control.util import set_draw_method
 
-        set_draw_method(args.draw)  # process-wide picker; affects off + burst
+        set_draw_method(args.draw)  # process-wide picker
 
     model_name, engine_opts, post_engine = scenario_engine(args)
     args.model = model_name  # so cfg/tokenizer use the resolved (lora base) name
@@ -332,23 +332,22 @@ async def main():
 
     built = scenario_build(args, model)
     version, env = bc.version_tag(args.label), bc.env_tag()
-    has_accel = bc.accelerate_supported()
 
     want = [p.strip() for p in args.paths.split(",") if p.strip()]
     print("=" * 72)
     print(f"scenario={args.scenario} model={model_name} N={args.n_particles} "
-          f"max_tokens={args.max_tokens} label={args.label} accel_api={has_accel}")
+          f"max_tokens={args.max_tokens} label={args.label}")
     print(f"config={built.config}")
 
-    async def smc_run(path):
+    async def smc_run():
         return await bc.run_smc(
-            built.sampler, built.critic, path=path, n_particles=args.n_particles,
+            built.sampler, built.critic, n_particles=args.n_particles,
             max_tokens=args.max_tokens, ess_threshold=args.ess_threshold, seed=args.seed)
 
     for path in want:
         try:
             if path == "raw":
-                if not (built.supports_raw and has_accel):
+                if not built.supports_raw:
                     print("  raw      : skipped (no engine ceiling on this version)")
                     continue
 
@@ -368,15 +367,15 @@ async def main():
                 print(f"  raw      : {med:7.3f}s  (engine decode ceiling)")
                 continue
 
-            med, last, dts = await bc.trials(lambda: smc_run(path),
+            med, last, dts = await bc.trials(lambda: smc_run(),
                                              n_warmup=args.n_warmup, n_trials=args.n_trials)
             mean_len = float(np.mean([len(c) for c in last.contexts]))
             extra = {"draw": args.draw}
-            if path == "require" and args.critic_split and built.critic is not None:
-                # rollout-only require (drop the critic) -> critic_s = with - without
+            if args.critic_split and built.critic is not None:
+                # rollout-only run (drop the critic) -> critic_s = with - without
                 base_critic = built.critic
                 built.critic = None
-                nc_med, _, _ = await bc.trials(lambda: smc_run("require"),
+                nc_med, _, _ = await bc.trials(lambda: smc_run(),
                                                n_warmup=0, n_trials=args.n_trials)
                 built.critic = base_critic
                 extra.update(rollout_s=nc_med, critic_s=med - nc_med)
@@ -384,21 +383,12 @@ async def main():
                 scenario=args.scenario, config=built.config, path=path,
                 dt_median=med, dt_all=dts, version=version, env=env,
                 log_ml=float(last.log_ml), mean_len=mean_len, extra=extra))
-            tag = {"off": "StepLoop", "require": "BurstLoop"}[path]
-            line = f"  {path:<8} : {med:7.3f}s  ({tag})  log_ml={last.log_ml:+.4f}  mean_len={mean_len:.1f}"
+            line = f"  {path:<8} : {med:7.3f}s  log_ml={last.log_ml:+.4f}  mean_len={mean_len:.1f}"
             if "rollout_s" in extra:
                 line += f"  [rollout={extra['rollout_s']:.3f}s critic={extra['critic_s']:.3f}s]"
             print(line)
         except bc._Unsupported as e:
             print(f"  {path:<8} : skipped ({e})")
-        except Exception as e:
-            # A burst-capable API can still refuse a specific sampler (e.g. Set
-            # before it was engine-accelerated) -> NotAcceleratable. Record as a
-            # clean skip rather than crashing the whole scenario.
-            if type(e).__name__ == "NotAcceleratable":
-                print(f"  {path:<8} : skipped (not accelerated: {e})")
-            else:
-                raise
 
     await built.sampler.cleanup()
     print("=" * 72)

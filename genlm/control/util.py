@@ -357,8 +357,8 @@ def inverse_cdf(logps):
 
 # --- counter-based (device/order-independent) noise ---
 # Picker noise is a pure function of an explicit (seed, slot, step) key, not a shared RNG
-# stream: threefry-2x32 in torch int64 is bit-identical CPU/CUDA, so lane (GPU) and plain
-# (CPU) draw the SAME noise. Key in scope via the ``draw_key`` ContextVar; unkeyed -> torch.rand.
+# stream: threefry-2x32 in torch int64 is bit-identical CPU/CUDA, so GPU and CPU runs
+# draw the SAME noise. Key in scope via the ``draw_key`` ContextVar; unkeyed -> torch.rand.
 
 _DRAW_KEY = contextvars.ContextVar("draw_key", default=None)  # (slot, [next_ordinal]) | None
 _DRAW_SEED = 0  # base seed; set by set_draw_seed (mirror of seed_all's seed)
@@ -505,17 +505,9 @@ def set_draw_method(method):
 async def draw_from(lazyweights, draw=None):
     """Normalize, draw, and read back the drawn token's log-prob: ``(token, logZ, logp)``,
     where ``logZ`` is the row's normalizer. THE draw seam -- every sampler that draws from a
-    distribution wants exactly these three steps, so under a lane binding they happen once
-    for the collector's parked cohort rather than once per row (~30x cheaper batched). A
-    sampler needing something else (AWRS's rejection over unnormalized weights) does not call
-    this. A caller-supplied ``draw`` is a user picker, so it stays per row."""
-    from genlm.control.lane_seam import collector, current_binding
-
-    if current_binding() is not None and draw is None:
-        slot, ctr = _DRAW_KEY.get()
-        step = ctr[0]
-        ctr[0] = step + 1
-        return await collector().submit(lazyweights, slot, step)
+    distribution wants exactly these three steps. A sampler needing something else (AWRS's
+    rejection over unnormalized weights) does not call this. A caller-supplied ``draw`` is
+    a user picker."""
     logZ = lazyweights.sum()
     logps = lazyweights.spawn(lazyweights.weights - logZ)
     token = select(logps) if draw is None else draw(logps.exp().materialize())
@@ -525,19 +517,7 @@ async def draw_from(lazyweights, draw=None):
 async def draw_reweighted(proposal_logws, target_logws, draw=None):
     """Importance-sampling draw: sample from ``proposal_logws``, weight by
     target/proposal — ``(token, logw, logp)`` with ``logw = target[token] - logp``
-    (the proposal lookup is algebraically the returned ``logp``). Under a lane
-    binding the target lookup rides the collector's crossing as a companion
-    gather; no per-row device sync."""
-    from genlm.control.lane_seam import collector, current_binding
-
-    if current_binding() is not None and draw is None:
-        slot, ctr = _DRAW_KEY.get()
-        step = ctr[0]
-        ctr[0] = step + 1
-        token, _, logp, tval = await collector().submit(
-            proposal_logws, slot, step, companion=target_logws
-        )
-        return token, tval - logp, logp
+    (the proposal lookup is algebraically the returned ``logp``)."""
     token, _, logp = await draw_from(proposal_logws, draw)
     return token, target_logws[token] - logp, logp
 

@@ -1,15 +1,14 @@
-"""Gate-2 LoRA: K=2 multi-view burst with q=LoRA / p0=base on ONE engine.
+"""Gate-2 LoRA: K=2 multi-view with q=LoRA / p0=base on ONE vLLM engine.
 
-The proposal q and prior p0 are two ``PromptedLLM``s on the same vLLM engine differing
-only by adapter (q carries a LoRA, p0 is base). The burst submits two substreams per
-particle -- q's with the adapter, p0's without -- via per-request LoRA, injects both
-warm logit views, and reweights by ``p0/q``.
+The proposal q and prior p0 are two ``PromptedLLM``s on the same engine differing only by
+adapter (q carries a LoRA, p0 is base), so per-request LoRA has to reach each view
+independently; draws come from q and are reweighted by ``p0/q``. The reference is the same
+run over a HuggingFace ``AsyncTransformer`` carrying the same adapter.
 
 Requires CUDA + vLLM + a downloadable SmolLM LoRA adapter. (The backend forces the V1
 engine in-process at import; vLLM's V1 multiprocessing engine-core deadlocks on LoRA.)
 """
 
-import asyncio
 import json
 import os
 
@@ -18,27 +17,32 @@ import pytest
 
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():  # pragma: no cover
-    pytest.skip("LoRA burst needs CUDA + vLLM", allow_module_level=True)
+    pytest.skip("LoRA multi-view needs CUDA + vLLM", allow_module_level=True)
 
 from huggingface_hub import snapshot_download  # noqa: E402
 from genlm.backend.llm.vllm import AsyncVirtualLM  # noqa: E402
+from genlm.backend.llm.hf import AsyncTransformer  # noqa: E402
 from genlm.control.potential.built_in.llm import PromptedLLM  # noqa: E402
 from genlm.control.sampler.token import DirectTokenSampler  # noqa: E402
-from genlm.control.sampler.smc import Controller  # noqa: E402
-from genlm.control.lane_runner import LaneRunner, lane_blocker  # noqa: E402
-from genlm.control.sampler.sequence import Sequences, _unpack_particles  # noqa: E402
-from _harness import seed_all  # noqa: E402
+from _harness import run_case  # noqa: E402
 
 ADAPTER = "farpluto/SmolLM-135M-Instruct-Finetune-LoRA"
 EOS = [b"\n"]
 
 
 @pytest.fixture(scope="module")
-def lora_model():
+def adapter():
+    """(local adapter path, base model id) for ``ADAPTER``."""
     path = snapshot_download(ADAPTER)
     base = json.load(open(os.path.join(path, "adapter_config.json")))[
         "base_model_name_or_path"
     ]
+    return path, base
+
+
+@pytest.fixture(scope="module")
+def lora_model(adapter):
+    path, base = adapter
     m = AsyncVirtualLM.from_name(
         base,
         engine_opts={
@@ -54,60 +58,54 @@ def lora_model():
     return m
 
 
-def _run(model, q_lora_name, seed, lanes_on):
-    seed_all(seed)
+@pytest.fixture(scope="module")
+def ref_model(adapter):
+    """The reference backend: the same base + adapter behind plain per-context forwards."""
+    path, base = adapter
+    m = AsyncTransformer.from_name(base)
+    m.add_new_lora(path, "vk")
+    return m
+
+
+def _run(model, q_lora_name, seed):
+    """One K=2 multi-view run on ``model``: q under ``q_lora_name``, p0 base."""
     prompt_ids = model.tokenizer.encode("The capital of France is")
-    p0 = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS)
-    q = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS, lora_name=q_lora_name)
-    controller = Controller(
-        samplers=[DirectTokenSampler(potential=p0, proposal=q)],
-        critics=[None],
-        group_sizes=[8],
-        ess_threshold=0.0,
-        max_tokens=12,
-        twist_with_critic=False,
-    )
-    if lanes_on:
-        assert lane_blocker(controller) is None, lane_blocker(controller)
-        runner = LaneRunner(controller)
-        parts = asyncio.run(controller.run(lanes=runner))
-        return 1, float(Sequences(*_unpack_particles(parts)).log_ml)
-    parts = asyncio.run(controller.run())
-    return 0, float(Sequences(*_unpack_particles(parts)).log_ml)
+
+    def make():
+        p0 = PromptedLLM(model, prompt_ids=prompt_ids, eos_byte_strings=EOS)
+        q = PromptedLLM(
+            model, prompt_ids=prompt_ids, eos_byte_strings=EOS, lora_name=q_lora_name
+        )
+        return DirectTokenSampler(potential=p0, proposal=q)
+
+    return run_case(make, 8, 0.0, 12, seed)["log_ml"]
 
 
-def test_lora_proposal_burst_applies_adapter(lora_model):
-    """q=LoRA / p0=base on one engine -> K=2 multi-view burst. The config bursts, and
-    the adapter materially changes the draw (q=LoRA vs q=base diverge), proving the
-    per-request LoRA flows through the burst per view. (q=base is the degenerate q==p0
-    case -> log_ml 0; q=LoRA picks up a non-trivial p0/q correction.)"""
-    nb_lora, ml_lora = _run(lora_model, "vk", 1234, True)
-    nb_base, ml_base = _run(lora_model, None, 1234, True)
-    assert nb_lora > 0 and nb_base > 0, f"did not burst: lora={nb_lora} base={nb_base}"
+def test_lora_proposal_applies_adapter(lora_model):
+    """The adapter materially changes the draw: q=LoRA vs q=base diverge, so per-request
+    LoRA reaches the proposal view. (q=base is the degenerate q==p0 case -> log_ml 0;
+    q=LoRA picks up a non-trivial p0/q correction.)"""
+    ml_lora = _run(lora_model, "vk", 1234)
+    ml_base = _run(lora_model, None, 1234)
     assert abs(ml_lora - ml_base) > 1e-6, (
-        f"adapter had no effect on the burst draw: log_ml lora={ml_lora} base={ml_base}"
+        f"adapter had no effect on the draw: log_ml lora={ml_lora} base={ml_base}"
     )
 
 
-def test_lora_proposal_burst_vs_steploop(lora_model):
-    """The real target: q=LoRA / p0=base K=2 multi-view lane run vs the plain loop (which
-    applies q's adapter via slow-path per-view LoRA). Unbiased log_ml across seeds
-    (warm-KV residual only) -- validates the LoRA burst's correctness, not just that
+def test_lora_proposal_unbiased(lora_model, ref_model):
+    """q=LoRA / p0=base K=2 multi-view on the engine vs the same run over plain forwards.
+    Unbiased log_ml across seeds -- validates the LoRA path's correctness, not just that
     the adapter is wired."""
     seeds = (1234, 7, 99, 2024, 555, 31)
-    diffs, n_bursts = [], 0
+    diffs = []
     for seed in seeds:
-        nb, ml_burst = _run(lora_model, "vk", seed, True)
-        _, ml_slow = _run(lora_model, "vk", seed, False)
-        diffs.append(ml_burst - ml_slow)
-        n_bursts = max(n_bursts, nb)
+        diffs.append(_run(lora_model, "vk", seed) - _run(ref_model, "vk", seed))
     diffs = np.array(diffs)
     sem = diffs.std() / np.sqrt(len(diffs))
     print(
-        f"\nlora burst vs steploop over {len(seeds)} seeds: "
+        f"\nlora engine vs forwards over {len(seeds)} seeds: "
         f"log_ml diff mean={diffs.mean():+.4f} sem={sem:.4f}"
     )
-    assert n_bursts > 0, "did not burst"
     assert abs(diffs.mean()) <= max(0.3, 2.5 * sem), (
-        f"lora lane log_ml biased vs plain loop: mean {diffs.mean():+.4f} (sem {sem:.4f})"
+        f"lora log_ml biased vs plain forwards: mean {diffs.mean():+.4f} (sem {sem:.4f})"
     )

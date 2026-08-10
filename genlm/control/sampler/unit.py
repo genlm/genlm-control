@@ -71,16 +71,6 @@ class MultiTokenUnitSampler(TokenSampler):
         self.boundary_predicate = boundary_predicate
         self.max_subunits_per_unit = max_subunits_per_unit
 
-    def lane_draw_sampler(self):
-        # The subunit does the per-step draw, so recurse to its draw sampler.
-        return self.subunit_sampler.lane_draw_sampler()
-
-
-    def lane_max_steps(self, live) -> int:
-        # One unit's worth of subunit decode steps (+1 margin); the control-side reject at
-        # ``max_subunits_per_unit`` fires before this engine cap.
-        return self.max_subunits_per_unit + 1
-
     async def start_weight(self):
         """Return $\\overrightarrow{\\psi}(\\epsilon)$ (prefix weight of empty sequence)."""
         return await self.subunit_sampler.start_weight()
@@ -116,10 +106,9 @@ class MultiTokenUnitSampler(TokenSampler):
 
     @staticmethod
     def _to_append(unit):
-        """Controller ``to_append`` from a completed unit, shared by the slow
-        ``transition`` and the burst: if the unit ends with EOS, split the content off
-        and append EOS separately so ``context[-1] is EOS`` (the terminal check fires);
-        otherwise the unit is a single item."""
+        """Controller ``to_append`` from a completed unit: if the unit ends with
+        EOS, split the content off and append EOS separately so ``context[-1] is
+        EOS`` (the terminal check fires); otherwise the unit is a single item."""
         if unit and unit[-1] is EOS:
             return ([unit[:-1]] if len(unit) > 1 else []) + [EOS]
         return [unit]

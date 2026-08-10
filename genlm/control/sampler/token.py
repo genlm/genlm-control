@@ -5,7 +5,6 @@ from arsenal import colors
 from arsenal.maths import log1mexp
 import warnings
 
-from genlm.control.potential.built_in.llm import find_engine_lm
 from genlm.control.util import (
     draw_from,
     draw_reweighted,
@@ -42,31 +41,6 @@ class TokenSampler:
     def __init__(self, target):
         self.target = target
         self.token_type = self.target.token_type
-
-    def lane_draw_sampler(self):
-        """The sampler whose ``target``/``proposal`` are the injected views: ``self``
-        at token grain; a unit sampler delegates to its subunit."""
-        return self
-
-    def lane_views(self):
-        """The LM views that hold lanes for this sampler: the draw sampler's target
-        leaf, then its proposal's when it has one. A slot is ``None`` when that
-        potential has no single lane-capable engine leaf.
-
-        One lane per DISTINCT leaf: target and proposal built over the same
-        ``PromptedLLM`` are one engine request serving both reads, never two identical
-        ones. Distinct instances over the same model still get a lane each -- their
-        prompts and adapters are per-instance."""
-        s = self.lane_draw_sampler()
-        views = [find_engine_lm(s.target)]
-        if s.proposal is not None:
-            views.append(find_engine_lm(s.proposal))
-        return list(dict.fromkeys(views))
-
-
-    def lane_max_steps(self, live) -> int:
-        """Engine decode-step budget for one row's run. The unit sampler overrides."""
-        return max(p.max_tokens_left for p in live) + 1
 
     async def round_start(self, contexts):
         """Population hook before a round's draws: this sampler's group's live contexts.
@@ -122,8 +96,6 @@ class TokenSampler:
         ess_threshold,
         max_tokens,
         critic=None,
-        *,
-        accelerate="auto",
         **kwargs,
     ):
         """Generate sequences using sequential Monte Carlo (SMC) inference with this token sampler and an optional critic.
@@ -137,10 +109,6 @@ class TokenSampler:
             max_tokens (int): The maximum number of tokens to generate.
             critic (Potential, optional): A potential function that guides the generation process
                 by scoring candidate sequences. Must have the same token type as the token sampler.
-            accelerate (str | bool, optional): Engine-acceleration knob forwarded to
-                `SMC.__call__`: ``"auto"`` (default), ``"off"`` (force per-token), or
-                ``"require"`` (engine or raise `NotAcceleratable`). ``True``/``False``
-                alias ``"auto"``/``"off"``.
             **kwargs (dict): Additional keyword arguments to pass to `SMC`'s `__call__` method.
         """
         from genlm.control.sampler.sequence import SMC
@@ -149,7 +117,6 @@ class TokenSampler:
             n_particles=n_particles,
             ess_threshold=ess_threshold,
             max_tokens=max_tokens,
-            accelerate=accelerate,
             **kwargs,
         )
 

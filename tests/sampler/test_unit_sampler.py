@@ -660,7 +660,7 @@ async def test_round_start_receives_live_population_once_per_round():
         max_subunits_per_unit=4,
     )
     particles = await SMC(unit_sampler)(
-        n_particles=3, ess_threshold=0.0, max_tokens=3, accelerate="off"
+        n_particles=3, ess_threshold=0.0, max_tokens=3
     )
 
     assert unit_sampler.rounds, "round_start never fired"

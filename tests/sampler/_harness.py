@@ -9,10 +9,10 @@ gate, its generator, and the other gate -- drift here is a silent false-green.
   nested unit lists and map EOS to a sentinel.
 - ``load_snapshot`` : load a reference snapshot, optionally enforcing a ``__config__``.
 - ``assert_unbiased`` : the ``|mean| <= max(floor, k*sem)`` no-bias check gate-2 repeats.
-- ``make_controller`` / ``run_burst`` / ``run_steploop`` / ``compare_runs`` / ``log`` :
-  the engine-agnostic run+compare loop. Shared by every no-bias gate, one per engine
-  (vLLM in ``test_engine_native.py``, MLX in ``test_engine_mlx.py``); only the engine
-  behind the ``PromptedLLM`` and the choice of reference differ.
+- ``make_controller`` / ``run_case`` / ``compare_runs`` / ``log`` : the engine-agnostic
+  run+compare loop. There is ONE control path; a gate compares the case served by the
+  engine under test against a reference (a cached snapshot, or the same case served by
+  a plain-forward backend).
 """
 
 import json
@@ -139,7 +139,7 @@ def make_controller(make_sampler, n_particles, ess_threshold, max_tokens, make_c
     )
 
 
-def _result(controller, parts, wall, n_lane_rows):
+def _result(controller, parts, wall):
     from genlm.control.sampler.sequence import Sequences, _unpack_particles
 
     seq = Sequences(*_unpack_particles(parts))
@@ -148,60 +148,32 @@ def _result(controller, parts, wall, n_lane_rows):
         "logw": [float(p.logw) for p in parts],
         "log_ml": float(seq.log_ml),
         "wall": wall,
-        "n_bursts": n_lane_rows,  # lane rows opened; >0 proves the lane path ran
         "n_resamples": controller.n_resamples,
     }
 
 
-def run_burst(make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None):
-    """One engine-accelerated (lanes-on) run at ``seed``."""
-    import asyncio
-
-    from genlm.control.lane_runner import LaneRunner, lane_blocker
-
-    seed_all(seed)
-    controller = make_controller(
-        make_sampler, n_particles, ess_threshold, max_tokens, make_critic
-    )
-    reason = lane_blocker(controller)
-    assert reason is None, f"lane path unavailable: {reason}"
-    runner = LaneRunner(controller)
-    opened = 0
-    _open = runner.open_row
-
-    def counting_open(p):
-        nonlocal opened
-        opened += 1
-        _open(p)
-
-    runner.open_row = counting_open
-    t0 = time.perf_counter()
-    parts = asyncio.run(controller.run(lanes=runner))
-    return _result(controller, parts, time.perf_counter() - t0, opened)
-
-
-def run_steploop(
+def run_case(
     make_sampler, n_particles, ess_threshold, max_tokens, seed, make_critic=None
 ):
-    """Same as :func:`run_burst` but lanes-off (``accelerate="off"`` ground truth,
-    gate-1-pinned == original) -- the live reference for configs with no cached
-    snapshot, and RNG-matched to the lane path so the paired diff is tight."""
+    """One run at ``seed``. Which engine serves it is decided by the potentials the
+    sampler factory builds over -- the control path is the same either way."""
     import asyncio
 
     seed_all(seed)
     controller = make_controller(
         make_sampler, n_particles, ess_threshold, max_tokens, make_critic
     )
+    t0 = time.perf_counter()
     parts = asyncio.run(controller.run())
-    return _result(controller, parts, 0.0, 0)
+    return _result(controller, parts, time.perf_counter() - t0)
 
 
 @pytest.fixture(scope="module", autouse=True)
 def threefry_draw():
-    """RNG-match burst<->StepLoop via the counter-based picker, so a comparison is a tight
-    paired check (warm-KV residual only) rather than divergent-path MC noise. Import it
-    into a no-bias gate module to arm it there; gate-1 must never see it, since its
-    llamppl reference cannot set draw keys and has to stay on ``gumbel_max``."""
+    """RNG-match run<->reference via the counter-based picker, so a comparison is a tight
+    paired check (engine numeric residual only) rather than divergent-path MC noise.
+    Import it into a no-bias gate module to arm it there; gate-1 must never see it, since
+    its llamppl reference cannot set draw keys and has to stay on ``gumbel_max``."""
     from genlm.control.util import set_draw_method
 
     set_draw_method("threefry_gumbel")
@@ -209,66 +181,63 @@ def threefry_draw():
     set_draw_method("gumbel_max")
 
 
-def live_steploop_ref(case, seed, make, mkc):
-    """A StepLoop at this seed on the engine under test -- the reference for a gate with
-    no cached snapshot of its own."""
-    return run_steploop(make, case.n_particles, case.ess, case.max_tokens, seed, mkc)
+def live_ref_factory(ref_llm):
+    """Reference resolver running each case live on ``ref_llm`` -- a ``PromptedLLM`` over
+    a second backend, so the comparison measures the engine under test, not the loop."""
+
+    def resolve(case, seed, make, mkc):
+        return run_case(
+            lambda: case.sampler(ref_llm, seed),
+            case.n_particles,
+            case.ess,
+            case.max_tokens,
+            seed,
+            (lambda: case.critic(ref_llm)) if case.make_critic is not None else None,
+        )
+
+    return resolve
 
 
 def assert_case_unbiased(
     case,
     llm,
     prompt,
-    resolve_ref=live_steploop_ref,
+    resolve_ref,
     *,
     ml_floor=0.3,
     ml_k=2.5,
     len_bound=None,
     len_k=None,
     need_resample=False,
-    need_rounds=False,
 ):
-    """Drive one ``gate2_cases`` case and assert the burst is unbiased against a reference.
+    """Drive one ``gate2_cases`` case on ``llm`` and assert it is unbiased against
+    ``resolve_ref(case, seed, make_sampler, make_critic)``.
 
-    Per seed: burst vs ``resolve_ref(case, seed, make_sampler, make_critic)``, accumulate
-    the log_ml + length diffs, then assert the MEAN log_ml diff is within sampling noise
-    of 0. ``len_bound`` bounds the mean length gap (sem-aware if ``len_k`` given, else
-    absolute). ``need_resample`` / ``need_rounds`` guard that the resample / per-unit-round
-    path actually fired (no vacuous pass); an ``n_bursts>0`` guard always runs.
-
-    ``resolve_ref`` is the only engine-specific part: vLLM reads cached snapshots where it
-    has them, everything else runs live.
+    Per seed: run vs reference, accumulate the log_ml + length diffs, then assert the
+    MEAN log_ml diff sits within sampling noise of 0. ``len_bound`` bounds the mean
+    length gap (sem-aware if ``len_k`` given, else absolute). ``need_resample`` guards
+    that the resample path actually fired (no vacuous pass).
     """
-    from genlm.control.lane_runner import lane_blocker
-
     c = case
     floor = c.match_floor
     llm.set_prompt_from_str(prompt)
     mkc = (lambda: c.critic(llm)) if c.make_critic is not None else None
-    blocker = lane_blocker(
-        make_controller(
-            lambda: c.sampler(llm, c.seeds[0]), c.n_particles, c.ess, c.max_tokens, mkc
-        )
-    )
-    assert blocker is None, f"{c.label}: not acceleratable -- {blocker}"
     diffs, len_gaps, matches = [], [], 0
-    any_resample, max_bursts = False, 0
+    any_resample = False
     for seed in c.seeds:
         make = lambda s=seed: c.sampler(llm, s)  # noqa: E731
-        slow = resolve_ref(c, seed, make, mkc)
-        burst = run_burst(make, c.n_particles, c.ess, c.max_tokens, seed, mkc)
-        s = compare_runs(c.label, c.ess, c.n_particles, slow, burst)
+        ref = resolve_ref(c, seed, make, mkc)
+        run = run_case(make, c.n_particles, c.ess, c.max_tokens, seed, mkc)
+        s = compare_runs(c.label, c.ess, c.n_particles, ref, run)
         diffs.append(s["log_ml_diff"])
-        len_gaps.append(s["mean_len_burst"] - s["mean_len_slow"])
+        len_gaps.append(s["mean_len_run"] - s["mean_len_ref"])
         matches += s["n_match"]
         any_resample = any_resample or s["n_resamples"] > 0
-        max_bursts = max(max_bursts, s["n_bursts"])
-    assert max_bursts > 0, f"{c.label}: burst never opened (n_bursts==0)"
     total = c.n_particles * len(c.seeds)
     log(f"{c.label}: contexts matching the reference {matches}/{total}")
     if floor is not None:
         # The no-bias check LOOSENS as the comparison degrades: it is `|mean| <=
-        # max(floor, k*sem)`, and its tightness comes entirely from the burst drawing
+        # max(floor, k*sem)`, and its tightness comes entirely from the run drawing
         # the same threefry keys as the reference. Lose the pairing and `sem` inflates
         # until any mean passes. This floor is what notices.
         assert matches >= floor, (
@@ -278,8 +247,6 @@ def assert_case_unbiased(
         )
     if need_resample:
         assert any_resample, f"{c.label}: ESS never crossed -- resample path unexercised"
-    if need_rounds:
-        assert max_bursts > 1, f"{c.label}: single unit round -- per-unit loop unexercised"
     m, sem = assert_unbiased(diffs, floor=ml_floor, k=ml_k, label=f"{c.label} log_ml")
     log(f"{c.label}: log_ml diff mean={m:+.4f} sem={sem:.4f}")
     if len_bound is not None:
@@ -290,59 +257,56 @@ def assert_case_unbiased(
     return np.array(diffs), np.array(len_gaps)
 
 
-def compare_runs(label, ess_threshold, n_particles, ref, burst):
-    """Burst-vs-reference stats + report. ``ref`` is the slow-path reference (cached or
-    live), ``burst`` the engine-accelerated run."""
+def compare_runs(label, ess_threshold, n_particles, ref, run):
+    """Run-vs-reference stats + report. ``ref`` is the reference (cached or live on a
+    second backend), ``run`` the case served by the engine under test."""
     log(
-        f"{label} ess={ess_threshold} N={n_particles}: wall={burst['wall']:.1f}s "
-        f"bursts={burst['n_bursts']} resamples={burst['n_resamples']} "
-        f"log_ml={burst['log_ml']:.3f}"
+        f"{label} ess={ess_threshold} N={n_particles}: wall={run['wall']:.1f}s "
+        f"resamples={run['n_resamples']} log_ml={run['log_ml']:.3f}"
     )
-    slow = ref
-    slow_ctx, burst_ctx = slow["contexts"], burst["contexts"]
-    slow_w = np.array(slow["logw"])
-    burst_w = np.array(burst["logw"])
+    ref_ctx, run_ctx = ref["contexts"], run["contexts"]
+    ref_w = np.array(ref["logw"])
+    run_w = np.array(run["logw"])
 
-    n_match = sum(a == b for a, b in zip(slow_ctx, burst_ctx))
-    slow_lens = [len(c) for c in slow_ctx]
-    burst_lens = [len(c) for c in burst_ctx]
+    n_match = sum(a == b for a, b in zip(ref_ctx, run_ctx))
+    ref_lens = [len(c) for c in ref_ctx]
+    run_lens = [len(c) for c in run_ctx]
     # First-divergence step per particle: isolates single-flip-then-cascade
-    # (the warm-KV signature) from a step-1 wiring bug.
+    # (the engine-numeric signature) from a step-1 wiring bug.
     first_div = []
-    for a, b in zip(slow_ctx, burst_ctx):
+    for a, b in zip(ref_ctx, run_ctx):
         k = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), None)
         first_div.append(k if k is not None else min(len(a), len(b)))
 
     matched = [
-        abs(slow_w[i] - burst_w[i])
+        abs(ref_w[i] - run_w[i])
         for i in range(n_particles)
-        if slow_ctx[i] == burst_ctx[i]
+        if ref_ctx[i] == run_ctx[i]
     ]
-    signed = burst_w - slow_w
+    signed = run_w - ref_w
     finite = signed[np.isfinite(signed)]
 
     lines = [
         f"=== {label}  ess={ess_threshold}  N={n_particles} ===",
         f"contexts match: {n_match}/{n_particles}",
         f"first-divergence step per particle: {first_div}",
-        f"mean len slow={np.mean(slow_lens):.3f} burst={np.mean(burst_lens):.3f}",
+        f"mean len ref={np.mean(ref_lens):.3f} run={np.mean(run_lens):.3f}",
         f"max |logw diff| over matched contexts: "
         f"{max(matched) if matched else float('nan'):.4e}",
-        f"signed logw diff (burst-slow): mean={np.mean(finite):+.4e} "
+        f"signed logw diff (run-ref): mean={np.mean(finite):+.4e} "
         f"std={np.std(finite):.4e} n={len(finite)}",
-        f"slow log_ml={slow['log_ml']:.6f}  burst log_ml={burst['log_ml']:.6f}  "
-        f"diff={burst['log_ml'] - slow['log_ml']:+.6f}",
-        f"burst wall={burst['wall']:.2f}s  bursts opened={burst['n_bursts']}",
+        f"ref log_ml={ref['log_ml']:.6f}  run log_ml={run['log_ml']:.6f}  "
+        f"diff={run['log_ml'] - ref['log_ml']:+.6f}",
+        f"run wall={run['wall']:.2f}s",
     ]
     print("\n" + "\n".join(lines))
 
     return {
-        "n_bursts": burst["n_bursts"],
-        "n_resamples": burst["n_resamples"],
+        "n_resamples": run["n_resamples"],
         "n_match": n_match,
-        "log_ml_diff": float(burst["log_ml"] - slow["log_ml"]),
-        "slow_log_ml": float(slow["log_ml"]),
-        "burst_log_ml": float(burst["log_ml"]),
-        "mean_len_slow": float(np.mean(slow_lens)),
-        "mean_len_burst": float(np.mean(burst_lens)),
+        "log_ml_diff": float(run["log_ml"] - ref["log_ml"]),
+        "ref_log_ml": float(ref["log_ml"]),
+        "run_log_ml": float(run["log_ml"]),
+        "mean_len_ref": float(np.mean(ref_lens)),
+        "mean_len_run": float(np.mean(run_lens)),
     }

@@ -83,8 +83,7 @@ class SoftVowelCritic(Potential):
 
 class ByteLengthBoundary(BoundaryPredicate):
     """A unit completes once its subunits span >= ``min_bytes`` bytes. Content-dependent +
-    variable-length -> rows reach the boundary at different engine steps -> the staggered
-    per-unit pop-out the burst must sync."""
+    variable-length, so rows reach the boundary at different step counts."""
 
     def __init__(self, min_bytes):
         self.min_bytes = min_bytes
@@ -101,12 +100,12 @@ class ByteLengthBoundary(BoundaryPredicate):
 # ``make_sampler(llm, seed)`` is two-arg so AWRS gets its per-seed rng (every other factory
 # ignores ``seed``); fresh per call (the async-trie Set sampler must bind to the run's loop).
 # ``reference`` selects the gate-2 comparison (an OPTION; default is the tight one):
-#   "steploop_cached" => cached OUR-StepLoop+threefry, RNG-matched to the burst => a TIGHT
-#       paired check (warm-KV residual only). Cached by gen_steploop_reference.py in
-#       gate2_steploop_snapshot.json. THE DEFAULT from here on.
+#   "forward_cached" => cached plain-forward+threefry run, RNG-matched to the engine => a
+#       TIGHT paired check (engine numeric residual only). Cached by gen_reference.py in
+#       gate2_forward_snapshot.json. THE DEFAULT from here on.
 #   "ref"      => cached ORIGINAL (main + llamppl) in gate2_snapshot.json -- the independent,
 #       un-RNG-matchable anchor (looser, statistical). Kept available, never overwritten.
-#   "steploop" => a live StepLoop run (no cache).
+#   "forward"  => a live plain-forward run on a second backend (no cache).
 
 
 @dataclass(frozen=True)
@@ -116,11 +115,11 @@ class Case:
     ess: float
     max_tokens: int
     seeds: tuple
-    reference: str  # "steploop_cached" (tight, default) | "ref" (original anchor) | "steploop" (live)
+    reference: str  # "forward_cached" (tight, default) | "ref" (original anchor) | "forward" (live)
     make_sampler: Callable  # (llm, seed) -> TokenSampler
     make_critic: Optional[Callable] = None  # (llm) -> Potential | None
     # Least `n_particles * len(seeds)` contexts that must match the reference EXACTLY.
-    # The no-bias check is sem-scaled, so it silently loosens if the burst stops drawing
+    # The no-bias check is sem-scaled, so it silently loosens if the run stops drawing
     # the reference's threefry keys; this is the floor that catches that. Set from a
     # measured run with margin, `None` to skip.
     match_floor: Optional[int] = None
@@ -164,33 +163,31 @@ S_AEIOU = (1234, 7, 99, 2024, 555, 31, 808, 42, 17, 6, 71, 900)
 CASES = {
     c.label: c
     for c in [
-        Case("unconstrained", 8, 0.0, 12, (1234, 7, 99, 2024, 31, 53, 71, 97), "steploop_cached",
+        Case("unconstrained", 8, 0.0, 12, (1234, 7, 99, 2024, 31, 53, 71, 97), "forward_cached",
              lambda llm, seed: DirectTokenSampler(llm), match_floor=24),
-        Case("constrained-boolfsa[a-z ]+", 16, 0.0, 12, (1234, 7), "steploop_cached",
+        Case("constrained-boolfsa[a-z ]+", 16, 0.0, 12, (1234, 7), "forward_cached",
              lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[a-z ]+")), match_floor=12),
-        Case("boolfsa[aeiou ]+", 16, 0.5, 10, S_AEIOU, "steploop_cached",
+        Case("boolfsa[aeiou ]+", 16, 0.5, 10, S_AEIOU, "forward_cached",
              lambda llm, seed: DirectTokenSampler(boolfsa(llm, r"[aeiou ]+")), match_floor=4),
-        Case("terminal-critic", 16, 0.0, 12, S6, "steploop_cached",
+        Case("terminal-critic", 16, 0.0, 12, S6, "forward_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: TerminalContainsCritic(llm.vocab), match_floor=28),
-        # Terminal-only critic WITH resampling. A terminal critic forces
-        # `twist_with_critic` off, so before this case the only critic the burst ever
-        # settled mid-burst was a twisting one, and the only terminal critic ran at
-        # ess=0 where no resample crosses. That gap is where a deferred terminal score
-        # could land after the resample that should have consumed it.
-        Case("terminal-critic-resample", 16, 0.5, 12, S6, "steploop_cached",
+        # Terminal-only critic WITH resampling: a terminal critic forces
+        # `twist_with_critic` off, so this is the one config where a critic score must
+        # land before the ESS test that consumes it.
+        Case("terminal-critic-resample", 16, 0.5, 12, S6, "forward_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: TerminalContainsCritic(llm.vocab), match_floor=14),
-        Case("twist-critic", 16, 0.5, 12, S12, "steploop_cached",
+        Case("twist-critic", 16, 0.5, 12, S12, "forward_cached",
              lambda llm, seed: DirectTokenSampler(llm),
              lambda llm: SoftVowelCritic(llm.vocab), match_floor=34),
-        Case("multitoken-boolfsa[a-z ]+", 8, 0.5, 6, S12, "steploop_cached",
+        Case("multitoken-boolfsa[a-z ]+", 8, 0.5, 6, S12, "forward_cached",
              lambda llm, seed: MultiTokenUnitSampler(
                  DirectTokenSampler(boolfsa(llm, r"[a-z ]+")),
                  ByteLengthBoundary(5), max_subunits_per_unit=6), match_floor=15),
-        Case("awrs[a-z ]+", 16, 0.0, 12, S6, "steploop_cached",
+        Case("awrs[a-z ]+", 16, 0.0, 12, S6, "forward_cached",
              lambda llm, seed: AWRS(llm, _condition(llm, r"[a-z ]+"), seed=seed)),
-        Case("set[a-z ]+", 8, 0.0, 8, (1234, 7, 99, 2024), "steploop_cached",
+        Case("set[a-z ]+", 8, 0.0, 8, (1234, 7, 99, 2024), "forward_cached",
              lambda llm, seed: SetTokenSampler(
                  EagerSetSampler(iter_potential=llm,
                                  item_potential=BoolFSA.from_regex(r"[a-z ]+")))),

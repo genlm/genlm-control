@@ -1,11 +1,9 @@
 import contextvars
 import weakref
-import numpy as np
 import torch
 import warnings
 from typing import NamedTuple
 from genlm.control.constant import EOS
-from genlm.control.lane_seam import current_binding
 from genlm.control.potential.base import Potential
 from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
@@ -29,21 +27,6 @@ def _walk_leaves(potential):
         return
     for child in children:
         yield from _walk_leaves(child)
-
-
-def _is_lane_lm(p):
-    return isinstance(p, PromptedLLM) and getattr(p.model, "supports_lanes", False)
-
-
-def find_engine_lm(potential):
-    """The single lane-capable engine LM leaf, or ``None`` if not exactly one."""
-    lms = [lf for lf in _walk_leaves(potential) if _is_lane_lm(lf)]
-    return lms[0] if len(lms) == 1 else None
-
-
-def lm_leaves(potential):
-    """All ``PromptedLLM`` leaves."""
-    return [lf for lf in _walk_leaves(potential) if isinstance(lf, PromptedLLM)]
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):
@@ -271,6 +254,9 @@ class PromptedLLM(Potential):
         self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
         self.lora_name = lora_name  # property setter derives self._fwd
+        # Content-keyed running log-prob sums serving prefix/complete (see
+        # _log_probability); keys carry the prompt, so prompt swaps are safe.
+        self._prefix_sums = {}
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -511,15 +497,40 @@ class PromptedLLM(Potential):
     async def _log_probability(self, context_ids):
         if not context_ids:  # empty context: log(1); no forwards to batch
             return 0.0
-        prefixes = [self.prompt_ids + context_ids[:i] for i in range(len(context_ids))]
-        log_ps = self._maybe_temper(
-            await self._fwd.batch_next_token_logprobs(prefixes)
-        )
-        target_ids = torch.tensor(context_ids, device=log_ps.device)
-        with torch.no_grad():
-            token_logprobs = torch.gather(log_ps, 1, target_ids.unsqueeze(1))
-            total_logprob = token_logprobs.sum().item()
-
+        # Content-keyed running sums make repeated scoring along a growing
+        # context O(1) amortized: a one-token extension prices with a single
+        # forward at the parent context (which also extends the engine's
+        # resident request for this path).
+        sums = self._prefix_sums
+        # Everything the returned number depends on is in the key: adapter,
+        # temperature and prompt are all mutable on a live instance.
+        head = (self.lora_name, self.temperature, tuple(self.prompt_ids))
+        key = (head, tuple(context_ids))
+        if key in sums:
+            return sums[key]
+        parent = (head, key[1][:-1])
+        if len(context_ids) == 1 or parent in sums:
+            base = sums.get(parent, 0.0)
+            log_ps = self._maybe_temper(
+                await self._fwd.next_token_logprobs(
+                    self.prompt_ids + context_ids[:-1]
+                )
+            )
+            total_logprob = base + float(log_ps[context_ids[-1]])
+        else:
+            prefixes = [
+                self.prompt_ids + context_ids[:i] for i in range(len(context_ids))
+            ]
+            log_ps = self._maybe_temper(
+                await self._fwd.batch_next_token_logprobs(prefixes)
+            )
+            target_ids = torch.tensor(context_ids, device=log_ps.device)
+            with torch.no_grad():
+                token_logprobs = torch.gather(log_ps, 1, target_ids.unsqueeze(1))
+                total_logprob = token_logprobs.sum().item()
+        while len(sums) >= 1 << 16:
+            sums.pop(next(iter(sums)))
+        sums[key] = total_logprob
         return total_logprob
 
     def _maybe_temper(self, logps):
@@ -538,69 +549,6 @@ class PromptedLLM(Potential):
             (float): The log probability of `context`.
         """
         return await self.log_probability(context)
-
-    async def _lane_logw_next(self, binding, context):
-        """This leaf's next-token weights pulled from its lane: feed the delta,
-        read the warm, then process the row exactly as a fresh forward would
-        (temper + EOS fold). The processed weights are stashed on the lane —
-        they price the next fed token's bank increment and serve ``complete``'s
-        EOS fold."""
-        context_ids = self.encode_tokens(context)
-        logps = await binding.read(self, self.prompt_ids + context_ids)
-        lw = self._process_logw_next(self._maybe_temper(logps))
-        binding.lane(self).stash = lw
-        return lw
-
-    async def _lane_score(self, binding, context, *, complete):
-        """This leaf's ``prefix`` (or ``complete``) along its lane's own path:
-        the banked fed-token sum, plus the stashed row's column for a token
-        drawn but not yet fed, plus the EOS fold for ``complete``.
-
-        A live lane one token behind advances (feed + read) after pricing — a
-        critic leaf's scores ARE its consumption, and the advance is what keeps
-        its lane feeding the engine's step."""
-        lane = binding.lane(self)
-        ids = self.prompt_ids + self.encode_tokens(context)
-        held = len(lane.context)
-        if len(ids) == held + 1:
-            if lane.stash is None:
-                raise RuntimeError(f"{self!r} lane has no stashed row to price")
-            val = lane.bank + lane.stash[context[-1]]
-            if not complete:
-                if not lane.closed:
-                    await self._lane_logw_next(binding, context)
-                return val
-            await self._lane_logw_next(binding, context)
-            return val + lane.stash[self.eos]
-        if len(ids) != held:
-            raise RuntimeError(
-                f"{self!r} lane holds {held} tokens; cannot score {len(ids)}"
-            )
-        if not complete:
-            return lane.bank
-        if lane.stash is None:
-            await self._lane_logw_next(binding, context)
-        return lane.bank + lane.stash[self.eos]
-
-    async def batch_prefix(self, contexts):
-        """Batched ``prefix``. Under a lane binding, served from the lane's own
-        banked path (no forward)."""
-        binding = current_binding()
-        if binding is not None and binding.has(self) and len(contexts) == 1:
-            return np.asarray(
-                [await self._lane_score(binding, contexts[0], complete=False)]
-            )
-        return await super().batch_prefix(contexts)
-
-    async def batch_complete(self, contexts):
-        """Batched ``complete``. Under a lane binding, served from the lane's own
-        banked path plus the stashed EOS fold."""
-        binding = current_binding()
-        if binding is not None and binding.has(self) and len(contexts) == 1:
-            return np.asarray(
-                [await self._lane_score(binding, contexts[0], complete=True)]
-            )
-        return await super().batch_complete(contexts)
 
     async def complete(self, context):
         """
@@ -716,9 +664,6 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Log probabilities for next tokens and EOS. Keys are Token objects.
         """
-        binding = current_binding()
-        if binding is not None and binding.has(self):
-            return await self._lane_logw_next(binding, context)
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
             await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
@@ -727,9 +672,7 @@ class PromptedLLM(Potential):
 
     async def batch_logw_next(self, contexts):
         """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
-        (`.weights` shape `[N, V+1]`). Under a lane binding this is served the row's
-        own warm exactly as the scalar path is -- a lane row is one context, so the
-        batch is the row's own.
+        (`.weights` shape `[N, V+1]`).
 
         Args:
             contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.
@@ -737,15 +680,6 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
         """
-        binding = current_binding()
-        if contexts and binding is not None and binding.has(self):
-            # A lane row's batch is its own context; a wider batch has no lane.
-            if len(contexts) != 1:
-                raise RuntimeError(
-                    f"{self!r} is lane-bound but was asked to batch "
-                    f"{len(contexts)} contexts; a lane serves one row."
-                )
-            return await self._lane_logw_next(binding, contexts[0])
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
             await self._fwd.batch_next_token_logprobs(

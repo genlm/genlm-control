@@ -1,12 +1,12 @@
-"""Generate gate-2's cached reference from the ORIGINAL genlm-control (main + llamppl
-``smc_standard``), not our StepLoop.
+"""Generate gate-2's independent anchor: the ORIGINAL genlm-control (main + llamppl
+``smc_standard``).
 
 The configs/critics/seeds are the SHARED ``gate2_cases.CASES`` the gate itself uses, so the
-reference can never drift from the test. Only ``reference == "ref"`` cases are emitted (the
-``"steploop"`` cases compare against a live StepLoop in the test, no cached key). main and
-this branch share the potential/sampler/PromptedLLM API verbatim -- only the SMC engine
-differs -- so importing ``gate2_cases`` under main's ``genlm.control`` builds the same
-samplers, just run through main's llamppl SMC (no ``accelerate=``).
+reference can never drift from the test. Only ``reference == "ref"`` cases are emitted; the
+rest resolve against ``gen_reference.py``'s plain-forward snapshot or a live second backend.
+main and this branch share the potential/sampler/PromptedLLM API verbatim -- only the SMC
+loop differs -- so importing ``gate2_cases`` under main's ``genlm.control`` builds the same
+samplers, just run through main's llamppl SMC.
 
 Run on the box, shadowing our genlm.control with main's:
 
