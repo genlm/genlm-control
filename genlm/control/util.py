@@ -1,6 +1,9 @@
+import asyncio
 import contextlib
 import contextvars
 import warnings
+import weakref
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -501,24 +504,112 @@ def set_draw_method(method):
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
 
 
-async def draw_from(lazyweights, draw=None):
-    """Normalize, draw, and read back the drawn token's log-prob: ``(token, logZ, logp)``,
-    where ``logZ`` is the row's normalizer. THE draw seam -- every sampler that draws from a
-    distribution wants exactly these three steps. A sampler needing something else (AWRS's
-    rejection over unnormalized weights) does not call this. A caller-supplied ``draw`` is
-    a user picker."""
-    logZ = lazyweights.sum()
-    logps = lazyweights.spawn(lazyweights.weights - logZ)
-    token = select(logps) if draw is None else draw(logps.exp().materialize())
-    return token, logZ, logps[token]
+async def draw_from(lazyweights, draw=None, target=None):
+    """Draw a token and price it: ``(token, logw, logp)``. THE draw seam -- every
+    sampler that draws from a distribution routes through here. A sampler needing
+    something else (AWRS's rejection over unnormalized weights) does not call this.
+
+    Without ``target``, ``logw`` is the row's normalizer ``logZ``. With ``target``
+    (a second ``LazyWeights`` over the same vocabulary), the draw is an importance
+    draw: sample from ``lazyweights`` as the proposal, price under the target --
+    ``logw = target[token] - logp``.
+
+    Concurrent callers meet in a per-event-loop window and execute as ONE batched
+    reduction per (backend, device, vocab-size) group -- one normalize, one pick,
+    one host readback for the whole cohort; target prices ride the same readback.
+    A lone caller degenerates to a solo draw; batched rows draw independent noise,
+    so the results are the same draws. A caller-supplied ``draw`` is a user picker
+    (materialized chart in, token out) and draws solo.
+    """
+    if draw is not None:
+        logZ = lazyweights.sum()
+        logps = lazyweights.spawn(lazyweights.weights - logZ)
+        token = draw(logps.exp().materialize())
+        logp = logps[token]
+        if target is None:
+            return token, logZ, logp
+        return token, target[token] - logp, logp
+
+    assert lazyweights.is_log
+    loop = asyncio.get_running_loop()
+    window = _DRAW_WINDOWS.get(loop)
+    if window is None:
+        window = _DRAW_WINDOWS[loop] = _DrawWindow()
+    future = loop.create_future()
+    window.queue.append((lazyweights, target, future))
+    if not window.armed:
+        window.armed = True
+        try:
+            # Hold the window open until a full event-loop pass adds no new draw
+            # (a cohort whose rows resolved together arrives together).
+            while True:
+                n = len(window.queue)
+                await asyncio.sleep(0)
+                if len(window.queue) == n:
+                    break
+            queue, window.queue = window.queue, []
+        finally:
+            window.armed = False
+        _flush_draws(queue)
+    return await future
 
 
-async def draw_reweighted(proposal_logws, target_logws, draw=None):
-    """Importance-sampling draw: sample from ``proposal_logws``, weight by
-    target/proposal — ``(token, logw, logp)`` with ``logw = target[token] - logp``
-    (the proposal lookup is algebraically the returned ``logp``)."""
-    token, _, logp = await draw_from(proposal_logws, draw)
-    return token, target_logws[token] - logp, logp
+class _DrawWindow:
+    """Per-event-loop draw meeting point; must not outlive its loop."""
+
+    __slots__ = ("queue", "armed")
+
+    def __init__(self):
+        self.queue = []
+        self.armed = False
+
+
+_DRAW_WINDOWS = weakref.WeakKeyDictionary()  # event loop -> _DrawWindow
+
+
+def _flush_draws(queue):
+    """One batched reduction per stackable group: stack rows, normalize, pick,
+    gather the drawn log-probs (and target prices for importance draws), and
+    resolve every future from one readback. Every future gets its draw or the
+    exception -- never silence."""
+    groups = defaultdict(list)
+    for lw, target, future in queue:
+        w = lw.weights
+        key = (
+            ("torch", w.device, w.shape[-1])
+            if torch.is_tensor(w)
+            else ("np", w.shape[-1])
+        )
+        groups[key].append((lw, target, future))
+    for entries in groups.values():
+        try:
+            rows = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in entries])
+            logZ = torch.logsumexp(rows, dim=-1)
+            logps = rows - logZ.unsqueeze(-1)
+            idx = _picker(logps)
+            logp = logps.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+            ids, logZs, drawn_logps = idx.tolist(), logZ.tolist(), logp.tolist()
+            # Importance draws: price the drawn column under each target row,
+            # in the same flush (one extra gather + readback for the subset).
+            rewt = [k for k, (_, t, _) in enumerate(entries) if t is not None]
+            if rewt:
+                t_rows = torch.stack(
+                    [torch.as_tensor(entries[k][1].weights) for k in rewt]
+                )
+                t_idx = idx[rewt]
+                t_vals = t_rows.gather(-1, t_idx.unsqueeze(-1)).squeeze(-1).tolist()
+                prices = dict(zip(rewt, t_vals))
+        except BaseException as exc:
+            for _, _, future in entries:
+                if not future.done():
+                    future.set_exception(exc)
+            continue
+        for k, ((lw, target, future), i, z, p) in enumerate(
+            zip(entries, ids, logZs, drawn_logps)
+        ):
+            if not future.done():
+                logw = z if target is None else prices[k] - p
+                future.set_result((lw.decode[i], logw, p))
 
 
 def select(lazyweights):

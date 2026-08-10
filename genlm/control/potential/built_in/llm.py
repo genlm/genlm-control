@@ -253,11 +253,7 @@ class PromptedLLM(Potential):
         self.model = llm
         self._default_prompt_ids = list(prompt_ids or [])
         self.temperature = temperature
-        self.lora_name = lora_name  # property setter derives self._fwd
-        # Content-keyed running log-prob sums serving prefix/complete (see
-        # _log_probability); keys carry the prompt, so prompt swaps are safe.
-        self._prefix_cache = {}
-        self._heads = {}  # interned key heads: entries share one tuple each
+        self.lora_name = lora_name
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -328,20 +324,6 @@ class PromptedLLM(Potential):
             "Cannot reset eos_byte_strings after initialization. "
             "Use spawn_new_eos(new_eos_byte_strings) instead."
         )
-
-    @property
-    def lora_name(self):
-        """LoRA adapter this view forwards under (``None`` = base model). Lanes open
-        under it (per-request LoRA); one-shot forwards go through ``_fwd``, an
-        adapter-bound view of the engine, so both paths apply the adapter
-        consistently. Assigning rebinds ``_fwd`` -- rebind between SMC runs,
-        never mid-run."""
-        return self._lora_name
-
-    @lora_name.setter
-    def lora_name(self, lora_name):
-        self._lora_name = lora_name
-        self._fwd = self.model.lora_view(lora_name)
 
     @property
     def prompt_ids(self):
@@ -498,47 +480,16 @@ class PromptedLLM(Potential):
     async def _log_probability(self, context_ids):
         if not context_ids:  # empty context: log(1); no forwards to batch
             return 0.0
-        # Content-keyed running sums make repeated scoring along a growing
-        # context O(1) amortized: a one-token extension prices with a single
-        # forward at the parent context (which also extends the engine's
-        # resident request for this path).
-        sums = self._prefix_cache
-        # Everything the returned number depends on is in the key: adapter
-        # (name AND weight id -- a re-registered name serves new weights),
-        # temperature and prompt are all mutable on a live instance.
-        head = (
-            self.lora_name,
-            self.model.lora_id(self.lora_name),
-            self.temperature,
-            tuple(self.prompt_ids),
+        prefixes = [self.prompt_ids + context_ids[:i] for i in range(len(context_ids))]
+        log_ps = self._maybe_temper(
+            await self.model.batch_next_token_logprobs(
+                prefixes, lora_name=self.lora_name
+            )
         )
-        head = self._heads.setdefault(head, head)
-        key = (head, tuple(context_ids))
-        if key in sums:
-            return sums[key]
-        parent = (head, key[1][:-1])
-        if len(context_ids) == 1 or parent in sums:
-            base = sums.get(parent, 0.0)
-            log_ps = self._maybe_temper(
-                await self._fwd.next_token_logprobs(
-                    self.prompt_ids + context_ids[:-1]
-                )
-            )
-            total_logprob = base + float(log_ps[context_ids[-1]])
-        else:
-            prefixes = [
-                self.prompt_ids + context_ids[:i] for i in range(len(context_ids))
-            ]
-            log_ps = self._maybe_temper(
-                await self._fwd.batch_next_token_logprobs(prefixes)
-            )
-            target_ids = torch.tensor(context_ids, device=log_ps.device)
-            with torch.no_grad():
-                token_logprobs = torch.gather(log_ps, 1, target_ids.unsqueeze(1))
-                total_logprob = token_logprobs.sum().item()
-        while len(sums) >= 1 << 16:
-            sums.pop(next(iter(sums)))
-        sums[key] = total_logprob
+        target_ids = torch.tensor(context_ids, device=log_ps.device)
+        with torch.no_grad():
+            token_logprobs = torch.gather(log_ps, 1, target_ids.unsqueeze(1))
+            total_logprob = token_logprobs.sum().item()
         return total_logprob
 
     def _maybe_temper(self, logps):
@@ -573,7 +524,9 @@ class PromptedLLM(Potential):
         context_ids = self.encode_tokens(context)
         logp_context = await self._log_probability(context_ids)
         logp_next = self._maybe_temper(
-            await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
+            await self.model.next_token_logprobs(
+                self.prompt_ids + context_ids, lora_name=self.lora_name
+            )
         )
         logp_eos = torch.logsumexp(logp_next[self.token_maps.eos_idxs], dim=0).item()
         return logp_context + logp_eos
@@ -659,9 +612,10 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Processed log probabilities for the next tokens.
         """
-        # N=1 wrapper around the batched on-device fold, returned as a CPU tensor.
+        # N=1 wrapper around the batched on-device fold; the row stays on the
+        # backend's device -- the draw window reads back only the drawn scalars.
         out = self._process_logw_next_batch(logw_next.unsqueeze(0))
-        return self.make_lazy_weights(out[0].float().cpu())
+        return self.make_lazy_weights(out[0].float())
 
     async def logw_next(self, context):
         """Get log probabilities for next tokens given the prompt and `context`.
@@ -674,7 +628,9 @@ class PromptedLLM(Potential):
         """
         context_ids = self.encode_tokens(context)
         logw_next = self._maybe_temper(
-            await self._fwd.next_token_logprobs(self.prompt_ids + context_ids)
+            await self.model.next_token_logprobs(
+                self.prompt_ids + context_ids, lora_name=self.lora_name
+            )
         )
         return self._process_logw_next(logw_next)
 
@@ -690,12 +646,13 @@ class PromptedLLM(Potential):
         """
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
-            await self._fwd.batch_next_token_logprobs(
-                [self.prompt_ids + context_ids for context_ids in context_ids_batch]
+            await self.model.batch_next_token_logprobs(
+                [self.prompt_ids + context_ids for context_ids in context_ids_batch],
+                lora_name=self.lora_name,
             )
         )
         # Equivalent to stacking per-row `_process_logw_next`, folded as one batch.
-        return self.make_lazy_weights(self._process_logw_next_batch(logw_nexts).float().cpu())
+        return self.make_lazy_weights(self._process_logw_next_batch(logw_nexts).float())
 
     def __repr__(self):
         return f"PromptedLLM(prompt={self.prompt!r})"

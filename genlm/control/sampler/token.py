@@ -7,7 +7,6 @@ import warnings
 
 from genlm.control.util import (
     draw_from,
-    draw_reweighted,
     awrs_gumbel_keys,
     get_draw_seed,
 )
@@ -153,7 +152,7 @@ class DirectTokenSampler(TokenSampler):
         proposal_logws, target_logws = await asyncio.gather(
             self.proposal.logw_next(context), self.potential.logw_next(context)
         )
-        return await draw_reweighted(proposal_logws, target_logws, draw)
+        return await draw_from(proposal_logws, draw, target=target_logws)
 
 
 class SetTokenSampler(TokenSampler):
