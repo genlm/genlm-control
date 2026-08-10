@@ -142,14 +142,9 @@ class MultiTokenUnitSampler(TokenSampler):
         context = list(flat_token_context)
 
         for _ in range(self.max_subunits_per_unit):
-            try:
-                subunit, logw_i, logp_i = await self.subunit_sampler.sample(
-                    context, draw=draw
-                )
-            except (RuntimeError, OSError, TimeoutError):
-                # Expected failures (network/timeout/system): reject with -inf weight.
-                return buffer, float("-inf"), logp
-
+            subunit, logw_i, logp_i = await self.subunit_sampler.sample(
+                context, draw=draw
+            )
             context.append(subunit)
             buffer.append(subunit)
             logw += logw_i

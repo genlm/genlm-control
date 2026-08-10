@@ -12,7 +12,6 @@ newer than ``SMC(...)``.
 
 from __future__ import annotations
 
-import inspect
 import json
 import platform
 import subprocess

@@ -45,7 +45,7 @@ class TokenSampler:
     async def round_start(self, contexts):
         """Population hook before a round's draws: this sampler's group's live contexts.
         One round is one unit per row at unit grain, so this is where per-unit population
-        bookkeeping goes (the engine is idle here, so forwards are legal). Default no-op."""
+        bookkeeping goes. Default no-op."""
 
     async def start_weight(self):
         """Compute the weight of the empty sequence under the target potential."""

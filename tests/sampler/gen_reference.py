@@ -1,14 +1,22 @@
 """Generate the TIGHT gate-2 reference: every case in CASES run over plain per-context
-forwards (a HuggingFace ``AsyncTransformer``) with the counter-based (threefry) picker.
-Stored in ``gate2_forward_snapshot.json`` -- a SEPARATE file that never touches the
+forwards with the counter-based (threefry) picker. Stored in
+``gate2_forward_snapshot.json`` -- a SEPARATE file that never touches the
 original-llamppl ``gate2_snapshot.json``.
 
-Because the picker is device-agnostic, the engine-served gate draws the SAME tokens as this
-reference, so ``reference="forward_cached"`` is a near-byte-exact paired check (engine
-numeric residual only) instead of divergent-path MC noise.
+Because the picker is device-agnostic, the engine-served gate draws the SAME tokens as
+this reference IF the rows agree to near-numeric precision -- which requires the
+reference forwards to come from the SAME engine numerics the gate runs on. A reference
+from another backend (HF fp32 on a laptop vs vLLM bf16 on an A100) flips enough draws
+that the paired check degenerates to noise.
 
-Needs no engine -- run anywhere with torch. From tests/sampler/:
-    python gen_reference.py [--only <substr>]
+So: ``--backend vllm`` (on the GPU that runs the gate, engine opts matching the gate
+fixture) generates the canonical reference -- every window starts from a cold
+residency table, so each ask prefills fresh while the population still batches into
+one frame, and the gate measures exactly the warm-KV-vs-reprefill residual.
+``--backend hf`` needs no engine and exists for local smoke only; never commit a
+snapshot from it. From tests/sampler/:
+
+    python gen_reference.py --backend vllm [--only <substr>]
 """
 
 import argparse
@@ -27,15 +35,47 @@ def _key(label, n, ess, mt, seed):
     return f"{label}|N={n}|ess={ess}|mt={mt}|seed={seed}"
 
 
+def _load(backend):
+    if backend == "vllm":
+        from genlm.backend.llm import AsyncVirtualLM
+
+        class _FreshEngine(AsyncVirtualLM):
+            """Every window starts from a cold residency table, so every ask
+            prefills a fresh request — no row ever comes from warm KV — while
+            the window still batches the population's asks into one frame,
+            matching the gate run's batch composition."""
+
+            def _execute(self, queries):
+                reaps = self._reap_idle(len(self._requests))
+                if reaps:
+                    self._sched.genlm_submit([], [], reaps)
+                super()._execute(queries)
+
+        # Engine opts must MATCH the gate fixture (test_engine_native.py):
+        # eager and cudagraph kernels differ numerically, and a row difference
+        # flips paired threefry draws.
+        return _FreshEngine.from_name(
+            MODEL,
+            engine_opts={
+                "gpu_memory_utilization": 0.2,
+                "max_model_len": 256,
+                "enable_prefix_caching": True,
+                "enforce_eager": True,
+            },
+        )
+    from genlm.backend.llm import AsyncTransformer
+
+    return AsyncTransformer.from_name(MODEL)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--only", default=None, help="regen only labels containing this substring")
+    ap.add_argument("--backend", default="hf", choices=["hf", "vllm"])
     args = ap.parse_args()
 
-    from genlm.backend.llm import AsyncTransformer
-
     set_draw_method("threefry_gumbel")  # the tight reference draws with the counter-based picker
-    llm = PromptedLLM(AsyncTransformer.from_name(MODEL), eos_byte_strings=EOS_BYTES)
+    llm = PromptedLLM(_load(args.backend), eos_byte_strings=EOS_BYTES)
     llm.set_prompt_from_str(PROMPT)
 
     try:

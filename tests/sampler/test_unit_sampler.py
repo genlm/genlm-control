@@ -260,50 +260,25 @@ async def test_multi_token_unit_sampler_start_weight():
 
 
 @pytest.mark.asyncio
-async def test_multi_token_unit_sampler_exception_handling():
-    """Test exception handling in sample method for expected errors."""
+async def test_multi_token_unit_sampler_error_propagates():
+    """A subunit sampler failure must surface, never become silent particle death."""
     vocab = [b"a", b"b"]
-    logws = np.log([0.499, 0.499, 0.002])  # EOS very unlikely, won't be sampled first
+    logws = np.log([0.499, 0.499, 0.002])
     mock_potential = MockPotential(vocab, logws)
 
-    # Create a subunit sampler that will raise an expected exception
     class FailingSampler(DirectTokenSampler):
         async def sample(self, context, draw=None):
-            # Fail after first token with a runtime error (expected failure type)
             if len(context) > 0:
                 raise RuntimeError("Simulated sampling failure")
             return await super().sample(context, draw)
 
-    subunit_sampler = FailingSampler(mock_potential)
-    # Boundary that's never hit (no b" " in vocab, EOS won't be sampled)
-    boundary = TokenSetBoundary({b" ", EOS})
     unit_sampler = MultiTokenUnitSampler(
-        subunit_sampler=subunit_sampler,
-        boundary_predicate=boundary,
+        subunit_sampler=FailingSampler(mock_potential),
+        boundary_predicate=TokenSetBoundary({b" ", EOS}),
         max_subunits_per_unit=3,
     )
-    # Should handle RuntimeError gracefully and return -inf weight
-    unit, weight, _ = await unit_sampler.sample([], draw=None)
-    assert weight == float("-inf")
-    assert isinstance(unit, list)
-
-    # Verify TypeError
-    class BuggySampler(DirectTokenSampler):
-        def __init__(self, potential):
-            super().__init__(potential)
-            self.call_count = 0
-
-        async def sample(self, context, draw=None):
-            self.call_count += 1
-            raise TypeError("Programming error: wrong type")
-
-    buggy_subunit_sampler = BuggySampler(mock_potential)
-    buggy_unit_sampler = MultiTokenUnitSampler(
-        subunit_sampler=buggy_subunit_sampler,
-        boundary_predicate=boundary,
-    )
-    with pytest.raises(TypeError, match="Programming error"):
-        await buggy_unit_sampler.sample([], draw=None)
+    with pytest.raises(RuntimeError, match="Simulated sampling failure"):
+        await unit_sampler.sample([], draw=None)
 
 
 @pytest.mark.asyncio

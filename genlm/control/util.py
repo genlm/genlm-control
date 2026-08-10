@@ -457,7 +457,6 @@ def draw_ordinal(context):
 
 def flatten_units(context):
     """Recursively flatten a (possibly unit-nested) context to a flat token list.
-    Matches the engine-prompt flatten in ``_Burst.context_ids``.
 
     Usage:
         potential.coerce(LLM, f=lambda ctx: b"".join(flatten_units(ctx)))

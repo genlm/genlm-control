@@ -256,7 +256,8 @@ class PromptedLLM(Potential):
         self.lora_name = lora_name  # property setter derives self._fwd
         # Content-keyed running log-prob sums serving prefix/complete (see
         # _log_probability); keys carry the prompt, so prompt swaps are safe.
-        self._prefix_sums = {}
+        self._prefix_cache = {}
+        self._heads = {}  # interned key heads: entries share one tuple each
 
         if token_maps is not None:
             if eos_byte_strings is not None:
@@ -501,10 +502,17 @@ class PromptedLLM(Potential):
         # context O(1) amortized: a one-token extension prices with a single
         # forward at the parent context (which also extends the engine's
         # resident request for this path).
-        sums = self._prefix_sums
-        # Everything the returned number depends on is in the key: adapter,
+        sums = self._prefix_cache
+        # Everything the returned number depends on is in the key: adapter
+        # (name AND weight id -- a re-registered name serves new weights),
         # temperature and prompt are all mutable on a live instance.
-        head = (self.lora_name, self.temperature, tuple(self.prompt_ids))
+        head = (
+            self.lora_name,
+            self.model.lora_id(self.lora_name),
+            self.temperature,
+            tuple(self.prompt_ids),
+        )
+        head = self._heads.setdefault(head, head)
         key = (head, tuple(context_ids))
         if key in sums:
             return sums[key]

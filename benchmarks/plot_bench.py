@@ -24,9 +24,8 @@ RESULTS = Path(__file__).resolve().parent / "results"
 VERSION_ORDER = ["main", "speedup-old", "speedup-now", "now-torch", "now-icdf",
                  "now-ondevice"]
 PATHS = ["smc", "raw"]
-PATH_LABEL = {"off": "off (per-token)", "require": "require (burst)",
-              "raw": "raw (vLLM ceiling)"}
-PATH_COLOR = {"off": "#7a7a7a", "require": "#2c7fb8", "raw": "#cccccc"}
+PATH_LABEL = {"smc": "smc (engine-served)", "raw": "raw (vLLM ceiling)"}
+PATH_COLOR = {"smc": "#2c7fb8", "raw": "#cccccc"}
 
 
 def _cfgstr(cfg: dict) -> str:
