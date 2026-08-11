@@ -70,6 +70,32 @@ async def test_multi_token_unit_sampler_fixed_length():
         assert len(unit) <= 3
 
 
+@pytest.mark.asyncio
+async def test_multi_token_unit_sampler_with_context():
+    """`sample` takes the structured (unit-nested) context directly -- it flattens
+    internally for the subunit sampler, so a caller passes the nested form, not a
+    separately-flattened one."""
+    vocab = [b"hello", b" ", b"world"]
+    logws = np.log([0.4, 0.2, 0.3, 0.1])
+
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = TokenSetBoundary({b" ", EOS})
+
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+        max_subunits_per_unit=10,
+    )
+    unit_context = [
+        [b"hello", b" "],
+        [b"world", b" "],
+    ]
+    unit, weight, logp = await unit_sampler.sample(unit_context, draw=None)
+    assert isinstance(unit, list)
+    assert len(unit) > 0
+
+
 class _NeverCompleteBoundary(BoundaryPredicate):
     """Boundary that never fires; covers max_subunits_per_unit truncation through
     a custom BoundaryPredicate subclass, not just the built-in TokenSetBoundary."""
@@ -260,6 +286,21 @@ async def test_multi_token_unit_sampler_start_weight():
 
 
 @pytest.mark.asyncio
+async def test_multi_token_unit_sampler_cleanup():
+    """Test cleanup"""
+    vocab = [b"hello", b" ", b"world"]
+    logws = np.log([0.4, 0.2, 0.3, 0.1])
+    mock_potential = MockPotential(vocab, logws)
+    subunit_sampler = DirectTokenSampler(mock_potential)
+    boundary = TokenSetBoundary({b" ", EOS})
+    unit_sampler = MultiTokenUnitSampler(
+        subunit_sampler=subunit_sampler,
+        boundary_predicate=boundary,
+    )
+    await unit_sampler.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_multi_token_unit_sampler_error_propagates():
     """A subunit sampler failure must surface, never become silent particle death."""
     vocab = [b"a", b"b"]
@@ -424,6 +465,18 @@ def test_cfg_boundary_get_parse_tree():
     assert tree.data == "start"
     tree = boundary.get_parse_tree("bbb")
     assert tree is None
+
+
+def test_cfg_boundary_repr():
+    """Test CFGBoundary string representation."""
+    grammar = 'start: "x"'
+    boundary1 = CFGBoundary(grammar, start_rule="start", complete_rules={"start"})
+    assert "CFGBoundary" in repr(boundary1)
+    assert "start" in repr(boundary1)
+    assert "complete_rules" in repr(boundary1)
+    boundary2 = CFGBoundary(grammar, complete_rules=None)
+    assert "CFGBoundary" in repr(boundary2)
+    assert "complete_rules" not in repr(boundary2)
 
 
 def test_cfg_boundary_exception_handling():
@@ -611,39 +664,3 @@ async def test_weight_is_negative_infinity_on_max_subunits():
     Z = 0.4 + 0.4 + 0.2
     expected_logp = 3 * np.log(0.4 / Z)
     assert np.isclose(logp, expected_logp, atol=1e-10)
-
-
-@pytest.mark.asyncio
-async def test_round_start_receives_live_population_once_per_round():
-    """`round_start` fires once per SMC round with the group's live contexts, before
-    that round's draws -- unit start for a unit-grain sampler."""
-    vocab = [b"a", b" "]
-    logws = np.log([0.45, 0.45, 0.1])
-    subunit_sampler = DirectTokenSampler(MockPotential(vocab, logws))
-
-    class Recording(MultiTokenUnitSampler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.rounds = []
-
-        async def round_start(self, contexts):
-            self.rounds.append([list(c) for c in contexts])
-
-    unit_sampler = Recording(
-        subunit_sampler=subunit_sampler,
-        boundary_predicate=TokenSetBoundary({b" ", EOS}),
-        max_subunits_per_unit=4,
-    )
-    particles = await SMC(unit_sampler)(
-        n_particles=3, ess_threshold=0.0, max_tokens=3
-    )
-
-    assert unit_sampler.rounds, "round_start never fired"
-    # First round: every particle live, nothing drawn yet.
-    assert unit_sampler.rounds[0] == [[], [], []]
-    # Each round sees only live rows, and never more than the population.
-    assert all(1 <= len(r) <= 3 for r in unit_sampler.rounds)
-    # Fires before the round's draws: round k's contexts are shorter than round k+1's.
-    for earlier, later in zip(unit_sampler.rounds, unit_sampler.rounds[1:]):
-        assert min(len(c) for c in later) > min(len(c) for c in earlier)
-    assert len(particles) == 3

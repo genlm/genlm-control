@@ -1,4 +1,6 @@
+import asyncio
 import pytest
+import tempfile
 import numpy as np
 from arsenal.maths import logsumexp
 
@@ -56,15 +58,7 @@ def _mock_params_with_proposal(draw, max_w=1e3):
 @given(_mock_params_with_proposal())
 async def test_direct_token_sampler_with_proposal_swor(params):
     """SWOR enumeration recovers `target.logw_next` under an arbitrary
-    same-vocab, fully-supported proposal.
-
-    SWOR only proves that each token's `logw + logp` sums to the right
-    `target.logw_next` value; it can't catch a bug where `logw` and `logp`
-    are each wrong but compensate in the sum. So we additionally force every
-    token directly and check the exact weight formula
-    `logw = target_logws[t] - proposal_logws[t] + log_Z_proposal` and
-    `logp = proposal_logps[t]` independently.
-    """
+    same-vocab, fully-supported proposal."""
     vocab, target_ws, proposal_ws, context = params
     target = MockPotential(vocab, np.log(target_ws))
     proposal = MockPotential(vocab, np.log(proposal_ws))
@@ -74,49 +68,101 @@ async def test_direct_token_sampler_with_proposal_swor(params):
         have = await trace_swor(sampler, context)
         want = await sampler.target.logw_next(context)
         have.assert_equal(want, atol=1e-5, rtol=1e-5)
-
-        target_logws = np.log(target_ws)
-        proposal_logws = np.log(proposal_ws)
-        log_Z_proposal = logsumexp(proposal_logws)
-        proposal_logps = proposal_logws - log_Z_proposal
-
-        for forced_idx in range(len(target_ws)):
-            forced_token = sampler.target.vocab_eos[forced_idx]
-
-            def draw(p, _tok=forced_token):
-                return _tok
-
-            tok, logw, logp = await sampler.sample(context, draw=draw)
-            tid = sampler.target.lookup[tok]
-            assert tid == forced_idx
-
-            expected_logw = target_logws[tid] - proposal_logws[tid] + log_Z_proposal
-            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10, atol=1e-12)
-            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10, atol=1e-12)
     finally:
         await sampler.cleanup()
 
 
-@pytest.mark.parametrize(
-    "proposal, exc_type, match",
-    [
-        (
-            MockPotential([bytes([i]) for i in range(2)], np.log([0.4, 0.4, 0.2])),
-            ValueError,
-            "different tokenizers",
-        ),
-        (object(), TypeError, "Potential"),
-    ],
-    ids=["vocab_mismatch", "not_a_potential"],
-)
-def test_direct_token_sampler_proposal_vocab_mismatch(proposal, exc_type, match):
+@pytest.mark.asyncio
+async def test_direct_token_sampler_with_proposal_monte_carlo():
+    """IS weighting under a skewed proposal recovers `target.logw_next` via
+    Monte-Carlo; also exercises the Gumbel-max (`draw=None`) path."""
+    vocab = [bytes([i]) for i in range(4)]
+    target_ws = np.array([0.1, 0.2, 0.3, 0.3, 0.1])
+    # Deliberately skewed proposal — supports same tokens but different mass.
+    proposal_ws = np.array([0.4, 0.1, 0.1, 0.3, 0.1])
+
+    target = MockPotential(vocab, np.log(target_ws))
+    proposal = MockPotential(vocab, np.log(proposal_ws))
+    sampler = DirectTokenSampler(target, proposal=proposal)
+
+    N = 20_000
+    samples = await asyncio.gather(*[sampler.sample([]) for _ in range(N)])
+
+    logws = sampler.target.alloc_logws()
+    for tok, logw, _ in samples:
+        if logw == float("-inf"):
+            continue
+        tid = sampler.target.lookup[tok]
+        logws[tid] = (
+            logw - np.log(N) if logws[tid] == float("-inf")
+            else logsumexp([logws[tid], logw - np.log(N)])
+        )
+
+    want = await sampler.target.logw_next([])
+    have = sampler.target.make_lazy_weights(logws)
+    np.testing.assert_allclose(
+        np.exp(have.weights), np.exp(want.weights), rtol=5e-2, atol=5e-2
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_token_sampler_with_proposal_exact_weight():
+    """Verify the exact weight formula for a single sample with a proposal:
+    logw = target_logws[token] - proposal_logps[token]
+         = target_logws[token] - proposal_logws[token] + log(Z_proposal)
+    """
+    vocab = [bytes([i]) for i in range(3)]
+    target_ws = np.array([0.2, 0.5, 0.1, 0.2])
+    proposal_ws = np.array([0.4, 0.1, 0.3, 0.2])
+
+    target = MockPotential(vocab, np.log(target_ws))
+    proposal = MockPotential(vocab, np.log(proposal_ws))
+    sampler = DirectTokenSampler(target, proposal=proposal)
+
+    # Use draw to deterministically pick each token and check its weight.
+    target_logws = np.log(target_ws)
+    proposal_logws = np.log(proposal_ws)
+    log_Z_proposal = logsumexp(proposal_logws)
+    proposal_logps = proposal_logws - log_Z_proposal
+
+    for forced_idx in range(len(target_ws)):
+        forced_token = sampler.target.vocab_eos[forced_idx]
+
+        def draw(p, _tok=forced_token):
+            # Return a specific token regardless of the distribution.
+            return _tok
+
+        tok, logw, logp = await sampler.sample([], draw=draw)
+        tid = sampler.target.lookup[tok]
+        assert tid == forced_idx
+
+        expected_logw = target_logws[tid] - proposal_logws[tid] + log_Z_proposal
+        np.testing.assert_allclose(logw, expected_logw, rtol=1e-10, atol=1e-12)
+
+        expected_logp = proposal_logps[tid]
+        np.testing.assert_allclose(logp, expected_logp, rtol=1e-10, atol=1e-12)
+
+
+
+def test_direct_token_sampler_proposal_vocab_mismatch():
     target = MockPotential([bytes([i]) for i in range(3)], np.log([0.3, 0.3, 0.3, 0.1]))
-    with pytest.raises(exc_type, match=match):
-        DirectTokenSampler(target, proposal=proposal)
+    different_vocab = MockPotential(
+        [bytes([i]) for i in range(2)], np.log([0.4, 0.4, 0.2])
+    )
+    with pytest.raises(ValueError, match="different tokenizers"):
+        DirectTokenSampler(target, proposal=different_vocab)
+
+
+def test_direct_token_sampler_proposal_must_be_potential():
+    target = MockPotential([bytes([i]) for i in range(3)], np.log([0.3, 0.3, 0.3, 0.1]))
+    with pytest.raises(TypeError, match="Potential"):
+        DirectTokenSampler(target, proposal=object())
 
 
 def test_direct_token_sampler_factory_threads_proposal():
-    """`direct_token_sampler` forwards `proposal` to `DirectTokenSampler`."""
+    """`direct_token_sampler` forwards `proposal` to `DirectTokenSampler`. The
+    default `autobatch=True` wraps both seats in `AutoBatchedPotential`, so
+    identity is checked through the wrapper's `.potential`."""
     from genlm.control.sampler import direct_token_sampler
 
     vocab = [bytes([i]) for i in range(3)]
@@ -127,7 +173,46 @@ def test_direct_token_sampler_factory_threads_proposal():
     s_with_proposal = direct_token_sampler(target, proposal=proposal)
 
     assert s_default.proposal is None
-    assert s_with_proposal.proposal is proposal
+    assert s_with_proposal.potential.potential is target
+    assert s_with_proposal.proposal.potential is proposal
+
+
+class _TrackedPotential(MockPotential):
+    """Records peak in-flight `logw_next` calls in a shared tracker.
+    The `sleep(0)` yields the loop so a sibling coroutine can also enter."""
+
+    def __init__(self, vocab, next_token_logws, tracker):
+        super().__init__(vocab, next_token_logws)
+        self._tracker = tracker
+
+    async def logw_next(self, context):
+        self._tracker["in_flight"] += 1
+        self._tracker["peak"] = max(self._tracker["peak"], self._tracker["in_flight"])
+        await asyncio.sleep(0)
+        self._tracker["in_flight"] -= 1
+        return await super().logw_next(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sampler_cls", ["direct", "awrs"])
+async def test_proposal_logw_next_runs_concurrently(sampler_cls):
+    """Target and proposal `logw_next` must overlap (peak=2). Sequential
+    `await; await` would give peak=1."""
+    from genlm.control.sampler import DirectTokenSampler, AWRS
+
+    vocab = [bytes([i]) for i in range(3)]
+    tracker = {"in_flight": 0, "peak": 0}
+    target = _TrackedPotential(vocab, np.log([0.3, 0.4, 0.2, 0.1]), tracker)
+    proposal = _TrackedPotential(vocab, np.log([0.1, 0.1, 0.5, 0.3]), tracker)
+
+    if sampler_cls == "direct":
+        sampler = DirectTokenSampler(target, proposal=proposal)
+    else:
+        condition = MockPotential(vocab, [0.0, 0.0, 0.0, float("-inf")])
+        sampler = AWRS(target, condition, proposal=proposal, seed=0)
+
+    await sampler.sample([])
+    assert tracker["peak"] == 2
 
 
 @pytest.mark.asyncio
@@ -159,9 +244,8 @@ async def test_set_token_sampler(params):
 @settings(deadline=None)
 @given(iter_item_params())
 async def test_set_token_sampler_logw_eos(params):
-    """ We check SetTokenSampler and AWRS both compute the forced-EOS
-    importance weight correctly: their cheap logw_eos(context) equals
-    logw_next(context)[eos] of the respective target. """
+    """ We check SetTokenSampler computes the forced-EOS importance weight
+    correctly: its cheap logw_eos(context) equals logw_next(context)[eos]. """
     iter_vocab, iter_next_token_ws, item_vocab, item_next_token_ws, context = params
 
     mock_iter = MockPotential(iter_vocab, np.log(iter_next_token_ws))
@@ -181,14 +265,20 @@ async def test_set_token_sampler_logw_eos(params):
     finally:
         await sampler.cleanup()
 
+
+@pytest.mark.asyncio
+async def test_awrs_logw_eos():
+    """ We check AWRS computes the forced-EOS importance weight correctly:
+    logw_eos(context) equals logw_next(context)[eos] of its potential*condition
+    target. """
     vocab = [bytes([i]) for i in range(3)]
     potential = MockPotential(vocab, np.log([0.3, 0.3, 0.3, 0.1]))
     condition = MockPotential(vocab, [0.0, float("-inf"), 0.0, 0.0])  # bans vocab[1]
-    awrs = AWRS(potential, condition, seed=0)
+    sampler = AWRS(potential, condition, seed=0)
 
-    awrs_context = [vocab[0], vocab[2]]
-    got = await awrs.logw_eos(awrs_context)
-    want = (await awrs.target.logw_next(awrs_context))[awrs.target.eos]
+    context = [vocab[0], vocab[2]]
+    got = await sampler.logw_eos(context)
+    want = (await sampler.target.logw_next(context))[sampler.target.eos]
     assert np.isclose(got, want, atol=1e-5, rtol=1e-5)
 
 
@@ -228,8 +318,42 @@ async def test_direct_token_sampler_proposal_different_distributions():
                 - proposal_logws_ctx.weights[tid]
                 + proposal_log_Z
             )
-            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10, atol=1e-12)
-            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(logw, expected_logw, rtol=1e-10)
+            np.testing.assert_allclose(logp, proposal_logps[tid], rtol=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_direct_token_sampler_proposal_different_distributions_monte_carlo():
+    """Monte Carlo IS estimation converges when target and proposal have
+    context-dependent weights (different effective distributions per context)."""
+    vocab = [bytes([i]) for i in range(3)]
+    target_base = np.log([0.3, 0.4, 0.2, 0.1])
+    proposal_base = np.log([0.1, 0.1, 0.5, 0.3])
+
+    target = ContextSensitiveMockPotential(vocab, target_base, context_scale=0.3)
+    proposal = ContextSensitiveMockPotential(vocab, proposal_base, context_scale=0.7)
+    sampler = DirectTokenSampler(target, proposal=proposal)
+
+    context = [vocab[0], vocab[1]]  # Non-empty context
+
+    N = 20_000
+    samples = [await sampler.sample(context) for _ in range(N)]
+
+    logws_accum = sampler.target.alloc_logws()
+    for tok, logw, _ in samples:
+        if logw == float("-inf"):
+            continue
+        tid = sampler.target.lookup[tok]
+        logws_accum[tid] = (
+            logw - np.log(N) if logws_accum[tid] == float("-inf")
+            else logsumexp([logws_accum[tid], logw - np.log(N)])
+        )
+
+    want = await sampler.target.logw_next(context)
+    have = sampler.target.make_lazy_weights(logws_accum)
+    np.testing.assert_allclose(
+        np.exp(have.weights), np.exp(want.weights), rtol=5e-2, atol=5e-2
+    )
 
 
 @pytest.mark.asyncio
@@ -242,8 +366,6 @@ async def test_direct_token_sampler_proposal_different_distributions():
         (np.log([0.3, 0.4, 0.2, 0.1]), np.log([0.3, 0.4, 0.2, 0.1])),
         # peaked target, near-uniform proposal.
         (np.log([0.6, 0.1, 0.1, 0.2]), np.log([0.25, 0.25, 0.25, 0.25])),
-        # skewed 5-way proposal (formerly its own Monte-Carlo recovery test).
-        (np.log([0.1, 0.2, 0.3, 0.3, 0.1]), np.log([0.4, 0.1, 0.1, 0.3, 0.1])),
     ],
 )
 async def test_sis_with_proposal_weights_match_manual_computation(
@@ -260,7 +382,7 @@ async def test_sis_with_proposal_weights_match_manual_computation(
     """
     from genlm.control.constant import EOS
 
-    vocab = [bytes([i]) for i in range(len(target_ws) - 1)]
+    vocab = [bytes([i]) for i in range(3)]
     target = MockPotential(vocab, target_ws)
     proposal = MockPotential(vocab, proposal_ws)
 
@@ -314,6 +436,51 @@ def mock_vocab_and_logws(draw, max_w=1e3):
     logws = [np.log(w) if w > 0 else -np.inf for w in ws]
     logws2 = [np.log(w) if w > 0 else -np.inf for w in ws2]
     return vocab, logws, logws2
+
+
+@pytest.mark.asyncio
+@settings(deadline=None)
+@given(mock_vocab_and_logws())
+async def test_smc_token_sampler(params):
+    vocab, logws, logws_critic = params
+    mock_potential = MockPotential(vocab, logws)
+    sequences = await DirectTokenSampler(mock_potential).smc(
+        n_particles=10,
+        ess_threshold=0.5,
+        max_tokens=10,
+    )
+    assert len(sequences) == 10
+    assert all(len(seq) <= 10 for seq in sequences)
+
+    mock_critic = MockPotential(vocab, logws_critic)
+    sequences = await DirectTokenSampler(mock_potential).smc(
+        n_particles=10,
+        ess_threshold=0.5,
+        max_tokens=10,
+        critic=mock_critic,
+    )
+    assert len(sequences) == 10
+    assert all(len(seq) <= 10 for seq in sequences)
+
+    with tempfile.NamedTemporaryFile() as tmp:
+        sequences = await DirectTokenSampler(mock_potential).smc(
+            n_particles=10,
+            ess_threshold=0.5,
+            max_tokens=10,
+            json_path=tmp.name,
+        )
+        assert len(sequences) == 10
+        assert all(len(seq) <= 10 for seq in sequences)
+
+        sequences = await DirectTokenSampler(mock_potential).smc(
+            n_particles=10,
+            ess_threshold=0.5,
+            max_tokens=10,
+            critic=mock_critic,
+            json_path=tmp.name,
+        )
+        assert len(sequences) == 10
+        assert all(len(seq) <= 10 for seq in sequences)
 
 
 @pytest.mark.asyncio

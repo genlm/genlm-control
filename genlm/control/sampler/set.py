@@ -53,19 +53,20 @@ class TrieSetSampler(SetSampler):
     `TrieSetSampler`s sample tokens from the `iter_potential`'s vocabulary.
     """
 
-    def __init__(self, iter_potential, item_potential, autobatch=False):
+    def __init__(self, iter_potential, item_potential, autobatch=True):
         """
         Initialize the `TrieSetSampler`.
 
         Args:
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
-            autobatch (bool): Wrap both potential seats in
-                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential].
-                Default False: the trie walk asks sequentially, so wrapping
-                buys no batching and pays a window pass per call (measured
-                +28% wall clock on the set benchmark). Enable only for
-                genuinely concurrent set-sampler call patterns.
+            autobatch (bool): Wrap the `iter_potential` seat in
+                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential]
+                (default True) -- its asks are one-per-particle-per-step and
+                concurrent, so they batch. `item_potential` is never wrapped:
+                the trie walk asks it sequentially, so wrapping buys no
+                batching and pays a window pass per call (measured +28% wall
+                clock on the set benchmark).
 
         Raises:
             ValueError: If the token type of `iter_potential` is not an iterable of the token type of `item_potential`.
@@ -77,7 +78,6 @@ class TrieSetSampler(SetSampler):
             )
         if autobatch:
             iter_potential = autobatched(iter_potential)
-            item_potential = autobatched(item_potential)
         self.iter_potential = iter_potential
         self.item_potential = item_potential
 
@@ -219,7 +219,7 @@ class TopKSetSampler(TrieSetSampler):
         That is, $\\textsf{item_potential.prefix}(x) \\leq \\textsf{item_potential.prefix}(xy)$ for all sequences of items $x, y$.
     """
 
-    def __init__(self, iter_potential, item_potential, K, autobatch=False):
+    def __init__(self, iter_potential, item_potential, K, autobatch=True):
         """
         Initialize the TopKSetSampler.
 

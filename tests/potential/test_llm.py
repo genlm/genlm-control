@@ -257,8 +257,11 @@ def test_providing_eos_tokens_and_token_maps(llm):
 
 
 def test_to_autobatched(llm):
-    with pytest.raises(ValueError, match="PromptedLLMs are autobatched by default"):
-        llm.to_autobatched()
+    from genlm.control.potential.autobatch import AutoBatchedPotential
+
+    wrapped = llm.to_autobatched()
+    assert isinstance(wrapped, AutoBatchedPotential)
+    assert wrapped.potential is llm
 
 
 @pytest.mark.asyncio

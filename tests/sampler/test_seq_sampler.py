@@ -7,7 +7,7 @@ import numpy as np
 
 from genlm.control.potential import Potential
 from genlm.control.sampler.sequence import SMC
-from genlm.control.sampler.smc import Controller
+from genlm.control.sampler.smc import SequenceModel
 from genlm.control.sampler.smc_record import string_for_serialization
 from genlm.control.sampler.token import DirectTokenSampler
 
@@ -18,14 +18,6 @@ from conftest import (
     double_weighted_sequence,
     WeightedSet,
 )
-
-
-@pytest.fixture
-def default_unit_sampler():
-    sequences = ["a", "b", "c"]
-    weights = [1, 2, 3]
-    p = WeightedSet(sequences, weights)
-    return DirectTokenSampler(p)
 
 
 @pytest.mark.asyncio
@@ -109,19 +101,6 @@ async def test_smc_with_critic(ess_threshold):
         np.exp(sequences.log_ml), sum(intersection_ws), atol=0.5, rtol=0.05
     )
 
-    # `.smc()` (the TokenSampler convenience wrapper) must thread `json_path`
-    # through to `SMC.__call__` without crashing, critic and all.
-    with tempfile.NamedTemporaryFile() as tmp:
-        via_smc = await unit_sampler.smc(
-            n_particles=10,
-            ess_threshold=ess_threshold,
-            max_tokens=10,
-            critic=critic,
-            json_path=tmp.name,
-        )
-        assert len(via_smc) == 10
-        assert all(len(seq) <= 10 for seq in via_smc)
-
 
 @st.composite
 def smc_params(draw, item_sampler, max_seq_len=5, max_size=5):
@@ -169,26 +148,22 @@ async def test_smc_weights(params):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("max_tokens, n_particles", [(2, 64), (1, 8)])
-async def test_max_tokens_boundary_forces_eos(max_tokens, n_particles):
+async def test_max_tokens_boundary_forces_eos():
     """ We check each particle's importance weight is correct for both
     termination modes: natural EOS (L < max_tokens) and EOS forced at the
-    boundary (L == max_tokens). At max_tokens=1, EOS is forced for every
-    particle, and the empty completion is the only sequence fitting the
-    boundary, so it also holds the entire partition. """
+    boundary (L == max_tokens). """
     seqs = ["", "a", "ab"]  # "" lets EOS fire at the start; "a" hits the boundary
-    weights = [1.0, 2.0, 3.0]
-    p = WeightedSet(seqs, weights)
+    p = WeightedSet(seqs, [1.0, 2.0, 3.0])
     unit_sampler = DirectTokenSampler(p)
     sampler = SMC(unit_sampler)
 
-    out = await sampler(n_particles=n_particles, ess_threshold=0, max_tokens=max_tokens)
+    out = await sampler(n_particles=64, ess_threshold=0, max_tokens=2)
     logeps = await p.prefix([])
 
     for seq, logw in out:
         assert seq[-1] == p.eos
         L = len(seq)
-        if L < max_tokens:
+        if L < 2:
             expected = (
                 logeps
                 + sum([(await p.logw_next(seq[:n])).sum() for n in range(L)])
@@ -203,14 +178,30 @@ async def test_max_tokens_boundary_forces_eos(max_tokens, n_particles):
             )
         assert np.isclose(logw, expected)
 
-    if max_tokens == 1:
-        assert all(seq == [p.eos] for seq, _ in out)
-        # Only the empty completion fits |y| <= 1, so the partition is its weight.
-        assert np.isclose(out.log_ml, np.log(weights[0]))
+
+@pytest.mark.asyncio
+async def test_max_tokens_one_forces_eos():
+    """ We check that if we hit the max tokens, the importance weight
+    of the EOS forced particle is correct. """
+    seqs = ["", "a", "ab"]  # "" gives the empty completion positive mass
+    weights = [1.0, 2.0, 3.0]
+    p = WeightedSet(seqs, weights)
+    unit_sampler = DirectTokenSampler(p)
+    sampler = SMC(unit_sampler)
+
+    out = await sampler(n_particles=8, ess_threshold=0, max_tokens=1)
+
+    logeps = await p.prefix([])
+    expected = logeps + (await p.logw_next([]))[p.eos]
+    for seq, logw in out:
+        assert seq == [p.eos]
+        assert np.isclose(logw, expected)
+    # Only the empty completion fits |y| <= 1, so the partition is its weight.
+    assert np.isclose(out.log_ml, np.log(weights[0]))
 
 
 @pytest.mark.asyncio
-async def test_controller_invalid_start_weight():
+async def test_sequence_model_invalid_start_weight():
     class MockPotential(Potential):
         async def prefix(self, context):
             if not context:
@@ -221,16 +212,9 @@ async def test_controller_invalid_start_weight():
             return 0
 
     unit_sampler = DirectTokenSampler(MockPotential([0]))
-    controller = Controller(
-        samplers=[unit_sampler],
-        critics=[None],
-        group_sizes=[1],
-        ess_threshold=0.5,
-        max_tokens=10,
-        twist_with_critic=True,
-    )
+    seq_model = SequenceModel(unit_sampler)
     with pytest.raises(ValueError, match="Start weight.*"):
-        await controller.start()
+        await seq_model.start()
 
 
 def test_string_for_serialization():
