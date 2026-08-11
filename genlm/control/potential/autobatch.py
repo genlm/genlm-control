@@ -127,7 +127,9 @@ class AutoBatchedPotential(Potential):
         return f"{self.__class__.__name__}({self.potential!r})"
 
     async def cleanup(self):
-        pass  # nothing to stop: the window lives and dies with its callers
+        # Nothing of the window's to stop (it lives and dies with its callers);
+        # forward like every wrapper, or the seat flag would break the chain.
+        await self.potential.cleanup()
 
 
 class _Window:
