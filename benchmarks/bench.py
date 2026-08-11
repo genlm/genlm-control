@@ -47,6 +47,30 @@ LORA_ADAPTER = "qiaw99/Qwen2.5-7B-Instruct-LogiQA-DPO-D"
 # --------------------------------------------------------------------------- #
 # Small shared builders (lazy genlm imports -> file also imports on main)      #
 # --------------------------------------------------------------------------- #
+def _print_window_stats(model):
+    """Batching breadcrumb histograms: control-side windows + backend residency."""
+    from genlm.control.util import take_window_stats
+
+    stats = take_window_stats()
+    draw = {k[1]: v for k, v in stats.items() if k[0] == "draw"}
+    if draw:
+        print(f"    draw window   : {dict(sorted(draw.items()))}")
+    ab = {}
+    for k, v in stats.items():
+        if k[0] == "autobatch":
+            ab.setdefault(k[1], {})[k[2]] = v
+    for method, hist in sorted(ab.items()):
+        print(f"    autobatch {method:<16}: {dict(sorted(hist.items()))}")
+    if hasattr(model, "take_stats"):
+        b = model.take_stats()
+        cohort = {k[1]: v for k, v in b.items() if isinstance(k, tuple) and k[0] == "cohort"}
+        steps = {k[1]: v for k, v in b.items() if isinstance(k, tuple) and k[0] == "steps"}
+        totals = {k: v for k, v in b.items() if isinstance(k, str)}
+        print(f"    backend cohort: {dict(sorted(cohort.items()))}")
+        print(f"    engine steps  : {dict(sorted(steps.items()))}")
+        print(f"    totals        : {totals}")
+
+
 def _terminal_critic(vocab):
     """Synthetic 0/-inf terminal indicator (completed text contains a space) -- a
     cheap, deterministic stand-in for a real answer/exec critic, all weight at
@@ -171,7 +195,7 @@ def scenario_build(args, model) -> Built:
 
         llm = PromptedLLM(model, eos_byte_strings=_eos_bytes(model, args.eos))
         llm.set_prompt_from_str(args.prompt)
-        sampler = DirectTokenSampler(llm * SynthPotential(llm, args.potential_us))
+        sampler = DirectTokenSampler(llm * SynthPotential(llm, args.potential_us), autobatch=args.autobatch)
         critic = None if args.no_critic else _terminal_critic(llm.vocab)
         cfg.update(potential_us=args.potential_us, eos=args.eos,
                    critic=not args.no_critic)
@@ -186,7 +210,7 @@ def scenario_build(args, model) -> Built:
         llm = PromptedLLM(model, eos_byte_strings=_eos_bytes(model, args.eos))
         llm.set_prompt_from_str(args.prompt)
         fsa = BoolFSA.from_regex(CONSTRAINTS[args.constraint]).coerce(llm, f=b"".join)
-        sampler = DirectTokenSampler(llm * fsa)
+        sampler = DirectTokenSampler(llm * fsa, autobatch=args.autobatch)
         critic = None if args.no_critic else _terminal_critic(llm.vocab)
         cfg.update(constraint=args.constraint, eos=args.eos,
                    critic=not args.no_critic)
@@ -199,14 +223,14 @@ def scenario_build(args, model) -> Built:
         cfg["critic"] = not args.no_critic
         cfg["eos"] = args.eos
         if s == "direct":
-            sampler = DirectTokenSampler(llm)
+            sampler = DirectTokenSampler(llm, autobatch=args.autobatch)
         else:
             from genlm.control.potential.built_in.wfsa import BoolFSA
 
             regex = CONSTRAINTS[args.constraint]
             cfg["constraint"] = args.constraint
             if s == "awrs":
-                sampler = AWRS(llm, BoolFSA.from_regex(regex).coerce(llm, f=b"".join))
+                sampler = AWRS(llm, BoolFSA.from_regex(regex).coerce(llm, f=b"".join), autobatch=args.autobatch)
             else:
                 from genlm.control.sampler import EagerSetSampler
 
@@ -220,7 +244,7 @@ def scenario_build(args, model) -> Built:
         eos = _eos_bytes(model, args.eos)
         p0 = PromptedLLM(model, prompt_ids=ids, eos_byte_strings=eos)
         q = PromptedLLM(model, prompt_ids=ids, eos_byte_strings=eos, lora_name="vk")
-        sampler = DirectTokenSampler(potential=p0, proposal=q)
+        sampler = DirectTokenSampler(potential=p0, proposal=q, autobatch=args.autobatch)
         critic = None if args.no_critic else _terminal_critic(p0.vocab)
         cfg.update(sampler="direct-multiview", lora=args.lora_adapter,
                    critic=not args.no_critic)
@@ -236,7 +260,7 @@ def scenario_build(args, model) -> Built:
             fewshot="Question: What is 2+3?\nAnswer: 2+3=5. The answer is 5\n\n")
         llm.prompt_ids = tok.encode(template.format_prompt(args.question))
         critic = CoTCritic(llm.vocab, target_answer=args.answer)
-        sampler = DirectTokenSampler(llm)
+        sampler = DirectTokenSampler(llm, autobatch=args.autobatch)
         cfg.update(answer=args.answer, critic=True)
         return Built(sampler, critic, llm.prompt_ids, cfg)
 
@@ -254,7 +278,7 @@ def scenario_build(args, model) -> Built:
         llm.prompt_ids = list(tok.encode(row["prompt"]))
         critic = CodeCorrectnessCritic(llm.vocab, row["code_context"],
                                        timeout_seconds=args.timeout)
-        sampler = DirectTokenSampler(llm)
+        sampler = DirectTokenSampler(llm, autobatch=args.autobatch)
         cfg.update(library=args.library, item=args.item, timeout=args.timeout,
                    critic=True)
         return Built(sampler, critic, llm.prompt_ids, cfg)
@@ -290,6 +314,10 @@ def parse_args():
     p.add_argument("--prompt", default="The")
     p.add_argument("--eos", choices=["natural", "newline"], default="natural")
     p.add_argument("--no-critic", action="store_true")
+    p.add_argument("--no-autobatch", dest="autobatch", action="store_false",
+                   help="construct samplers/SMC with autobatch seat wrapping OFF (default on)")
+    p.add_argument("--window-stats", action="store_true",
+                   help="print per-window cohort histograms after each smc path")
     p.add_argument("--no-prefix-cache", action="store_true")
     p.add_argument("--constraint", choices=["alpha", "json"], default="alpha")
     p.add_argument("--potential-us", type=int, default=500,
@@ -342,7 +370,8 @@ async def main():
     async def smc_run():
         return await bc.run_smc(
             built.sampler, built.critic, n_particles=args.n_particles,
-            max_tokens=args.max_tokens, ess_threshold=args.ess_threshold, seed=args.seed)
+            max_tokens=args.max_tokens, ess_threshold=args.ess_threshold, seed=args.seed,
+            autobatch=args.autobatch)
 
     for path in want:
         try:
@@ -387,6 +416,8 @@ async def main():
             if "rollout_s" in extra:
                 line += f"  [rollout={extra['rollout_s']:.3f}s critic={extra['critic_s']:.3f}s]"
             print(line)
+            if args.window_stats:
+                _print_window_stats(model)
         except bc._Unsupported as e:
             print(f"  {path:<8} : skipped ({e})")
 

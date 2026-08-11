@@ -44,15 +44,15 @@ class SMC:
             by scoring candidate sequences. Must have the same token type as the unit_sampler.
         autobatch (bool): Wrap the critic in
             [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
-            so concurrent per-particle scores execute as one batched call. The
-            sampler's own seats take the same flag at sampler construction.
+            so concurrent per-particle scores execute as one batched call. Default
+            True; the sampler's own seats take the same flag at sampler construction.
 
     Raises:
         ValueError: If unit_sampler is not a TokenSampler, if critic is not a Potential,
             or if the token types of unit_sampler and critic don't match.
     """
 
-    def __init__(self, unit_sampler, critic=None, autobatch=False):
+    def __init__(self, unit_sampler, critic=None, autobatch=True):
         if not isinstance(unit_sampler, TokenSampler):
             raise ValueError("`unit_sampler` must be a TokenSampler")
 

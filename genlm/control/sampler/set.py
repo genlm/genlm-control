@@ -4,6 +4,7 @@ from arsenal.maths import sample_dict
 from arsenal.datastructures import LocatorMaxHeap
 from abc import ABC, abstractmethod
 
+from genlm.control.potential.autobatch import autobatched
 from genlm.control.util import load_async_trie
 from genlm.backend.tokenization import Token
 
@@ -52,12 +53,18 @@ class TrieSetSampler(SetSampler):
     `TrieSetSampler`s sample tokens from the `iter_potential`'s vocabulary.
     """
 
-    def __init__(self, iter_potential, item_potential):
+    def __init__(self, iter_potential, item_potential, autobatch=False):
         """
         Initialize the `TrieSetSampler`.
 
         Args:
             item_potential (Potential): The potential defined over a vocabulary of items.
+            autobatch (bool): Wrap both potential seats in
+                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential].
+                Default False: the trie walk asks sequentially, so wrapping
+                buys no batching and pays a window pass per call (measured
+                +28% wall clock on the set benchmark). Enable only for
+                genuinely concurrent set-sampler call patterns.
 
         Raises:
             ValueError: If the token type of `iter_potential` is not an iterable of the token type of `item_potential`.
@@ -67,6 +74,9 @@ class TrieSetSampler(SetSampler):
                 "Token type of `iter_potential` must be an iterable of token type of `item_potential`. "
                 f"Got {iter_potential.token_type} and {item_potential.token_type}."
             )
+        if autobatch:
+            iter_potential = autobatched(iter_potential)
+            item_potential = autobatched(item_potential)
         self.iter_potential = iter_potential
         self.item_potential = item_potential
 
@@ -208,7 +218,7 @@ class TopKSetSampler(TrieSetSampler):
         That is, $\\textsf{item_potential.prefix}(x) \\leq \\textsf{item_potential.prefix}(xy)$ for all sequences of items $x, y$.
     """
 
-    def __init__(self, iter_potential, item_potential, K):
+    def __init__(self, iter_potential, item_potential, K, autobatch=False):
         """
         Initialize the TopKSetSampler.
 
@@ -216,10 +226,11 @@ class TopKSetSampler(TrieSetSampler):
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
             K (int|None): The number of top tokens to enumerate. If None, all tokens are enumerated.
+            autobatch (bool): See [`TrieSetSampler`][genlm.control.sampler.set.TrieSetSampler].
         """
         if K is not None and K <= 0:
             raise ValueError("K must be greater than 0 or None")
-        super().__init__(iter_potential, item_potential)
+        super().__init__(iter_potential, item_potential, autobatch=autobatch)
         self.K = K
 
     async def sample_set(self, context, draw=None, iter_logws=None):

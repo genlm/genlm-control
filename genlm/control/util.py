@@ -3,7 +3,7 @@ import contextlib
 import contextvars
 import warnings
 import weakref
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -504,6 +504,20 @@ def set_draw_method(method):
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
 
 
+# Batching breadcrumbs: (site, cohort_size) -> count, cheap enough to stay on.
+# Sites: "draw" (one entry per stacked group per flush) and "autobatch"
+# (one entry per batch call, see potential/autobatch.py). Read + clear via
+# ``take_window_stats()``.
+window_stats = Counter()
+
+
+def take_window_stats():
+    """Snapshot and reset the window-batching counters."""
+    global window_stats
+    stats, window_stats = window_stats, Counter()
+    return stats
+
+
 async def draw_from(lazyweights, draw=None, target=None):
     """Draw a token and price it: ``(token, logw, logp)``. THE draw seam -- every
     sampler that draws from a distribution routes through here. A sampler needing
@@ -582,6 +596,7 @@ def _flush_draws(queue):
         )
         groups[key].append((lw, target, future))
     for entries in groups.values():
+        window_stats[("draw", len(entries))] += 1
         try:
             rows = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in entries])
             logZ = torch.logsumexp(rows, dim=-1)

@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", default="The")
     p.add_argument("--eos", choices=["natural", "newline"], default="natural")
     p.add_argument("--no-critic", action="store_true")
+    p.add_argument("--no-autobatch", dest="autobatch", action="store_false",
+                   help="construct samplers/SMC with autobatch seat wrapping OFF (default on)")
     p.add_argument("--no-prefix-cache", action="store_true")
     p.add_argument("--constraint", choices=["alpha", "json"], default="alpha")
     p.add_argument("--lora-adapter", default=bench.LORA_ADAPTER)

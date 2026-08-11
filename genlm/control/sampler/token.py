@@ -114,7 +114,8 @@ class DirectTokenSampler(TokenSampler):
             must place positive mass on every token the target weights positively.
         autobatch (bool): Wrap the potential seats in
             [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
-            so concurrent per-particle asks execute as one batched call.
+            so concurrent per-particle asks execute as one batched call. Default
+            True; pass False to leave the seats unwrapped.
 
     Warning:
         Only use this sampler if the potential's `logw_next` method is efficient. This is the case
@@ -123,7 +124,7 @@ class DirectTokenSampler(TokenSampler):
         sampler will be slow.
     """
 
-    def __init__(self, potential, proposal=None, autobatch=False):
+    def __init__(self, potential, proposal=None, autobatch=True):
         if proposal is not None:
             _validate_proposal_vocab(potential, proposal)
         if autobatch:
@@ -241,7 +242,8 @@ class AWRS(TokenSampler):
             The proposal must place positive mass on every token the target
             weights positively.
         autobatch (bool): Wrap the potential seats (potential, condition, proposal)
-            in [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
+            in [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential]
+            (default True; pass False to leave the seats unwrapped),
             so concurrent per-particle asks execute as one batched call.
     """
 
@@ -256,7 +258,7 @@ class AWRS(TokenSampler):
         max_rejects=float("inf"),
         n_monte_carlo_samples=None,
         proposal=None,
-        autobatch=False,
+        autobatch=True,
     ):
         if proposal is not None:
             _validate_proposal_vocab(potential, proposal)
