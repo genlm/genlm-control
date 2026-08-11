@@ -316,6 +316,8 @@ def parse_args():
     p.add_argument("--no-critic", action="store_true")
     p.add_argument("--no-autobatch", dest="autobatch", action="store_false",
                    help="construct samplers/SMC with autobatch seat wrapping OFF (default on)")
+    p.add_argument("--n-smcs", type=int, default=1,
+                   help="concurrent SMC runs per trial (batched SMC via asyncio.gather)")
     p.add_argument("--window-stats", action="store_true",
                    help="print per-window cohort histograms after each smc path")
     p.add_argument("--no-prefix-cache", action="store_true")
@@ -361,6 +363,8 @@ async def main():
     built = scenario_build(args, model)
     version, env = bc.version_tag(args.label), bc.env_tag()
 
+    if args.n_smcs != 1:
+        built.config["n_smcs"] = args.n_smcs
     want = [p.strip() for p in args.paths.split(",") if p.strip()]
     print("=" * 72)
     print(f"scenario={args.scenario} model={model_name} N={args.n_particles} "
@@ -371,7 +375,7 @@ async def main():
         return await bc.run_smc(
             built.sampler, built.critic, n_particles=args.n_particles,
             max_tokens=args.max_tokens, ess_threshold=args.ess_threshold, seed=args.seed,
-            autobatch=args.autobatch)
+            autobatch=args.autobatch, n_smcs=args.n_smcs)
 
     for path in want:
         try:

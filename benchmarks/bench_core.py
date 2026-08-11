@@ -97,16 +97,29 @@ def seed_all(seed: int) -> None:
 # The run matrix: smc (this checkout) / raw (engine decode ceiling)            #
 # --------------------------------------------------------------------------- #
 async def run_smc(sampler, critic, *, n_particles: int, max_tokens: int,
-                  ess_threshold: float, seed: int, autobatch: bool = False):
-    """One SMC run. How the engine serves it is a property of the checkout, so a
-    speedup is read ACROSS versions of the same scenario, never across paths."""
+                  ess_threshold: float, seed: int, autobatch: bool = False,
+                  n_smcs: int = 1):
+    """One SMC run -- or ``n_smcs`` concurrent ones over the same sampler/critic
+    (batched SMC is plain ``asyncio.gather``; their asks meet below the potential
+    seam). How the engine serves it is a property of the checkout, so a speedup
+    is read ACROSS versions of the same scenario, never across paths."""
+    import asyncio
+
     from genlm.control.sampler.sequence import SMC
 
     seed_all(seed)
     smc = SMC(sampler, critic=critic, autobatch=autobatch)
     t0 = time.perf_counter()
-    seqs = await smc(n_particles=n_particles, ess_threshold=ess_threshold,
-                     max_tokens=max_tokens)
+    if n_smcs == 1:
+        seqs = await smc(n_particles=n_particles, ess_threshold=ess_threshold,
+                         max_tokens=max_tokens)
+    else:
+        runs = await asyncio.gather(*[
+            smc(n_particles=n_particles, ess_threshold=ess_threshold,
+                max_tokens=max_tokens)
+            for _ in range(n_smcs)
+        ])
+        seqs = runs[0]
     return time.perf_counter() - t0, seqs
 
 
