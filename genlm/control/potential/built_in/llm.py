@@ -711,5 +711,3 @@ class PromptedLLM(Potential):
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         return self.spawn(eos_byte_strings=eos_byte_strings)
 
-    def to_autobatched(self):
-        raise ValueError("PromptedLLMs are autobatched by default.")

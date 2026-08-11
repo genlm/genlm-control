@@ -5,6 +5,7 @@ from arsenal import colors
 from arsenal.maths import log1mexp
 import warnings
 
+from genlm.control.potential.autobatch import autobatched
 from genlm.control.util import (
     draw_from,
     awrs_gumbel_keys,
@@ -111,6 +112,9 @@ class DirectTokenSampler(TokenSampler):
             share `potential.vocab_eos` (cross-tokenizer not yet supported). When
             `None` (the default), the target acts as its own proposal. The proposal
             must place positive mass on every token the target weights positively.
+        autobatch (bool): Wrap the potential seats in
+            [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
+            so concurrent per-particle asks execute as one batched call.
 
     Warning:
         Only use this sampler if the potential's `logw_next` method is efficient. This is the case
@@ -119,11 +123,14 @@ class DirectTokenSampler(TokenSampler):
         sampler will be slow.
     """
 
-    def __init__(self, potential, proposal=None):
-        super().__init__(target=potential)
-        self.potential = potential
+    def __init__(self, potential, proposal=None, autobatch=False):
         if proposal is not None:
             _validate_proposal_vocab(potential, proposal)
+        if autobatch:
+            potential = autobatched(potential)
+            proposal = autobatched(proposal)
+        super().__init__(target=potential)
+        self.potential = potential
         self.proposal = proposal
 
     async def sample(self, context, draw=None):
@@ -233,6 +240,9 @@ class AWRS(TokenSampler):
             correction is applied (matching the `proper_weights=False` contract).
             The proposal must place positive mass on every token the target
             weights positively.
+        autobatch (bool): Wrap the potential seats (potential, condition, proposal)
+            in [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
+            so concurrent per-particle asks execute as one batched call.
     """
 
     def __init__(
@@ -246,12 +256,17 @@ class AWRS(TokenSampler):
         max_rejects=float("inf"),
         n_monte_carlo_samples=None,
         proposal=None,
+        autobatch=False,
     ):
+        if proposal is not None:
+            _validate_proposal_vocab(potential, proposal)
+        if autobatch:
+            potential = autobatched(potential)
+            condition = autobatched(condition)
+            proposal = autobatched(proposal)
         super().__init__(target=potential * condition)
         self.potential = potential
         self.condition = condition
-        if proposal is not None:
-            _validate_proposal_vocab(potential, proposal)
         self.proposal = proposal
 
         self.prune_logws = prune_logws

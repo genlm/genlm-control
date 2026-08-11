@@ -5,6 +5,7 @@ from functools import cached_property
 from dataclasses import dataclass
 
 from genlm.control.potential import Potential
+from genlm.control.potential.autobatch import autobatched
 from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.smc import SequenceModel, smc_standard
@@ -41,13 +42,17 @@ class SMC:
         unit_sampler (TokenSampler): The sampler that generates tokens.
         critic (Potential, optional): A potential function that guides the generation process
             by scoring candidate sequences. Must have the same token type as the unit_sampler.
+        autobatch (bool): Wrap the critic in
+            [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
+            so concurrent per-particle scores execute as one batched call. The
+            sampler's own seats take the same flag at sampler construction.
 
     Raises:
         ValueError: If unit_sampler is not a TokenSampler, if critic is not a Potential,
             or if the token types of unit_sampler and critic don't match.
     """
 
-    def __init__(self, unit_sampler, critic=None):
+    def __init__(self, unit_sampler, critic=None, autobatch=False):
         if not isinstance(unit_sampler, TokenSampler):
             raise ValueError("`unit_sampler` must be a TokenSampler")
 
@@ -66,7 +71,7 @@ class SMC:
                 )
 
         self.unit_sampler = unit_sampler
-        self.critic = critic
+        self.critic = autobatched(critic) if autobatch else critic
 
     async def __call__(
         self,

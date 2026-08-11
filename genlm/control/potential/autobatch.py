@@ -1,37 +1,32 @@
 import asyncio
-from typing import NamedTuple, Callable
+import weakref
 from collections import defaultdict
 
 from genlm.control.potential.base import Potential, VocabTables
 from genlm.control.util import LazyWeights
 
 
-class Request(NamedTuple):
-    batch_method_name: str
-    args_accumulator: Callable
-    future: asyncio.Future
-
-
 class AutoBatchedPotential(Potential):
     """
     AutoBatchedPotential is a wrapper around a Potential that enables automatic batching of concurrent requests.
 
-    This class manages a background loop that collects concurrent requests to instance methods
-    (`complete`, `prefix`, `score`, `logw_next`) and batches them together before
-    delegating to the corresponding batch methods of the underlying potential
-    (`batch_complete`, `batch_prefix`, `batch_score`, `batch_logw_next`).
+    Concurrent calls to instance methods (`complete`, `prefix`, `score`,
+    `logw_next`) meet in a per-event-loop window and execute as one call to the
+    corresponding batch method of the underlying potential (`batch_complete`,
+    `batch_prefix`, `batch_score`, `batch_logw_next`). The window is held open
+    by its first caller until a full event-loop pass adds no new request, then
+    flushed in that caller's own coroutine — no background task, nothing bound
+    to a loop at construction time.
 
     This class inherits all methods from [`Potential`][genlm.control.potential.base.Potential].
 
     Attributes:
         potential (Potential): The underlying potential instance that is being wrapped.
-        background_loop (AsyncBatchLoop): An asynchronous loop that manages batch requests.
     """
 
     def __init__(self, potential):
         self.potential = potential
-        self.background_loop = AsyncBatchLoop(potential)
-        self.background_loop.start()
+        self._windows = weakref.WeakKeyDictionary()  # event loop -> _Window
         # The wrapped potential's own tables: a wrapper indexes the same vocabulary,
         # so rebuilding them would cost O(len(vocab)) per wrap for an identical result.
         super().__init__(
@@ -44,25 +39,68 @@ class AutoBatchedPotential(Potential):
             ),
         )
 
+    async def _queued(self, batch_method_name, context):
+        loop = asyncio.get_running_loop()
+        window = self._windows.get(loop)
+        if window is None:
+            window = self._windows[loop] = _Window()
+        future = loop.create_future()
+        window.queue.append((batch_method_name, context, future))
+        if not window.armed:
+            window.armed = True
+            try:
+                # Callers reach their request at different depths of a `gather`
+                # tree, and each level is another scheduler turn; yield until a
+                # turn adds nothing, so the whole cohort lands in one flush.
+                while True:
+                    n = len(window.queue)
+                    await asyncio.sleep(0)
+                    if len(window.queue) == n:
+                        break
+                queue, window.queue = window.queue, []
+            finally:
+                window.armed = False
+            await self._flush(queue)
+        return await future
+
+    async def _flush(self, queue):
+        """One call per batch method for the whole cohort. Every future gets its
+        result or the exception -- never silence."""
+        groups = defaultdict(list)
+        for method_name, context, future in queue:
+            groups[method_name].append((context, future))
+        for method_name, requests in groups.items():
+            try:
+                results = await getattr(self.potential, method_name)(
+                    [context for context, _ in requests]
+                )
+                # batch_logw_next returns ONE batched LazyWeights [N, V+1]; split it
+                # back into per-request rows (other batch methods return [N] arrays).
+                if isinstance(results, LazyWeights):
+                    results = [
+                        results.spawn(results.weights[i])
+                        for i in range(len(requests))
+                    ]
+                assert len(results) == len(requests)
+                for (_, future), result in zip(requests, results):
+                    if not future.done():
+                        future.set_result(result)
+            except Exception as exc:
+                for _, future in requests:
+                    if not future.done():
+                        future.set_exception(exc)
+
     async def complete(self, context):
-        return await self.background_loop.queue_request(
-            "batch_complete", lambda args: ([*args[0], context],)
-        )
+        return await self._queued("batch_complete", context)
 
     async def prefix(self, context):
-        return await self.background_loop.queue_request(
-            "batch_prefix", lambda args: ([*args[0], context],)
-        )
+        return await self._queued("batch_prefix", context)
 
     async def score(self, context):
-        return await self.background_loop.queue_request(
-            "batch_score", lambda args: ([*args[0], context],)
-        )
+        return await self._queued("batch_score", context)
 
     async def logw_next(self, context):
-        return await self.background_loop.queue_request(
-            "batch_logw_next", lambda args: ([*args[0], context],)
-        )
+        return await self._queued("batch_logw_next", context)
 
     async def logw_eos(self, context):
         # No batch form to queue against, and the wrapped potential may answer it far
@@ -82,112 +120,36 @@ class AutoBatchedPotential(Potential):
         return await self.potential.batch_logw_next(contexts)
 
     def spawn(self, *args, **kwargs):
-        # creates a new background loop.
         return AutoBatchedPotential(self.potential.spawn(*args, **kwargs))
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.potential!r})"
 
     async def cleanup(self):
-        """Async cleanup - preferred method"""
-        await self.background_loop.cleanup()
-
-    def __del__(self):
-        if loop := getattr(self, "background_loop", None):
-            loop.close()
+        pass  # nothing to stop: the window lives and dies with its callers
 
 
-class AsyncBatchLoop:
-    """Asynchronous batch processing loop for potential methods."""
+class _Window:
+    """Per-event-loop request meeting point; must not outlive its loop."""
 
-    def __init__(self, potential, history=None):
-        self.potential = potential
-        self.q = asyncio.Queue()
-        self.task = None
-        self.history = history
+    __slots__ = ("queue", "armed")
 
-    def start(self):
-        """Start the background processing task."""
-        self.task = asyncio.create_task(self._background_loop())
+    def __init__(self):
+        self.queue = []
+        self.armed = False
 
-    def queue_request(self, batch_method_name, arg_accumulator):
-        """Queue a request for batch processing."""
-        future = asyncio.Future()
-        self.q.put_nowait(Request(batch_method_name, arg_accumulator, future))
-        return future
 
-    async def _background_loop(self):
-        """Background task that processes queued requests."""
-        while True:
-            try:
-                method_groups = defaultdict(list)
-                req = await self.q.get()
-                method_groups[req.batch_method_name].append(req)
+_WRAPPERS = weakref.WeakKeyDictionary()  # potential -> its AutoBatchedPotential
 
-                # Callers reach their request at different depths of a `gather` tree,
-                # and each level is another scheduler turn, so what is queued when this
-                # wakes is one turn's arrivals rather than the population's. Yield until
-                # a turn adds nothing: bounded by the callers' depth, and every turn
-                # waited on was going to happen anyway.
-                while True:
-                    try:
-                        while True:
-                            req = self.q.get_nowait()
-                            method_groups[req.batch_method_name].append(req)
-                    except asyncio.QueueEmpty:
-                        pass
-                    await asyncio.sleep(0)
-                    if self.q.empty():
-                        break
 
-                for method_name, requests in method_groups.items():
-                    try:
-                        batch_args = ([],)
-                        for req in requests:
-                            batch_args = req.args_accumulator(batch_args)
-
-                        results = await getattr(self.potential, method_name)(
-                            *batch_args
-                        )
-
-                        # batch_logw_next returns ONE batched LazyWeights [N, V+1]; split it
-                        # back into per-request rows (other batch methods return [N] arrays).
-                        if isinstance(results, LazyWeights):
-                            results = [
-                                results.spawn(results.weights[i])
-                                for i in range(len(requests))
-                            ]
-
-                        assert len(results) == len(requests)
-                        for i, req in enumerate(requests):
-                            req.future.set_result(results[i])
-
-                    except Exception as e:
-                        for req in requests:
-                            if not req.future.done():
-                                req.future.set_exception(e)
-
-            except asyncio.CancelledError:
-                break
-
-    def close(self):
-        """Stop the background processing task and cleanup resources."""
-        if task := getattr(self, "task", None):
-            try:
-                task.cancel()
-            except RuntimeError:  # pragma: no cover
-                pass  # pragma: no cover
-            self.task = None
-
-    async def cleanup(self):
-        """Async cleanup - preferred method"""
-        if self.task and not self.task.done():
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-            self.task = None
-
-    def __del__(self):
-        self.close()
+def autobatched(potential):
+    """THE autobatched view of ``potential`` -- memoized, so every call site
+    (and every sampler sharing the potential) resolves to the same wrapper and
+    therefore the same batching window. ``None`` passes through; an
+    already-wrapped potential is not wrapped twice."""
+    if potential is None or isinstance(potential, AutoBatchedPotential):
+        return potential
+    wrapper = _WRAPPERS.get(potential)
+    if wrapper is None:
+        wrapper = _WRAPPERS[potential] = AutoBatchedPotential(potential)
+    return wrapper
