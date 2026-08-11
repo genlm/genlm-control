@@ -1,6 +1,4 @@
 import asyncio
-import contextlib
-import contextvars
 import warnings
 import weakref
 from collections import Counter, defaultdict
@@ -358,106 +356,6 @@ def inverse_cdf(logps):
     return torch.searchsorted(cdf, u).squeeze(-1).clamp_(max=cdf.shape[-1] - 1)
 
 
-# --- counter-based (device/order-independent) noise ---
-# Picker noise is a pure function of an explicit (seed, slot, step) key, not a shared RNG
-# stream: threefry-2x32 in torch int64 is bit-identical CPU/CUDA, so GPU and CPU runs
-# draw the SAME noise. Key in scope via the ``draw_key`` ContextVar; unkeyed -> torch.rand.
-
-_DRAW_KEY = contextvars.ContextVar("draw_key", default=None)  # (slot, [next_ordinal]) | None
-_DRAW_SEED = 0  # base seed; set by set_draw_seed (mirror of seed_all's seed)
-
-_TF_MASK = 0xFFFFFFFF
-_TF_PARITY = 0x1BD11BDA
-_TF_ROT = (13, 15, 26, 6, 17, 29, 16, 24)
-_TF_ROUNDS = 20
-
-
-def _rotl32(x, r):
-    return ((x << r) | (x >> (32 - r))) & _TF_MASK
-
-
-def threefry_2x32(c0, c1, k0, k1):
-    """Threefry-2x32 keyed hash (``c*``/``k*`` int64 tensors/ints in [0, 2^32)); returns
-    the first 32-bit output word. Pure int arithmetic -> bit-identical across devices."""
-    ks0, ks1 = k0 & _TF_MASK, k1 & _TF_MASK
-    ks2 = (_TF_PARITY ^ ks0 ^ ks1) & _TF_MASK
-    ks = (ks0, ks1, ks2)
-    x0 = (c0 + ks0) & _TF_MASK
-    x1 = (c1 + ks1) & _TF_MASK
-    for r in range(_TF_ROUNDS):
-        x0 = (x0 + x1) & _TF_MASK
-        x1 = _rotl32(x1, _TF_ROT[r % 8])
-        x1 = x1 ^ x0
-        if (r + 1) % 4 == 0:
-            s = (r + 1) // 4
-            x0 = (x0 + ks[s % 3]) & _TF_MASK
-            x1 = (x1 + ks[(s + 1) % 3] + s) & _TF_MASK
-    return x0
-
-
-def threefry_uniform(n, seed, slot, step, device):
-    """``n`` device-independent uniforms keyed by (seed, slot, step), on the SAME 24-bit
-    float32 grid as ``torch.rand``: ``(x >> 8) / 2**24``, in ``[0, 1-2^-24]``. Must match
-    ``torch.rand``'s grid exactly or ``threefry_gumbel`` diverges from ``gumbel_max``.
-    Bit-identical across CPU/CUDA. ``slot``/``step`` scalar (-> ``[n]``) or ``[N]`` (->
-    ``[N, n]``)."""
-    i = torch.arange(n, device=device, dtype=torch.int64)  # counter word 0 (index)
-    slot = torch.as_tensor(slot, device=device, dtype=torch.int64)
-    step = torch.as_tensor(step, device=device, dtype=torch.int64)
-    if slot.ndim:  # batched: [N] keys -> [N, 1] against [n] indices
-        i, slot, step = i[None, :], slot[:, None], step[:, None]
-    x = threefry_2x32(i & _TF_MASK, step & _TF_MASK, seed & _TF_MASK, slot & _TF_MASK)
-    return (x >> 8).to(torch.float32) / 16777216.0  # 24-bit grid, like torch.rand(f32)
-
-
-def threefry_gumbel(logps):
-    """Gumbel-max over counter-based noise when a ``draw_key`` is in scope (device/order-
-    independent); torch.rand Gumbel fallback when unkeyed. A scalar key advances its ordinal
-    per draw; a batched key (per-row ``slot``/``step`` tensors) draws every row of ``[N, V]``
-    at once, byte-identical to the per-row scalar draws (noise is keyed, not streamed)."""
-    key = _DRAW_KEY.get()
-    if key is None:
-        u = torch.rand_like(logps, dtype=torch.float64)
-    else:
-        slot, ctr = key
-        if torch.is_tensor(slot):  # batched: one draw per row, ordinals fixed
-            step = ctr
-        else:  # scalar: advance the ordinal in this scope
-            step = ctr[0]
-            ctr[0] = step + 1
-        u = threefry_uniform(logps.shape[-1], _DRAW_SEED, slot, step, logps.device)
-    g = (-torch.log(-torch.log(u))).to(logps.dtype)  # finite Gumbel, then to model dtype
-    return (logps + g).argmax(dim=-1)
-
-
-def set_draw_seed(s):
-    """Base seed for the counter-based picker (``threefry_gumbel``); mirror of seed_all."""
-    global _DRAW_SEED
-    _DRAW_SEED = int(s) & _TF_MASK
-
-
-def get_draw_seed():
-    """Current base seed for the counter-based streams (AWRS's default per-instance seed)."""
-    return _DRAW_SEED
-
-
-def awrs_gumbel_keys(logps, seed, step):
-    """``logps + Gumbel`` over the threefry stream keyed by ``(seed, step)`` -- AWRS's OWN
-    per-instance (seed, counter), so it is driver-independent yet device-identical."""
-    u = threefry_uniform(logps.shape[-1], int(seed) & _TF_MASK, 0, int(step) & _TF_MASK,
-                         logps.device)
-    return logps + (-torch.log(-torch.log(u))).to(logps.dtype)
-
-
-def draw_ordinal(context):
-    """Flattened leaf count of a (possibly unit-nested) particle context -- the base draw
-    ordinal. Token grain: ``len(context)``; unit grain: total subunits drawn."""
-    n = 0
-    for item in context:
-        n += draw_ordinal(item) if isinstance(item, list) else 1
-    return n
-
-
 def flatten_units(context):
     """Recursively flatten a (possibly unit-nested) context to a flat token list.
 
@@ -473,24 +371,10 @@ def flatten_units(context):
     return flattened
 
 
-@contextlib.contextmanager
-def draw_key(slot, base=0):
-    """Scope the counter-based picker's key. Scalar ``slot``/``base`` (one particle): ``slot``
-    = particle row, ``base`` = draw ordinal so far (advanced per draw). Tensor ``slot``/``base``
-    (``[N]`` per-row): one batched draw over the population, ordinals fixed."""
-    key = (slot, base) if torch.is_tensor(slot) else (int(slot), [int(base)])
-    tok = _DRAW_KEY.set(key)
-    try:
-        yield
-    finally:
-        _DRAW_KEY.reset(tok)
-
-
 DRAW_METHODS = {
     "gumbel_max": gumbel_max,
     "multinomial": multinomial,
     "inverse_cdf": inverse_cdf,
-    "threefry_gumbel": threefry_gumbel,
 }
 # The picker ``select`` uses -- a process-wide setting (see ``set_draw_method``).
 _picker = gumbel_max

@@ -136,17 +136,6 @@ async def test_normalized_honours_an_overridden_prefix():
     assert await q.prefix(ctx) == pytest.approx(await p.prefix(ctx) - spanned)
 
 
-def test_wrappers_are_transparent_to_the_leaf_walk(p):
-    """``find_engine_lm``/``lm_leaves`` reach an LM through both wrappers, which is what
-    lets a burst inject a leaf under ``(llm * mask).normalize() * critic``."""
-    from genlm.control.potential.built_in.llm import _walk_leaves
-
-    other = Weighted(VOCAB, seed=1)
-    assert list(_walk_leaves((p * other).normalize())) == [p, other]
-    assert list(_walk_leaves((p**0.5) * other)) == [p, other]
-    assert list(_walk_leaves((p * other).normalize() ** 2.0)) == [p, other]
-
-
 @pytest.mark.asyncio
 async def test_collapsed_support_carries_no_weight():
     """The point of the local product: a step where the mask leaves one live token

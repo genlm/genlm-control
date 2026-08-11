@@ -58,6 +58,7 @@ class TrieSetSampler(SetSampler):
         Initialize the `TrieSetSampler`.
 
         Args:
+            iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
             autobatch (bool): Wrap both potential seats in
                 [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential].

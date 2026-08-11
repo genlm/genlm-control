@@ -25,10 +25,6 @@ class Normalized(Potential):
             p.vocab, tables=VocabTables(p.token_type, p.eos, p.vocab_eos, p.lookup)
         )
 
-    @property
-    def children(self):
-        return [self.p]
-
     def alloc_rows(self, n, default=float("-inf")):
         return self.p.alloc_rows(n, default)
 

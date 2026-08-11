@@ -5,7 +5,6 @@ import warnings
 from typing import NamedTuple
 from genlm.control.constant import EOS
 from genlm.control.potential.base import Potential
-from genlm.control.potential.coerce import Coerced
 from genlm.control.typing import infer_vocabulary_type
 from genlm.backend.tokenization import Token
 
@@ -13,20 +12,6 @@ from genlm.backend.tokenization import Token
 _prompt_ids_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "genlm_control_prompt_ids_overrides", default=None
 )
-
-
-def _walk_leaves(potential):
-    """Yield the leaf potentials (no ``children``), recursing composites' ``children``
-    and unwrapping ``Coerced`` (the wrapped potential is what ultimately computes)."""
-    if isinstance(potential, Coerced):
-        yield from _walk_leaves(potential.potential)
-        return
-    children = potential.children
-    if not children:
-        yield potential
-        return
-    for child in children:
-        yield from _walk_leaves(child)
 
 
 def _compat_eos_tokens(eos_byte_strings, kwargs):

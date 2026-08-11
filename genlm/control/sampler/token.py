@@ -6,11 +6,7 @@ from arsenal.maths import log1mexp
 import warnings
 
 from genlm.control.potential.autobatch import autobatched
-from genlm.control.util import (
-    draw_from,
-    awrs_gumbel_keys,
-    get_draw_seed,
-)
+from genlm.control.util import draw_from
 from genlm.control.sampler.set import SetSampler
 from genlm.control.sampler.util import _validate_proposal_vocab
 
@@ -296,9 +292,8 @@ class AWRS(TokenSampler):
         self.vocab_eos_set = set(self.target.vocab_eos)
         self.V = len(self.potential.vocab_eos)
         self.rng = np.random.default_rng(seed=seed)  # phantom-geometric (CPU scalar)
-        # Gumbel keys: per-instance threefry stream (driver-independent, on-device).
-        self._draw_seed = (seed if seed is not None else get_draw_seed()) & 0xFFFFFFFF
-        self._draw_ctr = 0
+        self._seed = seed
+        self._gen_cache = None  # per-device generator for rejection Gumbel noise
         self._valid_idxs_cache = None
 
     def _prune_logws(self, w):
@@ -316,11 +311,23 @@ class AWRS(TokenSampler):
             )
         return c
 
+    def _gen(self, device):
+        g = self._gen_cache
+        if g is None or g.device != torch.device(device):
+            g = self._gen_cache = torch.Generator(device=device)
+            if self._seed is not None:
+                g.manual_seed(int(self._seed))
+        return g
+
     def _make_keys(self, logps):
-        """Fresh Gumbel keys for one round; advance the counter so each round is independent."""
-        keys = awrs_gumbel_keys(logps, self._draw_seed, self._draw_ctr)
-        self._draw_ctr += 1
-        return keys
+        """Fresh Gumbel keys for one round, from this instance's own stream."""
+        u = torch.rand(
+            logps.shape,
+            dtype=torch.float64,
+            device=logps.device,
+            generator=self._gen(logps.device),
+        )
+        return logps + (-torch.log(-torch.log(u))).to(logps.dtype)
 
     async def _accept(self, context, token, verbosity=0):
         if self.prune_logws or token in self.vocab_eos_set:

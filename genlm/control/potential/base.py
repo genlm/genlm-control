@@ -200,11 +200,6 @@ class Potential(ABC, PotentialOps, PotentialTests):
         """
         return False
 
-    @property
-    def children(self):
-        """Sub-potentials this composes (``[]`` for a leaf; ``Product`` -> ``[p1, p2]``)."""
-        return []
-
     async def live_logws(self, context):
         """Live next-token weights as `(indices, values, eos)`: the vocabulary indices
         carrying finite weight, their weights, and the EOS weight -- or `None` when

@@ -10,6 +10,7 @@ from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported
 from genlm.control.sampler.token import TokenSampler
 from genlm.control.sampler.smc import SequenceModel, smc_standard
 
+
 class SMC:
     """This class implements sequential Monte Carlo (SMC) inference for controlled text generation.
     The generation process works as follows:
@@ -155,6 +156,7 @@ class SMC:
         await self.unit_sampler.cleanup()
         if self.critic:
             await self.critic.cleanup()
+
 
 @dataclass
 class Sequences:

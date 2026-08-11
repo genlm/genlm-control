@@ -100,10 +100,6 @@ class Product(Potential):
                 )
 
     @property
-    def children(self):
-        return [self.p1, self.p2]
-
-    @property
     def v1_idxs(self):
         if self._v1_idxs is None:
             self._v1_idxs = [self.p1.lookup[token] for token in self.vocab_eos]
