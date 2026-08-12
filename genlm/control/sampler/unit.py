@@ -90,8 +90,8 @@ class MultiTokenUnitSampler(TokenSampler):
 
         Args:
             context (list): The particle's structured (possibly nested) unit context.
-                It is flattened here so the subunit sampler sees a flat token list;
-                the structured form feeds the boundary predicate.
+                Flattened for the subunit sampler; the boundary predicate sees the
+                structured form.
             draw (callable, optional): Sampling function passed to subunit_sampler
 
         Returns:
@@ -185,11 +185,9 @@ class TokenSetBoundary(BoundaryPredicate):
 
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
-        # Match by byte content, not hash-set membership: a real-LLM ``Token``
-        # (bytes subclass hashing by token_id) has ``Token(13, b" ") in {b" "}``
-        # False despite matching bytes, so the boundary would silently never fire
-        # on that grain. Precompute a plain-bytes set (``bytes(t)`` works for both
-        # ``Token`` and ``bytes``) plus an EOS flag (EOS matches by identity).
+        # A ``Token`` is a bytes subclass that hashes by token_id, so
+        # ``Token(13, b" ") in {b" "}`` is False despite matching bytes and the
+        # boundary would silently never fire. Match byte content, and EOS by identity.
         self._eos_boundary = any(
             isinstance(t, EndOfSequence) for t in self.boundary_tokens
         )
@@ -198,9 +196,8 @@ class TokenSetBoundary(BoundaryPredicate):
         }
 
     def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
-        """Check boundary (ignore unit_context for stateless predicate). Matches by
-        byte content so it fires identically on ``bytes`` and real-LLM ``Token``
-        subunits; EOS is matched by identity."""
+        """Check boundary (ignore unit_context for stateless predicate). Subunits
+        match by byte content, EOS by identity."""
         if not subunit_buffer:
             return False
         last = subunit_buffer[-1]

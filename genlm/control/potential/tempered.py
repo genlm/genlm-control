@@ -8,7 +8,7 @@ class Tempered(Potential):
     """A potential with every log-weight scaled by `beta`, written `p ** beta`.
 
     Unnormalized: the next-token rows do not renormalize, so `p ** beta` is a raw
-    reweighting. Compose with `.normalize()` for a locally normalized temper --
+    reweighting. Compose with `.normalize()` for a locally normalized temper;
     `(p ** (1/tau)).normalize()` is `p` at temperature `tau`.
 
     A hard zero stays hard: `-inf` weights survive any `beta`, so a support mask is
@@ -30,8 +30,8 @@ class Tempered(Potential):
         return self.p.alloc_rows(n, default)
 
     def _scale(self, w):
-        """``beta * w``, in ``w``'s own backend, leaving ``-inf`` untouched -- scaling
-        it would make ``nan`` at ``beta <= 0`` and resurrect a masked token."""
+        """``beta * w``, in ``w``'s own backend, leaving ``-inf`` untouched: scaling it
+        would make ``nan`` at ``beta <= 0`` and resurrect a masked token."""
         if torch.is_tensor(w):
             out = w.clone()
             live = ~w.isneginf()
@@ -44,8 +44,8 @@ class Tempered(Potential):
         return out
 
     def _scale_one(self, v):
-        """:meth:`_scale` for a single score -- the scalar and batched lanes must agree
-        on ``-inf``, or a masked context reads ``nan`` through one and ``-inf`` through
+        """``_scale`` for a single score. The scalar and batched lanes must agree on
+        ``-inf``, or a masked context reads ``nan`` through one and ``-inf`` through
         the other."""
         v = float(v)
         return v if v == float("-inf") else self.beta * v

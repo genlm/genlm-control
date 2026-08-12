@@ -12,16 +12,25 @@ from genlm.control.potential.testing import PotentialTests
 
 
 def _as_ints(idx, dtype):
-    """An index run as an integer array, without a per-element pass when it already is
-    one. `np.fromiter` and not `torch.tensor(list)`, which is several times slower."""
+    """An index run as an integer array of `dtype`, copied only when it is not one
+    already. `np.fromiter` rather than `torch.tensor(list)`, several times faster here."""
     if isinstance(idx, np.ndarray):
         return idx.astype(dtype, copy=False)
     return np.fromiter(idx, dtype=dtype)
 
 
 class VocabTables(NamedTuple):
-    """What a vocabulary determines, built once and shareable by every potential over
-    it (see `Potential.build_tables`)."""
+    """The vocabulary-derived tables a potential needs.
+
+    Built by [build_tables][genlm.control.potential.base.Potential.build_tables] and
+    shareable by every potential over the same vocabulary.
+
+    Attributes:
+        token_type (TokenType): The type of tokens in the vocabulary.
+        eos (EndOfSequence): Special token to use as end-of-sequence.
+        vocab_eos (list): List of tokens in the vocabulary and `eos`, `eos` last.
+        lookup (dict): Mapping from tokens and `eos` to their indices in `vocab_eos`.
+    """
 
     token_type: TokenType
     eos: EndOfSequence
@@ -58,12 +67,25 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
     @staticmethod
     def build_tables(vocabulary, token_type=None, eos=None):
-        """The tables a vocabulary determines: `(token_type, eos, vocab_eos, lookup)`.
+        """Build the vocabulary tables a potential is initialized from.
 
-        A function of `(vocabulary, token_type, eos)` alone and O(len(vocabulary)) to
-        build, so potentials sharing a vocabulary should build it once and pass it to
-        each of them via `tables=` rather than each paying for its own. Validation
-        (token types, duplicate tokens) happens here, once.
+        The result is a function of `(vocabulary, token_type, eos)` alone and costs
+        O(len(vocabulary)) to build, so potentials sharing a vocabulary should build it
+        once and pass it to each of them via `tables=`. Token type and duplicate token
+        validation happens here.
+
+        Args:
+            vocabulary (list): List of tokens that make up the vocabulary.
+            token_type (TokenType, optional): Optional TokenType of all elements of the vocabulary.
+                If None, will be inferred from vocabulary.
+            eos (EndOfSequence, optional): Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
+
+        Returns:
+            (VocabTables): The tables `(token_type, eos, vocab_eos, lookup)`.
+
+        Raises:
+            ValueError: If vocabulary is empty or contains duplicate tokens.
+            TypeError: If vocabulary contains tokens which are not of `token_type`.
         """
         if not vocabulary:
             raise ValueError("vocabulary cannot be empty")
@@ -99,7 +121,7 @@ class Potential(ABC, PotentialOps, PotentialTests):
                 If None, will be inferred from vocabulary.
             eos (EndOfSequence, optional): Special token to use as end-of-sequence. Defaults to `EOS` sentinel.
             tables (VocabTables, optional): Prebuilt tables for this exact `vocabulary`,
-                as returned by :meth:`build_tables` -- skips the O(len(vocabulary))
+                as returned by `build_tables`, skipping the O(len(vocabulary))
                 construction and its validation. Mutually exclusive with `token_type`
                 and `eos`, which the tables already carry.
 
@@ -115,8 +137,8 @@ class Potential(ABC, PotentialOps, PotentialTests):
                     "`tables` already carries `token_type` and `eos`; pass them to "
                     "`build_tables` instead"
                 )
-            # Cheap arity check only -- comparing the vocabularies elementwise would
-            # cost exactly what injecting the tables is meant to avoid.
+            # Arity check only: comparing the vocabularies elementwise costs what
+            # injecting the tables saves.
             if len(vocabulary) + 1 != len(tables.vocab_eos):
                 raise ValueError(
                     f"`tables` covers {len(tables.vocab_eos) - 1} tokens but "
@@ -187,34 +209,33 @@ class Potential(ABC, PotentialOps, PotentialTests):
     def is_terminal_only(self) -> bool:
         """Whether this potential contributes weight only at sequence termination.
 
-        A terminal-only potential has ``prefix(context) == 0`` for every proper
-        prefix, so it never reweights mid-generation; all of its weight comes from
-        ``complete`` (equivalently, ``score`` at EOS). Indicator critics like
-        ``1[f(z) == y]`` are the canonical example.
+        A terminal-only potential has `prefix(context) == 0` for every proper prefix, so
+        it never reweights mid-generation; all of its weight comes from `complete`
+        (equivalently, `score` at EOS). Indicator critics like `1[f(z) == y]` are the
+        canonical example. As an SMC critic, a terminal-only potential lets the loop skip
+        the per-step twist and reweight only at termination. Override only in subclasses
+        which satisfy the `prefix == 0` invariant.
 
-        When used as an SMC critic, returning ``True`` lets the SMC loop skip
-        the per-step critic twist and reweight only at termination. Default
-        ``False``; override in subclasses that satisfy the ``prefix == 0``
-        invariant.
+        Returns:
+            (bool): Whether the potential is terminal-only. Defaults to `False`.
         """
         return False
 
     async def live_logws(self, context):
-        """Live next-token weights as `(indices, values, eos)`: the vocabulary indices
-        carrying finite weight, their weights, and the EOS weight -- or `None` when
-        this potential has no sparse enumeration.
+        """Enumerate the live next-token weights given `context`, if this potential can.
 
-        `indices` and `values` may be any array-like; a numpy array reaches the scatter
-        without a per-element pass, anything else is consumed once. `values` may instead
-        be a single float when every live token shares a weight (a support mask), which
-        is written as a scalar and builds no value array at all.
+        The triple is `(indices, values, eos)`: the vocabulary indices carrying finite
+        weight, their log-weights, and the EOS log-weight. `indices` and `values` may be
+        any array-like; a numpy array reaches the scatter without a per-element pass.
+        `values` may instead be a single float when every live token shares a weight (a
+        support mask), which is written as a scalar and builds no value array at all.
 
-        Implementing this replaces the dense per-context build in `logw_next` AND lets
-        `batch_logw_next` scatter the whole population into one `alloc_rows` block. An
-        override of `logw_next` must consult this first (as `Coerced` does, to keep its
-        own fallback), or the scalar and batched lanes disagree. Answer `None` per
-        instance, never per context: the batched scatter is all-or-nothing, so a
-        sometimes-`None` implementation is walked a second time for the whole batch.
+        Implementing this replaces the dense per-context build in `logw_next` and lets
+        `batch_logw_next` scatter the whole batch into one `alloc_rows` block. Potentials
+        which implement it override `_logw_next_dense` rather than `logw_next`, or the
+        scalar and batched lanes disagree. Answer `None` per instance, never per context:
+        the batched scatter is all-or-nothing, so a sometimes-`None` implementation is
+        walked a second time for the whole batch.
 
         Args:
             context (list): Sequence of tokens.
@@ -226,13 +247,12 @@ class Potential(ABC, PotentialOps, PotentialTests):
 
     def _rows_from_live(self, lives):
         """Scatter `live_logws` triples into one `[N, len(vocab_eos)]` block from
-        `alloc_rows` -- one allocation and one flat write for the whole batch,
-        never a dense row per context."""
+        `alloc_rows`: one allocation and one flat write for the whole batch."""
         V1 = len(self.vocab_eos)
         W = self.alloc_rows(len(lives))
         # Flat indices run to `len(lives) * V1`, which int32 carries for any real
-        # vocabulary -- half of what crosses to a device block. Both backends index
-        # from it directly, so nothing widens on the way in.
+        # vocabulary, at half the bytes crossing to a device block. Both backends
+        # index from it directly, so nothing widens on the way in.
         dtype = np.int32 if len(lives) * V1 < 2**31 else np.int64
         idxs, vals, eoss = [], [], []
         for idx, val, eos in lives:
@@ -243,8 +263,8 @@ class Potential(ABC, PotentialOps, PotentialTests):
         flat = packed = None
         if any(len(a) for a in idxs):
             flat = np.concatenate(idxs) if len(idxs) > 1 else idxs[0]
-            # One shared weight over the whole block (a support mask) writes as a
-            # scalar: no value array is built and none is shipped to the device.
+            # A single weight shared by the whole block (a support mask) writes as
+            # a scalar: no value array is built, and none is shipped to a device.
             if all(isinstance(v, (int, float)) for v in vals) and len(set(vals)) == 1:
                 packed = float(vals[0])
             else:
@@ -256,8 +276,8 @@ class Potential(ABC, PotentialOps, PotentialTests):
                         for a, v in zip(idxs, vals)
                     ]
                 )
-        # Every write to the block happens here, the EOS column in one go rather than
-        # one store per row -- on a device block those are a store apiece.
+        # Every write to the block happens here, the EOS column as one column write:
+        # on a device block, a store per row costs a device store apiece.
         if torch.is_tensor(W):
             W[:, -1] = torch.from_numpy(eos_col).to(dtype=W.dtype, device=W.device)
             if flat is not None:
@@ -287,9 +307,11 @@ class Potential(ABC, PotentialOps, PotentialTests):
         return await self._logw_next_dense(context)
 
     async def _logw_next_dense(self, context):
-        """The full row, computed without the sparse enumeration. Override this rather
-        than `logw_next` when the potential also implements `live_logws`, so the sparse
-        lane cannot be bypassed."""
+        """The full next-token row, computed without the `live_logws` enumeration.
+
+        Potentials which implement `live_logws` override this rather than `logw_next`, so
+        the sparse path cannot be bypassed.
+        """
         ctx_log_w = await self.prefix(context)
 
         if ctx_log_w == float("-inf"):
@@ -380,16 +402,17 @@ class Potential(ABC, PotentialOps, PotentialTests):
         return results
 
     async def batch_logw_next(self, contexts):
-        """Batched equivalent to `logw_next`: the next-token weights for every context in the
-        batch, as ONE `LazyWeights` whose weights are `[N, V+1]` (the batch dim leads). Row
-        `i` is `result.weights[i]`. Default: stack the per-particle `logw_next` (preserving
-        backend); `Product` composes batched, `PromptedLLM` serves its injected warm batch.
+        """Batched equivalent to `logw_next`.
+
+        Computes the next-token weights of each token in `self.vocab_eos` given each context in the batch,
+        as a single `LazyWeights` whose weights are `[N, V+1]` with the batch dimension leading;
+        row `i` is `result.weights[i]`.
 
         Args:
             contexts (list): List of sequences of tokens.
 
         Returns:
-            (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
+            (LazyWeights): Batched weights, `.weights` of shape `[N, V+1]`.
 
         Raises:
             ValueError: If any context has zero weight (log weight of -inf) under `prefix`.
@@ -425,28 +448,29 @@ class Potential(ABC, PotentialOps, PotentialTests):
     def alloc_logws(self, default=float("-inf")):
         """Allocate a new array of log weights for the potential's vocabulary and EOS.
 
-        One row of :meth:`alloc_rows`, so a potential that overrides that to place its
-        weights on a device gets this lane too.
+        One row of `alloc_rows`, so a potential which overrides that to place its weights
+        on a device gets this lane too.
 
         Args:
             default (float, optional): Default log weight. Defaults to -inf.
 
         Returns:
-            Array of length `len(self.vocab_eos)` filled with `default`.
+            (array): Array of length `len(self.vocab_eos)` filled with `default`.
         """
         return self.alloc_rows(1, default)[0]
 
     def alloc_rows(self, n, default=float("-inf")):
-        """Allocate an `[n, len(vocab_eos)]` weight block. Override to place the
-        block on a device (or in another backend); `live_logws` assembly and
-        `LazyWeights` both follow whatever this returns.
+        """Allocate a block of log weights for `n` contexts.
+
+        Override to place the block on a device or in another backend; the `live_logws`
+        scatter and the resulting `LazyWeights` both follow the array this returns.
 
         Args:
             n (int): Number of rows.
-            default (float, optional): Fill value. Defaults to -inf.
+            default (float, optional): Default log weight. Defaults to -inf.
 
         Returns:
-            Array of shape `[n, len(self.vocab_eos)]` filled with `default`.
+            (array): Array of shape `[n, len(self.vocab_eos)]` filled with `default`.
         """
         return np.full((n, len(self.vocab_eos)), default)
 

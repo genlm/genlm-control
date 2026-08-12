@@ -68,10 +68,10 @@ class PotentialOps:
             trie (dict | None): The symbol trie over `(other.vocab, f)`, as built by
                 `Coerced.build_trie`.
             tables (VocabTables | None): Prebuilt tables for `other.vocab`, as built
-                by `Potential.build_tables`. Both are functions of `other`'s
-                vocabulary alone, so coercions onto the same one should build each
-                once and pass it here rather than each paying for its own. Both are
-                incompatible with `prune=True`, which narrows that vocabulary.
+                by `Potential.build_tables`. Both `trie` and `tables` are functions of
+                `other`'s vocabulary alone, so coercions onto the same one should build
+                each once and pass it here. Both are incompatible with `prune=True`,
+                which narrows that vocabulary.
 
         Returns:
             (Coerced): A Potential that operates on the vocabulary of `other`.
@@ -89,9 +89,11 @@ class PotentialOps:
         )
 
     def to_autobatched(self):
-        """The autobatched view of this potential: concurrent requests to the instance
-        methods meet in a window and run as one batch call. Memoized -- every call
-        site resolves to the same wrapper, and therefore the same batching window.
+        """The autobatched view of this potential.
+
+        Concurrent requests to the instance methods meet in a window and run as one batch
+        call. The view is memoized, so every call site resolves to the same wrapper and
+        therefore the same batching window.
 
         See [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential] for more details.
 

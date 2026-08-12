@@ -1,8 +1,10 @@
-"""Sequential Monte Carlo: ``smc_standard`` (the algorithm, a free function) over
-``SequenceModel`` particles. Engine serving lives entirely below the potential
-layer; nothing here knows an engine exists. Batching B problems is plain
-concurrency: ``asyncio.gather(smc_a(...), smc_b(...))`` — concurrent asks meet
-below the potential seam."""
+"""Sequential Monte Carlo over ``SequenceModel`` particles.
+
+Nothing in this module knows an engine exists; serving lives below the potential
+layer. One ``smc_standard`` call is one SMC problem; several problems are batched
+by running them concurrently under ``asyncio.gather``, and their asks meet below
+the potential seam.
+"""
 
 import asyncio
 
@@ -18,20 +20,19 @@ from genlm.control.sampler.smc_record import SMCRecord
 class SequenceModel:
     """One particle: a candidate sequence's state and its per-step semantics.
 
-    Holds the mutable run state (``context``, ``weight``, ``twist_amount``,
-    ``max_tokens``, ``done``) and shares the sampler/critic/config with its
-    siblings — ``clone`` copies only the state, so resampling never copies a
-    sampler.
+    The mutable run state is ``context``, ``weight``, ``twist_amount``,
+    ``max_tokens`` and ``done``. ``clone`` copies that state alone; the sampler,
+    critic and configuration are shared across siblings.
 
     Args:
-        unit_sampler (TokenSampler): draws one unit per step via ``sample``.
-        critic (Potential, optional): reweights/twists the particle.
-        max_tokens (int): per-particle token budget; EOS is forced at the boundary.
-        twist_with_critic (bool): whether the critic twists during stepping
-            (vs. scoring once at termination).
-        terminate_when (callable, optional): ``context -> bool`` stop condition;
-            when it fires, EOS closes the sequence in that same step.
-        verbosity (int): 0 silent, 1 prints the particle per step.
+        unit_sampler (TokenSampler): Draws one unit per step via ``sample``.
+        critic (Potential, optional): Reweights and twists the particle.
+        max_tokens (int): Per-particle token budget; EOS is forced at the boundary.
+        twist_with_critic (bool): Whether the critic twists during stepping, rather
+            than scoring once at termination.
+        terminate_when (callable, optional): ``context -> bool`` stop condition.
+            When it fires, EOS closes the sequence in that same step.
+        verbosity (int): 0 is silent, 1 prints the particle at each step.
     """
 
     def __init__(
@@ -56,7 +57,7 @@ class SequenceModel:
         self.done = False
 
     def clone(self):
-        """A particle with copied state and shared sampler/critic."""
+        """Return a particle with copied state and a shared sampler and critic."""
         new = SequenceModel(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
@@ -71,13 +72,11 @@ class SequenceModel:
         new.done = self.done
         return new
 
-    # -- weight accounting ------------------------------------------------
-
     def score(self, amt):
         self.weight += amt
 
     def twist(self, amt):
-        """A bet on the upcoming resample; taken back by ``untwist``."""
+        """Add ``amt`` to the weight provisionally; ``untwist`` takes it back."""
         self.twist_amount += amt
         self.weight += amt
 
@@ -88,8 +87,6 @@ class SequenceModel:
     def finish(self):
         self.untwist()
         self.done = True
-
-    # -- the step ----------------------------------------------------------
 
     async def start(self):
         """Score the empty sequence's prefix weight."""
@@ -103,8 +100,7 @@ class SequenceModel:
         self.score(start_w)
 
     async def step(self):
-        """Advance by one unit: draw (or force EOS at the budget boundary),
-        score, critic-twist, terminate."""
+        """Advance the particle by one unit, forcing EOS at the token budget."""
         self.untwist()
 
         if self.max_tokens == 1:
@@ -141,16 +137,18 @@ class SequenceModel:
                 # Terminal-only critic: reweight once, at termination.
                 self.score(float(await self.critic.score(self.context)))
             else:
-                # The twist was taken back by finish(); at termination the
-                # critic's score is real weight.
+                # `finish` took the twist back; at termination the critic's score
+                # is real weight.
                 self.score(twist_amt)
 
     def _append(self, unit):
-        """Extend the context by one drawn unit. A multi-token unit ending in
-        EOS is split so ``context[-1] is EOS`` — the terminal check's contract.
-        ``terminate_when`` closes the sequence in the step that satisfied it;
-        the stop condition defines what a complete sequence *is*, so it carries
-        no weight correction."""
+        """Extend the context by one drawn unit.
+
+        A multi-token unit ending in EOS is split, so that ``context[-1] is EOS``
+        whenever the sequence is terminal. ``terminate_when`` appends EOS in the
+        step that satisfied it and carries no weight correction: the stop
+        condition defines what a complete sequence is.
+        """
         if isinstance(unit, list) and unit and unit[-1] is EOS:
             if len(unit) > 1:
                 self.context.append(unit[:-1])
@@ -180,21 +178,22 @@ async def smc_standard(
     resampling_method="multinomial",
     json_path=None,
 ):
-    """Standard SMC over clones of ``model``: step every live particle, test
-    ESS, resample when it dips. One call is one SMC problem; run several
-    concurrently to batch them (their asks meet below the potential layer).
+    """Run standard SMC over clones of ``model``.
+
+    One call is one SMC problem; run several concurrently to batch them.
 
     Args:
-        model (SequenceModel): the particle template; cloned ``n_particles`` times.
-        n_particles (int): number of particles.
-        ess_threshold (float): resample when ESS falls below this fraction of
+        model (SequenceModel): The particle template, cloned ``n_particles`` times.
+        n_particles (int): Number of particles.
+        ess_threshold (float): Resample when ESS falls below this fraction of
             ``n_particles``.
-        resampling_method (str): multinomial/stratified/systematic/residual.
-        json_path (str, optional): where to write the inference record
-            (viewable with ``InferenceVisualizer``).
+        resampling_method (str): One of 'multinomial', 'stratified', 'systematic',
+            'residual'.
+        json_path (str, optional): Path to write the inference record to, for use
+            with the ``InferenceVisualizer``.
 
     Returns:
-        (list[SequenceModel]): the completed particles.
+        (list[SequenceModel]): The completed particles.
     """
     resample_fn = get_resampling_fn(resampling_method)
     particles = [model.clone() for _ in range(n_particles)]

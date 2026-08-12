@@ -254,8 +254,8 @@ class PromptedLLM(Potential):
                 eos_byte_strings=eos_byte_strings or [default_eos],
             )
 
-        # Adopt the Potential-layer tables from token_maps directly rather
-        # than calling super().__init__(); they are already validated there.
+        # `token_maps` already carries validated Potential-layer tables, so they are
+        # adopted here instead of rebuilt by `super().__init__()`.
         self.token_type = self.token_maps.token_type
         self.eos = EOS
         self.vocab = self.token_maps.potential_vocab
@@ -517,10 +517,8 @@ class PromptedLLM(Potential):
         return logp_context + logp_eos
 
     def _eos_index_tensors(self, device):
-        """Cache (and return) the EOS / non-EOS column-index tensors used to fold
-        the engine vocab into the control vocab (EOS kept last). Shared by the
-        per-row :meth:`_process_logw_next` and the batched
-        :meth:`_process_logw_next_batch`."""
+        """The EOS / non-EOS column-index tensors which fold the engine vocab into the
+        control vocab, EOS kept last. Built once per device and cached."""
         if (
             not hasattr(self, "_eos_idxs_tensor")
             or not hasattr(self, "_non_eos_indices")
@@ -537,10 +535,19 @@ class PromptedLLM(Potential):
 
     def _verify_logit_padding(self, n_logits):
         """Guard the tail-padding used when the model emits fewer logits than
-        ``len(token_maps.decode)`` (e.g. Gemma's <image_soft_token>, added beyond
-        the embedding matrix). Padding the tail with -inf is only correct if the
-        model's logit indices are contiguous ``0..n_logits-1``; raises otherwise
-        instead of silently mis-folding columns. Verified once and cached."""
+        ``len(token_maps.decode)`` (e.g. Gemma's <image_soft_token>, added beyond the
+        embedding matrix).
+
+        Padding the tail with -inf is correct only if the model's logit indices are
+        contiguous ``0..n_logits-1``, so this raises rather than silently mis-folding
+        columns. Checked once and cached.
+
+        Args:
+            n_logits (int): Number of logits the model emitted.
+
+        Raises:
+            ValueError: If a token id in the logit range differs from its index.
+        """
         if not hasattr(self, "_logit_padding_verified"):
             for i in range(n_logits):
                 if self.token_maps.decode[i].token_id != i:
@@ -552,16 +559,23 @@ class PromptedLLM(Potential):
             self._logit_padding_verified = True
 
     def _process_logw_next_batch(self, logits):
-        """Vectorized, on-device analog of :meth:`_process_logw_next`: maps a
-        ``[N, n_logits]`` batch of raw engine logits to ``[N, V+1]`` control-vocab
-        log-weights (EOS folded into the last column) entirely on device, no host
-        transfer. Returns a ``torch.Tensor`` (not a ``LazyWeights``); the caller samples
-        on-device and transfers only the N drawn ids back."""
+        """Fold a batch of raw engine logits into control-vocab log-weights.
+
+        Stays on the logits' device and returns a ``torch.Tensor`` rather than a
+        ``LazyWeights``, so a caller can draw on-device and read back only the drawn ids.
+
+        Args:
+            logits (torch.Tensor): Raw engine logits, ``[N, n_logits]``.
+
+        Returns:
+            (torch.Tensor): Log-weights over the control vocabulary, ``[N, V+1]``, with
+                EOS in the last column.
+        """
         eos_idxs, non_eos = self._eos_index_tensors(logits.device)
         n_decode = len(self.token_maps.decode)
         n_logits = logits.shape[1]
         if n_logits < n_decode:
-            self._verify_logit_padding(n_logits)  # same guard as the per-row path
+            self._verify_logit_padding(n_logits)
             pad = torch.full(
                 (logits.shape[0], n_decode - n_logits),
                 float("-inf"),
@@ -578,8 +592,8 @@ class PromptedLLM(Potential):
         )
         out[:, : len(self.vocab)] = logits[:, non_eos]
         if eos_idxs.numel() == 1:
-            # On-device single-EOS gather: index with the 0-dim tensor, NOT
-            # `eos_idxs.item()`, so the EOS column needs no host sync.
+            # Index with the 0-dim tensor and never `eos_idxs.item()`, which would
+            # force a host sync for the EOS column.
             out[:, -1] = logits[:, eos_idxs[0]]
         else:
             out[:, -1] = torch.logsumexp(logits[:, eos_idxs], dim=1)
@@ -597,8 +611,8 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Processed log probabilities for the next tokens.
         """
-        # N=1 wrapper around the batched on-device fold; the row stays on the
-        # backend's device -- the draw window reads back only the drawn scalars.
+        # The row stays on the backend's device; the draw window reads back only the
+        # drawn scalars.
         out = self._process_logw_next_batch(logw_next.unsqueeze(0))
         return self.make_lazy_weights(out[0].float())
 
@@ -620,14 +634,14 @@ class PromptedLLM(Potential):
         return self._process_logw_next(logw_next)
 
     async def batch_logw_next(self, contexts):
-        """Next-token log-weights for a batch of contexts, as ONE batched `LazyWeights`
-        (`.weights` shape `[N, V+1]`).
+        """Get log probabilities for next tokens given the prompt and `context`, for a batch of contexts.
 
         Args:
-            contexts (list[list[bytes]] | list[list[Token]]): A list of token sequences.
+            contexts (list[list[bytes]] | list[list[Token]]): A list of sequences of byte tokens or Token objects.
 
         Returns:
-            (LazyWeights): batched log-weights, `.weights` shape `[N, V+1]`. Keys are Tokens.
+            (LazyWeights): Log probabilities for next tokens and EOS for each context, `.weights`
+                of shape `[N, V+1]`. Keys are Token objects.
         """
         context_ids_batch = [self.encode_tokens(context) for context in contexts]
         logw_nexts = self._maybe_temper(
@@ -636,7 +650,6 @@ class PromptedLLM(Potential):
                 lora_name=self.lora_name,
             )
         )
-        # Equivalent to stacking per-row `_process_logw_next`, folded as one batch.
         return self.make_lazy_weights(self._process_logw_next_batch(logw_nexts).float())
 
     def __repr__(self):

@@ -212,7 +212,7 @@ class BoolCFG(Potential):
             contexts (list): A list of sequences of tokens in the CFG's alphabet.
 
         Returns:
-            (LazyWeights): one batched `LazyWeights`, `.weights` shape `[N, V+1]`.
+            (LazyWeights): Batched log-weights, `.weights` of shape `[N, V+1]`.
         """
         rows = []
         for context in contexts:

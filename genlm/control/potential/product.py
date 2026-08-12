@@ -62,8 +62,9 @@ class Product(Potential):
             self._v1_idxs = ...
             self._v2_idxs = ...
             if self.p1.eos is EOS and self.p2.eos is EOS:
-                # Same vocab, default sentinel: adopt the operands' tables
-                # directly instead of rebuilding (e.g. a 128k engine-LM vocab).
+                # Same vocab and default sentinel: the operands' tables already
+                # describe this product, so rebuilding them is O(V) for nothing
+                # (V is 128k for an engine LM).
                 self.token_type = token_type
                 self.eos = EOS
                 self.vocab = self.p1.vocab
@@ -73,9 +74,9 @@ class Product(Potential):
                 super().__init__(self.p1.vocab, token_type=token_type)
 
         else:
-            # Ordered by p1, NOT `list(set(...) & set(...))`: set iteration order varies
-            # with PYTHONHASHSEED, which permutes the vocabulary and flips Gumbel-max
-            # draws -- the same seed would then give different samples across runs.
+            # Ordered by p1, never `list(set(...) & set(...))`: set iteration order
+            # varies with PYTHONHASHSEED, which permutes the vocabulary and flips
+            # Gumbel-max draws, so one seed gives different samples across runs.
             keep = set(self.p2.vocab)
             common_vocab = [x for x in dict.fromkeys(self.p1.vocab) if x in keep]
             if not common_vocab:
@@ -138,10 +139,12 @@ class Product(Potential):
         return W1 + W2
 
     def _compose(self, w1_full, w2_full):
-        """Sum the operands' weights over the shared vocab, slicing on the last axis
-        so the same code handles a single ``[V]`` draw and a batched ``[N, V]`` one.
-        Reconciles mixed backends: a numpy operand is lifted to the other's torch
-        device; both-numpy stays numpy and matches the per-token path exactly."""
+        """Sum the operands' weights over the shared vocabulary.
+
+        Slices on the last axis, so one code path serves a single ``[V]`` row and a
+        batched ``[N, V]`` one. Mixed backends are reconciled by lifting a numpy operand
+        onto the other's torch device; two numpy operands stay numpy.
+        """
         w1 = w1_full[self.v1_idxs] if w1_full.ndim == 1 else w1_full[:, self.v1_idxs]
         w2 = w2_full[self.v2_idxs] if w2_full.ndim == 1 else w2_full[:, self.v2_idxs]
         t1, t2 = torch.is_tensor(w1), torch.is_tensor(w2)
@@ -149,7 +152,7 @@ class Product(Potential):
             if w1.device != w2.device:
                 dev = w1.device if w1.device.type != "cpu" else w2.device
                 w1, w2 = w1.to(dev), w2.to(dev)
-        elif t1:  # numpy w2 -> lift to w1's device (dtype preserved -> same promotion)
+        elif t1:  # dtype is preserved, so promotion matches the both-numpy path
             w2 = torch.as_tensor(w2, device=w1.device)
         elif t2:
             w1 = torch.as_tensor(w1, device=w2.device)
@@ -171,7 +174,7 @@ class Product(Potential):
     async def batch_logw_next(self, contexts):
         W1, W2 = await asyncio.gather(
             self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
-        )  # each is one batched LazyWeights [N, V_i]; compose over the vocab axis -> [N, V]
+        )
         return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
 
     def spawn(self, p1_opts=None, p2_opts=None):

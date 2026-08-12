@@ -43,10 +43,11 @@ class SMC:
         unit_sampler (TokenSampler): The sampler that generates tokens.
         critic (Potential, optional): A potential function that guides the generation process
             by scoring candidate sequences. Must have the same token type as the unit_sampler.
-        autobatch (bool): Wrap the critic in
+        autobatch (bool): Whether to wrap the critic in
             [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
-            so concurrent per-particle scores execute as one batched call. Default
-            True; the sampler's own seats take the same flag at sampler construction.
+            so that concurrent per-particle scores execute as one batched call.
+            Default True. The unit sampler's own seats take a separate `autobatch`
+            flag, at the sampler's construction.
 
     Raises:
         ValueError: If unit_sampler is not a TokenSampler, if critic is not a Potential,
@@ -106,7 +107,7 @@ class SMC:
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
             resampling_method (str, optional): One of 'multinomial', 'stratified',
                 'systematic', 'residual'. Defaults to 'multinomial'.
-            terminate_when (callable, optional): ``context -> bool`` stop condition.
+            terminate_when (callable, optional): A `context -> bool` stop condition.
                 When it fires, EOS closes the sequence in that same step.
 
         Returns:

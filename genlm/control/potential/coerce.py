@@ -34,13 +34,13 @@ class Coerced(Potential):
         via the coercion function (i.e. `set(f([x])) <= set(potential.vocab)`). If no such tokens are found, a `ValueError` is raised.
         This behavior can be overridden by setting `prune=False`, in which case the coerced potential's vocabulary will include all tokens from the target vocabulary.
 
-        When the wrapped potential exposes a memoized chart (`_consume`, i.e. a
-        WFSA/BoolFSA) AND `f` distributes over concatenation at the context in hand
-        (`f(xs+[t]) == f(xs)+f([t])`, so each target token maps to a fixed symbol
-        path), `logw_next` takes the shared-prefix-trie fast path
-        (:meth:`live_logws`). Any other `f` -- which the contract permits -- falls
-        back to the per-extension `batch_prefix`, which makes no such assumption, so
-        a non-distributing `f` is correct, just not accelerated.
+        `logw_next` takes the shared-prefix trie fast path (`live_logws`) when the wrapped
+        potential exposes a memoized chart (`_consume`, i.e. a WFSA/BoolFSA) and `f`
+        distributes over concatenation at the context in hand
+        (`f(xs+[t]) == f(xs)+f([t])`, so each target token maps to a fixed symbol path).
+        Any other `f` is permitted and falls back to the per-extension `batch_prefix`,
+        which assumes nothing about `f`: a non-distributing `f` is correct, just not
+        accelerated.
     """
 
     def __init__(
@@ -70,13 +70,13 @@ class Coerced(Potential):
                 asked about, falling back to the assumption-free path wherever it
                 does not hold; `True`/`False` declare it and skip the check.
             trie (dict | None): The symbol trie over `(target_vocab, f)`, as built by
-                :meth:`build_trie`. It is a function of those two alone, so coercions
-                sharing a vocabulary should build it once and pass it here rather than
-                each paying for its own. `None` (default) builds one lazily.
-            tables (VocabTables | None): Prebuilt vocabulary tables for `target_vocab`
-                (`Potential.build_tables`), shared for the same reason as `trie`.
-                Like `trie`, incompatible with `prune=True`, which narrows the
-                vocabulary the tables describe.
+                `build_trie`. It is a function of those two alone, so coercions sharing
+                a vocabulary should build it once and pass it here. `None` (default)
+                builds one lazily.
+            tables (VocabTables | None): Prebuilt vocabulary tables for `target_vocab`,
+                as built by `Potential.build_tables` and shared for the same reason as
+                `trie`. Both are incompatible with `prune=True`, which narrows the
+                vocabulary they describe.
 
         Raises:
             ValueError: If no valid tokens are found in the target vocabulary that can be mapped to the original potential's vocabulary.
@@ -84,8 +84,8 @@ class Coerced(Potential):
         self.potential = potential
         self.f = f
         if prune and (trie is not None or tables is not None):
-            # Both index the coerced vocabulary, which pruning is about to shrink --
-            # injected ones would silently describe the wrong tokens.
+            # Both index the coerced vocabulary, which pruning is about to shrink,
+            # so an injected one would silently describe the wrong tokens.
             raise ValueError(
                 "an injected `trie`/`tables` indexes the coerced vocabulary, which "
                 "`prune=True` narrows; pass `prune=False` or build them over the "
@@ -118,18 +118,19 @@ class Coerced(Potential):
 
         super().__init__(tokens, tables=tables)
 
-        # `None` = check the identity at each context (see `_distributes_at`); a
-        # bool is the caller's declaration and is taken as given.
+        # `None` means check the identity at each context (`_distributes_at`); a bool
+        # is the caller's declaration and is taken as given.
         self._f_homomorphic = None if homomorphic is None else bool(homomorphic)
 
     def _distributes_at(self, context, ctx_syms):
-        """Whether `f(context + [t]) == f(context) + f([t])` at THIS context, over a
-        couple of probe tokens -- the identity `live_logws` keys the trie on.
+        """Whether `f(context + [t]) == f(context) + f([t])` at this context, over a
+        couple of probe tokens: the identity `live_logws` keys the trie on.
 
-        Checked per call rather than once at construction because the ways `f` can
+        Checked per context rather than once at construction, since the ways `f` can
         fail to distribute are length- and position-dependent, so no fixed sample of
-        contexts settles it. One extra `f` per probe token, against a walk over the
-        whole vocabulary. Any error counts as non-distributing."""
+        contexts settles it. Costs one extra `f` per probe token, against a walk over
+        the whole vocabulary. Any error counts as non-distributing.
+        """
         try:
             return all(
                 tuple(self.f([*context, t])) == ctx_syms + tuple(self.f([t]))
@@ -152,8 +153,8 @@ class Coerced(Potential):
         return float(await self.complete(context) - await self.prefix(context))
 
     async def _logw_next_dense(self, context):
-        # The assumption-free fallback to the `live_logws` trie walk: one coerced
-        # extension prefix-ed PER vocab token, assuming nothing about `f`.
+        # The fallback to the `live_logws` trie walk: one coerced extension prefixed
+        # per vocab token, assuming nothing about `f`.
         Ws = self.alloc_logws()
         ctx = self.f(context)
         ctx_w = await self.potential.prefix(ctx)
@@ -164,20 +165,27 @@ class Coerced(Potential):
         Ws[:-1] = await self.potential.batch_prefix(exts) - ctx_w
         return self.make_lazy_weights(Ws)
 
-    # -- the trie fast path: a shared-prefix trie over the target vocab, scored from
-    #    the wrapped potential's MEMOIZED chart (``_consume``), no per-vocab replay --
+    # The trie fast path: a shared-prefix trie over the target vocab, scored from the
+    # wrapped potential's memoized `_consume` chart.
 
     @staticmethod
     def build_trie(vocab, f):
-        """Prefix trie over the symbol sequences ``f([t])`` of `vocab`. A node is a
-        dict ``{sym: child}``; tokens that END at a node are recorded under the
-        sentinel key ``()`` as a list of vocab indices (a list because distinct
-        target tokens can share an ``f``-image). Sharing common prefixes lets
-        :meth:`live_logws` score each shared prefix ONCE instead of re-prefixing
-        every token's full symbol path.
+        """Build the prefix trie over the symbol sequences `f([t])` of `vocab`.
 
-        A function of `(vocab, f)` alone -- build it once per vocabulary and pass it
-        to every coercion over that vocabulary via `trie=`.
+        A node is a dict `{sym: child}`; the tokens ending at a node are recorded under
+        the sentinel key `()` as a list of vocab indices, a list because distinct target
+        tokens can share an `f`-image. Sharing common prefixes lets `live_logws` score
+        each shared prefix once instead of re-prefixing every token's full symbol path.
+
+        The trie is a function of `(vocab, f)` alone, so it can be built once per
+        vocabulary and passed to every coercion over that vocabulary via `trie=`.
+
+        Args:
+            vocab (list): The target vocabulary.
+            f (callable): The coercion function.
+
+        Returns:
+            (dict): The root node of the trie.
         """
         trie = {}
         for idx, tok in enumerate(vocab):
@@ -189,24 +197,31 @@ class Coerced(Potential):
 
     @property
     def _sym_trie(self):
-        """This coercion's symbol trie -- the injected one, else built and held."""
+        """This coercion's symbol trie: the injected one, else built on first use."""
         if self._sym_trie_cache is None:
             self._sym_trie_cache = self.build_trie(self.vocab, self.f)
         return self._sym_trie_cache
 
     async def live_logws(self, context):
-        """The vocab tokens the wrapped potential's MEMOIZED chart (``_consume``, i.e.
-        a WFSA/BoolFSA) admits, scored by one shared-prefix trie walk over that chart
-        rather than one coerced extension prefix-ed PER vocab token. ``None`` when the
-        lane is unavailable, leaving ``logw_next`` its assumption-free fallback: the
-        trie keys on ``f(context)+f([t])``, equal to ``f(context+[t])`` only when ``f``
-        distributes (`_f_homomorphic`, asserted by `homomorphic=` or probed per call).
+        """The vocab tokens the wrapped potential admits, from one shared-prefix trie walk.
 
-        The wrapped potential may offer ``_advance(chart, sym) -> chart | None``, the
-        incremental step the walk is already shaped for: the chart threads down the
-        trie instead of every node re-deriving and re-consuming its full symbol path,
-        and a ``None`` prunes that subtree -- sound because the potential declares the
-        branch dead. Without it each node is scored from ``_consume(ctx_syms + path)``.
+        Scored over the potential's memoized `_consume` chart (i.e. a WFSA/BoolFSA)
+        rather than one coerced extension prefixed per vocab token. `None` when the walk
+        is unavailable, leaving `logw_next` its fallback: the trie keys on
+        `f(context)+f([t])`, which equals `f(context+[t])` only when `f` distributes
+        (`_f_homomorphic`, declared by `homomorphic=` or probed per context).
+
+        The wrapped potential may offer `_advance(chart, sym) -> chart | None`, the
+        incremental step this walk is shaped for: the chart threads down the trie
+        instead of every node re-deriving and re-consuming its full symbol path, and a
+        `None` prunes that subtree, the potential having declared the branch dead.
+        Without it, each node is scored from `_consume(ctx_syms + path)`.
+
+        Args:
+            context (list): Sequence of tokens.
+
+        Returns:
+            (tuple | None): `(indices, values, eos)`, or `None` if the walk is unavailable.
         """
         p = self.potential
         if self._f_homomorphic is False or not hasattr(p, "_consume"):
@@ -217,9 +232,9 @@ class Coerced(Potential):
         ctx_chart = p._consume(ctx_syms)
         ctx_w = p.prefix_logw(ctx_chart)
         if ctx_w == float("-inf"):
-            # A zero-weight context has no live row -- scoring it would divide the
-            # walk by `-inf` and hand back `+inf` weights under a `nan` EOS. The one
-            # per-context `None`, and the batch it drops to the dense path raises there.
+            # A zero-weight context has no live row: scoring it would divide the walk
+            # by `-inf` and hand back `+inf` weights under a `nan` EOS. The one
+            # per-context `None`; the batch it drops to the dense path raises there.
             return None
         # Read before the walk: a chart the walk mutates must not move EOS under it.
         eos = p.complete_logw(ctx_chart) - ctx_w
@@ -260,8 +275,6 @@ class Coerced(Potential):
 
     async def batch_prefix(self, contexts):
         return await self.potential.batch_prefix(contexts=self._batch_f(contexts))
-
-    # batch_logw_next inherited from Potential (stacks per-context logw_next -> [N, V+1]).
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.potential!r})"

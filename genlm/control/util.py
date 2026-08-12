@@ -12,9 +12,9 @@ from genlm.backend.tokenization import Token
 
 
 def logsumexp(x, axis=-1, keepdims=False):
-    """Log-sum-exp along ``axis``, in the array's own backend. An all-(-inf) slice
-    reduces to ``-inf``, not ``nan``. The default reduces the last axis, so a batched
-    ``[N, V]`` block reduces per row."""
+    """Log-sum-exp along `axis`, in the array's own backend. An all-`-inf` slice
+    reduces to `-inf`, not `nan`. The default axis is the last one, so a batched
+    `[N, V]` block reduces per row."""
     if torch.is_tensor(x):
         return torch.logsumexp(x, axis, keepdim=keepdims)
     x = np.asarray(x)
@@ -31,13 +31,13 @@ def to_numpy(w):
 
 
 def stack_weights(arrays):
-    """Stack per-context weight arrays into one ``[N, V]`` batch, preserving the producer's
-    backend (numpy stays numpy, torch stays torch) -- the batched-``LazyWeights`` weights."""
+    """Stack per-context weight arrays into one `[N, V]` batch, preserving the producer's
+    backend (numpy stays numpy, torch stays torch)."""
     return torch.stack(arrays) if torch.is_tensor(arrays[0]) else np.stack(arrays)
 
 
 def _xp(w):
-    """The array module (``torch`` or ``np``) backing ``w`` -- for backend-agnostic ops."""
+    """The array module (`torch` or `np`) backing `w`, for backend-agnostic ops."""
     return torch if torch.is_tensor(w) else np
 
 
@@ -66,9 +66,9 @@ class LazyWeights:
         Raises:
             AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
-        # ``weights`` keeps the producer's backend (LM->torch, grammar/FSA/trie->numpy; a
-        # raw python sequence becomes numpy). Vocab is the LAST axis: ``[V]`` (one context)
-        # or ``[N, V]`` (population); bulk ops reduce dim=-1, so one object serves both.
+        # `weights` keeps the producer's backend (LM->torch, grammar/FSA/trie->numpy; a
+        # raw python sequence becomes numpy). Vocab is the last axis: `[V]` for one
+        # context, `[N, V]` for a population, and bulk ops reduce dim=-1.
         if not (torch.is_tensor(weights) or isinstance(weights, np.ndarray)):
             weights = np.asarray(weights)
         assert weights.shape[-1] == len(decode)
@@ -212,8 +212,8 @@ class LazyWeights:
 
         Args:
             top (int, optional): The number of top weights to materialize. Defaults to None.
-            sort (bool, optional): Order the chart by descending weight. Required by
-                `top`; skip it when only the mapping is wanted, as a picker is.
+            sort (bool, optional): Order the chart by descending weight. Defaults to True.
+                Required by `top`; skip it when only the token-to-weight mapping is needed.
 
         Returns:
             (Chart): A chart representation of the weights.
@@ -337,20 +337,20 @@ def load_async_trie(V, backend=None, **kwargs):
 
 
 def gumbel_max(logps):
-    """Argmax of ``logps + Gumbel noise`` -- the default picker."""
+    """Argmax of `logps + Gumbel noise`; the default picker."""
     g = -torch.log(-torch.log(torch.rand_like(logps)))
     return (logps + g).argmax(dim=-1)
 
 
 def multinomial(logps):
-    """Categorical draw over the last dim (scalar for ``[V]``, ``[N]`` for ``[N, V]``)."""
+    """Categorical draw over the last dim (scalar for `[V]`, `[N]` for `[N, V]`)."""
     p = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp()
     return torch.multinomial(p, 1).squeeze(-1)
 
 
 def inverse_cdf(logps):
-    """Single-uniform inverse-CDF draw over the last dim (scalar for ``[V]``, ``[N]`` for
-    ``[N, V]``); one uniform per row, on ``logps``'s device."""
+    """Single-uniform inverse-CDF draw over the last dim (scalar for `[V]`, `[N]` for
+    `[N, V]`); one uniform per row, on `logps`'s device."""
     cdf = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp().cumsum(dim=-1)
     u = torch.rand((*cdf.shape[:-1], 1), dtype=cdf.dtype, device=cdf.device)
     return torch.searchsorted(cdf, u).squeeze(-1).clamp_(max=cdf.shape[-1] - 1)
@@ -376,22 +376,25 @@ DRAW_METHODS = {
     "multinomial": multinomial,
     "inverse_cdf": inverse_cdf,
 }
-# The picker the draw window uses -- a process-wide setting (see ``set_draw_method``).
+# Process-wide picker for the draw window; set it via `set_draw_method`.
 _picker = gumbel_max
 
 
 def set_draw_method(method):
-    """Set the token picker the draw window (``draw_from``/``picker_indices``) uses: a
-    name in ``DRAW_METHODS`` (``"gumbel_max"`` default, ``"multinomial"``,
-    ``"inverse_cdf"``) or a custom ``(logps_tensor) -> index`` callable. Process-wide."""
+    """
+    Set the token picker used by `draw_from` and `picker_indices`, process-wide.
+
+    Args:
+        method (str | callable): A name in `DRAW_METHODS`, or a custom
+            `(logps_tensor) -> index` callable.
+    """
     global _picker
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
 
 
-# Batching breadcrumbs: (site, cohort_size) -> count, cheap enough to stay on.
-# Sites: "draw" (one entry per stacked group per flush) and "autobatch"
-# (one entry per batch call, see potential/autobatch.py). Read + clear via
-# ``take_window_stats()``.
+# Batching counters: (site, cohort_size) -> count. Sites are "draw" (one entry per
+# stacked group per flush) and "autobatch" (one entry per batch call, see
+# potential/autobatch.py). Read and clear via `take_window_stats`.
 window_stats = Counter()
 
 
@@ -403,21 +406,25 @@ def take_window_stats():
 
 
 async def draw_from(lazyweights, draw=None, target=None):
-    """Draw a token and weigh it: ``(token, logw, logp)``. THE draw seam -- every
-    sampler that draws from a distribution routes through here. A sampler needing
-    something else (AWRS's rejection over unnormalized weights) does not call this.
+    """
+    Draw a token from a next-token distribution and weigh it.
 
-    Without ``target``, ``logw`` is the row's normalizer ``logZ``. With ``target``
-    (a second ``LazyWeights`` over the same vocabulary), the draw is an importance
-    draw: sample from ``lazyweights`` as the proposal, weigh under the target --
-    ``logw = target[token] - logp``.
+    Concurrent callers meet in a per-event-loop window and execute as one batched
+    reduction per (backend, device, vocab-size) group: one normalize, one pick, one
+    host readback for the whole cohort, target log-weights included. Batched rows
+    draw independent noise, and a lone caller degenerates to a solo draw.
 
-    Concurrent callers meet in a per-event-loop window and execute as ONE batched
-    reduction per (backend, device, vocab-size) group -- one normalize, one pick,
-    one host readback for the whole cohort; target log-weights ride the same readback.
-    A lone caller degenerates to a solo draw; batched rows draw independent noise,
-    so the results are the same draws. A caller-supplied ``draw`` is a user picker
-    (materialized chart in, token out) and draws solo.
+    Args:
+        lazyweights (LazyWeights): The log-weight row to draw from.
+        draw (callable, optional): Custom picker, taking a materialized normalized
+            chart and returning a token. Draws solo, outside the window.
+        target (LazyWeights, optional): A second row over the same vocabulary. Makes
+            the draw an importance draw: `lazyweights` is the proposal, and the token
+            is weighed under the target.
+
+    Returns:
+        (tuple): `(token, logw, logp)`, where `logw` is the row's normalizer `logZ`
+            without `target` and `target[token] - logp` with it.
     """
     if draw is not None:
         logZ = lazyweights.sum()
@@ -447,12 +454,22 @@ class _Window:
 
 
 async def collect_window(store, entry):
-    """Meet concurrent callers in a per-event-loop window: append ``entry`` and, if
-    nobody holds the window yet, hold it open until a full event-loop pass adds no
-    new entry. Returns the drained cohort to the holding caller -- who flushes it in
-    their own coroutine, never a background task -- and ``None`` to everyone else.
-    ``store`` maps event loop -> ``_Window`` (a ``weakref.WeakKeyDictionary`` owned
-    by the call site; one store per seam)."""
+    """
+    Meet concurrent callers in a per-event-loop window.
+
+    Appends `entry` and, if nobody holds the window yet, holds it open until a full
+    event-loop pass adds no new entry. The holding caller flushes the cohort in its
+    own coroutine; there is no background task.
+
+    Args:
+        store (weakref.WeakKeyDictionary): Event loop to `_Window` map, owned by the
+            call site. One store per window.
+        entry (Any): The request to add to the window.
+
+    Returns:
+        (list | None): The drained cohort for the holding caller, `None` for everyone
+            else.
+    """
     loop = asyncio.get_running_loop()
     window = store.get(loop)
     if window is None:
@@ -462,9 +479,9 @@ async def collect_window(store, entry):
         return None
     window.armed = True
     try:
-        # Callers reach the window at different depths of a ``gather`` tree, and
-        # each level is another scheduler turn; yield until a turn adds nothing,
-        # so the whole cohort lands in one flush.
+        # Callers reach the window at different depths of a `gather` tree, and each
+        # level is another scheduler turn; yield until a turn adds nothing, so the
+        # whole cohort lands in one flush.
         while True:
             n = len(window.queue)
             await asyncio.sleep(0)
@@ -480,10 +497,9 @@ _DRAW_WINDOWS = weakref.WeakKeyDictionary()  # event loop -> _Window
 
 
 def _flush_draws(queue):
-    """One batched reduction per stackable group: stack rows, normalize, pick,
-    gather the drawn log-probs (and target log-weights for importance draws), and
-    resolve every future from one readback. Every future gets its draw or the
-    exception -- never silence."""
+    """Resolve a cohort of draws with one batched reduction per stackable group, off
+    a single host readback. Every future is resolved, with its draw or with the
+    exception the group raised."""
     groups = defaultdict(list)
     for lw, target, future in queue:
         w = lw.weights
@@ -504,9 +520,8 @@ def _flush_draws(queue):
             ids = idx.tolist()
             # One float readback for the cohort's normalizers and drawn log-probs.
             logZs, drawn_logps = torch.stack([logZ, logp]).tolist()
-            # Importance draws: read the drawn token's log-weight under each
-            # target row in the same flush (one extra gather + readback for the
-            # subset).
+            # Importance draws: the drawn token's log-weight under each target row,
+            # one extra gather and readback over that subset.
             target_logws = {}
             targeted = [k for k, (_, t, _) in enumerate(entries) if t is not None]
             if targeted:
@@ -530,9 +545,9 @@ def _flush_draws(queue):
 
 
 def picker_indices(weights):
-    """Apply the configured picker to a (possibly batched) log-weight array, returning the
-    drawn index/indices over dim=-1 (scalar for ``[V]``, ``[N]`` for ``[N, V]``). Lifts to
-    torch (the picker family is pure-torch); a no-op on the common torch path."""
+    """Apply the configured picker to a (possibly batched) log-weight array, returning
+    the drawn index/indices over dim=-1 (scalar for `[V]`, `[N]` for `[N, V]`). The
+    picker family is pure-torch, so a non-torch array is lifted first."""
     return _picker(torch.as_tensor(weights))
 
 

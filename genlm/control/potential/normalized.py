@@ -11,9 +11,9 @@ class Normalized(Potential):
 
     `prefix` and `complete` subtract the normalizers of the prefixes they span, which
     costs one `batch_logw_next` over `len(context)` prefixes. Nothing on a sampler's
-    generation path reads them -- `logw_eos` routes through `logw_next`, and
-    `start_weight` only ever asks for `prefix([])` -- so the sweep is a cold path,
-    hot only if this is used as a per-step critic.
+    generation path reads them (`logw_eos` routes through `logw_next`, and `start_weight`
+    only ever asks for `prefix([])`), so the sweep is a cold path, hot only when this is
+    used as a per-step critic.
 
     Attributes:
         p (Potential): The normalized potential.

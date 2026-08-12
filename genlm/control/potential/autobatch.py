@@ -15,8 +15,8 @@ class AutoBatchedPotential(Potential):
     corresponding batch method of the underlying potential (`batch_complete`,
     `batch_prefix`, `batch_score`, `batch_logw_next`). The window is held open
     by its first caller until a full event-loop pass adds no new request, then
-    flushed in that caller's own coroutine — no background task, nothing bound
-    to a loop at construction time.
+    flushed in that caller's own coroutine, so nothing binds to an event loop at
+    construction time.
 
     This class inherits all methods from [`Potential`][genlm.control.potential.base.Potential].
 
@@ -27,8 +27,8 @@ class AutoBatchedPotential(Potential):
     def __init__(self, potential):
         self.potential = potential
         self._windows = weakref.WeakKeyDictionary()  # event loop -> _Window
-        # The wrapped potential's own tables: a wrapper indexes the same vocabulary,
-        # so rebuilding them would cost O(len(vocab)) per wrap for an identical result.
+        # A wrapper indexes the same vocabulary as what it wraps, so it reuses those
+        # tables rather than paying O(len(vocab)) to rebuild an identical set.
         super().__init__(
             potential.vocab,
             tables=VocabTables(
@@ -47,8 +47,8 @@ class AutoBatchedPotential(Potential):
         return await future
 
     async def _flush(self, queue):
-        """One call per batch method for the whole cohort. Every future gets its
-        result or the exception -- never silence."""
+        """One call per batch method for the whole cohort. Every future is resolved,
+        with its result or with the exception that call raised."""
         groups = defaultdict(list)
         for method_name, context, future in queue:
             groups[method_name].append((context, future))
@@ -58,8 +58,8 @@ class AutoBatchedPotential(Potential):
                 results = await getattr(self.potential, method_name)(
                     [context for context, _ in requests]
                 )
-                # batch_logw_next returns ONE batched LazyWeights [N, V+1]; split it
-                # back into per-request rows (other batch methods return [N] arrays).
+                # `batch_logw_next` answers with a single batched LazyWeights [N, V+1],
+                # unlike the other batch methods' [N] arrays of results.
                 if isinstance(results, LazyWeights):
                     results = [
                         results.spawn(results.weights[i])
@@ -87,7 +87,7 @@ class AutoBatchedPotential(Potential):
         return await self._queued("batch_logw_next", context)
 
     async def logw_eos(self, context):
-        # No batch form to queue against, and the wrapped potential may answer it far
+        # No batch form to queue against, and the wrapped potential may answer far
         # more cheaply than the default read off a whole `logw_next` row.
         return await self.potential.logw_eos(context)
 
@@ -119,17 +119,26 @@ class AutoBatchedPotential(Potential):
         return f"{self.__class__.__name__}({self.potential!r})"
 
     async def cleanup(self):
-        # Nothing of the window's to stop (it lives and dies with its callers);
-        # forward like every wrapper, or the seat flag would break the chain.
+        # The window owns nothing to stop; it lives and dies with its callers. The
+        # forward keeps the wrapper transparent to the cleanup chain.
         await self.potential.cleanup()
 
 
 def autobatched(potential):
-    """THE autobatched view of ``potential`` -- memoized on the potential itself,
-    so every call site (and every sampler sharing the potential) resolves to the
-    same wrapper and therefore the same batching window, and the wrapper dies
-    with its potential. ``None`` passes through; an already-wrapped potential is
-    not wrapped twice."""
+    """
+    Return the autobatched view of a potential.
+
+    Memoized on the potential itself, so every call site sharing a potential resolves
+    to the same wrapper and therefore the same batching window, and the wrapper dies
+    with its potential.
+
+    Args:
+        potential (Potential): The potential to wrap. `None` passes through, as does
+            an already-wrapped potential.
+
+    Returns:
+        (AutoBatchedPotential): The potential's autobatched wrapper.
+    """
     if potential is None or isinstance(potential, AutoBatchedPotential):
         return potential
     wrapper = potential.__dict__.get("_autobatched")
