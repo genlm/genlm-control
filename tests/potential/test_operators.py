@@ -6,6 +6,7 @@ from genlm.control.potential import (
     AutoBatchedPotential,
     MultiProcPotential,
 )
+from genlm.control.potential.autobatch import autobatched
 
 
 class SimplePotential(Potential):
@@ -72,11 +73,13 @@ async def test_coerce_operator(p1):
 @pytest.mark.asyncio
 async def test_to_autobatched(p1):
     have = p1.to_autobatched()
-    want = AutoBatchedPotential(p1)
-    assert have.potential == want.potential
+    assert isinstance(have, AutoBatchedPotential)
+    assert have.potential is p1
+    # One door: every route to the wrapper yields THE wrapper (same window).
+    assert p1.to_autobatched() is have
+    assert autobatched(p1) is have
 
     await have.cleanup()
-    await want.cleanup()
 
 
 @pytest.mark.asyncio

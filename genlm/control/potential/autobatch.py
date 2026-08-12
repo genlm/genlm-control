@@ -3,7 +3,7 @@ import weakref
 from collections import defaultdict
 
 from genlm.control.potential.base import Potential, VocabTables
-from genlm.control.util import LazyWeights, window_stats
+from genlm.control.util import LazyWeights, collect_window, window_stats
 
 
 class AutoBatchedPotential(Potential):
@@ -40,26 +40,9 @@ class AutoBatchedPotential(Potential):
         )
 
     async def _queued(self, batch_method_name, context):
-        loop = asyncio.get_running_loop()
-        window = self._windows.get(loop)
-        if window is None:
-            window = self._windows[loop] = _Window()
-        future = loop.create_future()
-        window.queue.append((batch_method_name, context, future))
-        if not window.armed:
-            window.armed = True
-            try:
-                # Callers reach their request at different depths of a `gather`
-                # tree, and each level is another scheduler turn; yield until a
-                # turn adds nothing, so the whole cohort lands in one flush.
-                while True:
-                    n = len(window.queue)
-                    await asyncio.sleep(0)
-                    if len(window.queue) == n:
-                        break
-                queue, window.queue = window.queue, []
-            finally:
-                window.armed = False
+        future = asyncio.get_running_loop().create_future()
+        queue = await collect_window(self._windows, (batch_method_name, context, future))
+        if queue is not None:
             await self._flush(queue)
         return await future
 
@@ -120,8 +103,17 @@ class AutoBatchedPotential(Potential):
     async def batch_logw_next(self, contexts):
         return await self.potential.batch_logw_next(contexts)
 
+    def is_terminal_only(self):
+        return self.potential.is_terminal_only()
+
+    async def live_logws(self, context):
+        return await self.potential.live_logws(context)
+
+    def alloc_rows(self, n, default=float("-inf")):
+        return self.potential.alloc_rows(n, default)
+
     def spawn(self, *args, **kwargs):
-        return AutoBatchedPotential(self.potential.spawn(*args, **kwargs))
+        return autobatched(self.potential.spawn(*args, **kwargs))
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.potential!r})"
@@ -132,27 +124,15 @@ class AutoBatchedPotential(Potential):
         await self.potential.cleanup()
 
 
-class _Window:
-    """Per-event-loop request meeting point; must not outlive its loop."""
-
-    __slots__ = ("queue", "armed")
-
-    def __init__(self):
-        self.queue = []
-        self.armed = False
-
-
-_WRAPPERS = weakref.WeakKeyDictionary()  # potential -> its AutoBatchedPotential
-
-
 def autobatched(potential):
-    """THE autobatched view of ``potential`` -- memoized, so every call site
-    (and every sampler sharing the potential) resolves to the same wrapper and
-    therefore the same batching window. ``None`` passes through; an
-    already-wrapped potential is not wrapped twice."""
+    """THE autobatched view of ``potential`` -- memoized on the potential itself,
+    so every call site (and every sampler sharing the potential) resolves to the
+    same wrapper and therefore the same batching window, and the wrapper dies
+    with its potential. ``None`` passes through; an already-wrapped potential is
+    not wrapped twice."""
     if potential is None or isinstance(potential, AutoBatchedPotential):
         return potential
-    wrapper = _WRAPPERS.get(potential)
+    wrapper = potential.__dict__.get("_autobatched")
     if wrapper is None:
-        wrapper = _WRAPPERS[potential] = AutoBatchedPotential(potential)
+        wrapper = potential._autobatched = AutoBatchedPotential(potential)
     return wrapper

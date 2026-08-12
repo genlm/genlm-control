@@ -101,8 +101,7 @@ class MultiTokenUnitSampler(TokenSampler):
                     weighted w.r.t. $\\psi(x \\mid \\bm{x})$
                 - logp: Sum of log-probabilities of sampling choices
         """
-        unit_context = context
-        flat_context = list(flatten_units(context))
+        flat_context = flatten_units(context)
 
         buffer, logw, logp = [], 0.0, 0.0
         for _ in range(self.max_subunits_per_unit):
@@ -115,7 +114,7 @@ class MultiTokenUnitSampler(TokenSampler):
             logp += logp_i
             if subunit is EOS:
                 return buffer, logw, logp
-            if self.boundary_predicate(unit_context, buffer):
+            if self.boundary_predicate(context, buffer):
                 return self.boundary_predicate.finalize_unit(buffer), logw, logp
         # max subunits without a boundary: reject the unit.
         return buffer, float("-inf"), logp

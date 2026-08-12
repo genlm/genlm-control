@@ -73,7 +73,6 @@ def _render_svg(pstats_path: str, svg_path: str) -> None:
 
 def main() -> None:
     args = parse_args()
-    from genlm.control.sampler.sequence import SMC
 
     model_name, engine_opts, post_engine = bench.scenario_engine(args)
     args.model = model_name
@@ -83,10 +82,11 @@ def main() -> None:
     built = bench.scenario_build(args, model)
 
     async def run():
-        bc.seed_all(args.seed)
-        await SMC(built.sampler, critic=built.critic)(
-            n_particles=args.n_particles, ess_threshold=args.ess_threshold,
-            max_tokens=args.max_tokens)
+        # The exact benchmarked entry, so the profiled path is bench's path.
+        await bc.run_smc(
+            built.sampler, built.critic, n_particles=args.n_particles,
+            max_tokens=args.max_tokens, ess_threshold=args.ess_threshold,
+            seed=args.seed, autobatch=args.autobatch)
 
     asyncio.run(run())  # warmup (untimed, unprofiled): cold prefill / CUDA graphs
 
@@ -101,7 +101,6 @@ def main() -> None:
         with lock:
             worker_profs.append(prof)
         prof.enable()
-        threading.settrace(None)
 
     threading.setprofile(profile_thread)
 

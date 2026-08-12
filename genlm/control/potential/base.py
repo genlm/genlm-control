@@ -193,10 +193,9 @@ class Potential(ABC, PotentialOps, PotentialTests):
         ``1[f(z) == y]`` are the canonical example.
 
         When used as an SMC critic, returning ``True`` lets the SMC loop skip
-        the per-step critic twist and reweight
-        only at termination. In a batched run this fires only when EVERY group's
-        critic is terminal-only (the flag is population-wide). Default ``False``;
-        override in subclasses that satisfy the ``prefix == 0`` invariant.
+        the per-step critic twist and reweight only at termination. Default
+        ``False``; override in subclasses that satisfy the ``prefix == 0``
+        invariant.
         """
         return False
 

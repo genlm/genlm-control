@@ -77,7 +77,7 @@ async def test_mixed_shape_and_backend_split_into_separate_groups():
 
 
 @pytest.mark.asyncio
-async def test_importance_draw_matches_hand_computed_price():
+async def test_importance_draw_matches_hand_computed_logw():
     vocab = [b"a", b"b", b"c"]
     proposal = torch.log_softmax(torch.tensor([5.0, 0.0, 0.0]), -1)  # peaked at "a"
     target = torch.log_softmax(torch.tensor([1.0, 2.0, 5.0]), -1)  # peaked at "c"

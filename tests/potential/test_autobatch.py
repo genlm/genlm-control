@@ -191,12 +191,12 @@ class SmallPotential(Potential):
 
 
 class AllowAllPotential(Potential):
-    """Vocab of 4 int tokens, zero log-weight everywhere. Doubles as a boolean
-    AWRS condition (0 in log-space) and as a trivial SMC critic; only used to
-    exercise sampler construction, never `.sample()`."""
+    """Zero log-weight everywhere. Doubles as a boolean AWRS condition (0 in
+    log-space) and as a trivial SMC critic; only used to exercise sampler
+    construction, never `.sample()`."""
 
-    def __init__(self):
-        super().__init__([0, 1, 2, 3])
+    def __init__(self, vocab=(0, 1, 2, 3)):
+        super().__init__(list(vocab))
 
     async def complete(self, context):
         return 0.0
@@ -279,18 +279,8 @@ async def test_trie_set_sampler_wraps_iter_seat_only():
     per particle per step); item_potential is never wrapped -- the trie walk
     asks it sequentially. autobatch=False leaves both seats bare."""
 
-    class TinyBytes(Potential):
-        def __init__(self, vocab):
-            super().__init__(vocab)
-
-        async def complete(self, context):
-            return 0.0
-
-        async def prefix(self, context):
-            return 0.0
-
-    iter_potential = TinyBytes([b"a", b"b"])
-    item_potential = TinyBytes([97, 98])
+    iter_potential = AllowAllPotential([b"a", b"b"])
+    item_potential = AllowAllPotential([97, 98])
     sampler = TrieSetSampler(iter_potential, item_potential)
     assert isinstance(sampler.iter_potential, AutoBatchedPotential)
     assert sampler.iter_potential.potential is iter_potential
@@ -299,7 +289,7 @@ async def test_trie_set_sampler_wraps_iter_seat_only():
     await sampler.cleanup()
 
     bare_sampler = TrieSetSampler(
-        TinyBytes([b"a", b"b"]), TinyBytes([97, 98]), autobatch=False
+        AllowAllPotential([b"a", b"b"]), AllowAllPotential([97, 98]), autobatch=False
     )
     assert not isinstance(bare_sampler.iter_potential, AutoBatchedPotential)
     assert not isinstance(bare_sampler.item_potential, AutoBatchedPotential)
@@ -382,3 +372,39 @@ async def test_spawn_rewraps():
 
     await wrapped.cleanup()
     await spawned.cleanup()
+
+
+def test_view_covers_potential_surface():
+    """Every public callable on `Potential` must be defined on the view: an
+    inherited base default answers for the WRAPPER instead of the wrapped
+    potential (this silently broke `cleanup`, then `is_terminal_only`). Pure
+    functions of the shared vocab tables are exempt -- the inherited default
+    computes the identical result."""
+    exempt = {"build_tables", "make_lazy_weights", "alloc_logws"}
+    missing = [
+        name
+        for name, member in vars(Potential).items()
+        if callable(member)
+        and not name.startswith("_")
+        and name not in exempt
+        and name not in vars(AutoBatchedPotential)
+    ]
+    assert not missing, f"AutoBatchedPotential must define/forward: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_memo_and_flag_forwarding():
+    """One door: `autobatched`, `to_autobatched`, and `spawn` all resolve through
+    the per-instance memo; semantic flags read off the wrapped potential."""
+
+    class TerminalOnly(AllowAllPotential):
+        def is_terminal_only(self):
+            return True
+
+    p = TerminalOnly()
+    wrapped = autobatched(p)
+    assert p.to_autobatched() is wrapped
+    assert autobatched(p) is wrapped
+    assert wrapped.is_terminal_only() is True
+
+    await wrapped.cleanup()

@@ -1,8 +1,8 @@
 """Per-scenario plots from a results store -> one SVG each.
 
 Reads ``results/<store>.jsonl`` (written by bench.py), and for every scenario draws
-a grouped bar chart: x = control version, bars = smc / raw wall-clock, with the
-cross-version speedup annotated. Writes ``results/<store>__<scenario>.svg``.
+a grouped bar chart: x = control version, bars = smc / raw wall-clock.
+Writes ``results/<store>__<scenario>.svg``.
 
     python benchmarks/plot_bench.py [store]   # default store: bench
 """
@@ -58,19 +58,12 @@ def main() -> None:
         fig, ax = plt.subplots(figsize=(1.8 * len(versions) + 3, 4.6))
         for i, p in enumerate(PATHS):
             vals = [by_ver[v].get(p, np.nan) for v in versions]
-            bars = ax.bar(x + (i - 1) * w, vals, w, label=PATH_LABEL[p],
-                          color=PATH_COLOR[p])
+            bars = ax.bar(x + (i - (len(PATHS) - 1) / 2) * w, vals, w,
+                          label=PATH_LABEL[p], color=PATH_COLOR[p])
             for rect, val in zip(bars, vals):
                 if np.isfinite(val):
                     ax.text(rect.get_x() + rect.get_width() / 2, val,
                             f"{val:.2f}s", ha="center", va="bottom", fontsize=7)
-        # step/burst speedup annotation per version
-        for xi, v in zip(x, versions):
-            off, req = by_ver[v].get("off"), by_ver[v].get("require")
-            if off and req:
-                ax.text(xi, max(off, req) * 1.12, f"{off / req:.1f}× burst",
-                        ha="center", va="bottom", fontsize=8, fontweight="bold",
-                        color="#2c7fb8")
         ax.set_xticks(x)
         ax.set_xticklabels(versions)
         ax.set_ylabel("wall-clock (s, median of 3 trials)")

@@ -21,10 +21,6 @@ class MockAsyncTransformer:  # Mock the backend LLM object
         except ValueError:
             self.byte_vocab = None  # Handle cases like BERT where byte vocab fails
 
-    def lora_view(self, lora_name):
-        # PromptedLLM binds its forward handle via lora_view; no adapters here.
-        return self
-
 
 class MockLLM(PromptedLLM):
     def __init__(self, tokenizer, model_name="mock_model", eos_byte_strings=None):

@@ -320,14 +320,16 @@ class AWRS(TokenSampler):
         return g
 
     def _make_keys(self, logps):
-        """Fresh Gumbel keys for one round, from this instance's own stream."""
+        """Fresh Gumbel keys for one round, from this instance's own stream.
+        float64 uniforms keep a zero draw (``-inf`` key) at 2^-53; the chained
+        in-place ops reuse the one buffer."""
         u = torch.rand(
             logps.shape,
             dtype=torch.float64,
             device=logps.device,
             generator=self._gen(logps.device),
         )
-        return logps + (-torch.log(-torch.log(u))).to(logps.dtype)
+        return logps + u.log_().neg_().log_().neg_().to(logps.dtype)
 
     async def _accept(self, context, token, verbosity=0):
         if self.prune_logws or token in self.vocab_eos_set:

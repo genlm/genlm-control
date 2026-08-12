@@ -400,7 +400,7 @@ async def main():
                 print(f"  raw      : {med:7.3f}s  (engine decode ceiling)")
                 continue
 
-            med, last, dts = await bc.trials(lambda: smc_run(),
+            med, last, dts = await bc.trials(smc_run,
                                              n_warmup=args.n_warmup, n_trials=args.n_trials)
             mean_len = float(np.mean([len(c) for c in last.contexts]))
             extra = {"draw": args.draw}
@@ -408,7 +408,7 @@ async def main():
                 # rollout-only run (drop the critic) -> critic_s = with - without
                 base_critic = built.critic
                 built.critic = None
-                nc_med, _, _ = await bc.trials(lambda: smc_run(),
+                nc_med, _, _ = await bc.trials(smc_run,
                                                n_warmup=0, n_trials=args.n_trials)
                 built.critic = base_critic
                 extra.update(rollout_s=nc_med, critic_s=med - nc_med)
