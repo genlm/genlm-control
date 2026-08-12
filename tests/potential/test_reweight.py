@@ -47,6 +47,17 @@ async def test_tempered_contract(p, beta):
     await q.assert_batch_consistency(CONTEXTS)
 
 
+def test_tempered_preserves_terminal_only(p):
+    """beta * 0 == 0: a terminal-only potential stays terminal-only tempered."""
+
+    class TerminalOnly(Weighted):
+        def is_terminal_only(self):
+            return True
+
+    assert (TerminalOnly(VOCAB) ** 0.5).is_terminal_only()
+    assert not (p**0.5).is_terminal_only()
+
+
 @pytest.mark.asyncio
 async def test_tempered_scales(p):
     q = p**2.5

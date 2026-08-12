@@ -29,6 +29,10 @@ class Tempered(Potential):
     def alloc_rows(self, n, default=float("-inf")):
         return self.p.alloc_rows(n, default)
 
+    def is_terminal_only(self) -> bool:
+        # beta * 0 == 0: tempering preserves the prefix == 0 invariant.
+        return self.p.is_terminal_only()
+
     def _scale(self, w):
         """``beta * w``, in ``w``'s own backend, leaving ``-inf`` untouched: scaling it
         would make ``nan`` at ``beta <= 0`` and resurrect a masked token."""
