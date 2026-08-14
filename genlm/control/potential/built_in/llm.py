@@ -400,6 +400,11 @@ class PromptedLLM(Potential):
         if not tokens:
             return []
 
+        try:
+            return [t.token_id for t in tokens]
+        except AttributeError:  # a non-Token (deprecated bytes) in the context
+            pass
+
         result = []
         warned = False
         for item in tokens:
@@ -584,9 +589,10 @@ class PromptedLLM(Potential):
             )
             logits = torch.cat([logits, pad], dim=1)
         logits = logits[:, :n_decode].log_softmax(dim=1)  # [N, n_decode]
-        out = torch.full(
+        # Uninitialized is safe: every column is written below — the vocab block,
+        # then the EOS column.
+        out = torch.empty(
             (logits.shape[0], len(self.vocab) + 1),
-            float("-inf"),
             dtype=logits.dtype,
             device=logits.device,
         )
