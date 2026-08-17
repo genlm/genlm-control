@@ -19,7 +19,7 @@ def systematic_resample(weights):
         weights (array-like): Normalized probability weights summing to 1.
 
     Returns:
-        ndarray: Integer array of ancestor indices.
+        (np.ndarray): Integer array of ancestor indices.
     """
     N = len(weights)
     positions = (np.random.random() + np.arange(N)) / N
@@ -53,7 +53,7 @@ def stratified_resample(weights):
         weights (array-like): Normalized probability weights summing to 1.
 
     Returns:
-        ndarray: Integer array of ancestor indices.
+        (np.ndarray): Integer array of ancestor indices.
     """
     N = len(weights)
     positions = (np.random.random(N) + np.arange(N)) / N
@@ -85,7 +85,7 @@ def residual_resample(weights):
         weights (array-like): Normalized probability weights summing to 1.
 
     Returns:
-        ndarray: Integer array of ancestor indices.
+        (np.ndarray): Integer array of ancestor indices.
     """
     N = len(weights)
     weights = np.asarray(weights, dtype=float)
@@ -120,7 +120,7 @@ def multinomial_resample(weights):
         weights (array-like): Normalized probability weights summing to 1.
 
     Returns:
-        ndarray: Integer array of ancestor indices.
+        (np.ndarray): Integer array of ancestor indices.
     """
     N = len(weights)
     return np.random.choice(N, size=N, replace=True, p=weights)
@@ -141,7 +141,7 @@ def get_resampling_fn(method):
         method (str): One of 'systematic', 'stratified', 'residual', 'multinomial'.
 
     Returns:
-        callable: Resampling function that takes weights and returns indices.
+        (callable): Resampling function that takes weights and returns indices.
 
     Raises:
         ValueError: If method is not recognized.

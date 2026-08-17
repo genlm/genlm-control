@@ -13,7 +13,7 @@ def string_for_serialization(ctx):
         ctx (list): A particle's token context (list of tokens / units).
 
     Returns:
-        str: The escaped, pipe-joined string used in the SMC visualization JSON.
+        (str): The escaped, pipe-joined string used in the SMC visualization JSON.
     """
     return "|".join(escape(y) for y in ctx)
 
