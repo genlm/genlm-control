@@ -39,7 +39,9 @@ test = [
     "pytest-xdist",
     "hypothesis==6.130.13",
     "hypothesis-jsonschema",
-    "setuptools"
+    "setuptools",
+    # tests/test_viz.py polls the visualizer's HTTP server.
+    "requests"
 ]
 docs = [
     "mkdocs",
