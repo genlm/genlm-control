@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import asyncio
+import torch
 import warnings
 
 from genlm.bytes import BeamParams
@@ -17,9 +18,12 @@ def model_name():
 # module instantiates BOTH a module-scoped `llm` engine and a per-test
 # `byte_llm`/`ByteLLM` engine, so two 0.9-util engines must coexist on one GPU
 # -> "Free memory ... less than desired GPU memory utilization". gpt2 is tiny, so
-# cap each engine's footprint to a small fraction so they fit together. (CPU/HF
-# backend ignores engine_opts, so this is a no-op off-GPU.)
-_LOW_GPU = {"engine_opts": {"gpu_memory_utilization": 0.3}}
+# cap each engine's footprint to a small fraction so they fit together.
+# `engine_opts` is vLLM-only, and `load_model_by_name` falls back to HF without
+# CUDA, so the option is gated on the same condition that picks the backend.
+_LOW_GPU = (
+    {"engine_opts": {"gpu_memory_utilization": 0.3}} if torch.cuda.is_available() else {}
+)
 
 
 @pytest.fixture(scope="module")
