@@ -172,3 +172,14 @@ cython_debug/
 
 # Local dev-loop script (box-specific paths/IPs); keep untracked
 scripts/box.sh
+
+# macOS
+.DS_Store
+
+# Agent instructions and scratch notes; local only
+CLAUDE.md
+
+# Local tooling / dev artifacts
+pyrightconfig.json
+uv.lock
+benchmarks/results/
