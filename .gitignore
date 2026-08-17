@@ -182,4 +182,4 @@ CLAUDE.md
 # Local tooling / dev artifacts
 pyrightconfig.json
 uv.lock
-benchmarks/results/
+benchmarks/
