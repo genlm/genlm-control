@@ -4,6 +4,7 @@ import time
 import numpy as np
 from genlm.control.potential import Potential
 from genlm.control.potential.autobatch import AutoBatchedPotential, autobatched
+from genlm.control.util import BatchAbandoned
 from genlm.control.sampler.token import DirectTokenSampler, AWRS
 from genlm.control.sampler.sequence import SMC
 from genlm.control.sampler.set import TrieSetSampler
@@ -408,3 +409,21 @@ async def test_memo_and_flag_forwarding():
     assert wrapped.is_terminal_only() is True
 
     await wrapped.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_batch_fails_co_callers():
+    """A cancelled batch holder must fail its co-callers, not orphan them, and not
+    with its own `CancelledError` -- that would leave their tasks cancelled and
+    skip their `except Exception`."""
+    potential = autobatched(MockPotential())
+    tasks = [asyncio.ensure_future(potential.prefix([1, 2])) for _ in range(3)]
+    await asyncio.sleep(0)  # everyone is queued; tasks[0] holds the batch
+    tasks[0].cancel()
+
+    results = await asyncio.gather(*tasks[1:], return_exceptions=True)
+    for result in results:
+        assert isinstance(result, BatchAbandoned)
+        assert not isinstance(result, asyncio.CancelledError)
+    assert all(not t.cancelled() for t in tasks[1:])
+    assert tasks[0].cancelled()

@@ -11,7 +11,8 @@ from genlm.control.util import (
     draw_from,
     picker_indices,
     set_draw_method,
-    take_window_stats,
+    take_batch_stats,
+    BatchAbandoned,
 )
 
 VOCAB4 = [b"a", b"b", b"c", b"d"]
@@ -27,19 +28,19 @@ def lw(weights, vocab):
 
 
 @pytest.fixture(autouse=True)
-def _clean_window_stats():
+def _clean_batch_stats():
     # Drain any residue from a previous test/loop before and after, so a
-    # test's ``take_window_stats()`` snapshot is its own draws, nothing else.
-    take_window_stats()
+    # test's ``take_batch_stats()`` snapshot is its own draws, nothing else.
+    take_batch_stats()
     yield
-    take_window_stats()
+    take_batch_stats()
 
 
 @pytest.mark.asyncio
 async def test_cohort_formation():
     rows = [torch.log_softmax(torch.randn(4), -1) for _ in range(6)]
     await asyncio.gather(*[draw_from(lw(r, VOCAB4)) for r in rows])
-    stats = take_window_stats()
+    stats = take_batch_stats()
     assert stats[("draw", 6)] == 1
 
 
@@ -56,7 +57,7 @@ async def test_nested_gather_depths_land_in_one_cohort():
     rows = [torch.log_softmax(torch.randn(4), -1) for _ in range(9)]
     depths = [0, 1, 2] * 3
     await asyncio.gather(*[nested(r, d) for r, d in zip(rows, depths)])
-    stats = take_window_stats()
+    stats = take_batch_stats()
     assert stats[("draw", 9)] == 1
 
 
@@ -70,7 +71,7 @@ async def test_mixed_shape_and_backend_split_into_separate_groups():
         *[draw_from(lw(r, VOCAB4)) for r in torch_rows],
         *[draw_from(lw(r, vocab3)) for r in np_rows],
     )
-    stats = take_window_stats()
+    stats = take_batch_stats()
     assert stats[("draw", 4)] == 1  # the torch/V=4 group
     assert stats[("draw", 3)] == 1  # the numpy/V=3 group, not merged into the above
     assert sum(stats.values()) == 2
@@ -87,7 +88,7 @@ async def test_importance_draw_matches_hand_computed_logw():
         draw_from(lw(proposal, vocab), target=lw(target, vocab)),
         *[draw_from(lw(r, vocab)) for r in plain_rows],
     )
-    stats = take_window_stats()
+    stats = take_batch_stats()
     assert stats[("draw", 3)] == 1  # importance + plain draws, one cohort
 
     tok, logw, logp = out[0]
@@ -109,7 +110,7 @@ async def test_custom_draw_takes_solo_path():
         return max(chart, key=chart.__getitem__)  # highest-prob token
 
     tok, logw, logp = await draw_from(lw(row, VOCAB4), draw=picker)
-    assert not take_window_stats()  # solo path never touches the window
+    assert not take_batch_stats()  # solo path never touches the window
 
     assert tok == b"c"  # argmax of the raw logits
     idx = VOCAB4.index(tok)
@@ -122,7 +123,7 @@ async def test_custom_draw_takes_solo_path():
     tok2, logw2, logp2 = await draw_from(
         lw(row, VOCAB4), draw=picker, target=lw(target, VOCAB4)
     )
-    assert not take_window_stats()
+    assert not take_batch_stats()
 
     idx2 = VOCAB4.index(tok2)
     expected_logw2 = target[idx2].item() - logp2
@@ -144,7 +145,7 @@ async def test_exception_fails_its_group_without_poisoning_others():
     )
     good_out, bad_out = await asyncio.gather(good_task, bad_task)
 
-    stats = take_window_stats()
+    stats = take_batch_stats()
     assert stats[("draw", 3)] == 1  # good group flushed
     assert stats[("draw", 2)] == 1  # bad group flushed too, same cohort
 
@@ -165,7 +166,7 @@ async def test_distribution_matches_known_categorical():
 
     torch.manual_seed(0)
     out = await asyncio.gather(*[draw_from(lw(row, vocab)) for _ in range(n)])
-    stats = take_window_stats()
+    stats = take_batch_stats()
     assert stats[("draw", n)] == 1  # one batched reduction for the whole cohort
 
     counts = Counter(tok for tok, _, _ in out)
@@ -189,3 +190,24 @@ def test_set_draw_method_round_trip():
             assert bool(((idxs >= 0) & (idxs < 4)).all())
     finally:
         set_draw_method("gumbel_max")  # never leak a picker across test order
+
+
+@pytest.mark.asyncio
+async def test_abandoned_batch_fails_co_callers():
+    """A cancelled batch holder must fail its co-callers, not orphan them.
+
+    The failure is never the holder's own `CancelledError`: handed to a caller who
+    never asked for one, that leaves their task cancelled and skips their
+    `except Exception`.
+    """
+    rows = [torch.log_softmax(torch.randn(4), -1) for _ in range(3)]
+    tasks = [asyncio.ensure_future(draw_from(lw(r, VOCAB4))) for r in rows]
+    await asyncio.sleep(0)  # everyone is queued; tasks[0] holds the batch
+    tasks[0].cancel()
+
+    results = await asyncio.gather(*tasks[1:], return_exceptions=True)
+    for result in results:
+        assert isinstance(result, BatchAbandoned)
+        assert not isinstance(result, asyncio.CancelledError)
+    assert all(not t.cancelled() for t in tasks[1:])
+    assert tasks[0].cancelled()

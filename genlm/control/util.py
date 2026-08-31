@@ -334,6 +334,14 @@ def load_async_trie(V, backend=None, **kwargs):
 
 # --- token-picker family ---
 # Each maps a log-weight tensor -> drawn index over dim=-1 (1-D draw or batched [N, V]).
+# The pickers draw from the global torch RNG, so `torch.manual_seed` -- not
+# `np.random.seed` -- is what makes a run's draws reproducible. Two other streams
+# exist and are seeded separately: `np.random` drives resampling
+# (`sampler/resampling.py`) and AWRS's phantom-token geometrics, and AWRS's rejection
+# noise comes from a per-instance `torch.Generator` (its `seed=` argument).
+# The pickers stay at the row's dtype (fp32 off the engine): fp64 would cost an
+# [N, V] double buffer per step, `inverse_cdf`'s cumsum is the only place fp32 error
+# is measurable and it is already clamped, and MPS has no fp64 at all.
 
 
 def gumbel_max(logps):
@@ -394,14 +402,14 @@ def set_draw_method(method):
 
 # Batching counters: (site, cohort_size) -> count. Sites are "draw" (one entry per
 # stacked group per flush) and "autobatch" (one entry per batch call, see
-# potential/autobatch.py). Read and clear via `take_window_stats`.
-window_stats = Counter()
+# potential/autobatch.py). Read and clear via `take_batch_stats`.
+batch_stats = Counter()
 
 
-def take_window_stats():
-    """Snapshot and reset the window-batching counters."""
-    global window_stats
-    stats, window_stats = window_stats, Counter()
+def take_batch_stats():
+    """Snapshot and reset the batching counters."""
+    global batch_stats
+    stats, batch_stats = batch_stats, Counter()
     return stats
 
 
@@ -437,13 +445,17 @@ async def draw_from(lazyweights, draw=None, target=None):
 
     assert lazyweights.is_log
     future = asyncio.get_running_loop().create_future()
-    queue = await collect_window(_DRAW_WINDOWS, (lazyweights, target, future))
-    if queue is not None:
-        _flush_draws(queue)
+    batch = await join_batch(_DRAW_BATCHES, (lazyweights, target, future))
+    if batch is not None:
+        _flush_draws(batch)
     return await future
 
 
-class _Window:
+class BatchAbandoned(RuntimeError):
+    """The caller holding a batch died before it could be flushed."""
+
+
+class _Batch:
     """Per-event-loop request meeting point; must not outlive its loop."""
 
     __slots__ = ("queue", "armed")
@@ -453,53 +465,80 @@ class _Window:
         self.armed = False
 
 
-async def collect_window(store, entry):
+async def join_batch(store, entry):
     """
-    Meet concurrent callers in a per-event-loop window.
+    Join the batch of concurrent callers on this event loop.
 
-    Appends `entry` and, if nobody holds the window yet, holds it open until a full
-    event-loop pass adds no new entry. The holding caller flushes the cohort in its
-    own coroutine; there is no background task.
+    Appends `entry` and, if nobody holds the batch yet, holds it open until a full
+    event-loop pass adds no new entry. The holding caller flushes the batch in its
+    own coroutine; there is no background task. An entry is a tuple ending in its
+    future: a holder that dies before handing the batch off fails every other queued
+    future rather than orphaning it, so an entry is always resolved exactly once.
 
     Args:
-        store (weakref.WeakKeyDictionary): Event loop to `_Window` map, owned by the
-            call site. One store per window.
-        entry (Any): The request to add to the window.
+        store (weakref.WeakKeyDictionary): Event loop to `_Batch` map, owned by the
+            call site. One store per batch.
+        entry (tuple): The request to add, ending in its future.
 
     Returns:
-        (list | None): The drained cohort for the holding caller, `None` for everyone
+        (list | None): The drained batch for the holding caller, `None` for everyone
             else.
     """
     loop = asyncio.get_running_loop()
-    window = store.get(loop)
-    if window is None:
-        window = store[loop] = _Window()
-    window.queue.append(entry)
-    if window.armed:
+    batch = store.get(loop)
+    if batch is None:
+        batch = store[loop] = _Batch()
+    batch.queue.append(entry)
+    if batch.armed:
         return None
-    window.armed = True
+    batch.armed = True
     try:
-        # Callers reach the window at different depths of a `gather` tree, and each
+        # Callers reach the batch at different depths of a `gather` tree, and each
         # level is another scheduler turn; yield until a turn adds nothing, so the
-        # whole cohort lands in one flush.
+        # whole batch lands in one flush.
         while True:
-            n = len(window.queue)
+            n = len(batch.queue)
             await asyncio.sleep(0)
-            if len(window.queue) == n:
+            if len(batch.queue) == n:
                 break
-        queue, window.queue = window.queue, []
+        queue, batch.queue = batch.queue, []
         return queue
+    except BaseException as exc:
+        queue, batch.queue = batch.queue, []
+        # Not this caller's own entry: it is unwinding past its `await`, so an
+        # exception set there is only ever logged as never retrieved.
+        fail_futures([e for e in queue if e is not entry], batch_abandoned(exc))
+        raise
     finally:
-        window.armed = False
+        batch.armed = False
 
 
-_DRAW_WINDOWS = weakref.WeakKeyDictionary()  # event loop -> _Window
+def batch_abandoned(exc):
+    """The failure handed to callers whose batch holder died.
+
+    Never the cause itself: a `CancelledError` given to a caller who never asked for
+    one leaves their task cancelled and skips their `except Exception`.
+    """
+    abandoned = BatchAbandoned(f"batch holder did not survive it: {exc!r}")
+    abandoned.__cause__ = exc
+    return abandoned
+
+
+def fail_futures(entries, exc):
+    """Resolve each entry's future -- its last element -- with `exc`."""
+    for entry in entries:
+        future = entry[-1]
+        if not future.done():
+            future.set_exception(exc)
+
+
+_DRAW_BATCHES = weakref.WeakKeyDictionary()  # event loop -> _Batch
 
 
 def _flush_draws(queue):
-    """Resolve a cohort of draws with one batched reduction per stackable group, off
-    a single host readback. Every future is resolved, with its draw or with the
-    exception the group raised."""
+    """Resolve a batch of draws with one batched reduction per stackable group, off
+    a single host readback. Every future is resolved, with its draw or with a
+    failure."""
     groups = defaultdict(list)
     for lw, target, future in queue:
         w = lw.weights
@@ -510,7 +549,7 @@ def _flush_draws(queue):
         )
         groups[key].append((lw, target, future))
     for entries in groups.values():
-        window_stats[("draw", len(entries))] += 1
+        batch_stats[("draw", len(entries))] += 1
         try:
             rows = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in entries])
             logZ = torch.logsumexp(rows, dim=-1)
@@ -531,17 +570,21 @@ def _flush_draws(queue):
                 t_idx = idx[targeted]
                 t_vals = t_rows.gather(-1, t_idx.unsqueeze(-1)).squeeze(-1).tolist()
                 target_logws = dict(zip(targeted, t_vals))
-        except BaseException as exc:
-            for _, _, future in entries:
-                if not future.done():
-                    future.set_exception(exc)
+        except Exception as exc:
+            fail_futures(entries, exc)
             continue
-        for k, ((lw, target, future), i, z, p) in enumerate(
+        except BaseException as exc:
+            # This flush is unwinding, so nothing else will resolve what it still
+            # owes. Groups already resolved are skipped by `fail_futures`.
+            for rest in groups.values():
+                fail_futures(rest, batch_abandoned(exc))
+            raise
+        for k, ((lw, target, future), tok_id, z, p) in enumerate(
             zip(entries, ids, logZs, drawn_logps)
         ):
             if not future.done():
                 logw = z if target is None else target_logws[k] - p
-                future.set_result((lw.decode[i], logw, p))
+                future.set_result((lw.decode[tok_id], logw, p))
 
 
 def picker_indices(weights):

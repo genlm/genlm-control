@@ -3,7 +3,13 @@ import weakref
 from collections import defaultdict
 
 from genlm.control.potential.base import Potential, VocabTables
-from genlm.control.util import LazyWeights, collect_window, window_stats
+from genlm.control.util import (
+    LazyWeights,
+    join_batch,
+    batch_stats,
+    batch_abandoned,
+    fail_futures,
+)
 
 
 class AutoBatchedPotential(Potential):
@@ -26,7 +32,7 @@ class AutoBatchedPotential(Potential):
 
     def __init__(self, potential):
         self.potential = potential
-        self._windows = weakref.WeakKeyDictionary()  # event loop -> _Window
+        self._batches = weakref.WeakKeyDictionary()  # event loop -> _Batch
         # A wrapper indexes the same vocabulary as what it wraps, so it reuses those
         # tables rather than paying O(len(vocab)) to rebuild an identical set.
         super().__init__(
@@ -41,19 +47,19 @@ class AutoBatchedPotential(Potential):
 
     async def _queued(self, batch_method_name, context):
         future = asyncio.get_running_loop().create_future()
-        queue = await collect_window(self._windows, (batch_method_name, context, future))
-        if queue is not None:
-            await self._flush(queue)
+        batch = await join_batch(self._batches, (batch_method_name, context, future))
+        if batch is not None:
+            await self._flush(batch)
         return await future
 
     async def _flush(self, queue):
-        """One call per batch method for the whole cohort. Every future is resolved,
-        with its result or with the exception that call raised."""
+        """One call per batch method for the whole batch. Every future is resolved,
+        with its result or with a failure."""
         groups = defaultdict(list)
         for method_name, context, future in queue:
             groups[method_name].append((context, future))
         for method_name, requests in groups.items():
-            window_stats[("autobatch", method_name, len(requests))] += 1
+            batch_stats[("autobatch", method_name, len(requests))] += 1
             try:
                 results = await getattr(self.potential, method_name)(
                     [context for context, _ in requests]
@@ -70,9 +76,13 @@ class AutoBatchedPotential(Potential):
                     if not future.done():
                         future.set_result(result)
             except Exception as exc:
-                for _, future in requests:
-                    if not future.done():
-                        future.set_exception(exc)
+                fail_futures(requests, exc)
+            except BaseException as exc:
+                # This flush is unwinding, so nothing else will resolve what it
+                # still owes. Groups already resolved are skipped by `fail_futures`.
+                for rest in groups.values():
+                    fail_futures(rest, batch_abandoned(exc))
+                raise
 
     async def complete(self, context):
         return await self._queued("batch_complete", context)

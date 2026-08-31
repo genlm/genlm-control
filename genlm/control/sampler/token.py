@@ -324,14 +324,14 @@ class AWRS(TokenSampler):
     def _make_keys(self, logps):
         """Draw Gumbel keys for one round, from this instance's own stream.
 
-        The uniforms are float64: a zero draw, which yields an ``-inf`` key, then
-        has probability 2^-53.
+        The uniforms are drawn at the widest float the device carries: at float64 a
+        zero draw, which yields an ``-inf`` key, has probability 2^-53. MPS has no
+        float64 and takes float32.
         """
+        device = logps.device
+        dtype = torch.float32 if device.type == "mps" else torch.float64
         u = torch.rand(
-            logps.shape,
-            dtype=torch.float64,
-            device=logps.device,
-            generator=self._gen(logps.device),
+            logps.shape, dtype=dtype, device=device, generator=self._gen(device)
         )
         return logps + u.log_().neg_().log_().neg_().to(logps.dtype)
 

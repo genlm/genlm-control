@@ -138,6 +138,18 @@ async def test_duplicate_tokens_get_independent_weights(llm):
     )
 
 
+def test_tokenize_roundtrip(llm):
+    """`tokenize` then `encode_tokens` must recover the tokenizer's own ids.
+
+    `tokenize` reads the decode table by id and `encode_tokens` reads `.token_id`
+    back off it, so this pins the table as id-faithful over a vocabulary where
+    several ids share a byte string.
+    """
+    text = "Hello, world!"
+    ids = llm.encode_tokens(llm.tokenize(text))
+    assert ids == llm.model.tokenizer.encode(text)
+
+
 # ---------------------------------------------------------------------------
 # Direct use of duplicate tokens in contexts
 # ---------------------------------------------------------------------------

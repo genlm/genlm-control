@@ -72,16 +72,27 @@ class SequenceModel:
         new.done = self.done
         return new
 
+    def _add_weight(self, amt):
+        """The one place ``weight`` changes. A ``+inf`` log-weight violates the
+        potential contract; a NaN weight means impossible, which is ``-inf``."""
+        if amt == float("inf"):
+            raise ValueError(
+                "A potential returned a log-weight of +inf, which violates the "
+                "potential contract."
+            )
+        w = self.weight + amt
+        self.weight = float("-inf") if np.isnan(w) else w
+
     def score(self, amt):
-        self.weight += amt
+        self._add_weight(amt)
 
     def twist(self, amt):
         """Add ``amt`` to the weight provisionally; ``untwist`` takes it back."""
         self.twist_amount += amt
-        self.weight += amt
+        self._add_weight(amt)
 
     def untwist(self):
-        self.weight -= self.twist_amount
+        self._add_weight(-self.twist_amount)
         self.twist_amount = 0.0
 
     def finish(self):
@@ -220,7 +231,8 @@ async def smc_standard(
         w_sum = logsumexp(W)
         nw = W - w_sum
         with np.errstate(divide="ignore"):
-            if -logsumexp(nw * 2) >= np.log(ess_threshold) + np.log(n_particles):
+            log_ess = -logsumexp(nw * 2)
+            if log_ess >= np.log(ess_threshold) + np.log(n_particles):
                 continue
 
         probs = np.exp(nw)

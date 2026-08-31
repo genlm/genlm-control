@@ -1,6 +1,5 @@
 import pytest
 import numpy as np
-import asyncio
 import torch
 import warnings
 
@@ -36,7 +35,7 @@ def llm(model_name):
     cleanup = getattr(instance, "cleanup", None)
     if cleanup is not None:
         try:
-            asyncio.run(cleanup())
+            cleanup()  # the backend's cleanup is sync
         except Exception as e:
             # Surface (don't swallow) a failing teardown: a silently-failing
             # cleanup is exactly how a later module hits an unexplained OOM.

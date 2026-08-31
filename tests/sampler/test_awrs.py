@@ -861,3 +861,19 @@ async def test_geometric_awrs_validity(logps, accept, rng, max_rejects, max_acce
         assert logp > -np.inf
     else:
         assert logp == -np.inf
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires Apple Silicon"
+)
+def test_make_keys_on_mps():
+    """Rejection keys must draw on whatever device the row is on. MPS has no
+    float64, so the widest uniform available there is float32."""
+    vocab = [b"a", b"b"]
+    logws = np.log([0.4, 0.4, 0.2])
+    sampler = AWRS(MockPotential(vocab, logws), MockPotential(vocab, logws))
+    logps = torch.log_softmax(torch.randn(16, device="mps"), -1)
+    keys = sampler._make_keys(logps)
+    assert keys.device.type == "mps"
+    assert keys.dtype == logps.dtype
+    assert torch.isfinite(keys).all()

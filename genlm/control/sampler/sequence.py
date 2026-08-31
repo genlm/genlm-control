@@ -108,7 +108,11 @@ class SMC:
             resampling_method (str, optional): One of 'multinomial', 'stratified',
                 'systematic', 'residual'. Defaults to 'multinomial'.
             terminate_when (callable, optional): A `context -> bool` stop condition.
-                When it fires, EOS closes the sequence in that same step.
+                When it fires, EOS closes the sequence in that same step, with no
+                importance correction: the condition defines which sequences are
+                complete, so it is part of the target rather than a truncation of it.
+                Contrast `max_tokens`, which cuts a sequence the model would have
+                continued and therefore does correct.
 
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
@@ -281,12 +285,6 @@ class Sequences:
 
 def _unpack_particles(particles):
     contexts, logws = map(
-        list,
-        zip(
-            *[
-                (p.context, float("-inf") if np.isnan(p.weight) else p.weight)
-                for p in particles
-            ]
-        ),
+        list, zip(*[(p.context, p.weight) for p in particles])
     )
     return contexts, logws

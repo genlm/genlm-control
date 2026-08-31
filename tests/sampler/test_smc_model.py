@@ -284,3 +284,38 @@ async def test_verbosity_prints_per_step(capsys):
     await smc_standard(model, n_particles=1, ess_threshold=0)
 
     assert capsys.readouterr().out.strip() != ""
+
+
+def test_nan_weight_folds_to_neg_inf():
+    """A NaN weight is coerced where the weight changes, not where it is reported:
+    stratified/systematic/residual resampling collapses a whole population onto one
+    ancestor when handed NaN probabilities, in silence."""
+    model = SequenceModel(unit_sampler=None)
+    model.score(-2.0)
+    model.score(float("nan"))
+    assert model.weight == float("-inf")
+
+    model.twist(float("nan"))
+    model.untwist()
+    assert model.weight == float("-inf")
+
+
+def test_positive_inf_weight_is_rejected():
+    """A +inf log-weight is what manufactures the downstream NaN via `W - w_sum`,
+    and it violates the potential contract on its own."""
+    model = SequenceModel(unit_sampler=None)
+    with pytest.raises(ValueError, match=r"\+inf"):
+        model.score(float("inf"))
+
+
+@pytest.mark.asyncio
+async def test_nan_weights_do_not_reach_the_resampler():
+    """A population whose draws come back NaN dies, rather than resampling off
+    NaN probabilities."""
+    schedule = [float("nan")] * 4
+    model = SequenceModel(ScheduledWeightSampler(schedule), max_tokens=5)
+
+    particles = await smc_standard(model, n_particles=4, ess_threshold=0.9)
+
+    assert len(particles) == 4
+    assert all(p.weight == float("-inf") for p in particles)
