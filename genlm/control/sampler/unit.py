@@ -1,31 +1,11 @@
 from abc import ABC, abstractmethod
 from typing import Any, Iterable, Optional
 
-from genlm.control.constant import EOS
+from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
+from genlm.control.util import flatten_units
 from lark import Lark
 from lark.exceptions import LarkError
-
-
-def flatten_units(context):
-    """
-    Flatten nested unit context to a flat token list. When using MultiTokenUnitSampler, token_ctx becomes nested [[...], [...], ...].
-    This helper flattens it for use with coercion functions like b"".join.
-
-    Usage:
-        potential.coerce(LLM, f=lambda ctx: b"".join(flatten_units(ctx)))
-    Args:
-        context: Either a flat list [token1, token2, ...] or nested [[token1, token2], [token3], ...]
-    Returns:
-        list: Flattened list of tokens
-    """
-    flattened = []
-    for item in context:
-        if isinstance(item, list):
-            flattened.extend(item)
-        else:
-            flattened.append(item)
-    return flattened
 
 
 class MultiTokenUnitSampler(TokenSampler):
@@ -78,6 +58,10 @@ class MultiTokenUnitSampler(TokenSampler):
             raise TypeError(
                 f"subunit_sampler must be a TokenSampler, got {type(subunit_sampler)}"
             )
+        if max_subunits_per_unit < 1:
+            raise ValueError(
+                f"max_subunits_per_unit must be >= 1, got {max_subunits_per_unit}"
+            )
 
         # Initialized with subunit sampler's target
         # We may want to add support for different samplers in the future
@@ -92,46 +76,11 @@ class MultiTokenUnitSampler(TokenSampler):
         return await self.subunit_sampler.start_weight()
 
     async def logw_eos(self, context):
-        """EOS log-weight at the ``max_tokens`` boundary.
-
-        ``context`` is the nested unit context (``[[...], [...], ...]``) that
-        ``SequenceModel`` carries for multi-token units. Flatten it to the token
-        list the underlying target expects, then defer to the subunit sampler so
-        its own (possibly cheaper) ``logw_eos`` is reused.
-        """
+        """EOS log-weight at the ``max_tokens`` boundary: defer to the subunit sampler
+        on the flattened context."""
         return await self.subunit_sampler.logw_eos(flatten_units(context))
 
-    async def forward(self):
-        """Called by LLaMPPL Model.call() to sample one multi-token unit.
-
-        Called by SequenceModel.step() when it calls self.call(unit_sampler).
-        """
-        parent = self.parent
-
-        # Flatten parent.token_ctx before passing to sample
-        # This ensures sample() always works with a flat list
-        flat_context = flatten_units(parent.token_ctx)
-
-        # Sample multi-token unit, passing both flat context and structured unit context
-        unit, logw, logp = await self.sample(
-            flat_context, unit_context=parent.token_ctx, draw=None
-        )
-
-        # Update parent's weight and logp
-        parent.score(logw)
-        parent.logp += logp
-
-        # If the unit ends with EOS, return EOS directly so SequenceModel can detect completion
-        # SequenceModel.step() checks `token_ctx[-1] is EOS` to finish generation
-        if unit and unit[-1] is EOS:
-            # Keep the unit content before EOS in token_ctx, then return EOS separately
-            if len(unit) > 1:
-                parent.token_ctx.append(unit[:-1])  # Add unit without EOS
-            return EOS  # Return EOS directly for SequenceModel to detect
-
-        return unit
-
-    async def sample(self, flat_token_context, unit_context=None, draw=None):
+    async def sample(self, context, draw=None):
         """Sample a multi-token unit by running sequence sampling for $\\varphi_{\\bm{x}}$.
         SIS for the localized potential:
 
@@ -140,10 +89,9 @@ class MultiTokenUnitSampler(TokenSampler):
         3. Return $(\\bm{s}, w)$ where $\\bm{s} \\in \\mathcal{B}^*$ forms unit $x \\in \\mathcal{A}$
 
         Args:
-            flat_token_context (list): Flat sequence of all previously sampled tokens.
-                This is pre-flattened by forward() to ensure compatibility with potentials.
-            unit_context (list, optional): Structured sequence of previously sampled units.
-                Used by boundary predicates that need context. Defaults to [].
+            context (list): The particle's structured (possibly nested) unit context.
+                Flattened for the subunit sampler; the boundary predicate sees the
+                structured form.
             draw (callable, optional): Sampling function passed to subunit_sampler
 
         Returns:
@@ -153,48 +101,23 @@ class MultiTokenUnitSampler(TokenSampler):
                     weighted w.r.t. $\\psi(x \\mid \\bm{x})$
                 - logp: Sum of log-probabilities of sampling choices
         """
-        if unit_context is None:
-            unit_context = []
+        flat_context = flatten_units(context)
 
-        subunit_buffer = []
-        current_context = list(flat_token_context)
-
-        # Accumulate weights
-        cumulative_logw = 0.0
-        cumulative_logp = 0.0
-
-        # Sequential sampling until EOT
+        buffer, logw, logp = [], 0.0, 0.0
         for _ in range(self.max_subunits_per_unit):
-            # Sample next subunit $(s_i, w_i) \\sim q_{\\text{sub}}(\\cdot \\mid \\bm{s}_{<i})$
-            try:
-                subunit, logw_i, logp_i = await self.subunit_sampler.sample(
-                    current_context, draw
-                )
-            except (RuntimeError, OSError, TimeoutError):
-                # Expected failures (network, timeout, system errors)
-                # Return current buffer with -inf weight to discard this sample
-                return subunit_buffer, float("-inf"), cumulative_logp
-
-            # Accumulate weight and logp
-            cumulative_logw += logw_i
-            cumulative_logp += logp_i
-
-            # Add to both buffer and context
-            subunit_buffer.append(subunit)
-            current_context.append(subunit)
-
-            # Check for EOS
+            subunit, logw_i, logp_i = await self.subunit_sampler.sample(
+                flat_context, draw=draw
+            )
+            flat_context.append(subunit)
+            buffer.append(subunit)
+            logw += logw_i
+            logp += logp_i
             if subunit is EOS:
-                return subunit_buffer, cumulative_logw, cumulative_logp
-
-            # Check boundary: is $\\bm{s} \\in \\mathcal{A}$ (complete unit)?
-            if self.boundary_predicate(unit_context, subunit_buffer):
-                # Let the predicate finalize the unit (e.g., remove delimiter tokens)
-                unit = self.boundary_predicate.finalize_unit(subunit_buffer)
-                return unit, cumulative_logw, cumulative_logp
-
-        # Max subunits exceeded: we return -inf weight to reject incomplete/invalid unit
-        return subunit_buffer, float("-inf"), cumulative_logp
+                return buffer, logw, logp
+            if self.boundary_predicate(context, buffer):
+                return self.boundary_predicate.finalize_unit(buffer), logw, logp
+        # max subunits without a boundary: reject the unit.
+        return buffer, float("-inf"), logp
 
     async def cleanup(self):
         """Clean up resources."""
@@ -262,10 +185,25 @@ class TokenSetBoundary(BoundaryPredicate):
 
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
+        # A ``Token`` is a bytes subclass that hashes by token_id, so
+        # ``Token(13, b" ") in {b" "}`` is False despite matching bytes and the
+        # boundary would silently never fire. Match byte content, and EOS by identity.
+        self._eos_boundary = any(
+            isinstance(t, EndOfSequence) for t in self.boundary_tokens
+        )
+        self._byte_boundaries = {
+            bytes(t) for t in self.boundary_tokens if not isinstance(t, EndOfSequence)
+        }
 
     def __call__(self, unit_context: list, subunit_buffer: list) -> bool:
-        """Check boundary (ignore unit_context for stateless predicate)."""
-        return bool(subunit_buffer and subunit_buffer[-1] in self.boundary_tokens)
+        """Check boundary (ignore unit_context for stateless predicate). Subunits
+        match by byte content, EOS by identity."""
+        if not subunit_buffer:
+            return False
+        last = subunit_buffer[-1]
+        if isinstance(last, EndOfSequence):
+            return self._eos_boundary
+        return bytes(last) in self._byte_boundaries
 
     def __repr__(self) -> str:
         return f"TokenSetBoundary({self.boundary_tokens!r})"

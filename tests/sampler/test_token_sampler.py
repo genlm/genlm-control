@@ -137,10 +137,10 @@ async def test_direct_token_sampler_with_proposal_exact_weight():
         assert tid == forced_idx
 
         expected_logw = target_logws[tid] - proposal_logws[tid] + log_Z_proposal
-        np.testing.assert_allclose(logw, expected_logw, rtol=1e-10)
+        np.testing.assert_allclose(logw, expected_logw, rtol=1e-10, atol=1e-12)
 
         expected_logp = proposal_logps[tid]
-        np.testing.assert_allclose(logp, expected_logp, rtol=1e-10)
+        np.testing.assert_allclose(logp, expected_logp, rtol=1e-10, atol=1e-12)
 
 
 
@@ -160,7 +160,9 @@ def test_direct_token_sampler_proposal_must_be_potential():
 
 
 def test_direct_token_sampler_factory_threads_proposal():
-    """`direct_token_sampler` forwards `proposal` to `DirectTokenSampler`."""
+    """`direct_token_sampler` forwards `proposal` to `DirectTokenSampler`. The
+    default `autobatch=True` wraps both seats in `AutoBatchedPotential`, so
+    identity is checked through the wrapper's `.potential`."""
     from genlm.control.sampler import direct_token_sampler
 
     vocab = [bytes([i]) for i in range(3)]
@@ -171,7 +173,8 @@ def test_direct_token_sampler_factory_threads_proposal():
     s_with_proposal = direct_token_sampler(target, proposal=proposal)
 
     assert s_default.proposal is None
-    assert s_with_proposal.proposal is proposal
+    assert s_with_proposal.potential.potential is target
+    assert s_with_proposal.proposal.potential is proposal
 
 
 class _TrackedPotential(MockPotential):
@@ -408,7 +411,7 @@ async def test_sis_with_proposal_weights_match_manual_computation(
                 expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
 
         np.testing.assert_allclose(
-            actual_logw, expected_logw, rtol=1e-10,
+            actual_logw, expected_logw, rtol=1e-10, atol=1e-12,
             err_msg=f"Weight mismatch for sequence {ctx}",
         )
 

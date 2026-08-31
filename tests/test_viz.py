@@ -7,6 +7,10 @@ import requests
 from pathlib import Path
 from genlm.control.viz import InferenceVisualizer
 
+# These bind fixed ports (8000/8001) and assert they are free first, so two of them must
+# never run at once. Under ``--dist loadgroup`` the whole module lands on one worker.
+pytestmark = pytest.mark.xdist_group("viz")
+
 
 @pytest.fixture
 def mocker(request):
@@ -36,7 +40,7 @@ def test_data():
             "mode": "init",
             "particles": [
                 {
-                    "contents": "<<<>>>b'h'",
+                    "contents_incr": "h",
                     "logweight": "-11.892930183943907",
                     "weight_incr": "-11.892930183943907",
                 }

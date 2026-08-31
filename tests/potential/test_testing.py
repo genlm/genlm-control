@@ -72,7 +72,9 @@ async def test_assert_batch_consistency():
             return self.make_lazy_weights([0.0] * len(self.vocab_eos))
 
         async def batch_logw_next(self, contexts, *args):
-            return [self.make_lazy_weights([1.0] * len(self.vocab_eos))] * len(contexts)
+            return self.make_lazy_weights(
+                np.stack([[1.0] * len(self.vocab_eos)] * len(contexts))
+            )
 
     pot = LogwNextErrorPotential()
     with pytest.raises(AssertionError) as exc:

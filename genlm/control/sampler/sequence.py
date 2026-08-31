@@ -1,17 +1,14 @@
 import numpy as np
 from genlm.grammar import Float
-from arsenal.maths import logsumexp
+from genlm.control.util import logsumexp
 from functools import cached_property
 from dataclasses import dataclass
-from arsenal import colors
-
-from llamppl import Model
-from llamppl import smc_standard
 
 from genlm.control.potential import Potential
-from genlm.control.constant import EOS, EndOfSequence
+from genlm.control.potential.autobatch import autobatched
+from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.util import escape
+from genlm.control.sampler.smc import SequenceModel, smc_standard
 
 
 class SMC:
@@ -46,13 +43,18 @@ class SMC:
         unit_sampler (TokenSampler): The sampler that generates tokens.
         critic (Potential, optional): A potential function that guides the generation process
             by scoring candidate sequences. Must have the same token type as the unit_sampler.
+        autobatch (bool): Whether to wrap the critic in
+            [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
+            so that concurrent per-particle scores execute as one batched call.
+            Default True. The unit sampler's own seats take a separate `autobatch`
+            flag, at the sampler's construction.
 
     Raises:
         ValueError: If unit_sampler is not a TokenSampler, if critic is not a Potential,
             or if the token types of unit_sampler and critic don't match.
     """
 
-    def __init__(self, unit_sampler, critic=None):
+    def __init__(self, unit_sampler, critic=None, autobatch=True):
         if not isinstance(unit_sampler, TokenSampler):
             raise ValueError("`unit_sampler` must be a TokenSampler")
 
@@ -71,16 +73,18 @@ class SMC:
                 )
 
         self.unit_sampler = unit_sampler
-        self.critic = critic
+        self.critic = autobatched(critic) if autobatch else critic
 
     async def __call__(
         self,
         n_particles,
         ess_threshold,
         max_tokens,
+        *,
         verbosity=0,
         json_path=None,
-        **kwargs,
+        resampling_method="multinomial",
+        terminate_when=None,
     ):
         """Generate sequences using sequential Monte Carlo inference.
 
@@ -101,27 +105,41 @@ class SMC:
                 particles at each step. Default is 0.
             json_path (str, optional): JSON file path for saving a record of the inference run.
                 This can be used in conjunction with the `InferenceVisualizer` to visualize the inference run.
-            **kwargs (dict): Additional keyword arguments to pass to the SMC algorithm.
-                See the `llamppl.inference.smc_standard` documentation for more details.
+            resampling_method (str, optional): One of 'multinomial', 'stratified',
+                'systematic', 'residual'. Defaults to 'multinomial'.
+            terminate_when (callable, optional): A `context -> bool` stop condition.
+                When it fires, EOS closes the sequence in that same step, with no
+                importance correction: the condition defines which sequences are
+                complete, so it is part of the target rather than a truncation of it.
+                Contrast `max_tokens`, which cuts a sequence the model would have
+                continued and therefore does correct.
 
         Returns:
             (Sequences): A container holding the generated sequences, their importance weights, and
                 other metadata from the generation process.
         """
+        assert max_tokens > 0
+        # A terminal-only critic has no per-step signal: reweight only at termination.
+        twist_with_critic = (
+            ess_threshold > 0
+            and self.critic is not None
+            and not self.critic.is_terminal_only()
+        )
         model = SequenceModel(
             unit_sampler=self.unit_sampler,
             critic=self.critic,
             max_tokens=max_tokens,
+            twist_with_critic=twist_with_critic,
+            terminate_when=terminate_when,
             verbosity=verbosity,
-            twist_with_critic=ess_threshold > 0,
         )
 
         particles = await smc_standard(
             model=model,
             n_particles=n_particles,
             ess_threshold=ess_threshold,
-            json_file=json_path,
-            **kwargs,
+            resampling_method=resampling_method,
+            json_path=json_path,
         )
 
         return Sequences(*_unpack_particles(particles))
@@ -133,7 +151,7 @@ class SMC:
 
         Example:
             ```python
-            sampler = SequenceSampler(unit_sampler, critic)
+            sampler = SMC(unit_sampler, critic)
             try:
                 sequences = await sampler(n_particles=10, ess_threshold=0.5, max_tokens=20)
             finally:
@@ -155,7 +173,6 @@ class Sequences:
 
     Attributes:
         size (int): Number of sequences in the container.
-        logp (float): Sum of log probabilities across all sequences.
         log_total (float): Log of the sum of importance weights.
         log_ml (float): Log marginal likelihood estimate.
         log_normalized_weights (list): Log weights normalized to sum to 1.
@@ -266,96 +283,8 @@ class Sequences:
             print(p)
 
 
-class SequenceModel(Model):
-    def __init__(
-        self,
-        unit_sampler,
-        critic=None,
-        max_tokens=float("inf"),
-        verbosity=0,
-        twist_with_critic=True,
-    ):
-        assert max_tokens > 0
-
-        super().__init__()
-        self.token_ctx = []
-        self.unit_sampler = unit_sampler
-        self.max_tokens = max_tokens
-        self.critic = critic
-        self.logp = 0
-        self.verbosity = verbosity
-        self.twist_with_critic = twist_with_critic
-
-    async def start(self):
-        start_w = await self.unit_sampler.start_weight()
-        if start_w == float("-inf"):
-            raise ValueError(
-                "Start weight is -inf (log(0)). This is likely because a potential assigns zero weight to "
-                "the empty sequence under `prefix`, which violates the potential contract."
-            )
-        self.score(start_w)
-
-    async def step(self):
-        if self.verbosity > 0:
-            print(self.__repr__())
-
-        # Advance the context: either sample, or force EOS at the max_tokens
-        # boundary. Forcing EOS is equivalent to swapping the proposal for a
-        # point mass at EOS for that step; its IS correction is therefore the
-        # target's unnormalized log-weight on EOS (see TokenSampler.logw_eos).
-        if self.max_tokens == 1:
-            self.score(await self.unit_sampler.logw_eos(self.token_ctx))
-            self.token_ctx.append(EOS)
-        else:
-            unit = await self.call(self.unit_sampler)
-            self.token_ctx.append(unit)
-
-        if self.weight == float("-inf"):
-            if self.critic:
-                assert self.twist_amount != float("-inf")
-            self.finish()
-            return
-
-        if self.token_ctx[-1] is EOS:
-            self.finish()
-            if self.critic:
-                self.score(await self.critic.score(self.token_ctx))
-            return
-
-        if self.critic and self.twist_with_critic:
-            twist_amt = await self.critic.score(self.token_ctx)
-            if twist_amt != float("-inf"):
-                self.twist(twist_amt)
-            else:
-                self.score(twist_amt)
-                self.finish()
-                return
-
-        self.max_tokens -= 1
-
-    def __repr__(self):
-        return (
-            f"{self.weight:.2f}:\t"
-            + colors.magenta % "["
-            + (colors.magenta % "|").join(escape(y) for y in self.token_ctx)
-            + colors.magenta % "]"
-        )
-
-    def string_for_serialization(self):
-        return "|".join(escape(y) for y in self.token_ctx)
-
-    def immutable_properties(self):
-        return set(["unit_sampler", "critic"])
-
-
 def _unpack_particles(particles):
     contexts, logws = map(
-        list,
-        zip(
-            *[
-                (p.token_ctx, float("-inf") if np.isnan(p.weight) else p.weight)
-                for p in particles
-            ]
-        ),
+        list, zip(*[(p.context, p.weight) for p in particles])
     )
     return contexts, logws

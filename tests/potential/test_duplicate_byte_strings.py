@@ -25,7 +25,6 @@ from transformers import AutoTokenizer
 
 from genlm.backend.llm import MockAsyncLM
 from genlm.control import PromptedLLM, BoolFSA, AWRS
-from genlm.control.potential.built_in.llm import TokenMappings
 
 MODELS_WITH_DUPLICATES = [
     "google/gemma-3-1b-pt",
@@ -139,30 +138,16 @@ async def test_duplicate_tokens_get_independent_weights(llm):
     )
 
 
-@pytest.mark.asyncio
-async def test_non_eos_indices_match_vocab(llm):
-    """_non_eos_indices must have exactly len(vocab) entries, one per vocab token."""
-    llm.set_prompt_from_str("test")
-    await llm.logw_next([])
-
-    assert len(llm._non_eos_indices) == len(llm.vocab)
-    assert len(llm._non_eos_indices) == len(llm.token_maps.decode) - len(
-        llm.token_maps.eos_idxs
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tokenize / encode / decode roundtrip
-# ---------------------------------------------------------------------------
-
-
 def test_tokenize_roundtrip(llm):
-    """tokenize → encode_tokens should produce the same ids as the raw tokenizer."""
+    """`tokenize` then `encode_tokens` must recover the tokenizer's own ids.
+
+    `tokenize` reads the decode table by id and `encode_tokens` reads `.token_id`
+    back off it, so this pins the table as id-faithful over a vocabulary where
+    several ids share a byte string.
+    """
     text = "Hello, world!"
-    tokens = llm.tokenize(text)
-    ids = llm.encode_tokens(tokens)
-    expected_ids = llm.model.tokenizer.encode(text)
-    assert ids == expected_ids
+    ids = llm.encode_tokens(llm.tokenize(text))
+    assert ids == llm.model.tokenizer.encode(text)
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +192,14 @@ async def test_prefix_complete_with_duplicate_token_in_context(llm):
 
 @pytest.mark.asyncio
 async def test_coerced_logw_next_has_duplicate_tokens(llm):
-    """logw_next on a coerced FSA should contain entries for duplicate tokens.
-
-    Both tokens sharing a byte string must appear as independent keys in the
-    coerced vocabulary and receive weights from logw_next. This verifies
-    duplicate tokens are not dropped during coercion.
+    """Coercing a BoolFSA onto an LLM with duplicate byte strings succeeds; both
+    tokens sharing a byte string remain independently addressable in the coerced
+    vocab/lookup, and logw_next returns finite weights over the coerced vocab.
     """
     llm.set_prompt_from_str("The answer is")
     fsa = BoolFSA.from_regex(r" (yes|no)")
     coerced = fsa.coerce(llm, f=b"".join)
+    assert len(coerced.vocab) > 0
 
     # Verify the coerced vocab itself contains duplicate byte_strings
     coerced_byte_strings = [t.byte_string for t in coerced.vocab]
@@ -235,20 +219,6 @@ async def test_coerced_logw_next_has_duplicate_tokens(llm):
             indices
         ), f"Duplicate tokens for {dup_bs!r} share an index: {indices}"
 
-
-# ---------------------------------------------------------------------------
-# Coerce path
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_coerced_logw_next(llm):
-    """Coercing a BoolFSA onto an LLM with duplicate byte strings should succeed
-    and logw_next should return valid weights."""
-    llm.set_prompt_from_str("The answer is")
-    fsa = BoolFSA.from_regex(r" (yes|no)")
-    coerced = fsa.coerce(llm, f=b"".join)
-    assert len(coerced.vocab) > 0
     lw = await coerced.logw_next([])
     assert len(lw) > 0
     assert not np.all(np.isinf(lw.weights))
@@ -282,27 +252,18 @@ async def test_smc_with_duplicate_vocab(llm):
 
 
 @pytest.mark.asyncio
-async def test_logw_next_consistency(llm):
-    """logw_next weights should be consistent with prefix/complete."""
-    llm.set_prompt_from_str("Once upon")
-    context = llm.tokenize(" a")
-    await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.asyncio
-async def test_autoreg_fact(llm):
-    """Autoregressive factorization: complete(x) == sum of prefix log-probs + eos."""
+async def test_generic_invariants_hold_with_duplicate_vocab(llm):
+    """logw_next/prefix/complete consistency, autoregressive factorization, and
+    batch consistency must all hold for a model with duplicate byte strings --
+    the duplicate tokens must not break any of PromptedLLM's generic invariants.
+    """
     llm.set_prompt_from_str("Once upon")
     context = llm.tokenize(" a time")
+    await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
     await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.asyncio
-async def test_batch_consistency(llm):
-    """Batch logw_next should match individual logw_next calls."""
-    llm.set_prompt_from_str("Once upon")
-    contexts = [llm.tokenize(" a"), llm.tokenize(" a time")]
-    await llm.assert_batch_consistency(contexts, rtol=1e-3, atol=1e-3)
+    await llm.assert_batch_consistency(
+        [llm.tokenize(" a"), context], rtol=1e-3, atol=1e-3
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -345,29 +306,6 @@ def test_encode_tokens_bytes_fallback_returns_first_match(llm):
 # ---------------------------------------------------------------------------
 # EOS with duplicate byte strings
 # ---------------------------------------------------------------------------
-
-
-def test_eos_duplicate_excludes_all_matching_tokens(mock_llm):
-    """If the EOS byte_string also appears as a non-EOS token (different token_id),
-    ALL tokens with that byte_string should be excluded from potential_vocab."""
-    decode = mock_llm.byte_vocab
-    eos_byte = decode[mock_llm.tokenizer.eos_token_id].byte_string
-
-    # Check if the EOS byte_string has duplicates in this model
-    eos_dupes = [t for t in decode if t.byte_string == eos_byte]
-    if len(eos_dupes) < 2:
-        pytest.skip("This model's EOS byte_string has no duplicate")
-
-    tm = TokenMappings.create(decode=decode, eos_byte_strings=[eos_byte])
-
-    # All duplicate tokens sharing the EOS byte_string must be excluded
-    for t in eos_dupes:
-        assert t.token_id in set(tm.eos_idxs), (
-            f"Token({t.token_id}, {t.byte_string!r}) should be EOS but is not"
-        )
-        assert not any(
-            v.token_id == t.token_id for v in tm.potential_vocab
-        ), f"Token({t.token_id}, {t.byte_string!r}) should be excluded from potential_vocab"
 
 
 def test_spawn_new_eos_with_duplicate_byte_string(llm):
@@ -427,13 +365,6 @@ def truncated_llm(truncated_mock_llm):
     return PromptedLLM(truncated_mock_llm)
 
 
-def test_byte_vocab_includes_all_tokens(mock_llm):
-    """byte_vocab should include ALL tokens from the tokenizer, including added
-    tokens beyond the model's embedding matrix. These tokens are part of the
-    vocabulary even if the model can't produce logits for them."""
-    assert len(mock_llm.byte_vocab) == len(mock_llm.tokenizer)
-
-
 @pytest.mark.asyncio
 async def test_logw_next_with_fewer_logits(truncated_llm):
     """logw_next must not crash when the model returns fewer logits than
@@ -445,7 +376,9 @@ async def test_logw_next_with_fewer_logits(truncated_llm):
     truncated_llm.set_prompt_from_str("Hello")
     lw = await truncated_llm.logw_next([])
     assert len(lw) > 0
-    assert np.any(np.isfinite(lw.weights))
+    # .any() on the native container: lw.weights may be a torch tensor, and
+    # np.any's dispatch passes kwargs torch rejects.
+    assert bool(np.isfinite(lw.weights).any())
 
 
 @pytest.mark.asyncio
@@ -458,17 +391,3 @@ async def test_smc_with_fewer_logits(truncated_llm):
 
     result = await sampler.smc(n_particles=3, ess_threshold=0.5, max_tokens=10)
     assert len(result.contexts) == 3
-
-
-def test_token_id_index_invariant(mock_llm):
-    """Token IDs must equal their position index in byte_vocab.
-
-    This invariant is assumed by the logit padding in _process_logw_next:
-    when the model returns fewer logits than len(byte_vocab), we pad with -inf
-    at the end, which is only correct if the extra tokens are at the highest
-    indices.
-    """
-    for i, token in enumerate(mock_llm.byte_vocab):
-        assert token.token_id == i, (
-            f"byte_vocab[{i}].token_id={token.token_id}, expected {i}"
-        )

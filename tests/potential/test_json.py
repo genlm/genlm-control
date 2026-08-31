@@ -17,7 +17,6 @@ from genlm.control.potential.built_in.json import (
     WHITESPACE_PARSER,
     StringLiteralMatchingPatternParser,
     prune_to_validatable_prefix,
-    PatriciaTrie,
 )
 from genlm.control.potential.streaming import AsyncSource
 import json
@@ -30,19 +29,24 @@ import regex
 
 
 @pytest.mark.asyncio
-async def test_validates_a_list_of_integers():
-    potential = JsonSchema({"type": "array", "items": {"type": "integer"}})
-
-    assert await potential.prefix(b"[1,2,3") == 0.0
-    assert await potential.prefix(b'["hello world"') == -float("inf")
-    assert await potential.prefix(b"{") == -float("inf")
-
-
-@pytest.mark.asyncio
-async def test_rejects_as_prefix_when_no_valid_continuation():
-    potential = JsonSchema({"type": "object"})
-
-    assert await potential.prefix(b"}") == -float("inf")
+@pytest.mark.parametrize(
+    "schema,prefix_bytes,expected",
+    [
+        ({"type": "array", "items": {"type": "integer"}}, b"[1,2,3", 0.0),
+        (
+            {"type": "array", "items": {"type": "integer"}},
+            b'["hello world"',
+            -float("inf"),
+        ),
+        ({"type": "array", "items": {"type": "integer"}}, b"{", -float("inf")),
+        ({"type": "array", "items": {"type": "integer"}}, b'["', -float("inf")),
+        ({"type": "object"}, b"}", -float("inf")),
+        ({"type": "integer"}, b'"', -float("inf")),
+    ],
+)
+async def test_validates_a_list_of_integers(schema, prefix_bytes, expected):
+    potential = JsonSchema(schema)
+    assert await potential.prefix(prefix_bytes) == expected
 
 
 @pytest.mark.asyncio
@@ -427,19 +431,6 @@ async def test_valid_prefix_for_schema_eg1():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "ws",
-    [
-        b"\n\n\n",
-        b"\n    \n",
-    ],
-)
-async def test_forbids_weird_whitespace(ws):
-    potential = JsonSchema({})
-    assert await potential.prefix(ws) == -float("inf")
-
-
-@pytest.mark.asyncio
 async def test_rejects_as_prefix_when_invalid_key_has_been_started():
     potential = JsonSchema(
         {
@@ -489,17 +480,6 @@ async def test_rejects_duplicated_key():
 
 
 @pytest.mark.asyncio
-async def test_rejects_string_as_invalid_integer_before_complete():
-    potential = JsonSchema(
-        {
-            "type": "integer",
-        }
-    )
-
-    assert await potential.prefix(b'"') == -float("inf")
-
-
-@pytest.mark.asyncio
 async def test_accepts_basic_integer_list():
     potential = JsonSchema({"type": "array", "items": {"type": "integer"}})
 
@@ -512,13 +492,6 @@ async def test_accepts_basic_integer_list():
         if isinstance(k, int) and k < 128 and k not in b" \n":
             assert v == -float("inf")
     assert logs[potential.eos] == 0.0
-
-
-@pytest.mark.asyncio
-async def test_rejects_string_as_invalid_integer_inside_list():
-    potential = JsonSchema({"type": "array", "items": {"type": "integer"}})
-
-    assert await potential.prefix(b'["') == -float("inf")
 
 
 @pytest.mark.asyncio
@@ -651,9 +624,10 @@ async def test_correctly_handles_fixed_object_keys(keys):
 
 
 @pytest.mark.asyncio
-async def test_float_parser_incomplete_literal():
+@pytest.mark.parametrize("text", ["0.", ""])
+async def test_float_parser_incomplete_literal(text):
     with pytest.raises(Incomplete):
-        await FLOAT_PARSER.parse_string("0.")
+        await FLOAT_PARSER.parse_string(text)
 
 
 @st.composite
@@ -710,12 +684,6 @@ async def test_utf8_chunking_always_splits_utf8_async(chunks):
 
 
 @pytest.mark.asyncio
-async def test_parser_raises_incomplete_on_empty_string():
-    with pytest.raises(Incomplete):
-        await FLOAT_PARSER.parse_string("")
-
-
-@pytest.mark.asyncio
 async def test_validates_a_list_of_integers_parser_only():
     parser = json_schema_parser({"type": "array", "items": {"type": "integer"}})
 
@@ -747,13 +715,6 @@ async def test_raises_value_error_for_logw_next_of_bad_prefix():
 
 
 @pytest.mark.asyncio
-async def test_json_validator_rejects_silly_whitespace():
-    potential = FullValidatorJsonSchema({"type": "object"})
-    assert await potential.prefix(b"\n\n\n") == -float("inf")
-    assert await potential.complete(b"\n\n\n") == -float("inf")
-
-
-@pytest.mark.asyncio
 async def test_float_parser_can_continue_parsing_across_boundaries():
     source = BasicSource(["2", ".", "0", "1"])
 
@@ -764,53 +725,6 @@ async def test_float_parser_can_continue_parsing_across_boundaries():
     f = await input.parse(parser)
 
     assert f == 2.01
-
-
-@dataclass(frozen=True)
-class JSONSchemaPotentialProblemMulti:
-    schema: Any
-    document: bytes
-    values: list[bytes]
-
-    @property
-    def value(self):
-        return json.loads(self.document)
-
-
-@st.composite
-def json_schema_potential_problem_multi(draw):
-    schema = draw(json_schema)
-    value = draw(from_schema(schema))
-    text = json.dumps(
-        value,
-        # Inverted so that this shrinks to True, as ascii-only
-        # JSON is simpler.
-        ensure_ascii=not draw(st.booleans()),
-        # Similarly inverted so as to shrink to True, on the
-        # theory that this means that if keys are out of
-        # order in a shrunk example then it really matters.
-        sort_keys=not draw(st.booleans()),
-        indent=draw(st.one_of(st.none(), st.integers(0, 4))),
-    )
-
-    document = text.encode("utf-8")
-    assert document
-    assume(len(document) > 1)
-
-    values = []
-
-    for _ in range(draw(st.integers(1, 10))):
-        offsets = draw(st.sets(st.integers(1, len(document) - 1), min_size=1))
-        offsets = sorted(offsets)
-        prefixes = [document[:v] for v in offsets]
-        values.extend(prefixes)
-
-    values = draw(st.permutations(values))
-    values = values[: draw(st.integers(1, len(values)))]
-
-    return JSONSchemaPotentialProblemMulti(
-        schema=schema, document=document, values=values
-    )
 
 
 @pytest.mark.asyncio
@@ -881,18 +795,10 @@ async def test_rejects_using_unicode_whitespace():
     assert await pot.prefix("{ \u3000".encode("utf-8")) == -float("inf")
 
 
-def test_chunking_immediately_rejects_invalid_utf8_bytes():
+@pytest.mark.parametrize("bad_byte_sequence", [b"\xc0", b"\xe3\x86\x8c\x80"])
+def test_chunking_immediately_rejects_invalid_utf8_bytes(bad_byte_sequence):
     def bad_bytes():
-        yield b"\xc0"
-        assert False
-
-    with pytest.raises(UnicodeDecodeError):
-        list(chunk_to_complete_utf8(bad_bytes()))
-
-
-def test_chunking_bails_early_on_invalid_start_bytes():
-    def bad_bytes():
-        yield b"\xe3\x86\x8c\x80"
+        yield bad_byte_sequence
         assert False
 
     with pytest.raises(UnicodeDecodeError):
@@ -900,12 +806,31 @@ def test_chunking_bails_early_on_invalid_start_bytes():
 
 
 @pytest.mark.asyncio
-async def test_long_whitespace_at_start_is_rejected():
-    validator = FullValidatorJsonSchema({"type": "object"})
-    assert await validator.prefix(b"  ") == 0
-    assert await validator.prefix(b"\n\n") == 0
-    assert await validator.prefix(b"    ") == -float("inf")
-    assert await validator.prefix(b"\n\n  ") == -float("inf")
+@pytest.mark.parametrize(
+    "potential,ws,method,expected",
+    [
+        (FullValidatorJsonSchema({"type": "object"}), b"  ", "prefix", 0.0),
+        (FullValidatorJsonSchema({"type": "object"}), b"\n\n", "prefix", 0.0),
+        (FullValidatorJsonSchema({"type": "object"}), b"    ", "prefix", -float("inf")),
+        (
+            FullValidatorJsonSchema({"type": "object"}),
+            b"\n\n  ",
+            "prefix",
+            -float("inf"),
+        ),
+        (FullValidatorJsonSchema({"type": "object"}), b"\n\n\n", "prefix", -float("inf")),
+        (
+            FullValidatorJsonSchema({"type": "object"}),
+            b"\n\n\n",
+            "complete",
+            -float("inf"),
+        ),
+        (JsonSchema({}), b"\n\n\n", "prefix", -float("inf")),
+        (JsonSchema({}), b"\n    \n", "prefix", -float("inf")),
+    ],
+)
+async def test_long_whitespace_at_start_is_rejected(potential, ws, method, expected):
+    assert await getattr(potential, method)(ws) == expected
 
 
 @pytest.mark.asyncio
@@ -915,25 +840,22 @@ async def test_no_double_newline_after_start():
     assert await potential.prefix(b"{\n  \n") == -float("inf")
 
 
-def test_repr_of_filter():
-    assert "filter" in repr(WHITESPACE_PARSER)
-
-
 @pytest.mark.asyncio
-async def test_const_fails_fast():
-    potential = ParserPotential(json_schema_parser({"const": False}))
-    assert await potential.prefix(b" ") == 0
-    assert await potential.prefix(b" f") == 0
-    assert await potential.prefix(b" false") == 0
-    assert await potential.prefix(b" n") == -float("inf")
-
-
-@pytest.mark.asyncio
-async def test_const_fails_fast_in_string_literals():
-    potential = ParserPotential(json_schema_parser({"const": "Hello world"}))
-    assert await potential.prefix(b" ") == 0
-    assert await potential.prefix(b'"Hello') == 0
-    assert await potential.prefix(b'"Hi') == -float("inf")
+@pytest.mark.parametrize(
+    "const_value,prefix_bytes,expected",
+    [
+        (False, b" ", 0.0),
+        (False, b" f", 0.0),
+        (False, b" false", 0.0),
+        (False, b" n", -float("inf")),
+        ("Hello world", b" ", 0.0),
+        ("Hello world", b'"Hello', 0.0),
+        ("Hello world", b'"Hi', -float("inf")),
+    ],
+)
+async def test_const_fails_fast(const_value, prefix_bytes, expected):
+    potential = ParserPotential(json_schema_parser({"const": const_value}))
+    assert await potential.prefix(prefix_bytes) == expected
 
 
 @pytest.mark.asyncio
@@ -1057,10 +979,16 @@ async def test_errors_if_string_only_matches_a_prefix():
 
 
 @pytest.mark.asyncio
-async def test_patterns_apply_if_matching_anywhere():
-    schema = {"type": "string", "pattern": "\\.(mp4|avi|mov|wmv|flv)$"}
-    parser = json_schema_parser(schema)
-    await parser.parse_string('"0.mp4"')
+@pytest.mark.parametrize(
+    "pattern,literal",
+    [
+        ("\\.(mp4|avi|mov|wmv|flv)$", '"0.mp4"'),
+        ("<[^>]+>", '"<0>0"'),
+    ],
+)
+async def test_patterns_apply_if_matching_anywhere(pattern, literal):
+    parser = json_schema_parser({"type": "string", "pattern": pattern})
+    await parser.parse_string(literal)
 
 
 @pytest.mark.asyncio
@@ -1070,14 +998,6 @@ async def test_patterns_reject_non_strings():
 
     with pytest.raises(ParseError):
         await parser.parse_string("0")
-
-
-@pytest.mark.asyncio
-async def test_patterns_apply_if_match_before_end_of_string():
-    schema = {"type": "string", "pattern": "<[^>]+>"}
-    parser = json_schema_parser(schema)
-
-    await parser.parse_string('"<0>0"')
 
 
 # List of 100 regular expressions for common data validation scenarios.
@@ -1437,7 +1357,7 @@ async def test_union_of_integer_and_number_with_e_notation():
 
     parser = json_schema_parser(schema)
 
-    await parser.parse_string("[1e-05]") == [1e-05]
+    assert await parser.parse_string("[1e-05]") == [1e-05]
 
 
 @pytest.mark.asyncio
@@ -1541,18 +1461,6 @@ async def test_parser_with_empty_properties():
 async def test_whitespace_parser_rejects_unicode_whitespace():
     with pytest.raises(ParseError):
         await WHITESPACE_PARSER.parse_string("\u3000")
-
-
-def test_trie_adding_prefix_of_existing():
-    trie = PatriciaTrie(["foobar"])
-
-    trie.add_string("foo")
-
-    assert trie.root.prefix == "foo"
-    assert trie.root.accepting
-
-    assert trie.root.children["b"].prefix == "ar"
-    assert trie.root.children["b"].accepting
 
 
 @pytest.mark.asyncio

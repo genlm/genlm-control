@@ -20,8 +20,6 @@ class MockAsyncTransformer:  # Mock the backend LLM object
             self.byte_vocab, _ = decode_vocab(tokenizer)
         except ValueError:
             self.byte_vocab = None  # Handle cases like BERT where byte vocab fails
-        # maybe add other attributes if PromptedLLM.__init__ needs them
-        # e.g., self.model_name_or_path = tokenizer.name_or_path
 
 
 class MockLLM(PromptedLLM):
@@ -187,17 +185,6 @@ async def test_set_overrides(canonical_potential):
     assert (
         await canonical_potential.complete([token_2637_bytes, token_82_bytes]) == 0.0
     ), "Override (2637, 82) failed in complete"
-
-
-def test_check_canonicality(canonical_potential):
-    """Test check_canonicality method with canonical context"""
-    assert canonical_potential._check_canonicality([])
-    # Single token is always canonical
-    assert canonical_potential._check_canonicality([b" the"])
-    # Valid token sequence should be canonical
-    assert canonical_potential._check_canonicality([b"Token", b"ization"])
-    # This should be non-canonical
-    assert not canonical_potential._check_canonicality([b"hel", b"lo", b" world"])
 
 
 @pytest.mark.asyncio

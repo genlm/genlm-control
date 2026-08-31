@@ -4,6 +4,7 @@ from arsenal.maths import sample_dict
 from arsenal.datastructures import LocatorMaxHeap
 from abc import ABC, abstractmethod
 
+from genlm.control.potential.autobatch import autobatched
 from genlm.control.util import load_async_trie
 from genlm.backend.tokenization import Token
 
@@ -30,7 +31,7 @@ class SetSampler(ABC):
         self.target = target
 
     @abstractmethod
-    async def sample_set(self, context):
+    async def sample_set(self, context, draw=None):
         """Sample a weighted set of tokens from the target potential's vocabulary."""
         pass  # pragma: no cover
 
@@ -52,13 +53,18 @@ class TrieSetSampler(SetSampler):
     `TrieSetSampler`s sample tokens from the `iter_potential`'s vocabulary.
     """
 
-    def __init__(self, iter_potential, item_potential):
+    def __init__(self, iter_potential, item_potential, autobatch=True):
         """
         Initialize the `TrieSetSampler`.
 
         Args:
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
+            autobatch (bool): Wrap the `iter_potential` seat in
+                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential]
+                (default True). `item_potential` is never wrapped: the trie walk
+                asks it sequentially, so a window pass per ask buys no batching
+                (measured +28% wall clock on the set benchmark).
 
         Raises:
             ValueError: If the token type of `iter_potential` is not an iterable of the token type of `item_potential`.
@@ -68,6 +74,8 @@ class TrieSetSampler(SetSampler):
                 "Token type of `iter_potential` must be an iterable of token type of `item_potential`. "
                 f"Got {iter_potential.token_type} and {item_potential.token_type}."
             )
+        if autobatch:
+            iter_potential = autobatched(iter_potential)
         self.iter_potential = iter_potential
         self.item_potential = item_potential
 
@@ -99,7 +107,7 @@ class TrieSetSampler(SetSampler):
             word2leaf[get_word_key(token)]: lookup[token] for token in common_tokens
         }
 
-    async def sample_set(self, context):
+    async def sample_set(self, context, draw=None):
         """
         Sample a weighted set of tokens given a context.
 
@@ -206,7 +214,7 @@ class TopKSetSampler(TrieSetSampler):
         That is, $\\textsf{item_potential.prefix}(x) \\leq \\textsf{item_potential.prefix}(xy)$ for all sequences of items $x, y$.
     """
 
-    def __init__(self, iter_potential, item_potential, K):
+    def __init__(self, iter_potential, item_potential, K, autobatch=True):
         """
         Initialize the TopKSetSampler.
 
@@ -214,10 +222,11 @@ class TopKSetSampler(TrieSetSampler):
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
             K (int|None): The number of top tokens to enumerate. If None, all tokens are enumerated.
+            autobatch (bool): See [`TrieSetSampler`][genlm.control.sampler.set.TrieSetSampler].
         """
         if K is not None and K <= 0:
             raise ValueError("K must be greater than 0 or None")
-        super().__init__(iter_potential, item_potential)
+        super().__init__(iter_potential, item_potential, autobatch=autobatch)
         self.K = K
 
     async def sample_set(self, context, draw=None):

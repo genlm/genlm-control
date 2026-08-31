@@ -1,6 +1,8 @@
 import asyncio
 import numpy as np
 
+from genlm.control.util import to_numpy
+
 
 class PotentialTests:
     """A mixin class providing testing utilities for validating Potential implementations.
@@ -73,7 +75,9 @@ class PotentialTests:
         for i, (want, have) in enumerate(zip(wants, haves)):
             abs_diff, rel_diff = self._compute_diff(want, have)
             info = (want, have, abs_diff, rel_diff, tokens[i])
-            (valids if abs_diff <= atol and rel_diff <= rtol else errors).append(info)
+            # Equal infinities compare equal; an inf/finite mismatch does not.
+            ok = np.isclose(have, want, rtol=rtol, atol=atol)
+            (valids if ok else errors).append(info)
 
         if valids and verbosity > 0:
             print(
@@ -133,7 +137,7 @@ class PotentialTests:
         )
 
         abs_diff, rel_diff = self._compute_diff(want, have)
-        if abs_diff > atol or rel_diff > rtol:
+        if not np.isclose(have, want, rtol=rtol, atol=atol):
             error_msg = (
                 f"{self.colors['red']}Factorization not satisfied for context {context!r}:{self.colors['reset']}\n"
                 + self._format_diff(want, have, abs_diff, rel_diff, atol, rtol)
@@ -176,9 +180,11 @@ class PotentialTests:
 
         for i, context in enumerate(contexts):
             logw_next = await self.logw_next(context, *method_args)
+            # batch_logw_next returns one batched LazyWeights; row i is .weights[i].
+            batch_row = to_numpy(batch_logw_nexts.weights[i])
             try:
                 np.testing.assert_allclose(
-                    batch_logw_nexts[i].weights, logw_next.weights, rtol=rtol, atol=atol
+                    batch_row, to_numpy(logw_next.weights), rtol=rtol, atol=atol
                 )
                 if verbosity > 0:
                     print(
@@ -186,13 +192,13 @@ class PotentialTests:
                     )
                     print(
                         f"{self.colors['green']}Non-batched: {logw_next.weights}\n"
-                        + f"{self.colors['green']}Batched:     {batch_logw_nexts[i].weights}{self.colors['reset']}\n"
+                        + f"{self.colors['green']}Batched:     {batch_row}{self.colors['reset']}\n"
                     )
             except AssertionError:
                 raise AssertionError(
                     f"{self.colors['red']}Batch logw_next mismatch for context {context}:{self.colors['reset']}\n"
                     + f"{self.colors['green']}Non-batched: {logw_next.weights}\n"
-                    + f"{self.colors['red']}Batched:     {batch_logw_nexts[i].weights}{self.colors['reset']}"
+                    + f"{self.colors['red']}Batched:     {batch_row}{self.colors['reset']}"
                 )
 
             score = await self.score(context, *method_args)

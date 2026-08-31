@@ -88,7 +88,7 @@ class MultiProcPotential(Potential):
                 for context in contexts
             )
         )
-        return [self.make_lazy_weights(result) for result in results]
+        return self.make_lazy_weights(np.stack(results))
 
     async def batch_complete(self, contexts):
         results = await asyncio.gather(

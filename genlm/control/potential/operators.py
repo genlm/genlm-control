@@ -25,7 +25,34 @@ class PotentialOps:
 
         return Product(self, other)
 
-    def coerce(self, other, f, prune=True):
+    def __pow__(self, beta):
+        """Scale this potential's log-weights by `beta`.
+
+        See [`Tempered`][genlm.control.potential.tempered.Tempered] for more details.
+
+        Args:
+            beta (float): The exponent, `1/temperature`.
+
+        Returns:
+            (Tempered): The unnormalized `self ** beta`.
+        """
+        from genlm.control.potential.tempered import Tempered
+
+        return Tempered(self, beta)
+
+    def normalize(self):
+        """Renormalize this potential's next-token rows.
+
+        See [`Normalized`][genlm.control.potential.normalized.Normalized] for more details.
+
+        Returns:
+            (Normalized): A potential whose `logw_next` sums to one at every context.
+        """
+        from genlm.control.potential.normalized import Normalized
+
+        return Normalized(self)
+
+    def coerce(self, other, f, prune=True, homomorphic=None, trie=None, tables=None):
         """Coerce the current potential to operate on the vocabulary of another potential.
 
         See [`Coerced`][genlm.control.potential.coerce.Coerced] for more details.
@@ -35,25 +62,47 @@ class PotentialOps:
             f (callable): A function mapping sequences of tokens from self's vocab to sequences of tokens from other's vocab.
             prune (bool): Whether to prune the coerced potential's vocabulary to only include tokens that can be mapped to the original potential's vocabulary.
                 If `False`, the coerced potential's vocabulary will include all tokens from the target vocabulary.
+            homomorphic (bool | None): Whether `f` distributes over concatenation
+                (enables the trie fast path). `None` probes it; pass `True`/`False`
+                to declare it explicitly. See `Coerced`.
+            trie (dict | None): The symbol trie over `(other.vocab, f)`, as built by
+                `Coerced.build_trie`.
+            tables (VocabTables | None): Prebuilt tables for `other.vocab`, as built
+                by `Potential.build_tables`. Both `trie` and `tables` are functions of
+                `other`'s vocabulary alone, so coercions onto the same one should build
+                each once and pass it here. Both are incompatible with `prune=True`,
+                which narrows that vocabulary.
 
         Returns:
             (Coerced): A Potential that operates on the vocabulary of `other`.
         """
         from genlm.control.potential.coerce import Coerced
 
-        return Coerced(self, other.vocab, f=f, prune=prune)
+        return Coerced(
+            self,
+            other.vocab,
+            f=f,
+            prune=prune,
+            homomorphic=homomorphic,
+            trie=trie,
+            tables=tables,
+        )
 
     def to_autobatched(self):
-        """Create a new potential instance that automatically batches concurrent requests to the instance methods.
+        """The autobatched view of this potential.
+
+        Concurrent requests to the instance methods meet in a window and run as one batch
+        call. The view is memoized, so every call site resolves to the same wrapper and
+        therefore the same batching window.
 
         See [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential] for more details.
 
         Returns:
-            (AutoBatchedPotential): A new potential instance that wraps the current potential and automatically batches concurrent requests to the instance methods.
+            (AutoBatchedPotential): The memoized autobatched view of this potential.
         """
-        from genlm.control.potential.autobatch import AutoBatchedPotential
+        from genlm.control.potential.autobatch import autobatched
 
-        return AutoBatchedPotential(self)
+        return autobatched(self)
 
     def to_multiprocess(self, num_workers=2, spawn_args=None):
         """Create a new potential instance that parallelizes operations using multiprocessing.
