@@ -17,7 +17,7 @@ from .sampler import (
     topk_token_sampler,
     AWRS,
 )
-from .util import set_draw_method, DRAW_METHODS
+from genlm.backend.draw import set_draw_method, DRAW_METHODS
 from .viz import InferenceVisualizer
 
 __all__ = [

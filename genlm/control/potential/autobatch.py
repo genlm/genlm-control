@@ -2,14 +2,15 @@ import asyncio
 import weakref
 from collections import defaultdict
 
-from genlm.control.potential.base import Potential, VocabTables
-from genlm.control.util import (
-    LazyWeights,
-    join_batch,
-    batch_stats,
+from genlm.backend.batching import (
     batch_abandoned,
+    batch_stats,
     fail_futures,
+    join_batch,
 )
+
+from genlm.control.potential.base import Potential, VocabTables
+from genlm.control.util import LazyWeights
 
 
 class AutoBatchedPotential(Potential):
@@ -47,7 +48,7 @@ class AutoBatchedPotential(Potential):
 
     async def _queued(self, batch_method_name, context):
         future = asyncio.get_running_loop().create_future()
-        batch = await join_batch(self._batches, (batch_method_name, context, future))
+        batch = await join_batch(self._batches, [(batch_method_name, context, future)])
         if batch is not None:
             await self._flush(batch)
         return await future

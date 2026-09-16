@@ -18,6 +18,7 @@ dependencies = [
     "genlm-grammar>=0.2.0",
     "genlm-backend>=0.2.0",
     "genlm-bytes>=0.2.0",
+    "llamppl>=0.2.3",
     "arsenal>=3.1.3",
     "IPython",
     "numpy",
@@ -59,9 +60,6 @@ mlx = [
 
 [tool.setuptools.packages.find]
 include = ["genlm", "genlm/control"]
-
-[tool.setuptools]
-package-data = { "genlm.control" = ["html/*"] }
 
 [tool.coverage.report]
 exclude_also = [

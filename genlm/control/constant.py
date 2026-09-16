@@ -21,6 +21,9 @@ class EndOfSequence:
     def __hash__(self):
         return hash(self.type_)
 
+    def __deepcopy__(self, memo):
+        return self  # a value-like singleton
+
     def __iter__(self):
         return iter([self])
 

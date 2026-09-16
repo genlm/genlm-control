@@ -1,17 +1,20 @@
-"""Unit tests for ``SequenceModel``'s per-step semantics and ``smc_standard``'s
-population loop -- the loop mechanics main's front-door SMC tests never pinned
-(forced EOS at the budget, terminate_when, twist bookkeeping, clone, and the
-all-dead/resample plumbing). Deterministic throughout, either via a minimal
-hand-rolled unit-sampler double or a real potential walked with a pinned
-draw=argmax picker -- no engine, no hypothesis."""
+"""Unit tests for ``SequenceModel``'s per-step semantics and its behaviour under
+llamppl's ``smc_standard`` population loop (forced EOS at the budget,
+terminate_when, twist bookkeeping, deepcopy, and the all-dead/resample
+plumbing). Deterministic throughout, either via a minimal hand-rolled
+unit-sampler double or a real potential walked with a pinned draw=argmax
+picker -- no engine, no hypothesis."""
+
+import copy
 
 import numpy as np
 import pytest
+from llamppl import smc_standard
+from llamppl.inference import resampling
 
 from genlm.control.constant import EOS
-from genlm.control.sampler import resampling
-from genlm.control.sampler.smc import SequenceModel, smc_standard
-from genlm.control.sampler.token import DirectTokenSampler
+from genlm.control.sampler.sequence import SMC, SequenceModel
+from genlm.control.sampler.token import DirectTokenSampler, TokenSampler
 
 from conftest import WeightedSet
 
@@ -42,14 +45,15 @@ class ScriptedSampler:
         return self.token, self.step_logw, 0.0
 
 
-class ScheduledWeightSampler:
+class ScheduledSampler(TokenSampler):
     """Each successive ``sample()`` call draws the next weight from a fixed
     schedule and returns EOS immediately. Deterministic: these coroutines never
     await anything, so asyncio runs a gather's tasks in list order -- successive
     particles' calls land on successive schedule entries, giving a population
     distinct weights with no RNG."""
 
-    def __init__(self, weight_schedule):
+    def __init__(self, target, weight_schedule):
+        super().__init__(target)
         self._weights = list(weight_schedule)
         self._i = 0
 
@@ -104,8 +108,11 @@ class PinnedDrawSampler:
 
 
 async def run_to_done(model):
+    """Drive one particle to completion the way ``smc_standard`` drives a population:
+    untwist, then step."""
     await model.start()
-    while not model.done:
+    while not model.finished:
+        model.untwist()
         await model.step()
     return model
 
@@ -124,7 +131,7 @@ async def test_forced_eos_at_max_tokens_boundary():
     await run_to_done(model)
 
     assert model.context == [1, 1, 1, EOS]
-    assert model.done
+    assert model.finished
     expected = 0.1 + 3 * (-0.3) + (-2.0)
     assert np.isclose(model.weight, expected)
 
@@ -168,9 +175,9 @@ async def test_terminate_when_appends_eos_same_step_no_correction():
 
 @pytest.mark.asyncio
 async def test_twist_matches_terminal_only_scoring():
-    """Per-step twisting (applied, then untwisted at the top of the next step)
-    nets to exactly the terminal critic score when there's no resampling in
-    between -- so a twist_with_critic run and a terminal-only-scored run land
+    """Per-step twisting (applied by the step, divided back out by the driver
+    before the next one) nets to exactly the terminal critic score when there's
+    no resampling in between -- so a twist_with_critic run and a terminal-only-scored run land
     on the same final weight for identical draws."""
     potential = WeightedSet(["aab", "b"], [3.0, 1.0])
     critic = WeightedSet(["aab", "b"], [2.0, 5.0])
@@ -207,31 +214,36 @@ async def test_start_raises_on_neg_inf_start_weight():
         await model.start()
 
 
-# -- clone: shared sampler/critic, copied state ---------------------------------
+# -- deepcopy: shared sampler/critic, copied state ------------------------------
 
 
-def test_clone_shares_sampler_and_critic_copies_state():
+def test_deepcopy_shares_sampler_and_critic_copies_state():
+    """``immutable_properties`` decides what a particle shares with its siblings:
+    the sampler and critic by identity, everything else copied."""
     sampler = ScriptedSampler()
-    critic = object()  # identity is all clone() cares about for the critic
+    critic = object()  # identity is all a particle needs from the critic
     parent = SequenceModel(sampler, critic=critic, max_tokens=10)
     parent.context = [1, 2, 3]
     parent.weight = -0.5
     parent.twist_amount = 0.25
 
-    child = parent.clone()
+    child = copy.deepcopy(parent)
 
     assert child.unit_sampler is sampler
     assert child.critic is critic
     assert child.context == parent.context and child.context is not parent.context
+    assert child.max_tokens == parent.max_tokens
     assert child.weight == parent.weight
     assert child.twist_amount == parent.twist_amount
 
     child.context.append(4)
     child.weight = 99.0
     child.twist_amount = -1.0
+    child.max_tokens = 1
     assert parent.context == [1, 2, 3]
     assert parent.weight == -0.5
     assert parent.twist_amount == 0.25
+    assert parent.max_tokens == 10
 
 
 # -- smc_standard: population-level plumbing ------------------------------------
@@ -248,13 +260,13 @@ async def test_smc_standard_all_dead_returns_without_crashing():
 
     assert len(particles) == 4
     assert all(p.weight == float("-inf") for p in particles)
-    assert all(p.done for p in particles)
+    assert all(p.finished for p in particles)
 
 
 @pytest.mark.asyncio
-async def test_smc_standard_default_resampling_is_multinomial(monkeypatch):
-    """An ESS-triggered resample uses multinomial resampling by default (no
-    resampling_method passed)."""
+async def test_smc_front_door_defaults_to_multinomial_resampling(monkeypatch):
+    """``SMC`` asks llamppl for multinomial resampling unless told otherwise --
+    llamppl's own default is stratified."""
     calls = []
     real_multinomial = resampling.RESAMPLING_METHODS["multinomial"]
 
@@ -267,11 +279,11 @@ async def test_smc_standard_default_resampling_is_multinomial(monkeypatch):
     # Half the population is far heavier than the other half, so ESS collapses
     # well below the threshold and a resample is forced.
     schedule = [0.0, 0.0, 0.0, 0.0, -20.0, -20.0, -20.0, -20.0]
-    model = SequenceModel(ScheduledWeightSampler(schedule), max_tokens=5)
+    sampler = ScheduledSampler(WeightedSet(["a"], [1.0]), schedule)
 
-    particles = await smc_standard(model, n_particles=8, ess_threshold=0.9)
+    sequences = await SMC(sampler)(n_particles=8, ess_threshold=0.9, max_tokens=5)
 
-    assert len(particles) == 8
+    assert len(sequences) == 8
     assert calls, "the default 'multinomial' entry was never invoked"
 
 
@@ -313,7 +325,8 @@ async def test_nan_weights_do_not_reach_the_resampler():
     """A population whose draws come back NaN dies, rather than resampling off
     NaN probabilities."""
     schedule = [float("nan")] * 4
-    model = SequenceModel(ScheduledWeightSampler(schedule), max_tokens=5)
+    sampler = ScheduledSampler(WeightedSet(["a"], [1.0]), schedule)
+    model = SequenceModel(sampler, max_tokens=5)
 
     particles = await smc_standard(model, n_particles=4, ess_threshold=0.9)
 

@@ -4,7 +4,7 @@ import time
 import numpy as np
 from genlm.control.potential import Potential
 from genlm.control.potential.autobatch import AutoBatchedPotential, autobatched
-from genlm.control.util import BatchAbandoned
+from genlm.backend.batching import BatchAbandoned
 from genlm.control.sampler.token import DirectTokenSampler, AWRS
 from genlm.control.sampler.sequence import SMC
 from genlm.control.sampler.set import TrieSetSampler

@@ -6,9 +6,7 @@ import numpy as np
 
 
 from genlm.control.potential import Potential
-from genlm.control.sampler.sequence import SMC
-from genlm.control.sampler.smc import SequenceModel
-from genlm.control.sampler.smc_record import string_for_serialization
+from genlm.control.sampler.sequence import SMC, SequenceModel
 from genlm.control.sampler.token import DirectTokenSampler
 
 from hypothesis import strategies as st, settings, given
@@ -217,16 +215,22 @@ async def test_sequence_model_invalid_start_weight():
         await seq_model.start()
 
 
-def test_string_for_serialization():
-    assert string_for_serialization([b"a", b"b"]) == "a|b"
-    assert string_for_serialization([]) == ""
+def test_string_for_serialization_joins_the_context():
+    """The serialization the record stores is the escaped context, pipe-joined."""
+    model = SequenceModel(unit_sampler=None)
+    assert model.string_for_serialization() == ""
+    model.context = [b"a"]
+    assert model.string_for_serialization() == "a"
+    model.context = [b"a", b"b"]
+    assert model.string_for_serialization() == "a|b"
 
 
 @pytest.mark.asyncio
 async def test_record_increments_rebuild_each_context():
-    """A step records only what it appended, so a particle's context is the
-    concatenation of its increments along the ancestor chain (the walk the viewer
-    does). Resampling is on, so the fork bookkeeping is exercised."""
+    """A step records a diff against its ancestor (``keep`` shared characters plus
+    ``contents_incr``), so a particle's serialization is rebuilt along the ancestor
+    chain -- the walk the viewer does. Resampling is on, so the fork bookkeeping is
+    exercised."""
     p = WeightedSet(["0", "00", "1"], [3.0, 2.0, 1.0])
     sampler = SMC(DirectTokenSampler(p))
 
@@ -236,24 +240,26 @@ async def test_record_increments_rebuild_each_context():
         )
         history = json.loads(pathlib.Path(tmp.name).read_text())
 
-    rebuilt = None  # per-row token lists, carried forward step to step
+    rebuilt = None  # per-row strings, carried forward step to step
     for step in history:
         parts = step["particles"]
         assert all("contents" not in rec for rec in parts), "record stores increments"
         if rebuilt is None:
-            parent = [[] for _ in parts]
+            parent = ["" for _ in parts]
         elif step["mode"] == "resample":
-            parent = [list(rebuilt[a]) for a in step["ancestors"]]
+            parent = [rebuilt[a] for a in step["ancestors"]]
         else:
-            parent = [list(row) for row in rebuilt]
+            parent = list(rebuilt)
         assert len(parent) == len(parts)
         rebuilt = [
-            row + ([] if not rec["contents_incr"] else rec["contents_incr"].split("|"))
+            row[: rec["keep"]] + rec["contents_incr"]
             for row, rec in zip(parent, parts)
         ]
 
     # Every rebuilt row is a prefix of that particle's final serialized context;
-    # a dropped increment, a mis-keyed ancestor, or a bad separator all break this.
+    # a dropped increment, a mis-keyed ancestor, or a bad ``keep`` all break this.
     for row, (context, _) in zip(rebuilt, out):
-        final = string_for_serialization(context).split("|") if context else []
+        model = SequenceModel(unit_sampler=None)
+        model.context = context
+        final = model.string_for_serialization()
         assert row == final[: len(row)], (row, final)

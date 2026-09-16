@@ -1,13 +1,11 @@
-import asyncio
 import warnings
-import weakref
-from collections import Counter, defaultdict
 
 import numpy as np
 import torch
 from genlm.grammar import Float, Log
 
 from genlm.control.constant import EndOfSequence
+from genlm.backend.draw import draw_from as backend_draw_from
 from genlm.backend.tokenization import Token
 
 
@@ -332,38 +330,6 @@ def load_async_trie(V, backend=None, **kwargs):
     return AsyncTokenCharacterTrie(load_trie(V, backend, **kwargs))
 
 
-# --- token-picker family ---
-# Each maps a log-weight tensor -> drawn index over dim=-1 (1-D draw or batched [N, V]).
-# The pickers draw from the global torch RNG, so `torch.manual_seed` -- not
-# `np.random.seed` -- is what makes a run's draws reproducible. Two other streams
-# exist and are seeded separately: `np.random` drives resampling
-# (`sampler/resampling.py`) and AWRS's phantom-token geometrics, and AWRS's rejection
-# noise comes from a per-instance `torch.Generator` (its `seed=` argument).
-# The pickers stay at the row's dtype (fp32 off the engine): fp64 would cost an
-# [N, V] double buffer per step, `inverse_cdf`'s cumsum is the only place fp32 error
-# is measurable and it is already clamped, and MPS has no fp64 at all.
-
-
-def gumbel_max(logps):
-    """Argmax of `logps + Gumbel noise`; the default picker."""
-    g = -torch.log(-torch.log(torch.rand_like(logps)))
-    return (logps + g).argmax(dim=-1)
-
-
-def multinomial(logps):
-    """Categorical draw over the last dim (scalar for `[V]`, `[N]` for `[N, V]`)."""
-    p = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp()
-    return torch.multinomial(p, 1).squeeze(-1)
-
-
-def inverse_cdf(logps):
-    """Single-uniform inverse-CDF draw over the last dim (scalar for `[V]`, `[N]` for
-    `[N, V]`); one uniform per row, on `logps`'s device."""
-    cdf = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp().cumsum(dim=-1)
-    u = torch.rand((*cdf.shape[:-1], 1), dtype=cdf.dtype, device=cdf.device)
-    return torch.searchsorted(cdf, u).squeeze(-1).clamp_(max=cdf.shape[-1] - 1)
-
-
 def flatten_units(context):
     """Recursively flatten a (possibly unit-nested) context to a flat token list.
 
@@ -379,219 +345,38 @@ def flatten_units(context):
     return flattened
 
 
-DRAW_METHODS = {
-    "gumbel_max": gumbel_max,
-    "multinomial": multinomial,
-    "inverse_cdf": inverse_cdf,
-}
-# Process-wide picker for the draw window; set it via `set_draw_method`.
-_picker = gumbel_max
-
-
-def set_draw_method(method):
-    """
-    Set the token picker used by `draw_from` and `picker_indices`, process-wide.
-
-    Args:
-        method (str | callable): A name in `DRAW_METHODS`, or a custom
-            `(logps_tensor) -> index` callable.
-    """
-    global _picker
-    _picker = DRAW_METHODS[method] if isinstance(method, str) else method
-
-
-# Batching counters: (site, cohort_size) -> count. Sites are "draw" (one entry per
-# stacked group per flush) and "autobatch" (one entry per batch call, see
-# potential/autobatch.py). Read and clear via `take_batch_stats`.
-batch_stats = Counter()
-
-
-def take_batch_stats():
-    """Snapshot and reset the batching counters."""
-    global batch_stats
-    stats, batch_stats = batch_stats, Counter()
-    return stats
-
-
 async def draw_from(lazyweights, draw=None, target=None):
-    """
-    Draw a token from a next-token distribution and weigh it.
-
-    Concurrent callers meet in a per-event-loop window and execute as one batched
-    reduction per (backend, device, vocab-size) group: one normalize, one pick, one
-    host readback for the whole cohort, target log-weights included. Batched rows
-    draw independent noise, and a lone caller degenerates to a solo draw.
+    """Draw a token from a `LazyWeights` row through the backend draw window
+    (`genlm.backend.draw`) and weigh it. A custom `draw` picker draws solo, outside
+    the window.
 
     Args:
         lazyweights (LazyWeights): The log-weight row to draw from.
-        draw (callable, optional): Custom picker, taking a materialized normalized
-            chart and returning a token. Draws solo, outside the window.
-        target (LazyWeights, optional): A second row over the same vocabulary. Makes
-            the draw an importance draw: `lazyweights` is the proposal, and the token
-            is weighed under the target.
+        draw (callable, optional): Picker taking a materialized normalized chart and
+            returning a token.
+        target (LazyWeights, optional): A second row over the same vocabulary, making
+            this an importance draw: `lazyweights` is the proposal and the token is
+            weighed under `target`.
 
     Returns:
-        (tuple): `(token, logw, logp)`, where `logw` is the row's normalizer `logZ`
-            without `target` and `target[token] - logp` with it.
+        (tuple): `(token, logw, logp)`, `logw` being the row's log-normalizer, or
+            `target[token] - logp` with a target.
     """
-    if draw is not None:
-        logZ = lazyweights.sum()
-        logps = lazyweights.spawn(lazyweights.weights - logZ)
-        token = draw(logps.exp().materialize())
-        logp = logps[token]
-        if target is None:
-            return token, logZ, logp
-        return token, target[token] - logp, logp
-
     assert lazyweights.is_log
-    future = asyncio.get_running_loop().create_future()
-    batch = await join_batch(_DRAW_BATCHES, (lazyweights, target, future))
-    if batch is not None:
-        _flush_draws(batch)
-    return await future
-
-
-class BatchAbandoned(RuntimeError):
-    """The caller holding a batch died before it could be flushed."""
-
-
-class _Batch:
-    """Per-event-loop request meeting point; must not outlive its loop."""
-
-    __slots__ = ("queue", "armed")
-
-    def __init__(self):
-        self.queue = []
-        self.armed = False
-
-
-async def join_batch(store, entry):
-    """
-    Join the batch of concurrent callers on this event loop.
-
-    Appends `entry` and, if nobody holds the batch yet, holds it open until a full
-    event-loop pass adds no new entry. The holding caller flushes the batch in its
-    own coroutine; there is no background task. An entry is a tuple ending in its
-    future: a holder that dies before handing the batch off fails every other queued
-    future rather than orphaning it, so an entry is always resolved exactly once.
-
-    Args:
-        store (weakref.WeakKeyDictionary): Event loop to `_Batch` map, owned by the
-            call site. One store per batch.
-        entry (tuple): The request to add, ending in its future.
-
-    Returns:
-        (list | None): The drained batch for the holding caller, `None` for everyone
-            else.
-    """
-    loop = asyncio.get_running_loop()
-    batch = store.get(loop)
-    if batch is None:
-        batch = store[loop] = _Batch()
-    batch.queue.append(entry)
-    if batch.armed:
-        return None
-    batch.armed = True
-    try:
-        # Callers reach the batch at different depths of a `gather` tree, and each
-        # level is another scheduler turn; yield until a turn adds nothing, so the
-        # whole batch lands in one flush.
-        while True:
-            n = len(batch.queue)
-            await asyncio.sleep(0)
-            if len(batch.queue) == n:
-                break
-        queue, batch.queue = batch.queue, []
-        return queue
-    except BaseException as exc:
-        queue, batch.queue = batch.queue, []
-        # Not this caller's own entry: it is unwinding past its `await`, so an
-        # exception set there is only ever logged as never retrieved.
-        fail_futures([e for e in queue if e is not entry], batch_abandoned(exc))
-        raise
-    finally:
-        batch.armed = False
-
-
-def batch_abandoned(exc):
-    """The failure handed to callers whose batch holder died.
-
-    Never the cause itself: a `CancelledError` given to a caller who never asked for
-    one leaves their task cancelled and skips their `except Exception`.
-    """
-    abandoned = BatchAbandoned(f"batch holder did not survive it: {exc!r}")
-    abandoned.__cause__ = exc
-    return abandoned
-
-
-def fail_futures(entries, exc):
-    """Resolve each entry's future -- its last element -- with `exc`."""
-    for entry in entries:
-        future = entry[-1]
-        if not future.done():
-            future.set_exception(exc)
-
-
-_DRAW_BATCHES = weakref.WeakKeyDictionary()  # event loop -> _Batch
-
-
-def _flush_draws(queue):
-    """Resolve a batch of draws with one batched reduction per stackable group, off
-    a single host readback. Every future is resolved, with its draw or with a
-    failure."""
-    groups = defaultdict(list)
-    for lw, target, future in queue:
-        w = lw.weights
-        key = (
-            ("torch", w.device, w.shape[-1])
-            if torch.is_tensor(w)
-            else ("np", w.shape[-1])
+    if draw is None:
+        idx, logw, logp = await backend_draw_from(
+            lazyweights.weights,
+            target=None if target is None else target.weights,
         )
-        groups[key].append((lw, target, future))
-    for entries in groups.values():
-        batch_stats[("draw", len(entries))] += 1
-        try:
-            rows = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in entries])
-            logZ = torch.logsumexp(rows, dim=-1)
-            logps = rows.sub_(logZ.unsqueeze(-1))  # stack copied; safe in place
-            idx = _picker(logps)
-            logp = logps.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
-            ids = idx.tolist()
-            # One float readback for the cohort's normalizers and drawn log-probs.
-            logZs, drawn_logps = torch.stack([logZ, logp]).tolist()
-            # Importance draws: the drawn token's log-weight under each target row,
-            # one extra gather and readback over that subset.
-            target_logws = {}
-            targeted = [k for k, (_, t, _) in enumerate(entries) if t is not None]
-            if targeted:
-                t_rows = torch.stack(
-                    [torch.as_tensor(entries[k][1].weights) for k in targeted]
-                )
-                t_idx = idx[targeted]
-                t_vals = t_rows.gather(-1, t_idx.unsqueeze(-1)).squeeze(-1).tolist()
-                target_logws = dict(zip(targeted, t_vals))
-        except Exception as exc:
-            fail_futures(entries, exc)
-            continue
-        except BaseException as exc:
-            # This flush is unwinding, so nothing else will resolve what it still
-            # owes. Groups already resolved are skipped by `fail_futures`.
-            for rest in groups.values():
-                fail_futures(rest, batch_abandoned(exc))
-            raise
-        for k, ((lw, target, future), tok_id, z, p) in enumerate(
-            zip(entries, ids, logZs, drawn_logps)
-        ):
-            if not future.done():
-                logw = z if target is None else target_logws[k] - p
-                future.set_result((lw.decode[tok_id], logw, p))
+        return lazyweights.decode[idx], logw, logp
 
-
-def picker_indices(weights):
-    """Apply the configured picker to a (possibly batched) log-weight array, returning
-    the drawn index/indices over dim=-1 (scalar for `[V]`, `[N]` for `[N, V]`). The
-    picker family is pure-torch, so a non-torch array is lifted first."""
-    return _picker(torch.as_tensor(weights))
+    logZ = lazyweights.sum()
+    logps = lazyweights.spawn(lazyweights.weights - logZ)
+    token = draw(logps.exp().materialize())
+    logp = logps[token]
+    if target is None:
+        return token, logZ, logp
+    return token, target[token] - logp, logp
 
 
 def escape(x):

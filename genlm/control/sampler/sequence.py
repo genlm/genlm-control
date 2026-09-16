@@ -1,14 +1,15 @@
 import numpy as np
+from arsenal import colors
 from genlm.grammar import Float
-from genlm.control.util import logsumexp
+from llamppl import Model, smc_standard
 from functools import cached_property
 from dataclasses import dataclass
 
 from genlm.control.potential import Potential
 from genlm.control.potential.autobatch import autobatched
-from genlm.control.constant import EOS, EndOfSequence  # noqa: F401 (re-exported)
+from genlm.control.constant import EOS, EndOfSequence
 from genlm.control.sampler.token import TokenSampler
-from genlm.control.sampler.smc import SequenceModel, smc_standard
+from genlm.control.util import escape, logsumexp
 
 
 class SMC:
@@ -139,7 +140,7 @@ class SMC:
             n_particles=n_particles,
             ess_threshold=ess_threshold,
             resampling_method=resampling_method,
-            json_path=json_path,
+            json_file=json_path,
         )
 
         return Sequences(*_unpack_particles(particles))
@@ -281,6 +282,153 @@ class Sequences:
     def show(self):
         for p in sorted(self, reverse=True):
             print(p)
+
+
+class SequenceModel(Model):
+    """One particle: a candidate sequence's state and its per-step semantics.
+
+    The per-particle state is ``context`` and ``max_tokens``, alongside ``Model``'s
+    weight, twist and finished flags; the sampler, critic and configuration are
+    shared across siblings (see ``immutable_properties``).
+
+    Args:
+        unit_sampler (TokenSampler): Draws one unit per step via ``sample``.
+        critic (Potential, optional): Reweights and twists the particle.
+        max_tokens (int): Per-particle token budget; EOS is forced at the boundary.
+        twist_with_critic (bool): Whether the critic twists during stepping, rather
+            than scoring once at termination.
+        terminate_when (callable, optional): ``context -> bool`` stop condition.
+            When it fires, EOS closes the sequence in that same step.
+        verbosity (int): 0 is silent, 1 prints the particle at each step.
+    """
+
+    def __init__(
+        self,
+        unit_sampler,
+        critic=None,
+        max_tokens=float("inf"),
+        twist_with_critic=True,
+        terminate_when=None,
+        verbosity=0,
+    ):
+        super().__init__()
+        self.unit_sampler = unit_sampler
+        self.critic = critic
+        self.max_tokens = max_tokens
+        self.twist_with_critic = twist_with_critic
+        self.terminate_when = terminate_when
+        self.verbosity = verbosity
+        self.context = []
+
+    def immutable_properties(self):
+        """Properties shared by every particle; the rest is deep-copied per particle."""
+        return {
+            "unit_sampler",
+            "critic",
+            "twist_with_critic",
+            "terminate_when",
+            "verbosity",
+        }
+
+    def __deepcopy__(self, memo):
+        # Tokens are immutable, so the context copies shallowly and EOS keeps its identity.
+        memo[id(self.context)] = list(self.context)
+        return super().__deepcopy__(memo)
+
+    def score(self, amt):
+        """Add ``amt`` to the log-weight. A ``+inf`` log-weight violates the potential
+        contract; NaN folds to ``-inf``."""
+        if amt == float("inf"):
+            raise ValueError(
+                "A potential returned a log-weight of +inf, which violates the "
+                "potential contract."
+            )
+        super().score(amt)
+
+    async def start(self):
+        """Score the empty sequence's prefix weight."""
+        start_w = await self.unit_sampler.start_weight()
+        if start_w == float("-inf"):
+            raise ValueError(
+                "Start weight is -inf (log(0)). This is likely because a potential "
+                "assigns zero weight to the empty sequence under `prefix`, which "
+                "violates the potential contract."
+            )
+        self.score(start_w)
+
+    async def step(self):
+        """Advance the particle by one unit, forcing EOS at the token budget.
+        The caller untwists first, as ``smc_standard`` does."""
+        if self.max_tokens == 1:
+            logw = await self.unit_sampler.logw_eos(self.context)
+            unit = EOS
+        else:
+            unit, logw, _ = await self.unit_sampler.sample(self.context)
+
+        self.score(logw)
+        self._append(unit)
+
+        if self.weight == float("-inf"):
+            self.finish()
+            return
+
+        twist_amt = None
+        if self.critic is not None and self.twist_with_critic:
+            twist_amt = float(await self.critic.score(self.context))
+            if twist_amt == float("-inf"):
+                self.score(twist_amt)
+                self.finish()
+                return
+            self.twist(twist_amt)
+
+        if self.verbosity > 0:
+            print(self.__repr__())
+
+        self.max_tokens -= 1
+        if self.max_tokens == 0 or self.context[-1] is EOS:
+            self.finish()
+            if self.critic is None:
+                return
+            if twist_amt is None:
+                # Terminal-only critic: reweight once, at termination.
+                self.score(float(await self.critic.score(self.context)))
+            else:
+                # `finish` took the twist back; at termination the critic's score
+                # is real weight.
+                self.score(twist_amt)
+
+    def _append(self, unit):
+        """Extend the context by one drawn unit.
+
+        A multi-token unit ending in EOS is split, so that ``context[-1] is EOS``
+        whenever the sequence is terminal. ``terminate_when`` appends EOS in the
+        step that satisfied it and carries no weight correction: the stop
+        condition defines what a complete sequence is.
+        """
+        if isinstance(unit, list) and unit and unit[-1] is EOS:
+            if len(unit) > 1:
+                self.context.append(unit[:-1])
+            self.context.append(EOS)
+        else:
+            self.context.append(unit)
+        if (
+            self.terminate_when is not None
+            and self.context[-1] is not EOS
+            and self.terminate_when(self.context)
+        ):
+            self.context.append(EOS)
+
+    def string_for_serialization(self):
+        """The particle's context as the inference record stores it."""
+        return "|".join(escape(y) for y in self.context)
+
+    def __repr__(self):
+        return (
+            f"{self.weight:.2f}:\t"
+            + colors.magenta % "["
+            + (colors.magenta % "|").join(escape(y) for y in self.context)
+            + colors.magenta % "]"
+        )
 
 
 def _unpack_particles(particles):

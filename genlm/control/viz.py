@@ -4,6 +4,7 @@ import socketserver
 import threading
 import tempfile
 import shutil
+from importlib.resources import files
 from pathlib import Path
 
 
@@ -45,7 +46,8 @@ class InferenceVisualizer:
         self._server = None
         self._server_thread = None
         self._port = port
-        self._html_dir = Path(__file__).parent / "html"
+        # The viewer is llamppl's: it renders the record llamppl's SMCRecord writes.
+        self._html_dir = Path(str(files("llamppl") / "html"))
 
         # Set up serve directory
         if serve_dir is None:
@@ -61,7 +63,7 @@ class InferenceVisualizer:
             def translate_path(self_, path):
                 # Remove query parameters for file lookup
                 clean_path = path.split("?")[0]
-                # HTML files come from package
+                # HTML files come from llamppl's package
                 if clean_path.endswith(".html"):
                     return str(self._html_dir / clean_path.lstrip("/"))
                 # JSON files come from serve directory

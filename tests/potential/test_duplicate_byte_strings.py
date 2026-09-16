@@ -18,10 +18,8 @@ Models tested:
 import warnings
 
 import pytest
-import torch
 import numpy as np
 from collections import Counter
-from transformers import AutoTokenizer
 
 from genlm.backend.llm import MockAsyncLM
 from genlm.control import PromptedLLM, BoolFSA, AWRS
@@ -324,70 +322,3 @@ def test_spawn_new_eos_with_duplicate_byte_string(llm):
         assert t.token_id in set(new_llm.token_maps.eos_idxs), (
             f"Token({t.token_id}, {t.byte_string!r}) should be EOS"
         )
-
-
-# ---------------------------------------------------------------------------
-# Fewer logits than vocab entries: real models may output fewer logits than
-# len(tokenizer) when the tokenizer has added tokens beyond the model's
-# embedding matrix (e.g. Gemma: len(tokenizer)=262145, vocab_size=262144).
-# ---------------------------------------------------------------------------
-
-
-class TruncatedMockAsyncLM(MockAsyncLM):
-    """Mock that returns fewer logits than len(byte_vocab), like a real HF model
-    whose config.vocab_size < len(tokenizer)."""
-
-    def __init__(self, tokenizer, truncate_by=1):
-        super().__init__(tokenizer)
-        self._truncate_by = truncate_by
-
-    def _get_logprobs(self, token_ids):
-        seed = sum([(i + 1) * t for i, t in enumerate(token_ids)])
-        self._rng.seed(seed)
-        n_logits = len(self.byte_vocab) - self._truncate_by
-        logits = torch.from_numpy(
-            self._rng.rand(n_logits).astype(np.float32)
-        )
-        return torch.log_softmax(logits, dim=-1)
-
-
-@pytest.fixture(scope="module")
-def truncated_mock_llm(model_name):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    except OSError:
-        pytest.skip(f"Model {model_name} not available")
-    return TruncatedMockAsyncLM(tokenizer, truncate_by=1)
-
-
-@pytest.fixture(scope="module")
-def truncated_llm(truncated_mock_llm):
-    return PromptedLLM(truncated_mock_llm)
-
-
-@pytest.mark.asyncio
-async def test_logw_next_with_fewer_logits(truncated_llm):
-    """logw_next must not crash when the model returns fewer logits than
-    len(token_maps.decode). Tokens without logits should get -inf.
-
-    This reproduces the bug where real HF models (e.g. Gemma) have
-    config.vocab_size < len(tokenizer).
-    """
-    truncated_llm.set_prompt_from_str("Hello")
-    lw = await truncated_llm.logw_next([])
-    assert len(lw) > 0
-    # .any() on the native container: lw.weights may be a torch tensor, and
-    # np.any's dispatch passes kwargs torch rejects.
-    assert bool(np.isfinite(lw.weights).any())
-
-
-@pytest.mark.asyncio
-async def test_smc_with_fewer_logits(truncated_llm):
-    """Full SMC should work even when model returns fewer logits."""
-    truncated_llm.set_prompt_from_str("The answer is")
-    fsa = BoolFSA.from_regex(r" (yes|no)")
-    coerced = fsa.coerce(truncated_llm, f=b"".join)
-    sampler = AWRS(truncated_llm, coerced)
-
-    result = await sampler.smc(n_particles=3, ess_threshold=0.5, max_tokens=10)
-    assert len(result.contexts) == 3

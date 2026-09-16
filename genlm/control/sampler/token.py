@@ -5,6 +5,7 @@ from arsenal import colors
 from arsenal.maths import log1mexp
 import warnings
 
+from genlm.backend.draw import logp_at, logsumexp_from
 from genlm.control.potential.autobatch import autobatched
 from genlm.control.util import draw_from
 from genlm.control.sampler.set import SetSampler
@@ -400,7 +401,7 @@ class AWRS(TokenSampler):
         lw = torch.as_tensor(logws.weights)  # no-op when already a device tensor
         if self.prune_logws:
             lw = self._prune_logws(lw)
-        logZ = float(torch.logsumexp(lw, 0))
+        logZ = await logsumexp_from(lw)
         logps = lw - logZ  # device [V]
         toks = logws.decode
 
@@ -455,8 +456,8 @@ class AWRS(TokenSampler):
         # (rejection failure) the result stays -inf.
         tok_idx = self.potential.lookup[tok]
         tw = torch.as_tensor(target_logws.weights)
-        log_ratio = float(tw[tok_idx]) - float(lw[tok_idx])
-        return tok, w + logZ + log_ratio, np.nan
+        t_lp, p_lp = await asyncio.gather(logp_at(tw, tok_idx), logp_at(lw, tok_idx))
+        return tok, w + logZ + t_lp - p_lp, np.nan
 
 
 # If the top log probability exceeds this value, then it will be
