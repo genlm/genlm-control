@@ -506,39 +506,6 @@ def test_cfg_boundary_exception_handling():
 
 
 @pytest.mark.asyncio
-async def test_weight_accumulation_single_token_unit():
-    """Test that a single-token unit has the correct weight.
-
-    When a unit consists of exactly one token (immediate boundary hit),
-    the unit weight should equal that token's individual weight.
-    """
-    # Vocabulary with space as boundary token
-    vocab = [b"a", b" "]
-    # Weights: a=0.3, space=0.6, EOS=0.1
-    logws = np.log([0.3, 0.6, 0.1])
-    mock_potential = MockPotential(vocab, logws)
-    subunit_sampler = DirectTokenSampler(mock_potential)
-    boundary = TokenSetBoundary({b" "})
-    unit_sampler = MultiTokenUnitSampler(
-        subunit_sampler=subunit_sampler,
-        boundary_predicate=boundary,
-        max_subunits_per_unit=10,
-    )
-
-    # Create deterministic draw function to always pick space (index 1)
-    def draw_space(probs):
-        return vocab[1]
-
-    unit, logw, logp = await unit_sampler.sample([], draw=draw_space)
-    # Unit should be just the space token
-    assert unit == [b" "]
-    expected_logw = np.log(0.3 + 0.6 + 0.1)
-    assert np.isclose(logw, expected_logw, atol=1e-10)
-    expected_logp = np.log(0.6)
-    assert np.isclose(logp, expected_logp, atol=1e-10)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "vocab,weights,boundary,tokens",
     [

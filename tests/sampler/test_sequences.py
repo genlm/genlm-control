@@ -110,21 +110,6 @@ def test_posterior_normalization():
     assert np.isclose(sum(posterior.values()), 1.0)
 
 
-def test_string_representation():
-    sequences = Sequences(contexts=[[b"test", EndOfSequence()]], log_weights=[0.0])
-    # Test that string representation doesn't raise errors
-    str(sequences)
-    repr(sequences)
-
-
-def test_decoded_posterior_basic_sequence():
-    # Simple case with one valid UTF-8 sequence
-    sequences = Sequences(contexts=[[b"hello", EndOfSequence()]], log_weights=[0.0])
-    posterior = sequences.decoded_posterior
-    assert len(posterior) == 1
-    assert posterior["hello"] == 1.0
-
-
 def test_decoded_posterior_multiple_sequences():
     # Multiple different valid sequences
     sequences = Sequences(

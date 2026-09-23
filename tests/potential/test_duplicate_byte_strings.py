@@ -259,10 +259,12 @@ async def test_generic_invariants_hold_with_duplicate_vocab(llm):
     """
     llm.set_prompt_from_str("Once upon")
     context = llm.tokenize(" a time")
-    await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await llm.assert_batch_consistency(
-        [llm.tokenize(" a"), context], rtol=1e-3, atol=1e-3
+    await llm.assert_contract(
+        [context],
+        batch_contexts=[llm.tokenize(" a"), context],
+        top=10,
+        rtol=1e-3,
+        atol=1e-3,
     )
 
 

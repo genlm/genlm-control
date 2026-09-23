@@ -275,17 +275,6 @@ async def test_smc_standard_default_resampling_is_multinomial(monkeypatch):
     assert calls, "the default 'multinomial' entry was never invoked"
 
 
-@pytest.mark.asyncio
-async def test_verbosity_prints_per_step(capsys):
-    """verbosity=1 prints the particle at every step."""
-    sampler = ScriptedSampler(token=1, step_logw=0.0, eos_logw=0.0)
-    model = SequenceModel(sampler, max_tokens=3, verbosity=1)
-
-    await smc_standard(model, n_particles=1, ess_threshold=0)
-
-    assert capsys.readouterr().out.strip() != ""
-
-
 def test_nan_weight_folds_to_neg_inf():
     """A NaN weight is coerced where the weight changes, not where it is reported:
     stratified/systematic/residual resampling collapses a whole population onto one

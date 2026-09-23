@@ -32,6 +32,37 @@ class PotentialTests:
         "reset": "\033[0m",
     }
 
+    async def assert_contract(
+        self, contexts, batch_contexts=None, rtol=1e-3, atol=1e-5, top=None, verbosity=0
+    ):
+        """Assert `logw_next` consistency and the autoregressive factorization at each
+        context, and batch consistency over `batch_contexts`.
+
+        Args:
+            contexts (list): Contexts to check individually.
+            batch_contexts (list): Contexts for the batch check. Defaults to
+                `contexts`; pass `[]` to skip the batch check.
+            rtol (float): Relative tolerance for floating point comparison.
+            atol (float): Absolute tolerance for floating point comparison.
+            top (int): If specified, only check the top-k tokens by log weight.
+            verbosity (int): Verbosity level.
+
+        Raises:
+            AssertionError: If any of the three properties does not hold.
+        """
+        for context in contexts:
+            await self.assert_logw_next_consistency(
+                context, rtol=rtol, atol=atol, top=top, verbosity=verbosity
+            )
+            await self.assert_autoreg_fact(
+                context, rtol=rtol, atol=atol, verbosity=verbosity
+            )
+        group = contexts if batch_contexts is None else batch_contexts
+        if group:
+            await self.assert_batch_consistency(
+                group, rtol=rtol, atol=atol, verbosity=verbosity
+            )
+
     async def assert_logw_next_consistency(
         self, context, rtol=1e-3, atol=1e-5, top=None, verbosity=0, method_args=()
     ):

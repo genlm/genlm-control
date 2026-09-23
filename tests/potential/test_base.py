@@ -86,9 +86,7 @@ async def test_empty(potential):
 
 @pytest.mark.asyncio
 async def test_properties(potential):
-    await potential.assert_logw_next_consistency([b"b", b"c"], verbosity=1)
-    await potential.assert_autoreg_fact([b"b", b"c"], verbosity=1)
-    await potential.assert_batch_consistency([[b"b", b"c"], [b"a"]], verbosity=1)
+    await potential.assert_contract([[b"b", b"c"], [b"a"]], verbosity=1)
 
 
 def test_initialization_errors():

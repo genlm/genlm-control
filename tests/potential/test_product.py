@@ -155,9 +155,9 @@ async def test_properties(product, context):
     assert len(logw_next.weights) == len(product.vocab_eos)
 
     # Test the inherited property checks
-    await product.assert_logw_next_consistency(context, verbosity=1)
-    await product.assert_autoreg_fact(context, verbosity=1)
-    await product.assert_batch_consistency([context, [b"a"]], verbosity=1)
+    await product.assert_contract(
+        [context], batch_contexts=[context, [b"a"]], verbosity=1
+    )
 
 
 def test_product_repr(product):

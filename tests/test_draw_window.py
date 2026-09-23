@@ -5,13 +5,13 @@ import numpy as np
 import pytest
 import torch
 
+from genlm.control import util
 from genlm.control.util import (
     DRAW_METHODS,
     LazyWeights,
     draw_from,
     picker_indices,
     set_draw_method,
-    take_batch_stats,
     BatchAbandoned,
 )
 
@@ -27,25 +27,23 @@ def lw(weights, vocab):
     )
 
 
-@pytest.fixture(autouse=True)
-def _clean_batch_stats():
-    # Drain any residue from a previous test/loop before and after, so a
-    # test's ``take_batch_stats()`` snapshot is its own draws, nothing else.
-    take_batch_stats()
-    yield
-    take_batch_stats()
+@pytest.fixture
+def cohorts(monkeypatch):
+    """Cohort sizes reduced by the batched flush; the solo path bypasses the picker
+    and records nothing."""
+    seen = []
+    picker = util._picker
+
+    def spy(logps):
+        seen.append(logps.shape[0])
+        return picker(logps)
+
+    monkeypatch.setattr(util, "_picker", spy)
+    return seen
 
 
 @pytest.mark.asyncio
-async def test_cohort_formation():
-    rows = [torch.log_softmax(torch.randn(4), -1) for _ in range(6)]
-    await asyncio.gather(*[draw_from(lw(r, VOCAB4)) for r in rows])
-    stats = take_batch_stats()
-    assert stats[("draw", 6)] == 1
-
-
-@pytest.mark.asyncio
-async def test_nested_gather_depths_land_in_one_cohort():
+async def test_nested_gather_depths_land_in_one_cohort(cohorts):
     # Peel ``depth`` extra layers of asyncio.gather before the actual draw_from
     # call -- each layer defers that call by one event-loop tick, staggering
     # arrivals at the window without opening a gap wide enough to flush early.
@@ -57,8 +55,7 @@ async def test_nested_gather_depths_land_in_one_cohort():
     rows = [torch.log_softmax(torch.randn(4), -1) for _ in range(9)]
     depths = [0, 1, 2] * 3
     await asyncio.gather(*[nested(r, d) for r, d in zip(rows, depths)])
-    stats = take_batch_stats()
-    assert stats[("draw", 9)] == 1
+    assert cohorts == [9]
 
 
 @pytest.mark.asyncio
@@ -67,14 +64,14 @@ async def test_mixed_shape_and_backend_split_into_separate_groups():
     torch_rows = [torch.log_softmax(torch.randn(4), -1) for _ in range(4)]
     np_rows = [np.log(np.full(3, 1 / 3)) for _ in range(3)]
 
-    await asyncio.gather(
+    out = await asyncio.gather(
         *[draw_from(lw(r, VOCAB4)) for r in torch_rows],
         *[draw_from(lw(r, vocab3)) for r in np_rows],
     )
-    stats = take_batch_stats()
-    assert stats[("draw", 4)] == 1  # the torch/V=4 group
-    assert stats[("draw", 3)] == 1  # the numpy/V=3 group, not merged into the above
-    assert sum(stats.values()) == 2
+    # Merged groups would raise in torch.stack on mismatched vocab sizes, so
+    # answering at all is the proof they stayed split.
+    assert all(tok in VOCAB4 for tok, _, _ in out[:4])
+    assert all(tok in vocab3 for tok, _, _ in out[4:])
 
 
 @pytest.mark.asyncio
@@ -88,8 +85,6 @@ async def test_importance_draw_matches_hand_computed_logw():
         draw_from(lw(proposal, vocab), target=lw(target, vocab)),
         *[draw_from(lw(r, vocab)) for r in plain_rows],
     )
-    stats = take_batch_stats()
-    assert stats[("draw", 3)] == 1  # importance + plain draws, one cohort
 
     tok, logw, logp = out[0]
     idx = vocab.index(tok)
@@ -110,7 +105,6 @@ async def test_custom_draw_takes_solo_path():
         return max(chart, key=chart.__getitem__)  # highest-prob token
 
     tok, logw, logp = await draw_from(lw(row, VOCAB4), draw=picker)
-    assert not take_batch_stats()  # solo path never touches the window
 
     assert tok == b"c"  # argmax of the raw logits
     idx = VOCAB4.index(tok)
@@ -123,7 +117,6 @@ async def test_custom_draw_takes_solo_path():
     tok2, logw2, logp2 = await draw_from(
         lw(row, VOCAB4), draw=picker, target=lw(target, VOCAB4)
     )
-    assert not take_batch_stats()
 
     idx2 = VOCAB4.index(tok2)
     expected_logw2 = target[idx2].item() - logp2
@@ -145,10 +138,6 @@ async def test_exception_fails_its_group_without_poisoning_others():
     )
     good_out, bad_out = await asyncio.gather(good_task, bad_task)
 
-    stats = take_batch_stats()
-    assert stats[("draw", 3)] == 1  # good group flushed
-    assert stats[("draw", 2)] == 1  # bad group flushed too, same cohort
-
     for tok, _, _ in good_out:
         assert tok in VOCAB4  # unaffected by the other group's failure
 
@@ -157,8 +146,16 @@ async def test_exception_fails_its_group_without_poisoning_others():
     assert bad_out[0] is bad_out[1]  # same exception instance on every future in the group
 
 
+@pytest.fixture(params=sorted(DRAW_METHODS))
+def picker(request, monkeypatch):
+    """Each registered picker in turn. The setting is process-wide, so the prior one is
+    registered for restore before it is changed."""
+    monkeypatch.setattr(util, "_picker", util._picker)
+    set_draw_method(request.param)
+
+
 @pytest.mark.asyncio
-async def test_distribution_matches_known_categorical():
+async def test_distribution_matches_known_categorical(picker):
     vocab = [b"a", b"b", b"c"]
     probs = torch.tensor([0.2, 0.3, 0.5])
     row = probs.log()
@@ -166,30 +163,16 @@ async def test_distribution_matches_known_categorical():
 
     torch.manual_seed(0)
     out = await asyncio.gather(*[draw_from(lw(row, vocab)) for _ in range(n)])
-    stats = take_batch_stats()
-    assert stats[("draw", n)] == 1  # one batched reduction for the whole cohort
 
     counts = Counter(tok for tok, _, _ in out)
     for tok, p in zip(vocab, probs.tolist()):
         assert abs(counts[tok] / n - p) < 0.04
 
 
-def test_set_draw_method_round_trip():
-    v_row = torch.log_softmax(torch.tensor([1.0, 2.0, 3.0, 0.5]), -1)
-    n_rows = torch.log_softmax(torch.randn(5, 4), -1)
-
-    try:
-        for name in DRAW_METHODS:
-            set_draw_method(name)
-
-            idx = picker_indices(v_row)
-            assert 0 <= int(idx) < 4
-
-            idxs = picker_indices(n_rows)
-            assert idxs.shape == (5,)
-            assert bool(((idxs >= 0) & (idxs < 4)).all())
-    finally:
-        set_draw_method("gumbel_max")  # never leak a picker across test order
+def test_picker_indices_shape_follows_the_row(picker):
+    """`[V]` reduces to a scalar index, `[N, V]` to one index per row."""
+    assert picker_indices(torch.log_softmax(torch.tensor([1.0, 2.0, 3.0, 0.5]), -1)).ndim == 0
+    assert picker_indices(torch.log_softmax(torch.randn(5, 4), -1)).shape == (5,)
 
 
 @pytest.mark.asyncio

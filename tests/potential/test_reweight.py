@@ -41,10 +41,7 @@ def p():
 @pytest.mark.parametrize("beta", [0.5, 1.0, 2.0, -1.0])
 async def test_tempered_contract(p, beta):
     q = p**beta
-    for ctx in CONTEXTS:
-        await q.assert_logw_next_consistency(ctx, top=None)
-        await q.assert_autoreg_fact(ctx)
-    await q.assert_batch_consistency(CONTEXTS)
+    await q.assert_contract(CONTEXTS)
 
 
 def test_tempered_preserves_terminal_only(p):
@@ -67,7 +64,7 @@ async def test_tempered_scales(p):
 
 
 @pytest.mark.asyncio
-async def test_tempered_keeps_hard_zeros(p):
+async def test_tempered_keeps_hard_zeros():
     """``-inf * 0`` must stay ``-inf``, not become ``nan``: a mask is not resurrected."""
 
     class Masked(Potential):
@@ -107,10 +104,7 @@ async def test_tempered_scalar_and_batched_agree_on_minus_inf(beta):
 @pytest.mark.asyncio
 async def test_normalized_contract(p):
     q = p.normalize()
-    for ctx in CONTEXTS:
-        await q.assert_logw_next_consistency(ctx, top=None)
-        await q.assert_autoreg_fact(ctx)
-    await q.assert_batch_consistency(CONTEXTS)
+    await q.assert_contract(CONTEXTS)
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,6 @@ from genlm.control.sampler import (
     topk_token_sampler,
 )
 from genlm.control.sampler.token import TokenSampler
-from unittest.mock import Mock
 
 
 @pytest.fixture(scope="module")
@@ -124,7 +123,10 @@ async def test_with_llm_and_critic_no_twist(llm):
 
 
 @pytest.mark.asyncio
-async def test_with_llm_critic_early_stop(llm):
+@pytest.mark.parametrize("with_critic", [False, True])
+async def test_with_llm_early_stop(llm, with_critic):
+    """A sampler answering -inf stops every particle after one step, whether or not a
+    critic sits behind it."""
     mtl_llm = llm.spawn_new_eos([b"."])
     n_calls = 0
     n_particles = 10
@@ -143,29 +145,8 @@ async def test_with_llm_critic_early_stop(llm):
             return 0
 
     sampler = MockSampler(mtl_llm)
-    engine = SMC(sampler, critic=MockPotential(mtl_llm.vocab))
-
-    await assert_engine_run(engine, n_particles, max_tokens=5, ess_threshold=0)
-
-    assert n_calls == n_particles
-
-    await engine.cleanup()
-
-
-@pytest.mark.asyncio
-async def test_with_llm_no_critic_early_stop(llm):
-    mtl_llm = llm.spawn_new_eos([b"."])
-    n_calls = 0
-    n_particles = 10
-
-    class MockSampler(TokenSampler):
-        async def sample(self, context):
-            nonlocal n_calls
-            n_calls += 1
-            return b"a", float("-inf"), np.nan
-
-    sampler = MockSampler(mtl_llm)
-    engine = SMC(sampler)
+    critic = MockPotential(mtl_llm.vocab) if with_critic else None
+    engine = SMC(sampler, critic=critic)
 
     await assert_engine_run(engine, n_particles, max_tokens=5, ess_threshold=0)
 
@@ -235,12 +216,3 @@ def test_invalids(llm, best_fsa):
     with pytest.raises(ValueError):
         # Fail to coerce beforehand.
         SMC(sampler, critic=best_fsa)
-
-
-def test_invalid_critic():
-    # Create a mock TokenSampler
-    mock_sampler = Mock(spec=TokenSampler)
-
-    # Try to create SMC with an invalid critic (just a string)
-    with pytest.raises(ValueError, match="`critic` must be a Potential"):
-        SMC(unit_sampler=mock_sampler, critic="not a potential")

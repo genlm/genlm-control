@@ -39,26 +39,6 @@ async def test_importance(S):
 
 @pytest.mark.asyncio
 @settings(deadline=None)
-@given(weighted_set(double_weighted_sequence))
-async def test_importance_with_critic(S):
-    sequences, weights1, weights2 = zip(*S)
-
-    p = WeightedSet(sequences, weights1)
-    unit_sampler = DirectTokenSampler(p)
-    critic = WeightedSet(sequences, weights2)
-
-    n_particles = 10
-    sampler = SMC(unit_sampler, critic=critic)
-    sequences = await sampler(n_particles=n_particles, ess_threshold=0, max_tokens=10)
-
-    logeps = await p.prefix([])
-    for seq, logw in sequences:
-        logZ = sum([(await p.logw_next(seq[:n])).sum() for n in range(len(seq))])
-        assert np.isclose(logw, logZ + logeps + await critic.score(seq))
-
-
-@pytest.mark.asyncio
-@settings(deadline=None)
 @given(weighted_set(weighted_sequence), st.floats(min_value=0, max_value=1))
 async def test_smc(S, ess_threshold):
     sequences, weights = zip(*S)

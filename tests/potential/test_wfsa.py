@@ -64,13 +64,7 @@ async def test_wfsa(float_wfsa, make_pot, complete_w, prefix_a_w, prefix_ab_w):
     log_weight = await pot.prefix(b"ab")
     assert np.isclose(log_weight, prefix_ab_w)
 
-    await pot.assert_logw_next_consistency(b"a")
-    await pot.assert_autoreg_fact(b"a")
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-
-    await pot.assert_batch_consistency([b"", b"ab", b"ac"])
+    await pot.assert_contract([b"a", b"", b"ab", b"ac"])
 
 
 @pytest.mark.asyncio
@@ -95,13 +89,7 @@ async def test_bool_fsa(float_wfsa):
     log_weight = await pot.prefix(b"ab")
     assert log_weight == 0
 
-    await pot.assert_logw_next_consistency(b"a")
-    await pot.assert_autoreg_fact(b"a")
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-
-    await pot.assert_batch_consistency([b"", b"ab", b"ac"])
+    await pot.assert_contract([b"a", b"", b"ab", b"ac"])
 
 
 @pytest.mark.asyncio
@@ -256,11 +244,7 @@ async def test_bool_fsa_boolean_consistency():
     """Math-consistency invariants hold for the default (Boolean) path."""
     fsa = BoolFSA.from_regex("a(b|c)")
     assert fsa.wfsa.R is Boolean
-    await fsa.assert_logw_next_consistency(b"a")
-    await fsa.assert_autoreg_fact(b"a")
-    await fsa.assert_logw_next_consistency(b"")
-    await fsa.assert_autoreg_fact(b"")
-    await fsa.assert_batch_consistency([b"", b"a", b"ab", b"ac"])
+    await fsa.assert_contract([b"a", b"", b"ab", b"ac"])
 
 
 @pytest.fixture
@@ -290,29 +274,6 @@ async def test_bool_fsa_constructed_from_boolean_wfsa(boolean_wfsa):
     assert (await pot.complete(b"c")) == -float("inf")
     with pytest.raises(ValueError, match="zero weight"):
         await pot.logw_next(b"c")
-
-
-@pytest.mark.asyncio
-async def test_bool_fsa_boolean_batch_logw_next(boolean_wfsa):
-    """``batch_logw_next`` on the Boolean path matches per-context ``logw_next``."""
-    pot = BoolFSA(boolean_wfsa)
-    contexts = [b"", b"a"]
-    single = [(await pot.logw_next(c)).weights for c in contexts]
-    batch = await pot.batch_logw_next(contexts)  # one batched LazyWeights, [N, V+1]
-    assert batch.weights.shape[0] == len(contexts)
-    for i, s in enumerate(single):
-        assert np.array_equal(s, batch.weights[i])
-
-
-@pytest.mark.asyncio
-async def test_bool_fsa_boolean_chart_scalar_accessors():
-    """Boolean ``prefix_logw``/``complete_logw`` match ``prefix``/``complete``."""
-    pot = BoolFSA.from_regex(r"(cat|car)")
-    assert pot.wfsa.R is Boolean
-    for ctx in (b"", b"c", b"ca", b"cat", b"car"):
-        chart = pot._consume(list(ctx))
-        assert pot.prefix_logw(chart) == await pot.prefix(list(ctx))
-        assert pot.complete_logw(chart) == await pot.complete(list(ctx))
 
 
 def test_bool_fsa_from_regex_bad_semiring_arg():

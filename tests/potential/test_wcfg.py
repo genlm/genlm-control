@@ -124,23 +124,11 @@ async def test_bcfg_prefix(byte_wcfg):
 async def test_properties(byte_wcfg):
     pot = WCFG(byte_wcfg)
 
-    await pot.assert_logw_next_consistency(b"ab")
-    await pot.assert_autoreg_fact(b"ab")
-    await pot.assert_batch_consistency([b"a", b"ab"])
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-    await pot.assert_batch_consistency([b""])
+    await pot.assert_contract([b"ab", b"a", b""])
 
     pot = BoolCFG(byte_wcfg)
 
-    await pot.assert_logw_next_consistency(b"ab")
-    await pot.assert_autoreg_fact(b"ab")
-    await pot.assert_batch_consistency([b"a", b"ab"])
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-    await pot.assert_batch_consistency([b""])
+    await pot.assert_contract([b"ab", b"a", b""])
 
 
 @pytest.mark.parametrize(

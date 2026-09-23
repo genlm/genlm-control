@@ -46,9 +46,7 @@ async def test_properties():
     p = MockPotential([b"a"[0], b"b"[0], b"c"[0]])
     c = Coerced(p, [b"aa", b"bb", b"aab", b"aad"], f=b"".join)
 
-    await c.assert_logw_next_consistency([b"aa", b"bb"], verbosity=1)
-    await c.assert_autoreg_fact([b"aa", b"bb"], verbosity=1)
-    await c.assert_batch_consistency([[b"aa", b"bb"], [b"aa"]], verbosity=1)
+    await c.assert_contract([[b"aa", b"bb"], [b"aa"]], verbosity=1)
 
 
 @pytest.mark.asyncio

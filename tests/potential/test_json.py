@@ -366,13 +366,11 @@ async def test_always_returns_correctly_on_valid_documents(problem):
         "ipv4",
         "date-time",
         "date",
-        "date-time",
         # duration not present in Draft 7 which we're currently using.
         # "duration",
         "email",
         "hostname",
         "idn-hostname",
-        "ipv4",
         "ipv6",
         "json-pointer",
         "relative-json-pointer",
@@ -907,7 +905,6 @@ async def test_can_validate_patterns_in_incomplete_strings():
     [
         "{",
         '{"id1": "0',
-        '{"id1": "0",',
         '{"id1": "0",',
         '{"id1": "0", "id2": "A',
     ],
