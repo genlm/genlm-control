@@ -1,7 +1,7 @@
 import asyncio
 import warnings
 import weakref
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -47,7 +47,7 @@ class LazyWeights:
     on potentially large weight arrays without immediate materialization.
 
     Attributes:
-        weights (np.ndarray): The weights associated with the tokens.
+        weights (np.ndarray | torch.Tensor): The weights associated with the tokens.
         encode (dict): A mapping from tokens to their corresponding indices in the weights array.
         decode (list): A list of tokens corresponding to the weights.
         is_log (bool): A flag indicating whether the weights are in log space.
@@ -58,7 +58,7 @@ class LazyWeights:
         Initialize the LazyWeights instance.
 
         Args:
-            weights (np.ndarray): The weights associated with the tokens.
+            weights (np.ndarray | torch.Tensor): The weights associated with the tokens.
             encode (dict): A mapping from tokens to their corresponding indices in the weights array.
             decode (list): A list of tokens corresponding to the weights.
             log (bool, optional): Indicates if the weights are in log space. Defaults to True.
@@ -194,7 +194,7 @@ class LazyWeights:
         Create a new LazyWeights instance over the same vocabulary with new weights.
 
         Args:
-            new_weights (np.ndarray): The new weights for the LazyWeights instance.
+            new_weights (np.ndarray | torch.Tensor): The new weights for the LazyWeights instance.
             log (bool, optional): Indicates if the new weights are in log space. Defaults to None.
 
         Returns:
@@ -400,19 +400,6 @@ def set_draw_method(method):
     _picker = DRAW_METHODS[method] if isinstance(method, str) else method
 
 
-# Batching counters: (site, cohort_size) -> count. Sites are "draw" (one entry per
-# stacked group per flush) and "autobatch" (one entry per batch call, see
-# potential/autobatch.py). Read and clear via `take_batch_stats`.
-batch_stats = Counter()
-
-
-def take_batch_stats():
-    """Snapshot and reset the batching counters."""
-    global batch_stats
-    stats, batch_stats = batch_stats, Counter()
-    return stats
-
-
 async def draw_from(lazyweights, draw=None, target=None):
     """
     Draw a token from a next-token distribution and weigh it.
@@ -549,7 +536,6 @@ def _flush_draws(queue):
         )
         groups[key].append((lw, target, future))
     for entries in groups.values():
-        batch_stats[("draw", len(entries))] += 1
         try:
             rows = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in entries])
             logZ = torch.logsumexp(rows, dim=-1)

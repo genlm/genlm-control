@@ -24,6 +24,8 @@ results = await asyncio.gather(
 
 This creates a new potential that is a wrapper ([`AutoBatchedPotential`][genlm.control.potential.autobatch]) around the original potential. The wrapper automatically collects concurrent requests in the background and processes them together using the potential's batch methods. This happens transparently without requiring changes to your code structure.
 
+`SMC` and the token samplers already wrap what they hold, so a critic or a sampler seat is batched without this call. Both take an `autobatch=False` flag to opt out. Wrapping is memoized on the potential, so wrapping an already-wrapped potential is a no-op.
+
 ## Multiprocessing
 
 CPU parallelization can significantly improve performance for compute-intensive `Potential` classes. This is particularly useful when methods like `complete`, `prefix`, or `logw_next` involve heavy computation.

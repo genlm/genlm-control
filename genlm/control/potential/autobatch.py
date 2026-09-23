@@ -6,7 +6,6 @@ from genlm.control.potential.base import Potential, VocabTables
 from genlm.control.util import (
     LazyWeights,
     join_batch,
-    batch_stats,
     batch_abandoned,
     fail_futures,
 )
@@ -59,7 +58,6 @@ class AutoBatchedPotential(Potential):
         for method_name, context, future in queue:
             groups[method_name].append((context, future))
         for method_name, requests in groups.items():
-            batch_stats[("autobatch", method_name, len(requests))] += 1
             try:
                 results = await getattr(self.potential, method_name)(
                     [context for context, _ in requests]
