@@ -218,7 +218,9 @@ class Tracer:
         cur = self.cur
 
         if cur.child_masses is None:
-            cur.child_masses = cur.mass * p
+            # float64: the trie hands back float32, in which a branch worth 1e-50
+            # is annihilated by subtraction from a sibling worth 1e-5 and never drawn.
+            cur.child_masses = cur.mass * np.asarray(p, dtype=np.float64)
             cur.context = context
 
         if context != cur.context:

@@ -877,3 +877,20 @@ def test_make_keys_on_mps():
     assert keys.device.type == "mps"
     assert keys.dtype == logps.dtype
     assert torch.isfinite(keys).all()
+
+
+def test_seed_governs_the_rejection_stream():
+    """`seed=None` means independent, not fixed: two unseeded samplers must not share
+    a key stream, while two samplers under one seed must agree."""
+    vocab = [b"a", b"b"]
+    logws = np.log([0.4, 0.4, 0.2])
+
+    def sampler(seed):
+        return AWRS(
+            MockPotential(vocab, logws), MockPotential(vocab, logws), seed=seed
+        )
+
+    row = torch.log_softmax(torch.randn(8), -1)
+    torch.manual_seed(0)
+    assert not torch.equal(sampler(None)._make_keys(row), sampler(None)._make_keys(row))
+    assert torch.equal(sampler(7)._make_keys(row), sampler(7)._make_keys(row))

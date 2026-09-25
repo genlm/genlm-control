@@ -314,11 +314,18 @@ class AWRS(TokenSampler):
         return c
 
     def _gen(self, device):
+        """This instance's rejection-noise stream, or `None` for the global torch RNG.
+
+        An unseeded sampler must not hold a private generator: a fresh
+        `torch.Generator` starts from a fixed state, so two unseeded samplers would
+        draw identical keys instead of independent ones.
+        """
+        if self._seed is None:
+            return None
         g = self._gen_cache
         if g is None or g.device != torch.device(device):
             g = self._gen_cache = torch.Generator(device=device)
-            if self._seed is not None:
-                g.manual_seed(int(self._seed))
+            g.manual_seed(int(self._seed))
         return g
 
     def _make_keys(self, logps):

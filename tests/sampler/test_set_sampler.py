@@ -3,7 +3,7 @@ import numpy as np
 
 from genlm.control.sampler import EagerSetSampler, TopKSetSampler
 from genlm.control.sampler.set import TrieSetSampler
-from conftest import iter_item_params, MockPotential, trace_swor_set
+from conftest import iter_item_params, MockPotential, trace_swor, trace_swor_set
 
 from hypothesis import given, strategies as st, settings
 
@@ -66,3 +66,25 @@ def test_iter_item_error():
         match="Token type of `iter_potential` must be an iterable of token type of `item_potential`.*",
     ):
         TrieSetSampler(iter_potential=p1, item_potential=p2)
+
+
+@pytest.mark.asyncio
+async def test_swor_reaches_a_branch_far_below_its_siblings():
+    """A 10-item token carries 10 * log(1e-5) of weight. The trie hands the tracer
+    float32 masses, in which that branch vanishes when subtracted from a sibling worth
+    1e-5, and the enumeration silently stops one token short of the target."""
+    from genlm.control.sampler.token import SetTokenSampler
+
+    vocab = [b"\x00", b"\x00" * 10]
+    sampler = SetTokenSampler(
+        set_sampler=EagerSetSampler(
+            iter_potential=MockPotential(vocab, np.log(np.array([1.0, 1.0, 1.0]))),
+            item_potential=MockPotential([0], np.log(np.array([1e-05, 1.0]))),
+        )
+    )
+    try:
+        have = await trace_swor(sampler, [])
+        want = await sampler.target.logw_next([])
+        have.assert_equal(want, atol=1e-3, rtol=1e-3)
+    finally:
+        await sampler.cleanup()
