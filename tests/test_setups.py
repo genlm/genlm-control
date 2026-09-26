@@ -13,7 +13,7 @@ from genlm.control.sampler.token import TokenSampler
 
 @pytest.fixture(scope="module")
 def llm():
-    return PromptedLLM.from_name("gpt2", backend="hf", temperature=0.5)
+    return PromptedLLM.from_name("openai-community/gpt2", backend="hf", temperature=0.5)
 
 
 @pytest.fixture(scope="module")

@@ -28,7 +28,7 @@ class ByteLLM(Potential):
         from genlm.control import ByteLLM
 
         beam_params = BeamParams(K=5, eos_byte_strings=[b"<|endoftext|>"], heal=True)
-        async with ByteLLM.from_name("gpt2", beam_params) as byte_llm:
+        async with ByteLLM.from_name("openai-community/gpt2", beam_params) as byte_llm:
             byte_llm.set_prompt_from_str("Hello")
             logp = await byte_llm.prefix([b" ", b"w", b"o", b"r", b"l", b"d"])
         ```

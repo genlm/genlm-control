@@ -54,7 +54,7 @@ By default, these methods simply call the corresponding non-batch method for all
 
 ```python
 # Load GPT-2 with temperature 0.5
-llm = PromptedLLM.from_name("gpt2", temperature=0.5)
+llm = PromptedLLM.from_name("openai-community/gpt2", temperature=0.5)
 
 # Set a prompt prefix that all generations will be conditioned on
 llm.set_prompt_from_str("Montreal is")
@@ -198,7 +198,7 @@ The [`Product`][genlm.control.potential.product] class allows you to combine two
 
 ```python
 # Example: Prompt intersection
-mtl_llm = PromptedLLM.from_name("gpt2")
+mtl_llm = PromptedLLM.from_name("openai-community/gpt2")
 mtl_llm.set_prompt_from_str("Montreal is")
 
 bos_llm = mtl_llm.spawn()
@@ -225,7 +225,7 @@ The [`Coerced`][genlm.control.potential.coerce] class allows you to adapt a pote
 ```python
 # Example: Coercing a byte-level FSA to work with a language model's tokens
 fsa = BoolFSA.from_regex(r"\sthe\s(best|worst).*")  # Works on bytes
-llm = PromptedLLM.from_name("gpt2")  # Works on byte sequences
+llm = PromptedLLM.from_name("openai-community/gpt2")  # Works on byte sequences
 
 # Coerce the FSA to work with the LLM's tokens by joining tokens into bytes
 coerced_fsa = fsa.coerce(llm, f=b''.join)

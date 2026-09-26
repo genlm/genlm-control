@@ -35,7 +35,7 @@ class MultiTokenUnitSampler(TokenSampler):
 
     Example:
         >>> # Sample word-level units (multi-token)
-        >>> llm = PromptedLLM.from_name("gpt2")
+        >>> llm = PromptedLLM.from_name("openai-community/gpt2")
         >>> subunit_sampler = DirectTokenSampler(llm)
         >>>
         >>> # Word boundaries at whitespace
