@@ -1,5 +1,3 @@
-# genlm-backend is co-developed with this branch: control calls a serving surface
-# (per-request `lora_name=`, transformers 5) that no released backend carries.
-# CI installs the backend from source so it tests against the surface it targets.
-# Delete this file and raise the floor in pyproject.toml once the backend releases.
-genlm-backend @ git+https://github.com/genlm/genlm-backend@shepard/speedups
+# genlm-backend 0.3.0 is tagged on main but not yet published to PyPI, so CI
+# installs it from git. Delete this file once the release is on PyPI.
+genlm-backend @ git+https://github.com/genlm/genlm-backend@main
