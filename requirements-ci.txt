@@ -1,3 +1,0 @@
-# genlm-backend 0.3.0 is tagged on main but not yet published to PyPI, so CI
-# installs it from git. Delete this file once the release is on PyPI.
-genlm-backend @ git+https://github.com/genlm/genlm-backend@main
