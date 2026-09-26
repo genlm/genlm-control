@@ -62,21 +62,13 @@ class Product(Potential):
             self._v1_idxs = ...
             self._v2_idxs = ...
             if self.p1.eos is EOS and self.p2.eos is EOS:
-                # Same vocab and default sentinel: the operands' tables already
-                # describe this product, so rebuilding them is O(V) for nothing
-                # (V is 128k for an engine LM).
-                self.token_type = token_type
-                self.eos = EOS
-                self.vocab = self.p1.vocab
-                self.vocab_eos = self.p1.vocab_eos
-                self.lookup = self.p1.lookup
+                super().__init__(self.p1.vocab, tables=self.p1.tables)
             else:
                 super().__init__(self.p1.vocab, token_type=token_type)
 
         else:
-            # Ordered by p1, never `list(set(...) & set(...))`: set iteration order
-            # varies with PYTHONHASHSEED, which permutes the vocabulary and flips
-            # Gumbel-max draws, so one seed gives different samples across runs.
+            # Ordered by p1: set iteration order varies with PYTHONHASHSEED, which
+            # would permute the vocabulary across runs.
             keep = set(self.p2.vocab)
             common_vocab = [x for x in dict.fromkeys(self.p1.vocab) if x in keep]
             if not common_vocab:
@@ -139,11 +131,8 @@ class Product(Potential):
         return W1 + W2
 
     def _compose(self, w1_full, w2_full):
-        """Sum the operands' weights over the shared vocabulary.
-
-        Slices on the last axis, so one code path serves a single ``[V]`` row and a
-        batched ``[N, V]`` one. Mixed backends are reconciled by lifting a numpy operand
-        onto the other's torch device; two numpy operands stay numpy.
+        """Sum the operands' weights over the shared vocabulary, for a `[V]` row or an
+        `[N, V]` batch. A numpy operand is lifted onto the other operand's torch device.
         """
         w1 = w1_full[self.v1_idxs] if w1_full.ndim == 1 else w1_full[:, self.v1_idxs]
         w2 = w2_full[self.v2_idxs] if w2_full.ndim == 1 else w2_full[:, self.v2_idxs]
@@ -165,7 +154,6 @@ class Product(Potential):
         return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
 
     async def logw_eos(self, context) -> float:
-        """Sum of the factors' eos log-weights."""
         e1, e2 = await asyncio.gather(
             self.p1.logw_eos(context), self.p2.logw_eos(context)
         )

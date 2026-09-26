@@ -60,11 +60,9 @@ class TrieSetSampler(SetSampler):
         Args:
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
-            autobatch (bool): Wrap the `iter_potential` seat in
-                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential]
-                (default True). `item_potential` is never wrapped: the trie walk
-                asks it sequentially, so a window pass per ask buys no batching
-                (measured +28% wall clock on the set benchmark).
+            autobatch (bool): Whether to wrap `iter_potential` in
+                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential].
+                Default True. `item_potential` is never wrapped.
 
         Raises:
             ValueError: If the token type of `iter_potential` is not an iterable of the token type of `item_potential`.

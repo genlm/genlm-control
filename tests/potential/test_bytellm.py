@@ -13,13 +13,8 @@ def model_name():
     return "gpt2"
 
 
-# On a GPU box the default backend is vLLM at gpu_memory_utilization=0.9. This
-# module instantiates BOTH a module-scoped `llm` engine and a per-test
-# `byte_llm`/`ByteLLM` engine, so two 0.9-util engines must coexist on one GPU
-# -> "Free memory ... less than desired GPU memory utilization". gpt2 is tiny, so
-# cap each engine's footprint to a small fraction so they fit together.
-# `engine_opts` is vLLM-only, and `load_model_by_name` falls back to HF without
-# CUDA, so the option is gated on the same condition that picks the backend.
+# Cap vLLM's GPU share so this engine fits beside others in the process;
+# `engine_opts` is vLLM-only, and `load_model_by_name` picks vLLM only under CUDA.
 _LOW_GPU = (
     {"engine_opts": {"gpu_memory_utilization": 0.3}} if torch.cuda.is_available() else {}
 )
@@ -30,15 +25,11 @@ def llm(model_name):
     """Provides the underlying LLM for the test module."""
     instance = load_model_by_name(model_name, llm_opts=_LOW_GPU)
     yield instance
-    # Release the GPU engine when the module finishes so it doesn't linger and
-    # starve subsequent test modules of GPU memory.
     cleanup = getattr(instance, "cleanup", None)
     if cleanup is not None:
         try:
             cleanup()  # the backend's cleanup is sync
         except Exception as e:
-            # Surface (don't swallow) a failing teardown: a silently-failing
-            # cleanup is exactly how a later module hits an unexplained OOM.
             warnings.warn(f"engine cleanup failed during teardown: {e}")
 
 
@@ -51,13 +42,8 @@ def beam_params(llm):
 
 @pytest.fixture
 def byte_llm(llm, beam_params):
-    """Provides a fresh ByteLLM instance for each test and handles cleanup.
-
-    Reuses the single module-scoped ``llm`` engine instead of creating its own,
-    so we don't accumulate multiple vLLM engines on the GPU (cleanup doesn't
-    promptly reclaim GPU memory within a process)."""
-    instance = ByteLLM(llm, beam_params)
-    yield instance
+    """Provides a fresh ByteLLM instance for each test."""
+    return ByteLLM(llm, beam_params)
 
 
 @pytest.mark.asyncio
@@ -179,14 +165,12 @@ async def test_cache_size_limit(llm, beam_params):
 
 @pytest.mark.asyncio
 async def test_cache_lru_eviction(llm, beam_params):
-    """Test that eviction removes the least-recently-*accessed* entry, not
-    simply the oldest-inserted one."""
+    """Test that LRU eviction removes the least-recently-used entry."""
     cache_size = 3
     byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
 
     try:
-        # Three independent single-byte contexts: none is a prefix of another,
-        # so caching one never touches another's recency as a side effect.
+        # Independent contexts: none is a prefix of another.
         await byte_llm.prefix([b"p"])
         await byte_llm.prefix([b"q"])
         await byte_llm.prefix([b"r"])
@@ -195,8 +179,7 @@ async def test_cache_lru_eviction(llm, beam_params):
         # Touch "p" again -- an exact cache hit -- making it most-recently-used.
         await byte_llm.prefix([b"p"])
 
-        # A new entry pushes the cache over the limit: eviction must take the
-        # least-recently-used entry ("q", never re-accessed), not "p".
+        # Over the limit: evicts "q", the least-recently-used entry.
         await byte_llm.prefix([b"s"])
 
         assert len(byte_llm._beam_cache) == cache_size
@@ -271,12 +254,7 @@ async def test_healing_enabled_succeeds(llm):
 
 @pytest.mark.asyncio
 async def test_healing_max_backoff(llm):
-    """heal_max_backoff bounds how far back healing may search for a valid
-    retokenization point (TokenHealer.try_heal only tries k in
-    [partial_len - max_backoff, partial_len]). At K=1, max_backoff=0 restricts
-    the healer to the exact token boundary the normal (pre-heal) extend step
-    already tried and failed at, so it can do no better than healing disabled
-    -- and must reach strictly less far than unlimited backoff."""
+    """heal_max_backoff=0 reaches as far as heal=False, and less far than unlimited backoff."""
     eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
@@ -316,8 +294,7 @@ async def test_healing_max_backoff(llm):
 
 @pytest.mark.asyncio
 async def test_context_manager_basic(llm, beam_params):
-    """Test that ByteLLM works as an async context manager, including driving
-    a full SMC run from inside the context."""
+    """Test that ByteLLM works as an async context manager, including SMC sampling."""
 
     async with ByteLLM(llm, beam_params) as byte_llm:
         # Verify we can use the instance inside the context
@@ -333,7 +310,7 @@ async def test_context_manager_basic(llm, beam_params):
         # Verify cache was populated
         assert byte_llm._beam_cache or byte_llm._initial_beam is not None
 
-        # SMC sampling must also work while the engine is held via the context manager
+        # SMC sampling inside the context
         byte_llm.set_prompt_from_str("The answer is:")
         fsa = BoolFSA.from_regex(r" (yes|no)")
         sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))

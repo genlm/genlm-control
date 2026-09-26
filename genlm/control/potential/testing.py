@@ -211,7 +211,6 @@ class PotentialTests:
 
         for i, context in enumerate(contexts):
             logw_next = await self.logw_next(context, *method_args)
-            # batch_logw_next returns one batched LazyWeights; row i is .weights[i].
             batch_row = to_numpy(batch_logw_nexts.weights[i])
             try:
                 np.testing.assert_allclose(

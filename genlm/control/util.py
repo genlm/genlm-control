@@ -13,8 +13,7 @@ from genlm.backend.tokenization import Token
 
 def logsumexp(x, axis=-1, keepdims=False):
     """Log-sum-exp along `axis`, in the array's own backend. An all-`-inf` slice
-    reduces to `-inf`, not `nan`. The default axis is the last one, so a batched
-    `[N, V]` block reduces per row."""
+    reduces to `-inf`, not `nan`."""
     if torch.is_tensor(x):
         return torch.logsumexp(x, axis, keepdim=keepdims)
     x = np.asarray(x)
@@ -26,18 +25,17 @@ def logsumexp(x, axis=-1, keepdims=False):
 
 
 def to_numpy(w):
-    """Coerce a weight array to numpy regardless of backend (no-op on numpy)."""
+    """Return `w` as a numpy array."""
     return w.cpu().numpy() if torch.is_tensor(w) else np.asarray(w)
 
 
 def stack_weights(arrays):
-    """Stack per-context weight arrays into one `[N, V]` batch, preserving the producer's
-    backend (numpy stays numpy, torch stays torch)."""
+    """Stack per-context weight arrays into one `[N, V]` batch in their own backend."""
     return torch.stack(arrays) if torch.is_tensor(arrays[0]) else np.stack(arrays)
 
 
 def _xp(w):
-    """The array module (`torch` or `np`) backing `w`, for backend-agnostic ops."""
+    """The array module (`torch` or `np`) backing `w`."""
     return torch if torch.is_tensor(w) else np
 
 
@@ -66,9 +64,7 @@ class LazyWeights:
         Raises:
             AssertionError: If the lengths of weights and decode do not match, or if encode has fewer entries than decode.
         """
-        # `weights` keeps the producer's backend (LM->torch, grammar/FSA/trie->numpy; a
-        # raw python sequence becomes numpy). Vocab is the last axis: `[V]` for one
-        # context, `[N, V]` for a population, and bulk ops reduce dim=-1.
+        # Vocab is the last axis: `[V]` for one context, `[N, V]` for a batch.
         if not (torch.is_tensor(weights) or isinstance(weights, np.ndarray)):
             weights = np.asarray(weights)
         assert weights.shape[-1] == len(decode)
@@ -93,7 +89,8 @@ class LazyWeights:
         if token in self.encode:
             return self.weights[self.encode[token]].item()
 
-        # Fallback: look up plain-bytes tokens by byte_string content (first match wins).
+        # Fallback: if token is plain bytes (not Token), look up by byte_string content.
+        # This supports old code that indexes by bytes; returns the first match.
         if Token.is_plain_bytes(token):
             if not hasattr(self, "_bytes_fallback"):
                 self._bytes_fallback = {}
@@ -212,8 +209,7 @@ class LazyWeights:
 
         Args:
             top (int, optional): The number of top weights to materialize. Defaults to None.
-            sort (bool, optional): Order the chart by descending weight. Defaults to True.
-                Required by `top`; skip it when only the token-to-weight mapping is needed.
+            sort (bool, optional): Order the chart by descending weight; ignored when `top` is set. Defaults to True.
 
         Returns:
             (Chart): A chart representation of the weights.
@@ -283,8 +279,6 @@ def load_trie(V, backend=None, **kwargs):
     Returns:
         (TokenCharacterTrie): A trie instance.
     """
-    from genlm.backend.tokenization import Token  # lazy: backend absent on mac
-
     # Convert pure bytes/strings vocabularies to Token objects.
     # Skip if V already contains Token objects (Token subclasses bytes,
     # so we must check Token first).
@@ -332,20 +326,14 @@ def load_async_trie(V, backend=None, **kwargs):
     return AsyncTokenCharacterTrie(load_trie(V, backend, **kwargs))
 
 
-# --- token-picker family ---
-# Each maps a log-weight tensor -> drawn index over dim=-1 (1-D draw or batched [N, V]).
-# The pickers draw from the global torch RNG, so `torch.manual_seed` -- not
-# `np.random.seed` -- is what makes a run's draws reproducible. Two other streams
-# exist and are seeded separately: `np.random` drives resampling
-# (`sampler/resampling.py`) and AWRS's phantom-token geometrics, and AWRS's rejection
-# noise comes from a per-instance `torch.Generator` (its `seed=` argument).
-# The pickers stay at the row's dtype (fp32 off the engine): fp64 would cost an
-# [N, V] double buffer per step, `inverse_cdf`'s cumsum is the only place fp32 error
-# is measurable and it is already clamped, and MPS has no fp64 at all.
+# Draw methods: each maps a log-weight tensor to a drawn index over the last dim
+# (scalar for `[V]`, `[N]` for `[N, V]`). They draw from the global torch RNG, so
+# `torch.manual_seed`, not `np.random.seed`, makes their draws reproducible. They
+# stay at the row's dtype: MPS has no fp64.
 
 
 def gumbel_max(logps):
-    """Argmax of `logps + Gumbel noise`; the default picker."""
+    """Argmax of `logps + Gumbel noise`; the default draw method."""
     g = -torch.log(-torch.log(torch.rand_like(logps)))
     return (logps + g).argmax(dim=-1)
 
@@ -357,8 +345,8 @@ def multinomial(logps):
 
 
 def inverse_cdf(logps):
-    """Single-uniform inverse-CDF draw over the last dim (scalar for `[V]`, `[N]` for
-    `[N, V]`); one uniform per row, on `logps`'s device."""
+    """Inverse-CDF draw over the last dim, one uniform per row (scalar for `[V]`, `[N]`
+    for `[N, V]`)."""
     cdf = (logps - torch.logsumexp(logps, dim=-1, keepdim=True)).exp().cumsum(dim=-1)
     u = torch.rand((*cdf.shape[:-1], 1), dtype=cdf.dtype, device=cdf.device)
     return torch.searchsorted(cdf, u).squeeze(-1).clamp_(max=cdf.shape[-1] - 1)
@@ -384,35 +372,33 @@ DRAW_METHODS = {
     "multinomial": multinomial,
     "inverse_cdf": inverse_cdf,
 }
-# Process-wide picker for the draw window; set it via `set_draw_method`.
-_picker = gumbel_max
+# Process-wide draw method for `draw_from`; set it via `set_draw_method`.
+_draw_method = gumbel_max
 
 
 def set_draw_method(method):
     """
-    Set the token picker used by `draw_from` and `picker_indices`, process-wide.
+    Set the draw method used by `draw_from` and `draw_indices`, process-wide.
 
     Args:
         method (str | callable): A name in `DRAW_METHODS`, or a custom
             `(logps_tensor) -> index` callable.
     """
-    global _picker
-    _picker = DRAW_METHODS[method] if isinstance(method, str) else method
+    global _draw_method
+    _draw_method = DRAW_METHODS[method] if isinstance(method, str) else method
 
 
 async def draw_from(lazyweights, draw=None, target=None):
     """
     Draw a token from a next-token distribution and weigh it.
 
-    Concurrent callers meet in a per-event-loop window and execute as one batched
-    reduction per (backend, device, vocab-size) group: one normalize, one pick, one
-    host readback for the whole cohort, target log-weights included. Batched rows
-    draw independent noise, and a lone caller degenerates to a solo draw.
+    Concurrent callers on one event loop are drawn together, one batched reduction
+    per backend, device and vocab size, each row with independent noise.
 
     Args:
         lazyweights (LazyWeights): The log-weight row to draw from.
-        draw (callable, optional): Custom picker, taking a materialized normalized
-            chart and returning a token. Draws solo, outside the window.
+        draw (callable, optional): Custom draw, taking the normalized probability
+            chart and returning a token. Bypasses batching.
         target (LazyWeights, optional): A second row over the same vocabulary. Makes
             the draw an importance draw: `lazyweights` is the proposal, and the token
             is weighed under the target.
@@ -456,15 +442,13 @@ async def join_batch(store, entry):
     """
     Join the batch of concurrent callers on this event loop.
 
-    Appends `entry` and, if nobody holds the batch yet, holds it open until a full
-    event-loop pass adds no new entry. The holding caller flushes the batch in its
-    own coroutine; there is no background task. An entry is a tuple ending in its
-    future: a holder that dies before handing the batch off fails every other queued
-    future rather than orphaning it, so an entry is always resolved exactly once.
+    The first caller holds the batch open until an event-loop pass adds no entry,
+    then receives it to flush. If that leader dies first, every other queued future
+    is failed with `BatchAbandoned`.
 
     Args:
-        store (weakref.WeakKeyDictionary): Event loop to `_Batch` map, owned by the
-            call site. One store per batch.
+        store (weakref.WeakKeyDictionary): Event loop to `_Batch` map, one per
+            batched call site.
         entry (tuple): The request to add, ending in its future.
 
     Returns:
@@ -480,9 +464,7 @@ async def join_batch(store, entry):
         return None
     batch.armed = True
     try:
-        # Callers reach the batch at different depths of a `gather` tree, and each
-        # level is another scheduler turn; yield until a turn adds nothing, so the
-        # whole batch lands in one flush.
+        # Callers nested in a `gather` tree arrive one scheduler turn per level.
         while True:
             n = len(batch.queue)
             await asyncio.sleep(0)
@@ -492,8 +474,8 @@ async def join_batch(store, entry):
         return queue
     except BaseException as exc:
         queue, batch.queue = batch.queue, []
-        # Not this caller's own entry: it is unwinding past its `await`, so an
-        # exception set there is only ever logged as never retrieved.
+        # Skip this caller's own entry: it is unwinding, so an exception set on it
+        # would go unretrieved.
         fail_futures([e for e in queue if e is not entry], batch_abandoned(exc))
         raise
     finally:
@@ -501,12 +483,12 @@ async def join_batch(store, entry):
 
 
 def batch_abandoned(exc):
-    """The failure handed to callers whose batch holder died.
+    """The failure handed to callers whose batch leader died.
 
     Never the cause itself: a `CancelledError` given to a caller who never asked for
     one leaves their task cancelled and skips their `except Exception`.
     """
-    abandoned = BatchAbandoned(f"batch holder did not survive it: {exc!r}")
+    abandoned = BatchAbandoned(f"batch leader did not survive it: {exc!r}")
     abandoned.__cause__ = exc
     return abandoned
 
@@ -523,9 +505,8 @@ _DRAW_BATCHES = weakref.WeakKeyDictionary()  # event loop -> _Batch
 
 
 def _flush_draws(queue):
-    """Resolve a batch of draws with one batched reduction per stackable group, off
-    a single host readback. Every future is resolved, with its draw or with a
-    failure."""
+    """Resolve a batch of draws with one batched reduction per stackable group. Every
+    future is resolved, with its draw or with a failure."""
     groups = defaultdict(list)
     for lw, target, future in queue:
         w = lw.weights
@@ -540,13 +521,12 @@ def _flush_draws(queue):
             rows = torch.stack([torch.as_tensor(lw.weights) for lw, _, _ in entries])
             logZ = torch.logsumexp(rows, dim=-1)
             logps = rows.sub_(logZ.unsqueeze(-1))  # stack copied; safe in place
-            idx = _picker(logps)
+            idx = _draw_method(logps)
             logp = logps.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
             ids = idx.tolist()
-            # One float readback for the cohort's normalizers and drawn log-probs.
+            # One float readback for the batch's normalizers and drawn log-probs.
             logZs, drawn_logps = torch.stack([logZ, logp]).tolist()
-            # Importance draws: the drawn token's log-weight under each target row,
-            # one extra gather and readback over that subset.
+            # Importance draws: the drawn token's log-weight under each target row.
             target_logws = {}
             targeted = [k for k, (_, t, _) in enumerate(entries) if t is not None]
             if targeted:
@@ -560,8 +540,7 @@ def _flush_draws(queue):
             fail_futures(entries, exc)
             continue
         except BaseException as exc:
-            # This flush is unwinding, so nothing else will resolve what it still
-            # owes. Groups already resolved are skipped by `fail_futures`.
+            # Unwinding: nothing else will resolve the futures still pending.
             for rest in groups.values():
                 fail_futures(rest, batch_abandoned(exc))
             raise
@@ -573,11 +552,10 @@ def _flush_draws(queue):
                 future.set_result((lw.decode[tok_id], logw, p))
 
 
-def picker_indices(weights):
-    """Apply the configured picker to a (possibly batched) log-weight array, returning
-    the drawn index/indices over dim=-1 (scalar for `[V]`, `[N]` for `[N, V]`). The
-    picker family is pure-torch, so a non-torch array is lifted first."""
-    return _picker(torch.as_tensor(weights))
+def draw_indices(weights):
+    """Draw indices over the last dim of a log-weight array with the configured draw method
+    (scalar for `[V]`, `[N]` for `[N, V]`)."""
+    return _draw_method(torch.as_tensor(weights))
 
 
 def escape(x):

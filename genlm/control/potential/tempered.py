@@ -1,18 +1,14 @@
 import numpy as np
 import torch
 
-from genlm.control.potential.base import Potential, VocabTables
+from genlm.control.potential.base import Potential
 
 
 class Tempered(Potential):
-    """A potential with every log-weight scaled by `beta`, written `p ** beta`.
+    """A potential with every log weight of `p` scaled by `beta`, written `p ** beta`.
 
-    Unnormalized: the next-token rows do not renormalize, so `p ** beta` is a raw
-    reweighting. Compose with `.normalize()` for a locally normalized temper;
-    `(p ** (1/tau)).normalize()` is `p` at temperature `tau`.
-
-    A hard zero stays hard: `-inf` weights survive any `beta`, so a support mask is
-    never resurrected.
+    The result is unnormalized; `(p ** (1/tau)).normalize()` is `p` at temperature `tau`.
+    `-inf` weights stay `-inf` for any `beta`.
 
     Attributes:
         p (Potential): The tempered potential.
@@ -22,9 +18,7 @@ class Tempered(Potential):
     def __init__(self, p, beta):
         self.p = p
         self.beta = float(beta)
-        super().__init__(
-            p.vocab, tables=VocabTables(p.token_type, p.eos, p.vocab_eos, p.lookup)
-        )
+        super().__init__(p.vocab, tables=p.tables)
 
     def alloc_rows(self, n, default=float("-inf")):
         return self.p.alloc_rows(n, default)
@@ -34,8 +28,7 @@ class Tempered(Potential):
         return self.p.is_terminal_only()
 
     def _scale(self, w):
-        """``beta * w``, in ``w``'s own backend, leaving ``-inf`` untouched: scaling it
-        would make ``nan`` at ``beta <= 0`` and resurrect a masked token."""
+        """`beta * w` in `w`'s own backend, with `-inf` entries left untouched."""
         if torch.is_tensor(w):
             out = w.clone()
             live = ~w.isneginf()
@@ -48,9 +41,7 @@ class Tempered(Potential):
         return out
 
     def _scale_one(self, v):
-        """``_scale`` for a single score. The scalar and batched lanes must agree on
-        ``-inf``, or a masked context reads ``nan`` through one and ``-inf`` through
-        the other."""
+        """`_scale` for a single score."""
         v = float(v)
         return v if v == float("-inf") else self.beta * v
 

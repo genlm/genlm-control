@@ -1,19 +1,12 @@
-from genlm.control.potential.base import Potential, VocabTables
+from genlm.control.potential.base import Potential
 from genlm.control.util import logsumexp
 
 
 class Normalized(Potential):
-    """A potential with every next-token row renormalized to sum to one.
+    """A potential with every next-token row of `p` renormalized to sum to one.
 
-    The locally normalized factor: `logw_next` sums to 0 at every context, so a step
-    whose support collapses to a single token carries no weight. `(llm * mask).normalize()`
-    is the local product-of-experts, as opposed to the unnormalized `llm * mask`.
-
-    `prefix` and `complete` subtract the normalizers of the prefixes they span, which
-    costs one `batch_logw_next` over `len(context)` prefixes. Nothing on a sampler's
-    generation path reads them (`logw_eos` routes through `logw_next`, and `start_weight`
-    only ever asks for `prefix([])`), so the sweep is a cold path, hot only when this is
-    used as a per-step critic.
+    `(llm * mask).normalize()` is the locally normalized product of `llm` and `mask`.
+    `prefix` and `complete` each cost one `batch_logw_next` over the prefixes of `context`.
 
     Attributes:
         p (Potential): The normalized potential.
@@ -21,9 +14,7 @@ class Normalized(Potential):
 
     def __init__(self, p):
         self.p = p
-        super().__init__(
-            p.vocab, tables=VocabTables(p.token_type, p.eos, p.vocab_eos, p.lookup)
-        )
+        super().__init__(p.vocab, tables=p.tables)
 
     def alloc_rows(self, n, default=float("-inf")):
         return self.p.alloc_rows(n, default)

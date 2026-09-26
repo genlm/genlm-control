@@ -7,8 +7,7 @@ import requests
 from pathlib import Path
 from genlm.control.viz import InferenceVisualizer
 
-# These bind fixed ports (8000/8001) and assert they are free first, so two of them must
-# never run at once. Under ``--dist loadgroup`` the whole module lands on one worker.
+# Tests bind fixed ports 8000/8001; under `--dist loadgroup` the group keeps them on one worker.
 pytestmark = pytest.mark.xdist_group("viz")
 
 

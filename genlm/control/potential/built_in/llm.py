@@ -3,9 +3,7 @@ import weakref
 import torch
 import warnings
 from typing import NamedTuple
-from genlm.control.constant import EOS
-from genlm.control.potential.base import Potential
-from genlm.control.typing import infer_vocabulary_type
+from genlm.control.potential.base import Potential, VocabTables
 from genlm.backend.tokenization import Token
 
 
@@ -110,9 +108,7 @@ class TokenMappings(NamedTuple):
         eos_byte_strings: EOS tokens as byte strings
         eos_token_objs: Actual EOS Token objects
         potential_vocab: Vocabulary excluding EOS tokens
-        token_type: TokenType of potential_vocab
-        vocab_eos: potential_vocab + [EOS]
-        lookup: token -> index over vocab_eos
+        tables: Potential tables built from potential_vocab
     """
 
     decode: list[Token]
@@ -121,9 +117,7 @@ class TokenMappings(NamedTuple):
     eos_byte_strings: list[bytes]
     eos_token_objs: list[Token]
     potential_vocab: list[Token]
-    token_type: object
-    vocab_eos: list
-    lookup: dict
+    tables: VocabTables
 
     @classmethod
     def create(cls, decode, eos_byte_strings=None, **kwargs):
@@ -134,8 +128,8 @@ class TokenMappings(NamedTuple):
             eos_byte_strings (list[bytes]): List of byte strings representing EOS tokens.
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
-        # Token objects are a bytes subclass, so this also normalizes any mix
-        # of Token and plain bytes to plain bytes.
+        # Coerce to bytes -> make spawn_new_eos accept tokens, bytes, or any
+        # mix without the caller having to remember.
         eos_byte_strings = [bytes(bs) for bs in eos_byte_strings]
         if len(set(eos_byte_strings)) != len(eos_byte_strings):
             raise ValueError("Duplicate eos byte strings")
@@ -174,15 +168,7 @@ class TokenMappings(NamedTuple):
         potential_vocab = [
             token for token in decode if token.token_id not in eos_token_ids
         ]
-        if not potential_vocab:
-            raise ValueError("vocabulary cannot be empty")
-
         encode = _TokenEncodeDict({token: i for i, token in enumerate(decode)})
-
-        # Tokens are unique by token_id, so the duplicate check
-        # Potential.__init__ performs cannot fire on this vocabulary.
-        lookup = {token: i for i, token in enumerate(potential_vocab)}
-        lookup[EOS] = len(potential_vocab)
 
         return cls(
             decode=decode,
@@ -191,9 +177,7 @@ class TokenMappings(NamedTuple):
             eos_byte_strings=eos_byte_strings,
             eos_token_objs=eos_token_objs,
             potential_vocab=potential_vocab,
-            token_type=infer_vocabulary_type(potential_vocab),
-            vocab_eos=potential_vocab + [EOS],
-            lookup=lookup,
+            tables=Potential.build_tables(potential_vocab),
         )
 
 
@@ -233,6 +217,7 @@ class PromptedLLM(Potential):
             temperature (float, optional): The temperature to apply to the language model's logits. Defaults to 1.
             token_maps (TokenMappings, optional): A precomputed mapping of tokens to token IDs with the potential's vocabulary.
                 If provided, `eos_byte_strings` must not be provided. Defaults to None, which constructs a TokenMappings from the language model's byte vocabulary and the EOS tokens.
+            lora_name (str, optional): Name of a LoRA adapter registered on `llm` to forward under. Defaults to None, which uses the base model.
         """
         eos_byte_strings = _compat_eos_tokens(eos_byte_strings, kwargs)
         self.model = llm
@@ -254,13 +239,9 @@ class PromptedLLM(Potential):
                 eos_byte_strings=eos_byte_strings or [default_eos],
             )
 
-        # `token_maps` already carries validated Potential-layer tables, so they are
-        # adopted here instead of rebuilt by `super().__init__()`.
-        self.token_type = self.token_maps.token_type
-        self.eos = EOS
-        self.vocab = self.token_maps.potential_vocab
-        self.vocab_eos = self.token_maps.vocab_eos
-        self.lookup = self.token_maps.lookup
+        super().__init__(
+            self.token_maps.potential_vocab, tables=self.token_maps.tables
+        )
 
     @classmethod
     def from_name(
@@ -468,7 +449,7 @@ class PromptedLLM(Potential):
         return await self._log_probability(context_ids)
 
     async def _log_probability(self, context_ids):
-        if not context_ids:  # empty context: log(1); no forwards to batch
+        if not context_ids:
             return 0.0
         prefixes = [self.prompt_ids + context_ids[:i] for i in range(len(context_ids))]
         log_ps = self._maybe_temper(
@@ -522,8 +503,7 @@ class PromptedLLM(Potential):
         return logp_context + logp_eos
 
     def _eos_index_tensors(self, device):
-        """The EOS / non-EOS column-index tensors which fold the engine vocab into the
-        control vocab, EOS kept last. Built once per device and cached."""
+        """Return the EOS and non-EOS indices into `token_maps.decode` as tensors on `device`, cached."""
         if (
             not hasattr(self, "_eos_idxs_tensor")
             or not hasattr(self, "_non_eos_indices")
@@ -539,13 +519,7 @@ class PromptedLLM(Potential):
         return self._eos_idxs_tensor, self._non_eos_indices
 
     def _verify_logit_padding(self, n_logits):
-        """Guard the tail-padding used when the model emits fewer logits than
-        ``len(token_maps.decode)`` (e.g. Gemma's <image_soft_token>, added beyond the
-        embedding matrix).
-
-        Padding the tail with -inf is correct only if the model's logit indices are
-        contiguous ``0..n_logits-1``, so this raises rather than silently mis-folding
-        columns. Checked once and cached.
+        """Check once that token ids `0..n_logits-1` match their indices in `token_maps.decode`.
 
         Args:
             n_logits (int): Number of logits the model emitted.
@@ -564,21 +538,21 @@ class PromptedLLM(Potential):
             self._logit_padding_verified = True
 
     def _process_logw_next_batch(self, logits):
-        """Fold a batch of raw engine logits into control-vocab log-weights.
-
-        Stays on the logits' device and returns a ``torch.Tensor`` rather than a
-        ``LazyWeights``, so a caller can draw on-device and read back only the drawn ids.
+        """Fold a batch of next-token log probabilities into log-weights over `self.vocab_eos`, on their device.
 
         Args:
-            logits (torch.Tensor): Raw engine logits, ``[N, n_logits]``.
+            logits (torch.Tensor): Next-token log probabilities from the model, `[N, n_logits]`.
 
         Returns:
-            (torch.Tensor): Log-weights over the control vocabulary, ``[N, V+1]``, with
-                EOS in the last column.
+            (torch.Tensor): Log-weights of shape `[N, V+1]`, EOS in the last column.
         """
         eos_idxs, non_eos = self._eos_index_tensors(logits.device)
         n_decode = len(self.token_maps.decode)
         n_logits = logits.shape[1]
+        # The model may produce fewer logits than len(token_maps.decode) when
+        # the tokenizer has added tokens beyond the model's embedding matrix
+        # (e.g. Gemma's <image_soft_token>). Pad with -inf so these tokens
+        # are unscorable but still present in the vocabulary.
         if n_logits < n_decode:
             self._verify_logit_padding(n_logits)
             pad = torch.full(
@@ -589,8 +563,6 @@ class PromptedLLM(Potential):
             )
             logits = torch.cat([logits, pad], dim=1)
         logits = logits[:, :n_decode].log_softmax(dim=1)  # [N, n_decode]
-        # Uninitialized is safe: every column is written below — the vocab block,
-        # then the EOS column.
         out = torch.empty(
             (logits.shape[0], len(self.vocab) + 1),
             dtype=logits.dtype,
@@ -598,8 +570,7 @@ class PromptedLLM(Potential):
         )
         out[:, : len(self.vocab)] = logits[:, non_eos]
         if eos_idxs.numel() == 1:
-            # Index with the 0-dim tensor and never `eos_idxs.item()`, which would
-            # force a host sync for the EOS column.
+            # Not `eos_idxs.item()`, which forces a host sync.
             out[:, -1] = logits[:, eos_idxs[0]]
         else:
             out[:, -1] = torch.logsumexp(logits[:, eos_idxs], dim=1)
@@ -617,8 +588,6 @@ class PromptedLLM(Potential):
         Returns:
             (LazyWeights): Processed log probabilities for the next tokens.
         """
-        # The row stays on the backend's device; the draw window reads back only the
-        # drawn scalars.
         out = self._process_logw_next_batch(logw_next.unsqueeze(0))
         return self.make_lazy_weights(out[0].float())
 

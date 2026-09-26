@@ -174,9 +174,9 @@ sequences.decoded_posterior
 
 ## Autobatching
 
-During generation, every particle asks the sentiment analysis potential for a score
+During generation, every particle requests a score from the sentiment analysis potential
 through the instance methods (`prefix`, `complete`). Because the potential also has
-parallelized batch versions of those methods, those concurrent asks can execute as a
+parallelized batch versions of those methods, those concurrent calls can execute as a
 single batched call.
 
 `SMC` does this for you: the critic is wrapped in

@@ -54,8 +54,7 @@ def test_ancestor_counts_are_unbiased(method):
 
 @pytest.mark.parametrize("method", ["systematic", "stratified"])
 def test_one_probe_per_stratum_bounds_each_count(method):
-    """One probe per stratum pins each ancestor count to floor/ceil of its share, so no
-    particle is over- or under-represented by more than one slot in a single draw."""
+    """Each ancestor count lies within floor/ceil of its expected share."""
     weights = np.array([0.5, 0.3, 0.15, 0.05])
     fn = get_resampling_fn(method)
     n = len(weights)

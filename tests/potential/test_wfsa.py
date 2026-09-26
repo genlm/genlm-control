@@ -197,8 +197,7 @@ def _boolean_wfsa_for_rejection():
     ],
 )
 def test_wfsa_init_wrong_semiring(make_wfsa):
-    # Float, Log, and Boolean are accepted by *some* class; WFSA itself
-    # (unlike BoolFSA) only accepts Float and Log.
+    # WFSA accepts only Float and Log; Boolean is BoolFSA's.
     with pytest.raises(ValueError, match="Unsupported semiring"):
         WFSA(wfsa=make_wfsa())
 
@@ -311,13 +310,11 @@ def test_wfsa_spawn(log_wfsa):
 
 def test_wfsa_clear_cache(log_wfsa):
     pot = WFSA(wfsa=log_wfsa)
-    # The empty-prefix base chart lives outside the LRU (``_start_chart``), so the
-    # ``_consume`` cache holds only non-empty prefixes and is empty after a clear.
+    # The empty-prefix chart is held outside the cache, as `_start_chart`.
     pot._consume(b"a")
     assert len(pot.cache) > 0
     pot.clear_cache()
     assert len(pot.cache) == 0
-    # `_consume(())` still returns the base chart after a clear (held separately).
     assert pot._consume(()) is pot._start_chart
 
 

@@ -25,9 +25,8 @@ async def test_multi_token_unit_sampler_basic():
     mock_potential = MockPotential(vocab, logws)
     subunit_sampler = DirectTokenSampler(mock_potential)
     boundary = TokenSetBoundary({b" ", b"!", EOS})
-    # The cap must sit far above the boundary's expected wait, or it fires instead: the
-    # non-boundary mass here is 0.7, so a cap of 10 truncates 0.7**10 ~ 3% of runs and
-    # this test fails on an unterminated buffer. Truncation has its own test below.
+    # Unit sampler samples words according to boundary. The cap sits far above the
+    # boundary's expected wait: non-boundary mass is 0.7, so a cap of 10 fails ~3% of runs.
     unit_sampler = MultiTokenUnitSampler(
         subunit_sampler=subunit_sampler,
         boundary_predicate=boundary,
@@ -72,9 +71,7 @@ async def test_multi_token_unit_sampler_fixed_length():
 
 @pytest.mark.asyncio
 async def test_multi_token_unit_sampler_with_context():
-    """`sample` takes the structured (unit-nested) context directly -- it flattens
-    internally for the subunit sampler, so a caller passes the nested form, not a
-    separately-flattened one."""
+    """Test that unit sampler correctly flattens multi-token unit context."""
     vocab = [b"hello", b" ", b"world"]
     logws = np.log([0.4, 0.2, 0.3, 0.1])
 
@@ -97,8 +94,7 @@ async def test_multi_token_unit_sampler_with_context():
 
 
 class _NeverCompleteBoundary(BoundaryPredicate):
-    """Boundary that never fires; covers max_subunits_per_unit truncation through
-    a custom BoundaryPredicate subclass, not just the built-in TokenSetBoundary."""
+    """Boundary that never fires."""
 
     def __call__(self, unit_context, subunit_buffer):
         return False
@@ -135,11 +131,7 @@ async def test_multi_token_unit_sampler_timeout(boundary):
 
 
 def test_token_set_boundary_real_token_grain():
-    """TokenSetBoundary fires by BYTE CONTENT, so it works on real-LLM ``Token``
-    subunits, not just the raw-``bytes`` mock grain. A ``Token`` subclasses ``bytes``
-    but hashes by ``token_id``, so plain set membership (``Token in {b" "}``) is
-    False despite matching content -- this guards that regression (the slow-lane
-    cadence and a real-LLM MultiTokenUnitSampler both depend on it)."""
+    """`TokenSetBoundary` matches `Token` subunits by byte content, not by hash."""
     from genlm.control.util import Token
 
     boundary = TokenSetBoundary({b" ", b"!", EOS})
@@ -147,7 +139,7 @@ def test_token_set_boundary_real_token_grain():
     space = Token(220, b" ")
     bang = Token(999, b"!")
     word = Token(31373, b"hello")
-    # Sanity: this is exactly the membership that silently fails without the fix.
+    # `Token` hashes by id, so plain set membership misses it.
     assert space not in {b" "} and space == b" "
 
     assert boundary([], [word, space]) is True  # ends on a boundary Token
@@ -155,7 +147,7 @@ def test_token_set_boundary_real_token_grain():
     assert boundary([], [word]) is False  # non-boundary Token
     assert boundary([], [word, EOS]) is True  # EOS matched by identity
     assert boundary([], []) is False
-    # Raw-bytes grain (the mock path) still works unchanged.
+    # Raw-bytes subunits.
     assert boundary([], [b"hi", b" "]) is True
     assert boundary([], [b"hi"]) is False
 
@@ -235,8 +227,7 @@ async def test_sequence_model_with_multi_token_units():
     ],
 )
 def test_flatten_units(context, expected):
-    """flatten_units recursively flattens (possibly nested) unit contexts:
-    flat, nested, empty, and mixed flat+nested inputs."""
+    """Test flatten_units on flat, nested, empty, and mixed contexts."""
     assert flatten_units(context) == expected
 
 
@@ -509,6 +500,7 @@ def test_cfg_boundary_exception_handling():
 @pytest.mark.parametrize(
     "vocab,weights,boundary,tokens",
     [
+        ([b"a", b" "], [0.3, 0.6, 0.1], TokenSetBoundary({b" "}), [b" "]),
         ([b"h", b" "], [0.4, 0.5, 0.1], TokenSetBoundary({b" "}), [b"h", b" "]),
         (
             [b"a", b"b", b" "],
@@ -525,8 +517,7 @@ def test_cfg_boundary_exception_handling():
     ],
 )
 async def test_weight_accumulation_multi_token_unit(vocab, weights, boundary, tokens):
-    """Unit weight is the product of subunit weights; logp is the sum of subunit
-    logps -- across unit lengths, and both TokenSetBoundary and FixedLengthBoundary."""
+    """Unit weight is the product of subunit weights; logp is the sum of subunit logps."""
     mock_potential = MockPotential(vocab, np.log(weights))
     subunit_sampler = DirectTokenSampler(mock_potential)
     unit_sampler = MultiTokenUnitSampler(

@@ -125,8 +125,7 @@ async def test_with_llm_and_critic_no_twist(llm):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_critic", [False, True])
 async def test_with_llm_early_stop(llm, with_critic):
-    """A sampler answering -inf stops every particle after one step, whether or not a
-    critic sits behind it."""
+    """A -inf sample stops every particle after one step."""
     mtl_llm = llm.spawn_new_eos([b"."])
     n_calls = 0
     n_particles = 10

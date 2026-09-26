@@ -6,15 +6,7 @@ from genlm.control.util import escape
 
 
 def string_for_serialization(ctx):
-    """Serialize a particle's token context to the pipe-joined, escaped string used in
-    the SMC visualization JSON.
-
-    Args:
-        ctx (list): A particle's token context (list of tokens / units).
-
-    Returns:
-        (str): The escaped, pipe-joined string used in the SMC visualization JSON.
-    """
+    """Serialize a token context as the escaped, pipe-joined record string."""
     return "|".join(escape(y) for y in ctx)
 
 
@@ -23,9 +15,8 @@ class SMCRecord:
         self.history = []
         self.most_recent_weights = [0.0 for _ in range(n)]
         self.step_num = 1
-        # Context length each particle has already been recorded up to. A step stores
-        # only what it appended, so the record is linear in sequence length rather
-        # than quadratic; the viewer rebuilds each string along the ancestor chain.
+        # Context length already recorded per particle; each step stores only the
+        # increment, which the viewer rebuilds along the ancestor chain.
         self.recorded_len = [0 for _ in range(n)]
 
     def particle_dict(self, particles):

@@ -2,7 +2,7 @@ import asyncio
 import weakref
 from collections import defaultdict
 
-from genlm.control.potential.base import Potential, VocabTables
+from genlm.control.potential.base import Potential
 from genlm.control.util import (
     LazyWeights,
     join_batch,
@@ -15,13 +15,10 @@ class AutoBatchedPotential(Potential):
     """
     AutoBatchedPotential is a wrapper around a Potential that enables automatic batching of concurrent requests.
 
-    Concurrent calls to instance methods (`complete`, `prefix`, `score`,
-    `logw_next`) meet in a per-event-loop window and execute as one call to the
-    corresponding batch method of the underlying potential (`batch_complete`,
-    `batch_prefix`, `batch_score`, `batch_logw_next`). The window is held open
-    by its first caller until a full event-loop pass adds no new request, then
-    flushed in that caller's own coroutine, so nothing binds to an event loop at
-    construction time.
+    This class collects concurrent requests to instance methods
+    (`complete`, `prefix`, `score`, `logw_next`) and batches them together before
+    delegating to the corresponding batch methods of the underlying potential
+    (`batch_complete`, `batch_prefix`, `batch_score`, `batch_logw_next`).
 
     This class inherits all methods from [`Potential`][genlm.control.potential.base.Potential].
 
@@ -32,17 +29,7 @@ class AutoBatchedPotential(Potential):
     def __init__(self, potential):
         self.potential = potential
         self._batches = weakref.WeakKeyDictionary()  # event loop -> _Batch
-        # A wrapper indexes the same vocabulary as what it wraps, so it reuses those
-        # tables rather than paying O(len(vocab)) to rebuild an identical set.
-        super().__init__(
-            potential.vocab,
-            tables=VocabTables(
-                potential.token_type,
-                potential.eos,
-                potential.vocab_eos,
-                potential.lookup,
-            ),
-        )
+        super().__init__(potential.vocab, tables=potential.tables)
 
     async def _queued(self, batch_method_name, context):
         future = asyncio.get_running_loop().create_future()
@@ -52,8 +39,7 @@ class AutoBatchedPotential(Potential):
         return await future
 
     async def _flush(self, queue):
-        """One call per batch method for the whole batch. Every future is resolved,
-        with its result or with a failure."""
+        """Run each batch method once over its queued requests and resolve every future."""
         groups = defaultdict(list)
         for method_name, context, future in queue:
             groups[method_name].append((context, future))
@@ -76,8 +62,7 @@ class AutoBatchedPotential(Potential):
             except Exception as exc:
                 fail_futures(requests, exc)
             except BaseException as exc:
-                # This flush is unwinding, so nothing else will resolve what it
-                # still owes. Groups already resolved are skipped by `fail_futures`.
+                # Unwinding: nothing else will resolve the futures still pending.
                 for rest in groups.values():
                     fail_futures(rest, batch_abandoned(exc))
                 raise
@@ -95,8 +80,6 @@ class AutoBatchedPotential(Potential):
         return await self._queued("batch_logw_next", context)
 
     async def logw_eos(self, context):
-        # No batch form to queue against, and the wrapped potential may answer far
-        # more cheaply than the default read off a whole `logw_next` row.
         return await self.potential.logw_eos(context)
 
     async def batch_complete(self, contexts):
@@ -114,8 +97,8 @@ class AutoBatchedPotential(Potential):
     def is_terminal_only(self):
         return self.potential.is_terminal_only()
 
-    async def live_logws(self, context):
-        return await self.potential.live_logws(context)
+    async def sparse_logw_next(self, context):
+        return await self.potential.sparse_logw_next(context)
 
     def alloc_rows(self, n, default=float("-inf")):
         return self.potential.alloc_rows(n, default)
@@ -127,8 +110,7 @@ class AutoBatchedPotential(Potential):
         return f"{self.__class__.__name__}({self.potential!r})"
 
     async def cleanup(self):
-        # The window owns nothing to stop; it lives and dies with its callers. The
-        # forward keeps the wrapper transparent to the cleanup chain.
+        """Async cleanup of the wrapped potential."""
         await self.potential.cleanup()
 
 
@@ -136,9 +118,7 @@ def autobatched(potential):
     """
     Return the autobatched view of a potential.
 
-    Memoized on the potential itself, so every call site sharing a potential resolves
-    to the same wrapper and therefore the same batching window, and the wrapper dies
-    with its potential.
+    Memoized on the potential, so every call site shares one wrapper and one batch.
 
     Args:
         potential (Potential): The potential to wrap. `None` passes through, as does

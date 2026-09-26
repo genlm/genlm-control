@@ -75,7 +75,7 @@ async def test_to_autobatched(p1):
     have = p1.to_autobatched()
     assert isinstance(have, AutoBatchedPotential)
     assert have.potential is p1
-    # One door: every route to the wrapper yields THE wrapper (same window).
+    # Every route to the wrapper returns the same instance.
     assert p1.to_autobatched() is have
     assert autobatched(p1) is have
 

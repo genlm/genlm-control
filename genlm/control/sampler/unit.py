@@ -116,7 +116,7 @@ class MultiTokenUnitSampler(TokenSampler):
                 return buffer, logw, logp
             if self.boundary_predicate(context, buffer):
                 return self.boundary_predicate.finalize_unit(buffer), logw, logp
-        # max subunits without a boundary: reject the unit.
+        # Max subunits exceeded: we return -inf weight to reject incomplete/invalid unit
         return buffer, float("-inf"), logp
 
     async def cleanup(self):
@@ -185,9 +185,8 @@ class TokenSetBoundary(BoundaryPredicate):
 
     def __init__(self, boundary_tokens: Iterable):
         self.boundary_tokens = set(boundary_tokens)
-        # A ``Token`` is a bytes subclass that hashes by token_id, so
-        # ``Token(13, b" ") in {b" "}`` is False despite matching bytes and the
-        # boundary would silently never fire. Match byte content, and EOS by identity.
+        # `Token` hashes by token_id, so raw set membership misses equal bytes and the
+        # boundary never fires. Match byte content, and EOS by identity.
         self._eos_boundary = any(
             isinstance(t, EndOfSequence) for t in self.boundary_tokens
         )

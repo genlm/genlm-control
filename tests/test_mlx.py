@@ -4,8 +4,6 @@ import pytest
 
 from genlm.control.potential.built_in.llm import load_model_by_name
 
-# MLX is Apple-silicon only; it cannot be installed on the Linux CI/GPU box, so
-# this backend test only runs where the `mlx` package is importable.
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 
 

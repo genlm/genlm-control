@@ -204,9 +204,7 @@ def test_string_for_serialization():
 
 @pytest.mark.asyncio
 async def test_record_increments_rebuild_each_context():
-    """A step records only what it appended, so a particle's context is the
-    concatenation of its increments along the ancestor chain (the walk the viewer
-    does). Resampling is on, so the fork bookkeeping is exercised."""
+    """Concatenating recorded increments along each ancestor chain rebuilds every context."""
     p = WeightedSet(["0", "00", "1"], [3.0, 2.0, 1.0])
     sampler = SMC(DirectTokenSampler(p))
 
@@ -232,8 +230,7 @@ async def test_record_increments_rebuild_each_context():
             for row, rec in zip(parent, parts)
         ]
 
-    # Every rebuilt row is a prefix of that particle's final serialized context;
-    # a dropped increment, a mis-keyed ancestor, or a bad separator all break this.
+    # Every rebuilt row is a prefix of that particle's final serialized context.
     for row, (context, _) in zip(rebuilt, out):
         final = string_for_serialization(context).split("|") if context else []
         assert row == final[: len(row)], (row, final)

@@ -154,8 +154,7 @@ async def test_spawn_and_repr():
 
 @pytest.mark.asyncio
 async def test_cleanup_is_a_safe_noop():
-    """There is no background task to stop -- the window lives and dies with its
-    callers -- so cleanup() is a no-op, safe to call repeatedly and after use."""
+    """cleanup() is a no-op, safe to call repeatedly and after use."""
     potential = MockPotential()
     autobatched = potential.to_autobatched()
 
@@ -166,8 +165,7 @@ async def test_cleanup_is_a_safe_noop():
 
 
 class SmallPotential(Potential):
-    """Vocab of 4 int tokens with a real (context-length-dependent) logw_next, so
-    concurrent requests produce distinguishable rows."""
+    """Vocab of 4 int tokens with a context-length-dependent logw_next."""
 
     def __init__(self):
         super().__init__([0, 1, 2, 3])
@@ -192,9 +190,7 @@ class SmallPotential(Potential):
 
 
 class AllowAllPotential(Potential):
-    """Zero log-weight everywhere. Doubles as a boolean AWRS condition (0 in
-    log-space) and as a trivial SMC critic; only used to exercise sampler
-    construction, never `.sample()`."""
+    """Zero log-weight everywhere; serves as an AWRS condition or SMC critic."""
 
     def __init__(self, vocab=(0, 1, 2, 3)):
         super().__init__(list(vocab))
@@ -206,8 +202,7 @@ class AllowAllPotential(Potential):
         return 0.0
 
 
-# Constructed at module scope -- before any event loop exists -- to pin that
-# AutoBatchedPotential and the samplers wrapping it never need one at construction.
+# Constructed before any event loop exists; see test_construct_outside_event_loop.
 _module_potential = SmallPotential()
 _module_critic = AllowAllPotential()
 _module_sampler = DirectTokenSampler(_module_potential, autobatch=True)
@@ -276,9 +271,8 @@ def test_smc_seat_default():
 
 @pytest.mark.asyncio
 async def test_trie_set_sampler_wraps_iter_seat_only():
-    """TrieSetSampler wraps only iter_potential by default (one concurrent ask
-    per particle per step); item_potential is never wrapped -- the trie walk
-    asks it sequentially. autobatch=False leaves both seats bare."""
+    """TrieSetSampler wraps only iter_potential by default; autobatch=False leaves
+    both seats bare."""
 
     iter_potential = AllowAllPotential([b"a", b"b"])
     item_potential = AllowAllPotential([97, 98])
@@ -299,8 +293,7 @@ async def test_trie_set_sampler_wraps_iter_seat_only():
 
 @pytest.mark.asyncio
 async def test_construct_outside_event_loop():
-    """The wrapper and the samplers seated on it were constructed at module scope,
-    before any event loop existed; running them later must still work."""
+    """Samplers constructed before any event loop existed run correctly."""
     seqs = await _module_smc(n_particles=4, ess_threshold=0.5, max_tokens=3)
     assert len(seqs) == 4
     await _module_smc.cleanup()
@@ -308,10 +301,8 @@ async def test_construct_outside_event_loop():
 
 @pytest.mark.asyncio
 async def test_concurrent_logw_next_one_batched_call_and_correct_rows():
-    """Concurrent logw_next calls through the wrapper meet in the window and hit
-    the underlying batch_logw_next as ONE call over the whole cohort; the batched
-    [N, V+1] LazyWeights splits back so row i matches the unbatched result for
-    request i (not some other row)."""
+    """Concurrent logw_next calls reach batch_logw_next as one call, and each row
+    matches its unbatched result."""
     potential = SmallPotential()
     wrapped = autobatched(potential)
 
@@ -328,7 +319,7 @@ async def test_concurrent_logw_next_one_batched_call_and_correct_rows():
     want = await asyncio.gather(*(potential.logw_next(c) for c in contexts))
     have = await asyncio.gather(*(wrapped.logw_next(c) for c in contexts))
 
-    assert calls == [len(contexts)]  # exactly one batched call, whole cohort
+    assert calls == [len(contexts)]  # exactly one batched call, whole batch
     for h, w in zip(have, want):
         h.assert_equal(w)
 
@@ -336,9 +327,9 @@ async def test_concurrent_logw_next_one_batched_call_and_correct_rows():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_error_fails_whole_cohort():
-    """An exception raised by the underlying batch method fails every caller
-    in the cohort with that exception -- never silence for some and not others."""
+async def test_concurrent_error_fails_whole_batch():
+    """An exception from the underlying batch method fails every caller in the batch
+    with that exception."""
 
     class ErrorPotential(SmallPotential):
         async def batch_logw_next(self, contexts):
@@ -358,29 +349,10 @@ async def test_concurrent_error_fails_whole_cohort():
     await wrapped.cleanup()
 
 
-@pytest.mark.asyncio
-async def test_spawn_rewraps():
-    """spawn() on the wrapper re-wraps a fresh spawn of the underlying potential,
-    not the same wrapper or the same underlying instance."""
-    potential = SmallPotential()
-    wrapped = autobatched(potential)
-
-    spawned = wrapped.spawn()
-    assert isinstance(spawned, AutoBatchedPotential)
-    assert spawned is not wrapped
-    assert isinstance(spawned.potential, SmallPotential)
-    assert spawned.potential is not potential
-
-    await wrapped.cleanup()
-    await spawned.cleanup()
-
-
 def test_view_covers_potential_surface():
-    """Every public callable on `Potential` must be defined on the view: an
-    inherited base default answers for the WRAPPER instead of the wrapped
-    potential (this silently broke `cleanup`, then `is_terminal_only`). Pure
-    functions of the shared vocab tables are exempt -- the inherited default
-    computes the identical result."""
+    """Every public callable on `Potential` is defined on `AutoBatchedPotential`,
+    except pure functions of the shared vocab tables: an inherited default answers
+    for the wrapper, not the wrapped potential."""
     exempt = {"build_tables", "make_lazy_weights", "alloc_logws"}
     missing = [
         name
@@ -395,8 +367,8 @@ def test_view_covers_potential_surface():
 
 @pytest.mark.asyncio
 async def test_memo_and_flag_forwarding():
-    """One door: `autobatched`, `to_autobatched`, and `spawn` all resolve through
-    the per-instance memo; semantic flags read off the wrapped potential."""
+    """`autobatched` and `to_autobatched` return the same wrapper, whose semantic
+    flags read off the wrapped potential."""
 
     class TerminalOnly(AllowAllPotential):
         def is_terminal_only(self):
@@ -413,9 +385,8 @@ async def test_memo_and_flag_forwarding():
 
 @pytest.mark.asyncio
 async def test_abandoned_batch_fails_co_callers():
-    """A cancelled batch holder must fail its co-callers, not orphan them, and not
-    with its own `CancelledError` -- that would leave their tasks cancelled and
-    skip their `except Exception`."""
+    """A cancelled batch leader fails its co-callers with `BatchAbandoned`, not its
+    own `CancelledError`."""
     potential = autobatched(MockPotential())
     tasks = [asyncio.ensure_future(potential.prefix([1, 2])) for _ in range(3)]
     await asyncio.sleep(0)  # everyone is queued; tasks[0] holds the batch

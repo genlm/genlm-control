@@ -128,8 +128,7 @@ def params(draw, max_size=5, min_p=1e-3):
 @settings(deadline=None, max_examples=25)
 @given(params=params(), normalizing_constant=st.floats(min_value=0.01, max_value=2.0))
 async def test_awrs_is_unbiased(params, normalizing_constant):
-    # normalizing_constant != 1 checks unbiasedness holds even when the potential's
-    # logw_next isn't itself normalized.
+    # normalizing_constant != 1 covers a potential whose logw_next is unnormalized.
     vocab, b_weights, c_weights = params
     c_weights = [w * normalizing_constant for w in c_weights]
     params = (vocab, b_weights, c_weights)
@@ -276,8 +275,7 @@ async def test_awrs_does_not_return_zero_weight_token_is_valid(
         kwargs["max_rejects"] = max_rejects
     sampler = AWRS(**kwargs)
 
-    # Reuse one sampler instance across draws to also exercise state carried
-    # across repeated sample() calls (RNG counter, geometric-vs-recursive cache).
+    # One sampler across draws, so state carried between sample() calls is exercised.
     for _ in range(n_samples):
         tok, logp, _ = await sampler.sample([])
         assert tok in sampler.vocab_eos_set
@@ -578,8 +576,6 @@ def test_monte_carlo_samples_deprecated():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_rejects", [183, None])
 async def test_awrs_example_with_underflow_error(max_rejects):
-    # max_rejects=183 is len(vocab)+1 (i.e. every token), so it's effectively
-    # unbounded here too; both configs are covered for the underflow regression.
     vocab = [bytes([i]) for i in range(182)]
     b_weights = [False] * 56 + [True] + [False] * 126
     c_weights = [0.23929169657812532] * 4 + [0.00023929169657812532] * 179
@@ -620,8 +616,7 @@ async def test_awrs_example_with_underflow_error(max_rejects):
             bytes([1]),
             1000,
         ),
-        # No token is ever valid: the running rejected mass still rounds to
-        # one, but there's no accept to recover -- must stay -inf throughout.
+        # No token is valid: every draw must come back -inf.
         (
             [0],
             [1.00000000e000, 2.22507386e-313],
@@ -712,9 +707,7 @@ class FakeRNG:
 
 
 def _keys_from(rng):
-    """The ``make_keys`` closure the rejection functions now take, drawing the Gumbel noise
-    from a ``FakeRNG`` -- mirrors the old ``logps - log(-log(rng.random((V,))))`` so the
-    controlled walk (and hypothesis' ``assume`` filtering) is byte-for-byte preserved."""
+    """A `make_keys` that draws its Gumbel noise from `rng`."""
 
     def make_keys(logps):
         u = torch.as_tensor(rng.random((len(logps),)), dtype=logps.dtype, device=logps.device)
@@ -867,8 +860,7 @@ async def test_geometric_awrs_validity(logps, accept, rng, max_rejects, max_acce
     not torch.backends.mps.is_available(), reason="requires Apple Silicon"
 )
 def test_make_keys_on_mps():
-    """Rejection keys must draw on whatever device the row is on. MPS has no
-    float64, so the widest uniform available there is float32."""
+    """Rejection keys are drawn on the row's device and in its dtype."""
     vocab = [b"a", b"b"]
     logws = np.log([0.4, 0.4, 0.2])
     sampler = AWRS(MockPotential(vocab, logws), MockPotential(vocab, logws))
@@ -880,8 +872,7 @@ def test_make_keys_on_mps():
 
 
 def test_seed_governs_the_rejection_stream():
-    """`seed=None` means independent, not fixed: two unseeded samplers must not share
-    a key stream, while two samplers under one seed must agree."""
+    """Unseeded samplers draw independent key streams; samplers sharing a seed agree."""
     vocab = [b"a", b"b"]
     logws = np.log([0.4, 0.4, 0.2])
 

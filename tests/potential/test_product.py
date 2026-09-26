@@ -60,8 +60,7 @@ def test_initialization_different_vocab():
 
 
 class _IntVocabPotential(SimplePotential):
-    """A potential with a different token type (int), via a subclass rather
-    than a direct constructor call, to exercise that construction path too."""
+    """A potential with a different token type (int)."""
 
     def __init__(self):
         super().__init__([1, 2, 3])
@@ -150,7 +149,6 @@ async def test_batch_operations(product):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("context", [[b"a", b"b"], [b"b", b"a"]], ids=["ab", "ba"])
 async def test_properties(product, context):
-    # Test that weights are properly combined
     logw_next = await product.logw_next(context)
     assert len(logw_next.weights) == len(product.vocab_eos)
 

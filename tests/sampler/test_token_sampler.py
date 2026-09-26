@@ -121,9 +121,7 @@ def test_direct_token_sampler_proposal_must_be_potential():
 
 
 def test_direct_token_sampler_factory_threads_proposal():
-    """`direct_token_sampler` forwards `proposal` to `DirectTokenSampler`. The
-    default `autobatch=True` wraps both seats in `AutoBatchedPotential`, so
-    identity is checked through the wrapper's `.potential`."""
+    """`direct_token_sampler` forwards `proposal` to `DirectTokenSampler`."""
     from genlm.control.sampler import direct_token_sampler
 
     vocab = [bytes([i]) for i in range(3)]

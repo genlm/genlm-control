@@ -105,9 +105,7 @@ def iter_item_params(draw, max_iter_w=1e3, max_item_w=1e3):
     context = [
         item.encode("utf-8") if isinstance(item, str) else item for item in context
     ]
-    # dict.fromkeys, not set(): a set of string tokens has PYTHONHASHSEED-dependent
-    # iteration order, which permutes the vocab and makes draws nondeterministic
-    # across processes. dict.fromkeys keeps deterministic first-seen order.
+    # dict.fromkeys, not set(): set order of str tokens depends on PYTHONHASHSEED.
     item_vocab = list(dict.fromkeys(item for items in iter_vocab for item in items))
 
     # Sample weights over item vocabulary and EOS.
@@ -147,11 +145,7 @@ class WeightedSet(Potential):
             np.log(total_weight) if total_weight != 0 else float("-inf"),
         )
 
-        # Deterministic vocabulary order: dedupe by first-seen order rather than
-        # via `set(...)`, whose string iteration order is randomized per process
-        # (PYTHONHASHSEED). A hash-dependent vocab permutes the index that the
-        # Gumbel-max draw maps onto, so the same RNG stream would pick different
-        # tokens run-to-run -- breaking any byte-exact token-identity assertion.
+        # dict.fromkeys, not set(): set order of str tokens depends on PYTHONHASHSEED.
         vocab = list(dict.fromkeys(t for seq in sequences for t in seq))
         super().__init__(vocab)
 

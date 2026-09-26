@@ -1,4 +1,4 @@
-# Vendored verbatim from llamppl.inference.resampling (llamppl>=0.2.2).
+# Vendored from llamppl.inference.resampling (llamppl>=0.2.2).
 # Do not modify: RNG consumption order must match llamppl's smc_standard exactly.
 import numpy as np
 

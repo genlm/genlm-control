@@ -192,9 +192,10 @@ async def test_prefix_complete_with_duplicate_token_in_context(llm):
 
 @pytest.mark.asyncio
 async def test_coerced_logw_next_has_duplicate_tokens(llm):
-    """Coercing a BoolFSA onto an LLM with duplicate byte strings succeeds; both
-    tokens sharing a byte string remain independently addressable in the coerced
-    vocab/lookup, and logw_next returns finite weights over the coerced vocab.
+    """logw_next on a coerced FSA should contain entries for duplicate tokens.
+
+    Both tokens sharing a byte string must appear as independent keys in the
+    coerced vocabulary, and logw_next must return valid weights.
     """
     llm.set_prompt_from_str("The answer is")
     fsa = BoolFSA.from_regex(r" (yes|no)")
@@ -253,10 +254,7 @@ async def test_smc_with_duplicate_vocab(llm):
 
 @pytest.mark.asyncio
 async def test_generic_invariants_hold_with_duplicate_vocab(llm):
-    """logw_next/prefix/complete consistency, autoregressive factorization, and
-    batch consistency must all hold for a model with duplicate byte strings --
-    the duplicate tokens must not break any of PromptedLLM's generic invariants.
-    """
+    """The generic potential contract holds for a model with duplicate byte strings."""
     llm.set_prompt_from_str("Once upon")
     context = llm.tokenize(" a time")
     await llm.assert_contract(

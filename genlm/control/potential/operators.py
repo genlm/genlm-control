@@ -62,16 +62,12 @@ class PotentialOps:
             f (callable): A function mapping sequences of tokens from self's vocab to sequences of tokens from other's vocab.
             prune (bool): Whether to prune the coerced potential's vocabulary to only include tokens that can be mapped to the original potential's vocabulary.
                 If `False`, the coerced potential's vocabulary will include all tokens from the target vocabulary.
-            homomorphic (bool | None): Whether `f` distributes over concatenation
-                (enables the trie fast path). `None` probes it; pass `True`/`False`
-                to declare it explicitly. See `Coerced`.
+            homomorphic (bool | None): Whether `f` distributes over concatenation,
+                which enables the trie fast path. `None` probes it. See `Coerced`.
             trie (dict | None): The symbol trie over `(other.vocab, f)`, as built by
                 `Coerced.build_trie`.
             tables (VocabTables | None): Prebuilt tables for `other.vocab`, as built
-                by `Potential.build_tables`. Both `trie` and `tables` are functions of
-                `other`'s vocabulary alone, so coercions onto the same one should build
-                each once and pass it here. Both are incompatible with `prune=True`,
-                which narrows that vocabulary.
+                by `Potential.build_tables`. `trie` and `tables` require `prune=False`.
 
         Returns:
             (Coerced): A Potential that operates on the vocabulary of `other`.
@@ -89,16 +85,14 @@ class PotentialOps:
         )
 
     def to_autobatched(self):
-        """The autobatched view of this potential.
+        """Return a potential instance that automatically batches concurrent requests to the instance methods.
 
-        Concurrent requests to the instance methods meet in a window and run as one batch
-        call. The view is memoized, so every call site resolves to the same wrapper and
-        therefore the same batching window.
+        The wrapper is memoized: repeated calls return the same instance.
 
         See [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential] for more details.
 
         Returns:
-            (AutoBatchedPotential): The memoized autobatched view of this potential.
+            (AutoBatchedPotential): A potential instance that wraps the current potential and automatically batches concurrent requests to the instance methods.
         """
         from genlm.control.potential.autobatch import autobatched
 

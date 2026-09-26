@@ -274,8 +274,7 @@ async def test_vllm_backend():
         engine_opts={"dtype": "float", "gpu_memory_utilization": 0.3},
     )
 
-    # Cleanup releases the engine, so it must outlive every use below --
-    # ``spawn_new_eos`` shares this same model.
+    # Cleanup releases the engine `spawn_new_eos` shares, so it runs after every use.
     try:
         llm.set_prompt_from_str("hello")
         context = llm.tokenize(" world!")
@@ -392,8 +391,7 @@ def test_duplicate_eos_byte_string_includes_all():
     ids=["constructor", "spawn", "spawn_new_eos", "token_mappings"],
 )
 def test_eos_tokens_deprecation(llm, make, expected):
-    """The deprecated `eos_tokens` kwarg is accepted (with DeprecationWarning) by
-    every construction path that takes `eos_byte_strings`."""
+    """Test that the deprecated eos_tokens kwarg works with DeprecationWarning."""
     with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
         result = make(llm)
     assert result.eos_byte_strings == expected

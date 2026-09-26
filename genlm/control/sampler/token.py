@@ -28,9 +28,6 @@ class TokenSampler:
         target (Potential): The potential that samples are properly weighted with respect to.
     """
 
-    # `None` unless the sampler draws from a separate proposal.
-    proposal = None
-
     def __init__(self, target):
         self.target = target
         self.token_type = self.target.token_type
@@ -46,13 +43,11 @@ class TokenSampler:
     async def sample(self, context, draw=None):
         """Sample a token and weight from the `target`potential's vocabulary.
 
-        `draw` is the second positional parameter on every subclass, so a wrapping
-        sampler may forward it positionally. A subclass that cannot honor a custom
-        picker raises rather than ignoring it.
+        A subclass that cannot honor `draw` raises rather than ignoring it.
 
         Args:
             context (list[int]): A sequence of tokens in the `target` potential's vocabulary.
-            draw (callable, optional): A picker over the normalized distribution,
+            draw (callable, optional): A draw over the normalized distribution,
                 replacing the configured one (see `set_draw_method`).
 
         Returns:
@@ -108,10 +103,9 @@ class DirectTokenSampler(TokenSampler):
             share `potential.vocab_eos` (cross-tokenizer not yet supported). When
             `None` (the default), the target acts as its own proposal. The proposal
             must place positive mass on every token the target weights positively.
-        autobatch (bool): Whether to wrap the potential seats in
+        autobatch (bool): Whether to wrap `potential` and `proposal` in
             [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
-            so that concurrent per-particle asks execute as one batched call.
-            Default True; pass False to leave the seats unwrapped.
+            batching concurrent calls across particles. Default True.
 
     Warning:
         Only use this sampler if the potential's `logw_next` method is efficient. This is the case
@@ -237,11 +231,9 @@ class AWRS(TokenSampler):
             correction is applied (matching the `proper_weights=False` contract).
             The proposal must place positive mass on every token the target
             weights positively.
-        autobatch (bool): Whether to wrap the potential seats (potential, condition
-            and proposal) in
+        autobatch (bool): Whether to wrap `potential`, `condition` and `proposal` in
             [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential],
-            so that concurrent per-particle asks execute as one batched call.
-            Default True; pass False to leave the seats unwrapped.
+            batching concurrent calls across particles. Default True.
     """
 
     def __init__(
@@ -331,9 +323,7 @@ class AWRS(TokenSampler):
     def _make_keys(self, logps):
         """Draw Gumbel keys for one round, from this instance's own stream.
 
-        The uniforms are drawn at the widest float the device carries: at float64 a
-        zero draw, which yields an ``-inf`` key, has probability 2^-53. MPS has no
-        float64 and takes float32.
+        Uniforms are float64 (float32 on MPS): a zero uniform yields an `-inf` key.
         """
         device = logps.device
         dtype = torch.float32 if device.type == "mps" else torch.float64
@@ -374,9 +364,7 @@ class AWRS(TokenSampler):
             (token, weight, np.nan): A tuple containing the sampled token, weight, and a dummy value for the log-probability of the sampled token.
 
         Raises:
-            ValueError: If `draw` is supplied. AWRS walks tokens in Gumbel-perturbed
-                weight order, accepting or rejecting each, so there is no categorical
-                draw for a picker to replace.
+            ValueError: If `draw` is supplied; AWRS has no categorical draw to replace.
         """
         if draw is not None:
             raise ValueError(
@@ -411,7 +399,8 @@ class AWRS(TokenSampler):
         logps = lw - logZ  # device [V]
         toks = logws.decode
 
-        # Cache successful calls (geometric_awrs may revisit a token).
+        # We cache successful calls, as algorithms may want to see the
+        # same successful token more than once (currently just geometric_awrs)
         cache = {}
 
         async def cached_accept(tok):
@@ -432,10 +421,24 @@ class AWRS(TokenSampler):
                 make_keys=self._make_keys,
                 max_rejects=self.max_rejects,
             )
-        # geometric_awrs when max_accepts > 2 (recursive_awrs ignores that
-        # parameter), or when the distribution is peaked enough that geometric is
-        # the more efficient of the two.
-        elif self.max_accepts > 2 or float(logps.max()) >= GEOMETRIC_THRESHOLD:
+        # We pick which algorithm to use based on parameters and the
+        # shape of the distribution, as this lets us pick the most
+        # effective option.
+        elif (
+            # If max_accepts is large then recursive_awrs (which
+            # does not currently support this parameter) isn't very
+            # useful, because the recursive step means that you never
+            # revisit the same value, so will often throw away most
+            # of the accepted mass if you were to continue. Also
+            # this parameter is only really relevant if you want to
+            # lower the variance, and geometric_awrs is lower variance.
+            self.max_accepts > 2
+            or
+            # If the distribution is strongly peaked around a single value
+            # then geometric_awrs will be more efficient. See below
+            # for specific derivation.
+            float(logps.max()) >= GEOMETRIC_THRESHOLD
+        ):
             tok, w, _ = await geometric_awrs(
                 logps=logps,
                 toks=toks,
@@ -479,12 +482,10 @@ GEOMETRIC_THRESHOLD = np.log(2 / 3)
 
 
 class _AwrsOrder:
-    """Descending Gumbel-perturbed order over device ``logps``.
+    """Descending Gumbel-perturbed order over device `logps`, built lazily by top-k.
 
-    The order is materialized lazily by ``torch.topk``, so only the walked top-k
-    slice crosses to the CPU checks; a walk past that slice triggers one full sort.
-    ``order[i]`` is the ``(vocab_id, logp)`` of the i-th best, with ``logp == -inf``
-    for a pruned token. ``reject(vid)`` sets a token to -inf for the next round.
+    `order[i]` is the `(vocab_id, logp)` of the i-th best, with `logp == -inf` for a
+    pruned token. `reject(vid)` sets that token's entry in `logps` to -inf in place.
     """
 
     __slots__ = ("_logps", "_keys", "_n", "_ids", "_lvals", "_k")
@@ -516,11 +517,9 @@ class _AwrsOrder:
 
 
 async def improper_sample(*, logps, toks, accept, make_keys, max_rejects):
-    """Run a single rejection loop, returning the first accepted value.
-
-    The sample is not properly weighted. The walk stops at the first pruned token
-    (``logp == -inf``).
-    """
+    """Implements a single rejection sampling loop which returns
+    the first value found with no attempt to make a properly
+    weighted sample."""
     order = _AwrsOrder(logps, make_keys)
     tok = None
     for count in range(len(order)):

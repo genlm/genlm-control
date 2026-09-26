@@ -70,9 +70,7 @@ def test_iter_item_error():
 
 @pytest.mark.asyncio
 async def test_swor_reaches_a_branch_far_below_its_siblings():
-    """A 10-item token carries 10 * log(1e-5) of weight. The trie hands the tracer
-    float32 masses, in which that branch vanishes when subtracted from a sibling worth
-    1e-5, and the enumeration silently stops one token short of the target."""
+    """SWOR enumeration reaches a token whose mass is far below its siblings'."""
     from genlm.control.sampler.token import SetTokenSampler
 
     vocab = [b"\x00", b"\x00" * 10]

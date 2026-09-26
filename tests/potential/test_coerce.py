@@ -63,8 +63,7 @@ async def test_coerced_batch_operations():
     want = np.array([await coerced.prefix(sequence) for sequence in sequences])
     np.testing.assert_array_equal(have, want)
 
-    # batch_score/batch_logw_next vs their non-batch counterparts, via the shared
-    # testing.py helper (rtol/atol=0 since MockPotential's arithmetic is exact).
+    # Covers batch_score and batch_logw_next; MockPotential's arithmetic is exact.
     await coerced.assert_batch_consistency(sequences, rtol=0, atol=0, verbosity=1)
 
 
@@ -143,8 +142,8 @@ def test_coerced_with_token_vocab():
 
 
 class ChartPotential(Potential):
-    """Byte potential on the `_consume` chart lane: the chart is the walk's landing
-    (position, alive), and the support is the set of prefixes of `words`."""
+    """Byte potential on the `_consume` chart lane, optionally with `_advance`; its
+    support is the prefixes of `words`."""
 
     def __init__(self, words, advance=False):
         super().__init__(sorted({b for w in words for b in w}))
@@ -161,7 +160,7 @@ class ChartPotential(Potential):
         return (len(syms), self._live(syms), tuple(syms))
 
     def _advance(self, chart, sym):
-        n, alive, syms = chart
+        n, _, syms = chart
         nxt = syms + (sym,)
         return (n + 1, True, nxt) if self._live(nxt) else None
 
@@ -180,8 +179,7 @@ class ChartPotential(Potential):
 
 @pytest.mark.asyncio
 async def test_advance_lane_matches_consume_lane():
-    """`_advance` threads the chart down the vocab trie and prunes dead subtrees;
-    it must produce exactly the rows the path-rebuilding walk does."""
+    """The `_advance` lane produces the same rows as the `_consume` lane."""
     words = [b"abc", b"abd", b"axy"]
     vocab = [b"a", b"ab", b"abc", b"abd", b"ax", b"axy", b"b", b"zz", b"abz"]
     slow = Coerced(ChartPotential(words), vocab, f=b"".join, prune=False)
@@ -193,16 +191,13 @@ async def test_advance_lane_matches_consume_lane():
         got = await fast.logw_next(context)
         np.testing.assert_array_equal(np.asarray(want.weights), np.asarray(got.weights))
 
-    # The point of threading the chart: dead subtrees are never consumed.
+    # Dead subtrees are never consumed.
     assert fast.potential.consumed < slow.potential.consumed
 
 
 @pytest.mark.asyncio
 async def test_trie_lane_matches_batch_prefix_lane():
-    """The trie walk must reproduce the assumption-free path it is a fast path for:
-    one coerced extension prefix-ed per vocab token. `homomorphic=False` forces that
-    path on an `f` that would otherwise qualify, so both lanes score the same
-    coercion. Dead tokens are absent from the walk and -inf from `batch_prefix`."""
+    """The trie walk matches the per-token `batch_prefix` path that `homomorphic=False` forces."""
     words = [b"abc", b"abd", b"axy"]
     vocab = [b"a", b"ab", b"abc", b"abd", b"ax", b"axy", b"b", b"zz", b"abz"]
     fast = Coerced(ChartPotential(words, advance=True), vocab, f=b"".join, prune=False)
@@ -211,8 +206,8 @@ async def test_trie_lane_matches_batch_prefix_lane():
     )
 
     # Distinct lanes, or this compares the trie walk against itself.
-    assert await fast.live_logws([b"a"]) is not None
-    assert await slow.live_logws([b"a"]) is None
+    assert await fast.sparse_logw_next([b"a"]) is not None
+    assert await slow.sparse_logw_next([b"a"]) is None
 
     # Contexts with a non-zero prefix weight (so the `- ctx_w` shift is exercised) and
     # one whose EOS is finite (`b"abc"` is a complete word).
@@ -224,8 +219,7 @@ async def test_trie_lane_matches_batch_prefix_lane():
 
 @pytest.mark.asyncio
 async def test_trie_lane_batches_sparsely():
-    """On the trie lane `logw_next` is `live_logws`, so the batch is one scattered
-    block rather than a dense row per context -- and must agree row for row."""
+    """On the trie lane, `batch_logw_next` agrees row for row with `logw_next`."""
     contexts = [[], [b"a"], [b"ab"]]
     c = Coerced(
         ChartPotential([b"abc", b"abd"], advance=True),
@@ -233,7 +227,7 @@ async def test_trie_lane_batches_sparsely():
         f=b"".join,
         prune=False,
     )
-    assert await c.live_logws([b"a"]) is not None
+    assert await c.sparse_logw_next([b"a"]) is not None
 
     batched = await c.batch_logw_next(contexts)
     for i, context in enumerate(contexts):

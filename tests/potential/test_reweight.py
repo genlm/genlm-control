@@ -1,5 +1,3 @@
-"""``p ** beta`` and ``p.normalize()``: the two single-parent reweightings."""
-
 import numpy as np
 import pytest
 
@@ -7,8 +5,7 @@ from genlm.control.potential import Potential
 
 
 class Weighted(Potential):
-    """A potential with an arbitrary per-context weight, so the wrappers are checked
-    against something whose ``prefix`` is not itself a sum of normalized steps."""
+    """A potential with an arbitrary, seeded per-context weight."""
 
     def __init__(self, vocab, seed=0):
         super().__init__(vocab)
@@ -65,7 +62,7 @@ async def test_tempered_scales(p):
 
 @pytest.mark.asyncio
 async def test_tempered_keeps_hard_zeros():
-    """``-inf * 0`` must stay ``-inf``, not become ``nan``: a mask is not resurrected."""
+    """Tempering by `0` keeps `-inf` weights at `-inf`, not `nan`."""
 
     class Masked(Potential):
         async def complete(self, context):
@@ -83,8 +80,7 @@ async def test_tempered_keeps_hard_zeros():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("beta", [0.0, 0.5, -1.0])
 async def test_tempered_scalar_and_batched_agree_on_minus_inf(beta):
-    """``beta * -inf`` is ``nan`` at ``beta == 0``, so the two lanes must share one
-    guard or a masked context reads a different score depending on which is called."""
+    """Scalar and batched tempered scores agree on `-inf` contexts."""
 
     class Masked(Potential):
         async def complete(self, context):
@@ -117,15 +113,13 @@ async def test_normalized_rows_sum_to_one(p):
 
 @pytest.mark.asyncio
 async def test_normalized_start_weight_is_the_inner_prefix(p):
-    """``prefix([])`` spans no step, so it is untouched -- what a sampler's
-    ``start_weight`` reads."""
+    """`normalize()` leaves `prefix([])` unchanged."""
     assert await p.normalize().prefix([]) == pytest.approx(await p.prefix([]))
 
 
 @pytest.mark.asyncio
 async def test_normalized_honours_an_overridden_prefix():
-    """``normalize()`` subtracts the spanned normalizers from the potential's OWN
-    ``prefix``; it must not rebuild that prefix out of per-step weights."""
+    """`normalize()` subtracts the spanned normalizers from the potential's own `prefix`."""
 
     class OwnPrefix(Weighted):
         async def prefix(self, context):
@@ -143,8 +137,7 @@ async def test_normalized_honours_an_overridden_prefix():
 
 @pytest.mark.asyncio
 async def test_collapsed_support_carries_no_weight():
-    """The point of the local product: a step where the mask leaves one live token
-    contributes nothing, instead of the LM's log-probability for that token."""
+    """Under `normalize()`, a step with one live token contributes zero weight."""
 
     class Peaked(Potential):
         async def complete(self, context):
@@ -154,7 +147,7 @@ async def test_collapsed_support_carries_no_weight():
             return -3.0 * len(context)
 
     class OnlyA(Potential):
-        """Forces ``b"a"`` and never terminates, so exactly one token stays live."""
+        """Forces `b"a"` and never terminates, so exactly one token stays live."""
 
         async def complete(self, context):
             return float("-inf")

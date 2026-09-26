@@ -1,30 +1,54 @@
 # Performance Optimizations
 
-The `genlm-control` library offers two key performance optimizations for instances of the `Potential` class:
+The main levers for the speed of a `genlm-control` program are:
 
-- **Autobatching**: Automatically batches concurrent requests to the potential's instances methods
+- **Backend choice**: Which inference engine serves the language model
+- **Auto-batching**: Concurrent requests to a potential's instance methods execute as one batch call (on by default)
+- **Concurrent SMC runs**: Independent inference problems share the same batches
 - **Multiprocessing**: Runs multiple instances of a `Potential` in parallel across CPU cores
 
 
+## Choosing a backend
+
+`PromptedLLM.from_name` takes `backend="vllm"`, `"hf"`, or `"mlx"`. The default is `vllm` when CUDA is available and `hf` otherwise.
+
+- **vllm** (GPU): The fastest. The engine keeps one request per live context, so extending a context by one token appends to its request instead of re-prefilling it, and concurrent requests run as one forward.
+- **mlx** (Apple silicon): Keeps the KV cache of the previous batch and extends it when the next batch continues it.
+- **hf** (transformers): Runs anywhere; the slowest.
+
+```python
+llm = PromptedLLM.from_name("meta-llama/Llama-3.2-1B", backend="vllm")
+```
+
 ## Auto-batching
 
-Auto-batching improves performance when a `Potential` class's batch methods (`batch_complete`,  `batch_prefix`, `batch_logw_next`, `batch_score`) are more efficient than sequentially running individual instance methods.
+Concurrent calls to a potential's instance methods (`complete`, `prefix`, `logw_next`, `score`) can execute as one call to the corresponding batch method (`batch_complete`, `batch_prefix`, `batch_logw_next`, `batch_score`). During SMC every particle makes these calls at every step, so batching turns N calls into one: for a language model, one forward over N contexts; for any other potential, whatever its batch methods save over N single calls.
 
-### Usage
+This is on by default. `DirectTokenSampler` and `AWRS` wrap the potentials they are given, `EagerSetSampler` and `TopKSetSampler` wrap their iterable potential, and `SMC` wraps its critic, each in an [`AutoBatchedPotential`][genlm.control.potential.autobatch]. The wrapper collects the calls made during one pass of the event loop and dispatches them together; nothing runs in the background. Each of these takes `autobatch=False` to opt out.
 
-To enable auto-batching, use the `to_autobatched()` method:
+A potential used outside a sampler or `SMC` can be wrapped by hand with `to_autobatched()`:
 
 ```python
 autobatched_potential = potential.to_autobatched()
-# Use it exactly like a regular potential - batching happens automatically
 results = await asyncio.gather(
-    *(autobatched.complete(seq) for seq in sequences) # These will batched and processed by batch_complete
+    *(autobatched_potential.complete(seq) for seq in sequences)  # one batch_complete call
 )
 ```
 
-This creates a new potential that is a wrapper ([`AutoBatchedPotential`][genlm.control.potential.autobatch]) around the original potential. The wrapper automatically collects concurrent requests in the background and processes them together using the potential's batch methods. This happens transparently without requiring changes to your code structure.
+Wrapping is memoized on the potential, so wrapping an already-wrapped potential returns the same wrapper.
 
-`SMC` and the token samplers already wrap what they hold, so a critic or a sampler seat is batched without this call. Both take an `autobatch=False` flag to opt out. Wrapping is memoized on the potential, so wrapping an already-wrapped potential is a no-op.
+Auto-batching only helps when the batch methods are faster than the single calls they replace. The defaults on `Potential` call the single method once per input, so a custom potential should implement the batch methods; the sentiment critic in [Getting Started](getting_started.md#autobatching) is an example.
+
+## Concurrent SMC runs
+
+One `SMC` call is one inference problem. Problems run concurrently share their batches: their particles' calls meet in the same auto-batched dispatch and the same backend forward, so running several under `asyncio.gather` costs close to running one. This holds when the runs share a language model instance; spawned copies with different prompts do.
+
+```python
+sequences_a, sequences_b = await asyncio.gather(
+    sampler_a.smc(n_particles=10, ess_threshold=0.5, max_tokens=30),
+    sampler_b.smc(n_particles=10, ess_threshold=0.5, max_tokens=30),
+)
+```
 
 ## Multiprocessing
 
@@ -57,7 +81,7 @@ In the batched case, requests within a batch are processed in parallel across wo
 
 ## When to use each optimization
 
-> **Note:** Built-in `Potential` classes that can benefit from auto-batching support (e.g., `PromptedLLM`) will have auto-batching enabled by default.
+> **Note:** Language model requests are also batched at the backend: concurrent `next_token_logprobs` requests to one model run as one forward whether or not they arrive through an `AutoBatchedPotential`.
 
 - Use auto-batching when the potential's batch operations are more efficient than sequential operations
 - Use multiprocessing when the potential's operations are compute-intensive and can benefit from parallel processing
