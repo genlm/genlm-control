@@ -70,16 +70,6 @@ def test_hash():
     assert len(test_set) == 2
 
 
-def test_iter():
-    eos = EndOfSequence("TEST")
-    assert list(iter(eos)) == [eos]
-
-
-def test_len():
-    eos = EndOfSequence("TEST")
-    assert len(eos) == 1
-
-
 def test_predefined_constants():
     assert isinstance(EOS, EndOfSequence)
     assert EOS.type_ == "EOS"

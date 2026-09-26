@@ -7,6 +7,9 @@ import requests
 from pathlib import Path
 from genlm.control.viz import InferenceVisualizer
 
+# Tests bind fixed ports 8000/8001; under `--dist loadgroup` the group keeps them on one worker.
+pytestmark = pytest.mark.xdist_group("viz")
+
 
 @pytest.fixture
 def mocker(request):
@@ -36,7 +39,7 @@ def test_data():
             "mode": "init",
             "particles": [
                 {
-                    "contents": "<<<>>>b'h'",
+                    "contents_incr": "h",
                     "logweight": "-11.892930183943907",
                     "weight_incr": "-11.892930183943907",
                 }

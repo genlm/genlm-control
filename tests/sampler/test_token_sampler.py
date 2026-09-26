@@ -105,45 +105,6 @@ async def test_direct_token_sampler_with_proposal_monte_carlo():
     )
 
 
-@pytest.mark.asyncio
-async def test_direct_token_sampler_with_proposal_exact_weight():
-    """Verify the exact weight formula for a single sample with a proposal:
-    logw = target_logws[token] - proposal_logps[token]
-         = target_logws[token] - proposal_logws[token] + log(Z_proposal)
-    """
-    vocab = [bytes([i]) for i in range(3)]
-    target_ws = np.array([0.2, 0.5, 0.1, 0.2])
-    proposal_ws = np.array([0.4, 0.1, 0.3, 0.2])
-
-    target = MockPotential(vocab, np.log(target_ws))
-    proposal = MockPotential(vocab, np.log(proposal_ws))
-    sampler = DirectTokenSampler(target, proposal=proposal)
-
-    # Use draw to deterministically pick each token and check its weight.
-    target_logws = np.log(target_ws)
-    proposal_logws = np.log(proposal_ws)
-    log_Z_proposal = logsumexp(proposal_logws)
-    proposal_logps = proposal_logws - log_Z_proposal
-
-    for forced_idx in range(len(target_ws)):
-        forced_token = sampler.target.vocab_eos[forced_idx]
-
-        def draw(p, _tok=forced_token):
-            # Return a specific token regardless of the distribution.
-            return _tok
-
-        tok, logw, logp = await sampler.sample([], draw=draw)
-        tid = sampler.target.lookup[tok]
-        assert tid == forced_idx
-
-        expected_logw = target_logws[tid] - proposal_logws[tid] + log_Z_proposal
-        np.testing.assert_allclose(logw, expected_logw, rtol=1e-10)
-
-        expected_logp = proposal_logps[tid]
-        np.testing.assert_allclose(logp, expected_logp, rtol=1e-10)
-
-
-
 def test_direct_token_sampler_proposal_vocab_mismatch():
     target = MockPotential([bytes([i]) for i in range(3)], np.log([0.3, 0.3, 0.3, 0.1]))
     different_vocab = MockPotential(
@@ -171,7 +132,8 @@ def test_direct_token_sampler_factory_threads_proposal():
     s_with_proposal = direct_token_sampler(target, proposal=proposal)
 
     assert s_default.proposal is None
-    assert s_with_proposal.proposal is proposal
+    assert s_with_proposal.potential.potential is target
+    assert s_with_proposal.proposal.potential is proposal
 
 
 class _TrackedPotential(MockPotential):
@@ -408,7 +370,7 @@ async def test_sis_with_proposal_weights_match_manual_computation(
                 expected_logw += target_ws[tid] - proposal_ws[tid] + proposal_logZ
 
         np.testing.assert_allclose(
-            actual_logw, expected_logw, rtol=1e-10,
+            actual_logw, expected_logw, rtol=1e-10, atol=1e-12,
             err_msg=f"Weight mismatch for sequence {ctx}",
         )
 

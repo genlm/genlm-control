@@ -105,10 +105,8 @@ def iter_item_params(draw, max_iter_w=1e3, max_item_w=1e3):
     context = [
         item.encode("utf-8") if isinstance(item, str) else item for item in context
     ]
-    item_vocab = set()
-    for items in iter_vocab:
-        item_vocab.update(items)
-    item_vocab = list(item_vocab)
+    # dict.fromkeys, not set(): set order of str tokens depends on PYTHONHASHSEED.
+    item_vocab = list(dict.fromkeys(item for items in iter_vocab for item in items))
 
     # Sample weights over item vocabulary and EOS.
     item_next_token_ws = draw(
@@ -147,7 +145,9 @@ class WeightedSet(Potential):
             np.log(total_weight) if total_weight != 0 else float("-inf"),
         )
 
-        super().__init__(list(set(t for seq in sequences for t in seq)))
+        # dict.fromkeys, not set(): set order of str tokens depends on PYTHONHASHSEED.
+        vocab = list(dict.fromkeys(t for seq in sequences for t in seq))
+        super().__init__(vocab)
 
     async def complete(self, context):
         return self.complete_logws.get(tuple(context), float("-inf"))
@@ -212,7 +212,9 @@ class Tracer:
         cur = self.cur
 
         if cur.child_masses is None:
-            cur.child_masses = cur.mass * p
+            # float64: the trie hands back float32, in which a branch worth 1e-50
+            # is annihilated by subtraction from a sibling worth 1e-5 and never drawn.
+            cur.child_masses = cur.mass * np.asarray(p, dtype=np.float64)
             cur.context = context
 
         if context != cur.context:

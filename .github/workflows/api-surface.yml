@@ -37,8 +37,10 @@ jobs:
           # Report-only: `|| true` keeps the step (and check) green even on breaks.
           python -m griffe check genlm.control -s . -a "origin/${{ github.base_ref }}" > /tmp/griffe.txt 2>&1 || true
 
+          # The check is report-only, so every API call is best-effort: a GitHub
+          # outage must not turn a passing surface report red.
           cid=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq ".[] | select(.body|contains(\"$MARKER\")) | .id" | head -1)
+                --jq ".[] | select(.body|contains(\"$MARKER\")) | .id" 2>/dev/null | head -1 || true)
 
           if [ -s /tmp/griffe.txt ]; then
             {
@@ -58,9 +60,9 @@ jobs:
               echo '```'
             } > /tmp/comment.md
             if [ -n "$cid" ]; then
-              gh api --method PATCH "repos/$REPO/issues/comments/$cid" -F body=@/tmp/comment.md >/dev/null
+              gh api --method PATCH "repos/$REPO/issues/comments/$cid" -F body=@/tmp/comment.md >/dev/null || true
             else
-              gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@/tmp/comment.md >/dev/null
+              gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@/tmp/comment.md >/dev/null || true
             fi
           else
             echo "No breaking public-API changes detected. ✅" >> "$GITHUB_STEP_SUMMARY"

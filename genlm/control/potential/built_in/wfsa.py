@@ -2,13 +2,16 @@ import string
 import warnings
 
 import numpy as np
-from arsenal.maths import logsumexp
+from collections import OrderedDict
 
 from genlm.grammar import Float, Log, WFSA as BaseWFSA
 from genlm.grammar.semiring import Boolean
+from genlm.control.util import logsumexp
 from genlm.grammar.lark_interface import interegular_to_wfsa
 
 from genlm.control.potential.base import Potential
+
+_DEFAULT_CACHE_MAXSIZE = 8_000_000
 
 
 def _float_to_boolean(wfsa):
@@ -39,12 +42,15 @@ class WFSA(Potential):
         wfsa (genlm_grammar.WFSA): The weighted finite state automaton used for potential calculations.
     """
 
-    def __init__(self, wfsa):
+    def __init__(self, wfsa, cache_maxsize=_DEFAULT_CACHE_MAXSIZE):
         """
         Initializes the WFSA potential.
 
         Args:
             wfsa (genlm_grammar.WFSA): The weighted finite state automaton.
+            cache_maxsize (int): Max number of prefix charts held in the LRU cache.
+                Set it above one decode step's working set (particles times
+                vocabulary trie nodes), or prefix sharing thrashes.
 
         Raises:
             ValueError: If the semiring of the provided WFSA is not Float or Log.
@@ -60,8 +66,14 @@ class WFSA(Potential):
         else:
             self.wfsa = wfsa
 
-        self.cache = {(): self.wfsa.epsremove.start}
+        self._init_cache(cache_maxsize)
         super().__init__(vocabulary=list(self.wfsa.alphabet))
+
+    def _init_cache(self, cache_maxsize):
+        """Initialize the prefix-chart LRU; the empty-prefix chart is held outside it."""
+        self._start_chart = self.wfsa.epsremove.start
+        self._cache_maxsize = cache_maxsize
+        self.cache = OrderedDict()
 
     @classmethod
     def from_regex(cls, pattern, charset=None, to_bytes=True):
@@ -109,22 +121,36 @@ class WFSA(Potential):
         return new
 
     def _consume(self, bs):
-        # XXX implement cache eviction
         bs = tuple(bs)
+        if not bs:
+            return self._start_chart
 
-        try:
-            return self.cache[bs]
-        except KeyError:
-            pass
+        cache = self.cache
+        curr = cache.get(bs)
+        if curr is not None:
+            cache.move_to_end(bs)
+            return curr
+
+        # Iterative: the prefix chain is as long as the context, so recursion overflows the stack.
+        n = len(bs) - 1
+        while n > 0 and bs[:n] not in cache:
+            n -= 1
+        if n:
+            cache.move_to_end(bs[:n])
+            prev = cache[bs[:n]]
+        else:
+            prev = self._start_chart
 
         wfsa = self.wfsa.epsremove
-        curr = wfsa.R.chart()
-        prev = self._consume(bs[:-1])
-        for i in prev:
-            for j, w in wfsa.arcs(i, bs[-1]):
-                curr[j] += prev[i] * w
-
-        self.cache[bs] = curr
+        for k in range(n, len(bs)):
+            curr = wfsa.R.chart()
+            for i in prev:
+                for j, w in wfsa.arcs(i, bs[k]):
+                    curr[j] += prev[i] * w
+            cache[bs[: k + 1]] = curr
+            if len(cache) > self._cache_maxsize:
+                cache.popitem(last=False)
+            prev = curr
 
         return curr
 
@@ -146,19 +172,33 @@ class WFSA(Potential):
         # TODO: optimize to use _consume cache
         return self.wfsa(context).score
 
+    def _chart_prefix_logw(self, chart):
+        """Prefix log weight of a `chart`; `-inf` if the chart is dead."""
+        if not chart:
+            return float("-inf")
+        bkwd = self.wfsa.epsremove.backward
+        log_ctx_w = logsumexp([(chart[i] * bkwd[i]).score for i in chart])
+        return float("-inf") if np.isnan(log_ctx_w) else log_ctx_w
+
+    def _logw_next_from_chart(self, chart, log_ctx_w):
+        """Next-token and EOS log weights from a `chart` (as `_consume` returns) and its
+        prefix log weight `log_ctx_w`."""
+        bkwd = self.wfsa.epsremove.backward
+        ws = self.wfsa.R.chart()
+        for i in chart:
+            for b, j, w in self.wfsa.epsremove.arcs(i=i):
+                ws[b] += chart[i] * w * bkwd[j]
+
+        ws[self.eos] = self.wfsa.R.zero
+        for j, w in self.wfsa.epsremove.F:
+            ws[self.eos] += chart[j] * w
+
+        log_ws = np.array([ws[b].score for b in self.vocab_eos]) - log_ctx_w
+        return self.make_lazy_weights(log_ws)
+
     def _prefix(self, context):
         curr = self._consume(context)
-
-        if not curr:
-            return float("-inf"), curr
-
-        bkwd = self.wfsa.epsremove.backward
-        log_ctx_w = logsumexp([(curr[i] * bkwd[i]).score for i in curr])
-
-        if np.isnan(log_ctx_w):
-            return float("-inf"), curr
-
-        return log_ctx_w, curr
+        return self._chart_prefix_logw(curr), curr
 
     async def prefix(self, context):
         """
@@ -189,24 +229,26 @@ class WFSA(Potential):
             (LazyWeights): Log-weights for next token and EOS.
         """
         log_ctx_w, curr = self._prefix(context)
-
         if log_ctx_w == float("-inf"):
             raise ValueError(f"Context {context!r} has zero weight.")
+        return self._logw_next_from_chart(curr, log_ctx_w)
 
-        bkwd = self.wfsa.epsremove.backward
+    async def logw_eos(self, context):
+        """Returns the EOS log weight given `context`."""
+        return float(await self.complete(context) - await self.prefix(context))
 
-        ws = self.wfsa.R.chart()
-        for i in curr:
-            for b, j, w in self.wfsa.epsremove.arcs(i=i):
-                ws[b] += curr[i] * w * bkwd[j]
+    # Sync by contract: `Coerced.sparse_logw_next` calls these per trie node.
 
-        ws[self.eos] = self.wfsa.R.zero
+    def prefix_logw(self, chart):
+        """Log prefix weight of a `chart` from `_consume`; `-inf` if dead."""
+        return float(self._chart_prefix_logw(chart))
+
+    def complete_logw(self, chart):
+        """Log complete weight of a `chart` from `_consume`."""
+        acc = self.wfsa.R.zero
         for j, w in self.wfsa.epsremove.F:
-            ws[self.eos] += curr[j] * w
-
-        log_ws = np.array([ws[b].score for b in self.vocab_eos]) - log_ctx_w
-
-        return self.make_lazy_weights(log_ws)
+            acc += chart[j] * w
+        return float(acc.score)
 
     def _repr_svg_(self):
         return self.wfsa._repr_svg_()
@@ -216,10 +258,10 @@ class WFSA(Potential):
 
     def spawn(self):
         cls = type(self)
-        return cls(wfsa=self.wfsa)
+        return cls(wfsa=self.wfsa, cache_maxsize=self._cache_maxsize)
 
     def clear_cache(self):
-        self.cache = {(): self.wfsa.epsremove.start}
+        self.cache = OrderedDict()
 
 
 class BoolFSA(WFSA):
@@ -230,19 +272,20 @@ class BoolFSA(WFSA):
     unsound because ``Log.star`` is partial).
     """
 
-    def __init__(self, wfsa):
+    def __init__(self, wfsa, cache_maxsize=_DEFAULT_CACHE_MAXSIZE):
         """Initialize the BoolFSA from a WFSA.
 
         Args:
             wfsa (genlm_grammar.WFSA): A Float, Log, or Boolean WFSA.
                 Float is converted to Log; Boolean is kept as-is.
+            cache_maxsize (int): See `WFSA`.
         """
         if wfsa.R is Boolean:
             self.wfsa = wfsa
-            self.cache = {(): self.wfsa.epsremove.start}
+            self._init_cache(cache_maxsize)
             Potential.__init__(self, vocabulary=list(self.wfsa.alphabet))
         else:
-            super().__init__(wfsa)
+            super().__init__(wfsa, cache_maxsize=cache_maxsize)
 
     @classmethod
     def from_regex(cls, pattern, charset=None, to_bytes=True, semiring="boolean"):
@@ -278,16 +321,20 @@ class BoolFSA(WFSA):
             wfsa = _float_to_boolean(wfsa)
         return cls(wfsa)
 
+    def _bool_prefix_logw(self, chart):
+        """Boolean prefix weight of a chart: 0 if any co-accessible state, else -inf."""
+        bkwd = self.wfsa.epsremove.backward
+        return 0.0 if any(bkwd[i].score for i in chart) else float("-inf")
+
+    def _bool_complete_logw(self, chart):
+        """Boolean complete weight of a chart: 0 if any accepting state, else -inf."""
+        finals = dict(self.wfsa.epsremove.F)
+        return 0.0 if any(i in finals and finals[i].score for i in chart) else float("-inf")
+
     def _prefix(self, context):
         if self.wfsa.R is Boolean:
             curr = self._consume(context)
-            if not curr:
-                return float("-inf"), curr
-            bkwd = self.wfsa.epsremove.backward
-            for i in curr:
-                if bkwd[i].score:  # i is co-accessible
-                    return 0.0, curr
-            return float("-inf"), curr
+            return self._bool_prefix_logw(curr), curr
         return super()._prefix(context)
 
     async def prefix(self, context):
@@ -316,18 +363,22 @@ class BoolFSA(WFSA):
             (float): ``0`` if accepted, ``-inf`` otherwise.
         """
         if self.wfsa.R is Boolean:
-            curr = self._consume(context)
-            if not curr:
-                return float("-inf")
-            finals = dict(self.wfsa.epsremove.F)
-            for i in curr:
-                if i in finals and finals[i].score:
-                    return 0.0
-            return float("-inf")
+            return self._bool_complete_logw(self._consume(context))
         complete_w = await super().complete(context)
         if complete_w > float("-inf"):
             return 0
         return float("-inf")
+
+    @staticmethod
+    def _booleanize(logw_next):
+        """Map `LazyWeights` to 0 where alive, -inf elsewhere."""
+        w = logw_next.weights
+        return logw_next.spawn(new_weights=np.where(w > float("-inf"), 0, w))
+
+    @staticmethod
+    def _bool(w):
+        """Scalar analogue of `_booleanize`: 0 if alive, -inf otherwise."""
+        return 0.0 if w > float("-inf") else float("-inf")
 
     async def logw_next(self, context):
         """Per-token admissibility log weights given `context`.
@@ -355,12 +406,19 @@ class BoolFSA(WFSA):
                     out[self.lookup[self.eos]] = 0.0
                     break
             return self.make_lazy_weights(out)
-        logw_next = await super().logw_next(context)
-        return logw_next.spawn(
-            new_weights=np.where(
-                logw_next.weights > float("-inf"), 0, logw_next.weights
-            )
-        )
+        return self._booleanize(await super().logw_next(context))
+
+    def prefix_logw(self, chart):
+        """Boolean prefix weight of a cached chart (0 if alive, else -inf)."""
+        if self.wfsa.R is Boolean:
+            return self._bool_prefix_logw(chart)
+        return self._bool(super().prefix_logw(chart))
+
+    def complete_logw(self, chart):
+        """Boolean complete weight of a cached chart (0 if accepting, else -inf)."""
+        if self.wfsa.R is Boolean:
+            return self._bool_complete_logw(chart)
+        return self._bool(super().complete_logw(chart))
 
     async def batch_logw_next(self, contexts):
         """Per-token admissibility log weights for a batch of contexts.
@@ -369,19 +427,9 @@ class BoolFSA(WFSA):
             contexts (list): The list of contexts.
 
         Returns:
-            (list): List of ``LazyWeights``, one per context.
+            (LazyWeights): Batched admissibility weights, `.weights` of shape `[N, V+1]`.
         """
-        if self.wfsa.R is Boolean:
-            return [await self.logw_next(c) for c in contexts]
-        logw_nexts = await super().batch_logw_next(contexts)
-        return [
-            logw_next.spawn(
-                new_weights=np.where(
-                    logw_next.weights > float("-inf"), 0, logw_next.weights
-                )
-            )
-            for logw_next in logw_nexts
-        ]
+        return self._booleanize(await super().batch_logw_next(contexts))
 
     def __repr__(self):
         return f"BoolFSA(wfsa={self.wfsa!r})"

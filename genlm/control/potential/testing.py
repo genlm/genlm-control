@@ -1,6 +1,8 @@
 import asyncio
 import numpy as np
 
+from genlm.control.util import to_numpy
+
 
 class PotentialTests:
     """A mixin class providing testing utilities for validating Potential implementations.
@@ -29,6 +31,37 @@ class PotentialTests:
         "red": "\033[91m",
         "reset": "\033[0m",
     }
+
+    async def assert_contract(
+        self, contexts, batch_contexts=None, rtol=1e-3, atol=1e-5, top=None, verbosity=0
+    ):
+        """Assert `logw_next` consistency and the autoregressive factorization at each
+        context, and batch consistency over `batch_contexts`.
+
+        Args:
+            contexts (list): Contexts to check individually.
+            batch_contexts (list): Contexts for the batch check. Defaults to
+                `contexts`; pass `[]` to skip the batch check.
+            rtol (float): Relative tolerance for floating point comparison.
+            atol (float): Absolute tolerance for floating point comparison.
+            top (int): If specified, only check the top-k tokens by log weight.
+            verbosity (int): Verbosity level.
+
+        Raises:
+            AssertionError: If any of the three properties does not hold.
+        """
+        for context in contexts:
+            await self.assert_logw_next_consistency(
+                context, rtol=rtol, atol=atol, top=top, verbosity=verbosity
+            )
+            await self.assert_autoreg_fact(
+                context, rtol=rtol, atol=atol, verbosity=verbosity
+            )
+        group = contexts if batch_contexts is None else batch_contexts
+        if group:
+            await self.assert_batch_consistency(
+                group, rtol=rtol, atol=atol, verbosity=verbosity
+            )
 
     async def assert_logw_next_consistency(
         self, context, rtol=1e-3, atol=1e-5, top=None, verbosity=0, method_args=()
@@ -73,7 +106,9 @@ class PotentialTests:
         for i, (want, have) in enumerate(zip(wants, haves)):
             abs_diff, rel_diff = self._compute_diff(want, have)
             info = (want, have, abs_diff, rel_diff, tokens[i])
-            (valids if abs_diff <= atol and rel_diff <= rtol else errors).append(info)
+            # Equal infinities compare equal; an inf/finite mismatch does not.
+            ok = np.isclose(have, want, rtol=rtol, atol=atol)
+            (valids if ok else errors).append(info)
 
         if valids and verbosity > 0:
             print(
@@ -133,7 +168,7 @@ class PotentialTests:
         )
 
         abs_diff, rel_diff = self._compute_diff(want, have)
-        if abs_diff > atol or rel_diff > rtol:
+        if not np.isclose(have, want, rtol=rtol, atol=atol):
             error_msg = (
                 f"{self.colors['red']}Factorization not satisfied for context {context!r}:{self.colors['reset']}\n"
                 + self._format_diff(want, have, abs_diff, rel_diff, atol, rtol)
@@ -176,9 +211,10 @@ class PotentialTests:
 
         for i, context in enumerate(contexts):
             logw_next = await self.logw_next(context, *method_args)
+            batch_row = to_numpy(batch_logw_nexts.weights[i])
             try:
                 np.testing.assert_allclose(
-                    batch_logw_nexts[i].weights, logw_next.weights, rtol=rtol, atol=atol
+                    batch_row, to_numpy(logw_next.weights), rtol=rtol, atol=atol
                 )
                 if verbosity > 0:
                     print(
@@ -186,13 +222,13 @@ class PotentialTests:
                     )
                     print(
                         f"{self.colors['green']}Non-batched: {logw_next.weights}\n"
-                        + f"{self.colors['green']}Batched:     {batch_logw_nexts[i].weights}{self.colors['reset']}\n"
+                        + f"{self.colors['green']}Batched:     {batch_row}{self.colors['reset']}\n"
                     )
             except AssertionError:
                 raise AssertionError(
                     f"{self.colors['red']}Batch logw_next mismatch for context {context}:{self.colors['reset']}\n"
                     + f"{self.colors['green']}Non-batched: {logw_next.weights}\n"
-                    + f"{self.colors['red']}Batched:     {batch_logw_nexts[i].weights}{self.colors['reset']}"
+                    + f"{self.colors['red']}Batched:     {batch_row}{self.colors['reset']}"
                 )
 
             score = await self.score(context, *method_args)

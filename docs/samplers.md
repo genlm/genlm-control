@@ -113,6 +113,16 @@ topk_sampler = topk_token_sampler(llm, fsa, K=10)
 eager_sampler = eager_token_sampler(llm, fsa)
 ```
 
+## Draw methods
+
+`DirectTokenSampler` and `SetTokenSampler` draw the token with a process-wide draw method, `gumbel_max` by default. `set_draw_method` switches it, by name (`"gumbel_max"`, `"multinomial"`, `"inverse_cdf"`) or to any `(logps) -> index` callable. All three draw the same categorical and differ only in how they consume the torch RNG, so `torch.manual_seed` is what makes draws reproducible. `inverse_cdf` uses one uniform per row, which makes it the choice for common-random-number comparisons across runs.
+
+```python
+from genlm.control import set_draw_method
+
+set_draw_method("inverse_cdf")
+```
+
 ## Sampler Selection Guide for Controlled Generation
 
 The following table provides general guidelines for selecting a sampler in the context of controlled generation from an LLM. Note that the best sampler may vary depending on the specific controlled generation task.

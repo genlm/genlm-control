@@ -172,32 +172,23 @@ sequences = await token_sampler.smc(
 sequences.decoded_posterior
 ```
 
-## Optimizing with Autobatching
+## Autobatching
 
-Finally, we can optimize performance using autobatching. During generation, all requests to the sentiment analysis potential are made to the instance methods (`prefix`, `complete`). We can take advantage of the fact that we have parallelized batch versions of these methods using the [`to_autobatched`][genlm.control.potential.operators.PotentialOps.to_autobatched] method.
+During generation, every particle requests a score from the sentiment analysis potential
+through the instance methods (`prefix`, `complete`). Because the potential also has
+parallelized batch versions of those methods, those concurrent calls can execute as a
+single batched call.
+
+`SMC` does this for you: the critic is wrapped in
+[`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential]
+unless you pass `autobatch=False`. The runs above were already batched. To see what
+it buys, turn it off:
 
 ```python
 from arsenal.timer import timeit
+from genlm.control import SMC
 
-# Create an autobatched version of the critic
-# This creates a new potential that automatically batches concurrent
-# requests to the instance methods (`prefix`, `complete`, `logw_next`)
-# and processes them using the batch methods (`batch_complete`, `batch_prefix`, `batch_logw_next`).
-autobatched_critic = critic.to_autobatched()
-
-# Run SMC with timing for comparison
 with timeit("Timing sentiment-guided sampling with autobatching"):
-    sequences = await token_sampler.smc(
-        n_particles=10,
-        max_tokens=25,
-        ess_threshold=0.5,
-        critic=autobatched_critic, # Pass the autobatched critic to the SMC sampler
-    )
-
-sequences.decoded_posterior
-
-# The autobatched version should be significantly faster than this version
-with timeit("Timing sentiment-guided sampling without autobatching"):
     sequences = await token_sampler.smc(
         n_particles=10,
         max_tokens=25,
@@ -206,4 +197,17 @@ with timeit("Timing sentiment-guided sampling without autobatching"):
     )
 
 sequences.decoded_posterior
+
+# The batched version should be significantly faster than this one.
+with timeit("Timing sentiment-guided sampling without autobatching"):
+    sequences = await SMC(token_sampler, critic, autobatch=False)(
+        n_particles=10,
+        max_tokens=25,
+        ess_threshold=0.5,
+    )
+
+sequences.decoded_posterior
 ```
+
+A potential used outside `SMC` can be wrapped by hand with
+[`to_autobatched`][genlm.control.potential.operators.PotentialOps.to_autobatched].
