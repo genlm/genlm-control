@@ -10,7 +10,7 @@ from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "gpt2"
+    return "openai-community/gpt2"
 
 
 # Cap vLLM's GPU share so this engine fits beside others in the process;

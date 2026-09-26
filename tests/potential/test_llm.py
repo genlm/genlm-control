@@ -55,7 +55,7 @@ def llm_config(request):
 @pytest.fixture(scope="module")
 def llm(llm_config):
     backend, opts = llm_config
-    return PromptedLLM.from_name("gpt2", backend=backend, **opts)
+    return PromptedLLM.from_name("openai-community/gpt2", backend=backend, **opts)
 
 
 @pytest.mark.asyncio
@@ -269,7 +269,7 @@ async def test_vllm_backend():
     # Note though that any differences between backends are encapsulated in the AsyncLM class, which
     # is tested in genlm_backend, so we shouldn't expect any significant differences in testing outcomes.
     llm = PromptedLLM.from_name(
-        "gpt2",
+        "openai-community/gpt2",
         backend="vllm",
         engine_opts={"dtype": "float", "gpu_memory_utilization": 0.3},
     )

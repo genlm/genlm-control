@@ -56,7 +56,7 @@ class MockLLM(PromptedLLM):
 
 @pytest.fixture(scope="module")
 def llm():
-    return PromptedLLM.from_name("gpt2", temperature=0.7, backend="hf")
+    return PromptedLLM.from_name("openai-community/gpt2", temperature=0.7, backend="hf")
 
 
 @pytest.fixture(scope="module")
@@ -212,7 +212,7 @@ async def test_example(canonical_potential, llm, text):
 
 def test_from_llm_extract_merges_slow_tokenizer():
     """Test that merges are extracted correctly from a slow tokenizer (using bpe_ranks)."""
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2", use_fast=False)
+    tokenizer = GPT2Tokenizer.from_pretrained("openai-community/gpt2", use_fast=False)
     mock_llm = MockLLM(tokenizer)  # MockLLM needs to handle token_maps now
     if mock_llm.token_maps is None:  # Handle case where super init was skipped
         pytest.skip(

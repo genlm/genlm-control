@@ -42,7 +42,7 @@ This example demonstrates how to constrain an LLM using a regular expression.
 from genlm.control import PromptedLLM, BoolFSA, AWRS
 
 # Create a language model potential.
-llm = PromptedLLM.from_name("gpt2")
+llm = PromptedLLM.from_name("openai-community/gpt2")
 llm.set_prompt_from_str("Here is my honest opinion:")
 
 # Create a finite-state automaton potential using a regular expression.
