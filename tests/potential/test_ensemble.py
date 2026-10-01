@@ -9,6 +9,7 @@ from genlm.control import (
     Potential,
     PromptedLLM,
     convert_to_weighted_logop,
+    direct_token_sampler,
     EOS,
 )
 from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt, Sequences
@@ -80,6 +81,34 @@ async def test_ensemble_batch_logw_next(mock_potential_1, mock_potential_2):
     ensemble = Ensemble(mock_potential_1, mock_potential_2, op="prod", a=0.5)
     results = await ensemble.batch_logw_next([[], ["a"]])
     assert results.weights.shape == (2, len(ensemble.vocab_eos))
+    expected = 0.5 * mock_potential_1.next_token_logws + 0.5 * (
+        mock_potential_2.next_token_logws
+    )
+    for row in results.weights:
+        np.testing.assert_allclose(row, expected)
+
+
+@pytest.mark.asyncio
+async def test_ensemble_logw_eos(mock_potential_1, mock_potential_2):
+    """Test logw_eos combines both potentials' EOS weights."""
+    ensemble = Ensemble(mock_potential_1, mock_potential_2, op="prod", a=0.5)
+    logw = await ensemble.logw_eos(["a"])
+    np.testing.assert_allclose(logw, np.log(0.001))
+
+
+@pytest.mark.asyncio
+async def test_ensemble_smc_forces_eos_at_max_tokens(
+    mock_potential_1, mock_potential_2
+):
+    """Test SMC over a token-level ensemble terminates at max_tokens."""
+    ensemble = Ensemble(mock_potential_1, mock_potential_2, op="prod", a=0.5)
+    sampler = direct_token_sampler(ensemble)
+    sequences = await sampler.smc(n_particles=4, ess_threshold=0.5, max_tokens=3)
+    assert len(sequences) == 4
+    for ctx, logw in zip(sequences.contexts, sequences.log_weights):
+        assert ctx[-1] is EOS
+        assert len(ctx) <= 3
+        assert np.isfinite(logw)
 
 
 @pytest.mark.asyncio
@@ -499,18 +528,15 @@ async def test_byte_ensemble_sampler_sample():
     )
     sampler = ByteEnsembleTokenSampler(ensemble, n_particles=3)
     token, logw, logp = await sampler.sample([])
-    assert isinstance(token, (int, bytes))
+    assert isinstance(token, int) and 0 <= token < 256
     assert isinstance(logw, (int, float, np.number))
     assert isinstance(logp, (int, float, np.number))
     assert np.isfinite(logw)
     assert np.isfinite(logp)
-    if isinstance(token, int):
-        next_context_bytes = bytes([token])
-    else:
-        next_context_bytes = token
-
-    assert next_context_bytes in ensemble.data_dict_1
-    assert next_context_bytes in ensemble.data_dict_2
+    assert bytes([token]) in ensemble.data_dict_1
+    assert bytes([token]) in ensemble.data_dict_2
+    assert (token,) in sampler.prefix_cache_1
+    assert (token,) in sampler.prefix_cache_2
 
 
 @pytest.mark.asyncio
@@ -531,7 +557,7 @@ async def test_byte_ensemble_weighted_different_prompts():
 
     sampler = ByteEnsembleTokenSampler(ensemble, n_particles=2)
     token, logw, logp = await sampler.sample([])
-    assert isinstance(token, (int, bytes))
+    assert token is EOS or isinstance(token, int)
     assert np.isfinite(logw)
 
 
@@ -703,16 +729,30 @@ async def test_byte_ensemble_token_sampler_start_weight():
 
 @pytest.mark.asyncio
 async def test_byte_ensemble_sampler_eos_handling():
-    """Test ByteEnsembleTokenSampler properly handles EOS tokens and max_tokens."""
+    """Test ByteEnsembleTokenSampler.logw_eos weighs and records forced EOS."""
     llm = load_model_by_name("openai-community/gpt2", backend="hf")
     ensemble = await ByteEnsemble.create(
         llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
     )
     sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
-    _, _, _ = await sampler.sample([])
-    if len(sampler.particle_prefix_log_prob_1) > 0:
-        assert len(sampler.particle_prefix_log_prob_1) >= 0
-        assert len(sampler.particle_prefix_log_prob_2) >= 0
+    token, _, _ = await sampler.sample([])
+    assert token is not EOS
+    logw = await sampler.logw_eos([token])
+    assert np.isfinite(logw)
+    assert np.isfinite(sampler.particle_prefix_log_prob_1[(token, EOS)])
+    assert np.isfinite(sampler.particle_prefix_log_prob_2[(token, EOS)])
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_sampler_draw_not_supported():
+    """Test ByteEnsembleTokenSampler rejects a custom draw."""
+    llm = load_model_by_name("openai-community/gpt2", backend="hf")
+    ensemble = await ByteEnsemble.create(
+        llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
+    )
+    sampler = ByteEnsembleTokenSampler(ensemble)
+    with pytest.raises(NotImplementedError):
+        await sampler.sample([], draw=lambda probs: 0)
 
 
 @pytest.mark.asyncio
@@ -920,3 +960,58 @@ async def test_byte_ensemble_sampler_smc_calls_ensemble_smc():
             pass
         else:
             raise
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_smc_records_weights_for_every_particle():
+    """Test every particle, EOS-sampled or forced at max_tokens, gets model weights."""
+    gpt2 = load_model_by_name("openai-community/gpt2")
+    ensemble = await ByteEnsemble.create(
+        gpt2, gpt2, "prod", b"The cat", b"A dog", a=0.5, K=3
+    )
+    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=3)
+    result = await sampler.smc(n_particles=3, ess_threshold=0.5, max_tokens=4)
+    assert isinstance(result, SequencesExt)
+    for ctx in result.contexts:
+        assert ctx[-1] is EOS
+        assert len(ctx) <= 4
+    assert np.all(np.isfinite(result.log_weights))
+    assert np.all(np.isfinite(result.log_prefix_weights_1))
+    assert np.all(np.isfinite(result.log_prefix_weights_2))
+
+
+@pytest.mark.parametrize("op", ["sum", "prod", "harmonic", "min", "max", "pm0.5", "p2"])
+@pytest.mark.parametrize("a", [0.3, 0.5, 0.7])
+def test_ops_zero_weights_give_neginf_not_nan(op, a):
+    """Test ops combine -inf (zero weight) entries without producing nan."""
+    fn = convert_to_weighted_logop(op, a)
+    x = np.array([-1.0, -np.inf, -np.inf, -1.0])
+    y = np.array([-2.0, -np.inf, -1.0, -np.inf])
+    result = fn(x, y)
+    assert not np.any(np.isnan(result))
+    assert result[1] == -np.inf
+    assert fn(-np.inf, -np.inf) == -np.inf
+
+
+def test_weighted_max_equal_weights_ignores_zero_term():
+    """Test weighted max at a=0.5 is the plain max even with a -inf input."""
+    fn = convert_to_weighted_logop("max", a=0.5)
+    np.testing.assert_allclose(fn(np.array([-np.inf]), np.array([-1.0])), [-1.0])
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_sum_samples_with_finite_weights():
+    """Test a non-prod byte ensemble samples properly (genlm-bytes' EOT slot is -inf)."""
+    gpt2 = load_model_by_name("openai-community/gpt2")
+    ensemble = await ByteEnsemble.create(
+        gpt2, gpt2, "sum", b"The cat", b"A dog", a=0.5, K=3
+    )
+    sampler = ByteEnsembleTokenSampler(ensemble)
+    _, _, _, proposal_weights = (await sampler._next_weights([]))[1:]
+    assert not np.any(np.isnan(proposal_weights))
+    tokens = set()
+    for _ in range(10):
+        token, logw, logp = await sampler.sample([])
+        assert np.isfinite(logw) and np.isfinite(logp)
+        tokens.add(token)
+    assert len(tokens) > 1

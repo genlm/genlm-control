@@ -418,11 +418,30 @@ def _weighted_extremum(func, a: float):
 
     def extremum(x, y, a):
         if a <= 0.5:
-            return (1 - 2 * a) * x + 2 * a * func(x, y)
+            other, coef, ext = x, 1 - 2 * a, 2 * a * func(x, y)
         else:
-            return (2 * a - 1) * y + 2 * (1 - a) * func(x, y)
+            other, coef, ext = y, 2 * a - 1, 2 * (1 - a) * func(x, y)
+        # At a=0.5 the other term vanishes; skip it so 0 * -inf doesn't give nan.
+        return ext if coef == 0 else coef * other + ext
 
     return lambda x, y: extremum(x, y, a)
+
+
+def _neginf_for_nan(op: Callable):
+    """Map nan results of `op` to -inf.
+
+    The log-space means produce nan only by combining infinities, e.g. two -inf
+    inputs, where the mean of zero weights is zero (-inf in log space).
+    """
+
+    def safe(x, y):
+        with np.errstate(invalid="ignore"):
+            result = op(x, y)
+        if np.ndim(result) == 0:
+            return float("-inf") if np.isnan(result) else result
+        return np.where(np.isnan(result), -np.inf, result)
+
+    return safe
 
 
 _POWER_MEANS = {
@@ -500,7 +519,7 @@ def convert_to_weighted_logop(
 
     # Ensemble operations
     if op in _POWER_MEANS:
-        return _power_mean(_POWER_MEANS[op], a)
+        return _neginf_for_nan(_power_mean(_POWER_MEANS[op], a))
 
     operations = {
         "sum": lambda x, y: logsumexp([x + log_a, y + log_1_minus_a], axis=0),
@@ -511,7 +530,7 @@ def convert_to_weighted_logop(
     }
 
     if op in operations:
-        return operations[op]
+        return _neginf_for_nan(operations[op])
 
     valid_ops = list(operations.keys()) + list(_POWER_MEANS.keys())
     raise ValueError(
