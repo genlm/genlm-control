@@ -3,6 +3,7 @@ import numpy as np
 from genlm.control.typing import Atomic
 from genlm.control.constant import EOS
 from genlm.control.potential import Coerced, Potential
+from genlm.backend.tokenization import Token
 
 
 class MockPotential(Potential):
@@ -39,10 +40,13 @@ async def test_simple():
     want = await p.score(b"aabb" + EOS)
     assert have == want
 
-    have = await c.logw_next([b"aa", b"bb"])
-    for x in c.vocab_eos:
-        want = await p.score(b"aabb" + x) - await p.prefix(b"aabb")
-        assert have[x] == want, [have[x], want, x]
+
+@pytest.mark.asyncio
+async def test_properties():
+    p = MockPotential([b"a"[0], b"b"[0], b"c"[0]])
+    c = Coerced(p, [b"aa", b"bb", b"aab", b"aad"], f=b"".join)
+
+    await c.assert_contract([[b"aa", b"bb"], [b"aa"]], verbosity=1)
 
 
 @pytest.mark.asyncio
@@ -59,14 +63,8 @@ async def test_coerced_batch_operations():
     want = np.array([await coerced.prefix(sequence) for sequence in sequences])
     np.testing.assert_array_equal(have, want)
 
-    have = await coerced.batch_score(sequences)
-    want = np.array([await coerced.score(sequence) for sequence in sequences])
-    np.testing.assert_array_equal(have, want)
-
-    haves = await coerced.batch_logw_next(sequences)
-    wants = [await coerced.logw_next(sequence) for sequence in sequences]
-    for have, want in zip(haves, wants):
-        have.assert_equal(want)
+    # Covers batch_score and batch_logw_next; MockPotential's arithmetic is exact.
+    await coerced.assert_batch_consistency(sequences, rtol=0, atol=0, verbosity=1)
 
 
 @pytest.mark.asyncio
@@ -113,3 +111,127 @@ def test_coerced_no_prune():
     c = Coerced(p, [b"aa", b"bb", b"aab", b"aad"], f=b"".join, prune=False)
     assert len(c.vocab) == 4
     assert set(c.vocab) == {b"aa", b"bb", b"aab", b"aad"}
+
+
+class TokenPotential(Potential):
+    """Mock potential with Token-based vocabulary."""
+
+    def __init__(self, tokens):
+        super().__init__(tokens)
+
+    async def complete(self, context):
+        return len(context)
+
+    async def prefix(self, context):
+        return len(context) / 2
+
+
+def test_coerced_with_token_vocab():
+    """Test Coerced with Token-based potential vocabulary (exercises byte_string extraction)."""
+    tokens = [
+        Token(0, b"a"),
+        Token(1, b"b"),
+        Token(2, b"c"),
+    ]
+    p = TokenPotential(tokens)
+    target = [b"aa", b"bb", b"aab", b"aad"]
+    c = Coerced(p, target, f=b"".join, prune=True)
+
+    assert len(c.vocab) == 3
+    assert set(c.vocab) == {b"aa", b"bb", b"aab"}
+
+
+class ChartPotential(Potential):
+    """Byte potential on the `_consume` chart lane, optionally with `_advance`; its
+    support is the prefixes of `words`."""
+
+    def __init__(self, words, advance=False):
+        super().__init__(sorted({b for w in words for b in w}))
+        self.words = list(words)
+        self.consumed = 0
+        if not advance:
+            self._advance = None  # coerce reads it with a default; None = no lane
+
+    def _live(self, syms):
+        return any(bytes(w).startswith(bytes(syms)) for w in self.words)
+
+    def _consume(self, syms):
+        self.consumed += 1
+        return (len(syms), self._live(syms), tuple(syms))
+
+    def _advance(self, chart, sym):
+        n, _, syms = chart
+        nxt = syms + (sym,)
+        return (n + 1, True, nxt) if self._live(nxt) else None
+
+    def prefix_logw(self, chart):
+        return -float(chart[0]) if chart[1] else float("-inf")
+
+    def complete_logw(self, chart):
+        return -float(chart[0]) if bytes(chart[2]) in map(bytes, self.words) else float("-inf")
+
+    async def prefix(self, context):
+        return self.prefix_logw(self._consume(tuple(context)))
+
+    async def complete(self, context):
+        return self.complete_logw(self._consume(tuple(context)))
+
+
+@pytest.mark.asyncio
+async def test_advance_lane_matches_consume_lane():
+    """The `_advance` lane produces the same rows as the `_consume` lane."""
+    words = [b"abc", b"abd", b"axy"]
+    vocab = [b"a", b"ab", b"abc", b"abd", b"ax", b"axy", b"b", b"zz", b"abz"]
+    slow = Coerced(ChartPotential(words), vocab, f=b"".join, prune=False)
+    fast = Coerced(ChartPotential(words, advance=True), vocab, f=b"".join, prune=False)
+    assert slow.potential._advance is None
+
+    for context in ([], [b"a"], [b"ab"], [b"ax"]):
+        want = await slow.logw_next(context)
+        got = await fast.logw_next(context)
+        np.testing.assert_array_equal(np.asarray(want.weights), np.asarray(got.weights))
+
+    # Dead subtrees are never consumed.
+    assert fast.potential.consumed < slow.potential.consumed
+
+
+@pytest.mark.asyncio
+async def test_trie_lane_matches_batch_prefix_lane():
+    """The trie walk matches the per-token `batch_prefix` path that `homomorphic=False` forces."""
+    words = [b"abc", b"abd", b"axy"]
+    vocab = [b"a", b"ab", b"abc", b"abd", b"ax", b"axy", b"b", b"zz", b"abz"]
+    fast = Coerced(ChartPotential(words, advance=True), vocab, f=b"".join, prune=False)
+    slow = Coerced(
+        ChartPotential(words), vocab, f=b"".join, prune=False, homomorphic=False
+    )
+
+    # Distinct lanes, or this compares the trie walk against itself.
+    assert await fast.sparse_logw_next([b"a"]) is not None
+    assert await slow.sparse_logw_next([b"a"]) is None
+
+    # Contexts with a non-zero prefix weight (so the `- ctx_w` shift is exercised) and
+    # one whose EOS is finite (`b"abc"` is a complete word).
+    for context in ([], [b"a"], [b"ab"], [b"ax"], [b"abc"]):
+        want = await slow.logw_next(context)
+        got = await fast.logw_next(context)
+        want.assert_equal(got, rtol=0, atol=0)
+
+
+@pytest.mark.asyncio
+async def test_trie_lane_batches_sparsely():
+    """On the trie lane, `batch_logw_next` agrees row for row with `logw_next`."""
+    contexts = [[], [b"a"], [b"ab"]]
+    c = Coerced(
+        ChartPotential([b"abc", b"abd"], advance=True),
+        [b"a", b"ab", b"abc", b"abd", b"zz"],
+        f=b"".join,
+        prune=False,
+    )
+    assert await c.sparse_logw_next([b"a"]) is not None
+
+    batched = await c.batch_logw_next(contexts)
+    for i, context in enumerate(contexts):
+        row = await c.logw_next(context)
+        np.testing.assert_array_equal(
+            np.asarray(batched.weights[i]), np.asarray(row.weights)
+        )

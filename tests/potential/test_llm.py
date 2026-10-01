@@ -1,10 +1,14 @@
+import asyncio
+import inspect
 import pytest
 import torch
 import numpy as np
 from arsenal.maths import logsumexp
 from hypothesis import given, strategies as st, settings, reject
 
+from genlm.backend.tokenization import Token
 from genlm.control.potential.built_in import PromptedLLM
+from genlm.control.potential.built_in.llm import TokenMappings
 
 # pytest.mark.asyncio seems to cause issues with hypothesis
 # and the vllm backend, so we use asyncio.run here.
@@ -51,7 +55,7 @@ def llm_config(request):
 @pytest.fixture(scope="module")
 def llm(llm_config):
     backend, opts = llm_config
-    return PromptedLLM.from_name("gpt2", backend=backend, **opts)
+    return PromptedLLM.from_name("openai-community/gpt2", backend=backend, **opts)
 
 
 @pytest.mark.asyncio
@@ -62,11 +66,11 @@ async def test_prompt_setting(llm, pre_prompt):
     # Test ids setter
     llm.prompt_ids = pre_prompt_ids
     assert llm.prompt_ids == pre_prompt_ids
-    assert b"".join(llm.prompt).decode() == pre_prompt
+    assert b"".join(t.byte_string for t in llm.prompt).decode() == pre_prompt
 
     # Test str setter
     llm.set_prompt_from_str(pre_prompt)
-    assert b"".join(llm.prompt).decode() == pre_prompt
+    assert b"".join(t.byte_string for t in llm.prompt).decode() == pre_prompt
     assert llm.prompt_ids == pre_prompt_ids
 
 
@@ -106,18 +110,17 @@ async def test_properties(llm, pre_prompt, context, temp):
     context = llm.tokenize(context)
     llm.temperature = temp
 
-    await llm.assert_logw_next_consistency(context, top=10, rtol=0.01, atol=1e-3)
-    await llm.assert_autoreg_fact(context, rtol=0.01, atol=1e-3)
+    await llm.assert_contract([context], batch_contexts=[], top=10, rtol=0.01, atol=1e-3)
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!", b"?"])
-    await new_llm.assert_logw_next_consistency(context, top=10, rtol=0.01, atol=1e-3)
-    await new_llm.assert_autoreg_fact(context, rtol=0.01, atol=1e-3)
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!", b"?"])
+    await new_llm.assert_contract([context], batch_contexts=[], top=10, rtol=0.01, atol=1e-3)
 
 
 @pytest.mark.asyncio
 @settings(deadline=None, max_examples=50)
 @given(st.lists(st.text(min_size=1), min_size=1, max_size=4))
 async def test_batch_consistency(llm, contexts):
+    llm.prompt_ids = llm.model.tokenizer.encode("test")
     contexts = [llm.tokenize(context) for context in contexts]
     await llm.assert_batch_consistency(contexts, rtol=1e-3, atol=1e-3)
 
@@ -148,21 +151,23 @@ def eos_test_params(draw):
 @given(eos_test_params())
 async def test_new_eos_tokens(llm, params):
     with pytest.raises(
-        ValueError, match="Cannot reset eos_tokens after initialization"
+        ValueError, match="Cannot reset eos_byte_strings after initialization"
     ):
-        llm.eos_tokens = []
+        llm.eos_byte_strings = []
 
     eos_token_ids, context_ids, prompt_ids = params
     llm.prompt_ids = prompt_ids
-    eos_tokens = [llm.token_maps.decode[x] for x in eos_token_ids]
-    new_llm = llm.spawn_new_eos(eos_tokens=eos_tokens)
-    assert new_llm.eos_tokens == eos_tokens
+    eos_bs = [llm.token_maps.decode[x].byte_string for x in eos_token_ids]
+    new_llm = llm.spawn_new_eos(eos_byte_strings=eos_bs)
+    assert new_llm.eos_byte_strings == eos_bs
 
     new_llm.temperature = 1.0
 
     assert new_llm.prompt_ids == prompt_ids  # check prompt_ids is not changed
     assert new_llm.token_maps.eos_idxs == eos_token_ids
-    assert set(new_llm.token_maps.decode) - set(eos_tokens) == set(new_llm.vocab)
+    vocab_bytes = {token.byte_string for token in new_llm.vocab}
+    decode_bytes = {token.byte_string for token in new_llm.token_maps.decode}
+    assert decode_bytes - set(eos_bs) == vocab_bytes
 
     context = new_llm.decode_tokens(context_ids)
     have = await new_llm.complete(context)
@@ -174,25 +179,37 @@ def test_invalid_eos_tokens(llm):
     # Test EOS token not in vocabulary
     invalid_eos = [b"THIS_TOKEN_DOES_NOT_EXIST"]
     with pytest.raises(ValueError, match="EOS token not in language model vocabulary"):
-        llm.spawn_new_eos(eos_tokens=invalid_eos)
+        llm.spawn_new_eos(eos_byte_strings=invalid_eos)
 
     # Test duplicate EOS tokens
-    duplicate_eos = [llm.token_maps.decode[0], llm.token_maps.decode[0]]
-    with pytest.raises(ValueError, match="Duplicate eos tokens"):
-        llm.spawn_new_eos(eos_tokens=duplicate_eos)
+    duplicate_eos = [
+        llm.token_maps.decode[0].byte_string,
+        llm.token_maps.decode[0].byte_string,
+    ]
+    with pytest.raises(ValueError, match="Duplicate eos byte strings"):
+        llm.spawn_new_eos(eos_byte_strings=duplicate_eos)
 
-    # Test attempting to modify eos_tokens directly
+    # Test attempting to modify eos_byte_strings directly
     with pytest.raises(
-        ValueError, match="Cannot reset eos_tokens after initialization"
+        ValueError, match="Cannot reset eos_byte_strings after initialization"
     ):
-        llm.eos_tokens = [llm.token_maps.decode[0]]
+        llm.eos_byte_strings = [llm.token_maps.decode[0].byte_string]
 
 
-def test_invalid_token_encoding(llm):
-    # Test encoding invalid tokens
-    invalid_tokens = [b"INVALID_TOKEN"]
-    with pytest.raises(ValueError, match="Token .* not in vocabulary"):
-        llm.encode_tokens(invalid_tokens)
+def test_eos_accepts_token_object(llm):
+    """A `Token` as EOS is coerced to bytes and recognised (used to raise
+    "EOS token not in language model vocabulary")."""
+    tok = llm.vocab[5]
+    new_llm = llm.spawn_new_eos(eos_byte_strings=[tok])
+    assert type(new_llm.eos_byte_strings[0]) is bytes
+    assert tok.token_id in new_llm.token_maps.eos_idxs
+
+
+def test_eos_token_and_equal_bytes_are_duplicates(llm):
+    """A `Token` and its equal plain bytes are the same EOS by content."""
+    tok = llm.vocab[5]
+    with pytest.raises(ValueError, match="Duplicate eos byte strings"):
+        llm.spawn_new_eos(eos_byte_strings=[tok, bytes(tok)])
 
 
 def test_prompt_from_str_invalid_type(llm):
@@ -218,7 +235,7 @@ def test_spawn(llm):
     assert new_llm.token_maps == llm.token_maps
     assert new_llm.vocab == llm.vocab
 
-    new_llm = llm.spawn(eos_tokens=[b"!"], temperature=1.0)
+    new_llm = llm.spawn(eos_byte_strings=[b"!"], temperature=1.0)
     assert new_llm.token_maps.eos_idxs == [0]
     assert new_llm.temperature == 1.0
     assert new_llm.prompt_ids == llm.prompt_ids
@@ -227,19 +244,22 @@ def test_spawn(llm):
 
 def test_providing_eos_tokens_and_token_maps(llm):
     with pytest.raises(
-        ValueError, match="eos_tokens must not be provided when token_maps is provided."
+        ValueError, match="eos_byte_strings must not be provided when token_maps is provided."
     ):
         PromptedLLM(
             llm.model,
             prompt_ids=llm.prompt_ids,
-            eos_tokens=[b"!"],
+            eos_byte_strings=[b"!"],
             token_maps=llm.token_maps,
         )
 
 
 def test_to_autobatched(llm):
-    with pytest.raises(ValueError, match="PromptedLLMs are autobatched by default"):
-        llm.to_autobatched()
+    from genlm.control.potential.autobatch import AutoBatchedPotential
+
+    wrapped = llm.to_autobatched()
+    assert isinstance(wrapped, AutoBatchedPotential)
+    assert wrapped.potential is llm
 
 
 @pytest.mark.asyncio
@@ -249,36 +269,187 @@ async def test_vllm_backend():
     # Note though that any differences between backends are encapsulated in the AsyncLM class, which
     # is tested in genlm_backend, so we shouldn't expect any significant differences in testing outcomes.
     llm = PromptedLLM.from_name(
-        "gpt2",
+        "openai-community/gpt2",
         backend="vllm",
-        engine_opts={"dtype": "float", "gpu_memory_utilization": 0.5},
+        engine_opts={"dtype": "float", "gpu_memory_utilization": 0.3},
     )
 
-    llm.set_prompt_from_str("hello")
-    context = llm.tokenize(" world!")
+    # Cleanup releases the engine `spawn_new_eos` shares, so it runs after every use.
+    try:
+        llm.set_prompt_from_str("hello")
+        context = llm.tokenize(" world!")
 
-    await llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await llm.assert_batch_consistency(
-        [context, llm.tokenize(" world")], rtol=1e-3, atol=1e-3
-    )
+        await llm.assert_contract(
+            [context],
+            batch_contexts=[context, llm.tokenize(" world")],
+            top=10,
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
-    new_llm = llm.spawn_new_eos(eos_tokens=[b"!"])
-    assert new_llm.token_maps.eos_idxs == [0]
-    assert new_llm.token_maps.decode[0] == b"!"
+        new_llm = llm.spawn_new_eos(eos_byte_strings=[b"!"])
+        assert new_llm.token_maps.eos_idxs == [0]
+        assert new_llm.token_maps.decode[0].byte_string == b"!"
 
-    context = llm.tokenize(" world")
-    await new_llm.assert_logw_next_consistency(context, top=10, rtol=1e-3, atol=1e-3)
-    await new_llm.assert_autoreg_fact(context, rtol=1e-3, atol=1e-3)
-    await new_llm.assert_batch_consistency(
-        [context, llm.tokenize(" worlds")], rtol=1e-3, atol=1e-3
-    )
-
-
-def test_llm_repr(llm):
-    repr(llm)
+        context = llm.tokenize(" world")
+        await new_llm.assert_contract(
+            [context],
+            batch_contexts=[context, llm.tokenize(" worlds")],
+            top=10,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+    finally:
+        cleanup = getattr(llm.model, "cleanup", None)
+        if cleanup is not None:
+            res = cleanup()
+            if inspect.isawaitable(res):
+                await res
 
 
 def test_prompt_warning(llm):
     with pytest.warns(UserWarning):
         llm.set_prompt_from_str("hello ")
+
+
+def test_encode_tokens_with_bytes(llm):
+    """Test that encode_tokens works with bytes (deprecated path) and issues warning."""
+    token = llm.vocab[0]
+    byte_string = token.byte_string
+
+    with pytest.warns(
+        DeprecationWarning, match="Passing bytes to encode_tokens is deprecated"
+    ):
+        result = llm.encode_tokens([byte_string])
+
+    assert result == [token.token_id]
+
+
+def test_encode_tokens_invalid_bytes(llm):
+    """Test that encode_tokens raises error for invalid bytes."""
+    with pytest.raises(ValueError, match="Token .* not in vocabulary"):
+        llm.encode_tokens([b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"])
+
+
+@pytest.mark.parametrize("key_exists", [True, False], ids=["hit", "miss"])
+def test_token_encode_dict_getitem_bytes(llm, key_exists):
+    """Test _TokenEncodeDict.__getitem__ with bytes key (deprecated path)."""
+    if key_exists:
+        token = llm.vocab[0]
+        with pytest.warns(
+            DeprecationWarning,
+            match="Indexing token_maps.encode by bytes is deprecated",
+        ):
+            idx = llm.token_maps.encode[token.byte_string]
+        assert idx == llm.token_maps.encode[token]
+    else:
+        with pytest.raises(KeyError):
+            llm.token_maps.encode[b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345"]
+
+
+@pytest.mark.parametrize("key_exists", [True, False], ids=["hit", "miss"])
+def test_token_encode_dict_contains_bytes(llm, key_exists):
+    """Test _TokenEncodeDict.__contains__ with bytes key (deprecated fallback)."""
+    if key_exists:
+        token = llm.vocab[0]
+        assert token.byte_string in llm.token_maps.encode
+    else:
+        assert b"THIS_DOES_NOT_EXIST_IN_VOCAB_12345" not in llm.token_maps.encode
+
+
+def test_duplicate_eos_byte_string_includes_all():
+    """Test that TokenMappings treats all tokens sharing an EOS byte_string as EOS."""
+    decode = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"hello"),
+        Token(token_id=3, byte_string=b"foo"),
+    ]
+
+    tm = TokenMappings.create(decode=decode, eos_byte_strings=[b"hello"])
+    assert set(tm.eos_idxs) == {0, 2}
+    assert all(t.byte_string != b"hello" for t in tm.potential_vocab)
+
+
+@pytest.mark.parametrize(
+    "make,expected",
+    [
+        (lambda llm: PromptedLLM(llm.model, eos_tokens=[b"!"]), [b"!"]),
+        (lambda llm: llm.spawn(eos_tokens=[b"!"]), [b"!"]),
+        (lambda llm: llm.spawn_new_eos(eos_tokens=[b"!"]), [b"!"]),
+        (
+            lambda llm: TokenMappings.create(
+                decode=[
+                    Token(token_id=0, byte_string=b"hello"),
+                    Token(token_id=1, byte_string=b"world"),
+                ],
+                eos_tokens=[b"hello"],
+            ),
+            [b"hello"],
+        ),
+    ],
+    ids=["constructor", "spawn", "spawn_new_eos", "token_mappings"],
+)
+def test_eos_tokens_deprecation(llm, make, expected):
+    """Test that the deprecated eos_tokens kwarg works with DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="eos_tokens.*deprecated"):
+        result = make(llm)
+    assert result.eos_byte_strings == expected
+
+
+def test_eos_tokens_and_byte_strings_conflict(llm):
+    """Test that specifying both eos_tokens and eos_byte_strings raises."""
+    with pytest.raises(TypeError, match="Cannot specify both"):
+        llm.spawn(eos_byte_strings=[b"!"], eos_tokens=[b"?"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_ids_is_per_asyncio_task(llm):
+    """Concurrent asyncio tasks setting distinct ``prompt_ids`` on the
+    same ``PromptedLLM`` instance must each read back their own value.
+
+    Pre-fix, ``prompt_ids`` was a plain mutable instance attribute, so this
+    would fail: every task would read whichever task set the attribute
+    most recently before the read. With ``prompt_ids`` backed by a
+    per-instance ``contextvars.ContextVar``, each task's reads see only
+    its own writes (asyncio Contexts are per-Task).
+    """
+
+    async def use_prompt(token_ids):
+        llm.prompt_ids = token_ids
+        # Yield to the event loop so sibling tasks get a chance to clobber
+        # ``llm.prompt_ids`` before we read it back. A shared-mutable-state
+        # implementation would race here; the contextvar isolates tasks.
+        await asyncio.sleep(0)
+        return list(llm.prompt_ids)
+
+    expected = [[1, 2, 3], [10, 20, 30], [100, 200, 300]]
+    results = await asyncio.gather(*[use_prompt(p) for p in expected])
+    assert results == expected
+
+
+def test_prompt_ids_override_entries_gc_with_instance(llm):
+    """Override-dict entries must be garbage-collected with their
+    PromptedLLM instance. Regression for the id(self)-reuse window
+    Samuel flagged on PR #143: with a plain dict keyed by id(self),
+    entries persist forever and a new instance allocated at the same
+    address would inherit the stale override.
+    """
+    import gc
+    import weakref
+    from genlm.control.potential.built_in.llm import _prompt_ids_overrides
+
+    transient = llm.spawn()
+    transient.prompt_ids = [9, 9, 9]
+    overrides = _prompt_ids_overrides.get()
+    assert overrides is not None and transient in overrides
+    n_before = len(overrides)
+
+    weak = weakref.ref(transient)
+    del transient
+    gc.collect()
+
+    assert weak() is None, "transient PromptedLLM was not collected"
+    assert len(overrides) == n_before - 1, (
+        f"stale override entry remained: before={n_before} after={len(overrides)}"
+    )

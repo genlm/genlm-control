@@ -34,65 +34,37 @@ def log_wfsa():
 
 
 @pytest.mark.asyncio
-async def test_wfsa(float_wfsa):
-    pot = WFSA(float_wfsa)
+@pytest.mark.parametrize(
+    "make_pot, complete_w, prefix_a_w, prefix_ab_w",
+    [
+        pytest.param(lambda fw: WFSA(fw), np.log(2), np.log(4), np.log(2), id="from_wfsa"),
+        pytest.param(
+            lambda fw: WFSA.from_regex("a(b|c)"), np.log(0.5), 0, np.log(0.5), id="from_regex"
+        ),
+    ],
+)
+async def test_wfsa(float_wfsa, make_pot, complete_w, prefix_a_w, prefix_ab_w):
+    pot = make_pot(float_wfsa)
 
     log_weight = await pot.complete(b"ab")
-    assert np.isclose(log_weight, np.log(2))
+    assert np.isclose(log_weight, complete_w)
 
     log_weight = await pot.complete(b"ac")
-    assert np.isclose(log_weight, np.log(2))
+    assert np.isclose(log_weight, complete_w)
 
     log_weight = await pot.complete(b"a")
     assert log_weight == float("-inf")
 
     log_weight = await pot.prefix(b"a")
-    assert np.isclose(log_weight, np.log(4))
+    assert np.isclose(log_weight, prefix_a_w)
 
     log_weight = await pot.prefix(b"c")
     assert log_weight == float("-inf")
 
     log_weight = await pot.prefix(b"ab")
-    assert np.isclose(log_weight, np.log(2))
+    assert np.isclose(log_weight, prefix_ab_w)
 
-    await pot.assert_logw_next_consistency(b"a")
-    await pot.assert_autoreg_fact(b"a")
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-
-    await pot.assert_batch_consistency([b"", b"ab", b"ac"])
-
-
-@pytest.mark.asyncio
-async def test_wfsa_regex():
-    pot = WFSA.from_regex("a(b|c)")
-
-    log_weight = await pot.complete(b"ab")
-    assert np.isclose(log_weight, np.log(0.5))
-
-    log_weight = await pot.complete(b"ac")
-    assert np.isclose(log_weight, np.log(0.5))
-
-    log_weight = await pot.complete(b"a")
-    assert log_weight == float("-inf")
-
-    log_weight = await pot.prefix(b"a")
-    assert np.isclose(log_weight, 0)
-
-    log_weight = await pot.prefix(b"c")
-    assert log_weight == float("-inf")
-
-    log_weight = await pot.prefix(b"ab")
-    assert np.isclose(log_weight, np.log(0.5))
-
-    await pot.assert_logw_next_consistency(b"a")
-    await pot.assert_autoreg_fact(b"a")
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-
-    await pot.assert_batch_consistency([b"", b"ab", b"ac"])
+    await pot.assert_contract([b"a", b"", b"ab", b"ac"])
 
 
 @pytest.mark.asyncio
@@ -117,13 +89,7 @@ async def test_bool_fsa(float_wfsa):
     log_weight = await pot.prefix(b"ab")
     assert log_weight == 0
 
-    await pot.assert_logw_next_consistency(b"a")
-    await pot.assert_autoreg_fact(b"a")
-
-    await pot.assert_logw_next_consistency(b"")
-    await pot.assert_autoreg_fact(b"")
-
-    await pot.assert_batch_consistency([b"", b"ab", b"ac"])
+    await pot.assert_contract([b"a", b"", b"ab", b"ac"])
 
 
 @pytest.mark.asyncio
@@ -210,38 +176,124 @@ async def test_bool_fsa_with_generated_regex(pattern, data):
         assert log_weight == 0, [matching_str, byte_string[:prefix]]
 
 
-def test_wfsa_init_wrong_semiring():
-    # Test initialization with unsupported semiring
-    wfsa = BaseWFSA(Boolean)  # TODO: support this semiring
+def _maxplus_wfsa():
+    from genlm.grammar.semiring import MaxPlus
+
+    return BaseWFSA(MaxPlus)
+
+
+def _boolean_wfsa_for_rejection():
+    m = BaseWFSA(Boolean)
+    m.add_I(0, Boolean.one)
+    m.add_F(0, Boolean.one)
+    return m
+
+
+@pytest.mark.parametrize(
+    "make_wfsa",
+    [
+        pytest.param(_maxplus_wfsa, id="maxplus"),
+        pytest.param(_boolean_wfsa_for_rejection, id="boolean"),
+    ],
+)
+def test_wfsa_init_wrong_semiring(make_wfsa):
+    # WFSA accepts only Float and Log; Boolean is BoolFSA's.
     with pytest.raises(ValueError, match="Unsupported semiring"):
-        WFSA(wfsa=wfsa)
+        WFSA(wfsa=make_wfsa())
 
 
-def test_wfsa_init_float_conversion(log_wfsa):
-    # Test that Float semiring is converted to Log
-    pot = WFSA(wfsa=log_wfsa)
+@pytest.mark.asyncio
+async def test_bool_fsa_from_regex_default_is_boolean():
+    """Default `from_regex` uses the Boolean semiring."""
+    fsa = BoolFSA.from_regex("a(b|c)")
+    assert fsa.wfsa.R is Boolean
+    assert (await fsa.complete(b"ab")) == 0
+    assert (await fsa.prefix(b"a")) == 0
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_from_regex_default_fixes_divergent_scc():
+    """Regression: leading-wildcard regex over a large charset previously
+    silently returned ``-inf`` via the Log path; the Boolean default fixes it."""
+    import warnings
+
+    pat = r"[\s\S]*[eE]njoy\s+[A-Za-z]+[iI][nN][gG][\s\S]*"
+    fsa = BoolFSA.from_regex(pat)
+    assert fsa.wfsa.R is Boolean
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=RuntimeWarning)
+        assert await fsa.prefix(b"") == 0
+        assert await fsa.prefix(b"Hello") == 0
+        assert await fsa.complete(b"I enjoy walking.") == 0
+        assert await fsa.complete(b"I enjoy films.") == -float("inf")
+        lw = await fsa.logw_next(b"")
+        assert not np.isnan(lw.weights).any()
+        assert (lw.weights > -float("inf")).any()
+
+
+def test_bool_fsa_from_regex_log_is_deprecated():
+    """Explicit `semiring="log"` still works but emits a DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        fsa = BoolFSA.from_regex("a(b|c)", semiring="log")
+    assert fsa.wfsa.R is Log
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_boolean_consistency():
+    """Math-consistency invariants hold for the default (Boolean) path."""
+    fsa = BoolFSA.from_regex("a(b|c)")
+    assert fsa.wfsa.R is Boolean
+    await fsa.assert_contract([b"a", b"", b"ab", b"ac"])
+
+
+@pytest.fixture
+def boolean_wfsa():
+    """A tiny Boolean WFSA: accepts only ``ab``."""
+    m = BaseWFSA(Boolean)
+    m.add_I(0, Boolean.one)
+    m.add_arc(0, b"a"[0], 1, Boolean.one)
+    m.add_arc(1, b"b"[0], 2, Boolean.one)
+    m.add_F(2, Boolean.one)
+    return m
+
+
+@pytest.mark.asyncio
+async def test_bool_fsa_constructed_from_boolean_wfsa(boolean_wfsa):
+    """`BoolFSA(boolean_wfsa)` exercises the Boolean `__init__` branch and
+    all four boolean public methods on accept / reject / empty-curr paths."""
+    pot = BoolFSA(boolean_wfsa)
+    assert pot.wfsa.R is Boolean
+    # accept paths
+    assert (await pot.prefix(b"a")) == 0
+    assert (await pot.complete(b"ab")) == 0
+    # reject paths
+    assert (await pot.complete(b"a")) == -float("inf")
+    # empty-curr paths (no transition from start on 'c')
+    assert (await pot.prefix(b"c")) == -float("inf")
+    assert (await pot.complete(b"c")) == -float("inf")
+    with pytest.raises(ValueError, match="zero weight"):
+        await pot.logw_next(b"c")
+
+
+def test_bool_fsa_from_regex_bad_semiring_arg():
+    with pytest.raises(ValueError, match="semiring must be"):
+        BoolFSA.from_regex("a", semiring="float")
+
+
+def test_wfsa_init_semiring_conversion(float_wfsa, log_wfsa):
+    # Float is converted to Log; an already-Log wfsa is kept as-is.
+    pot = WFSA(wfsa=float_wfsa)
     assert pot.wfsa.R is Log
+    assert pot.wfsa is not float_wfsa
 
-
-def test_wfsa_init_log_no_conversion(log_wfsa):
-    # Test that Log semiring is not converted
     pot = WFSA(wfsa=log_wfsa)
     assert pot.wfsa.R is Log
     assert pot.wfsa is log_wfsa
 
 
-def test_wfsa_repr(log_wfsa):
-    pot = WFSA(wfsa=log_wfsa)
-    repr(pot)
-
-    try:
-        pot._repr_svg_()
-    except graphviz.backend.execute.ExecutableNotFound:
-        pytest.skip("Graphviz not installed")
-
-
-def test_bool_fsa_repr(log_wfsa):
-    pot = BoolFSA(wfsa=log_wfsa)
+@pytest.mark.parametrize("cls", [WFSA, BoolFSA])
+def test_wfsa_repr(log_wfsa, cls):
+    pot = cls(wfsa=log_wfsa)
     repr(pot)
 
     try:
@@ -258,9 +310,12 @@ def test_wfsa_spawn(log_wfsa):
 
 def test_wfsa_clear_cache(log_wfsa):
     pot = WFSA(wfsa=log_wfsa)
+    # The empty-prefix chart is held outside the cache, as `_start_chart`.
+    pot._consume(b"a")
+    assert len(pot.cache) > 0
     pot.clear_cache()
-    assert len(pot.cache) == 1
-    assert () in pot.cache
+    assert len(pot.cache) == 0
+    assert pot._consume(()) is pot._start_chart
 
 
 @pytest.mark.asyncio

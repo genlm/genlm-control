@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
-import asyncio
+import torch
+import warnings
 
 from genlm.bytes import BeamParams
 from genlm.backend import load_model_by_name
@@ -9,24 +10,40 @@ from genlm.control import AWRS, BoolFSA, Potential, ByteLLM
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "gpt2"
+    return "openai-community/gpt2"
+
+
+# Cap vLLM's GPU share so this engine fits beside others in the process;
+# `engine_opts` is vLLM-only, and `load_model_by_name` picks vLLM only under CUDA.
+_LOW_GPU = (
+    {"engine_opts": {"gpu_memory_utilization": 0.3}} if torch.cuda.is_available() else {}
+)
 
 
 @pytest.fixture(scope="module")
-def beam_params(model_name):
+def llm(model_name):
+    """Provides the underlying LLM for the test module."""
+    instance = load_model_by_name(model_name, llm_opts=_LOW_GPU)
+    yield instance
+    cleanup = getattr(instance, "cleanup", None)
+    if cleanup is not None:
+        try:
+            cleanup()  # the backend's cleanup is sync
+        except Exception as e:
+            warnings.warn(f"engine cleanup failed during teardown: {e}")
+
+
+@pytest.fixture(scope="module")
+def beam_params(llm):
     """Provides BeamParams configured with the model's default EOS token."""
-    llm = load_model_by_name(model_name)
-    model_eos_token = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    return BeamParams(K=5, prune_threshold=0.0, eos_tokens={model_eos_token})
+    eos_byte_string = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
+    return BeamParams(K=5, prune_threshold=0.0, eos_byte_strings=[eos_byte_string])
 
 
 @pytest.fixture
-def byte_llm(model_name, beam_params):
-    """Provides a fresh ByteLLM instance for each test and handles cleanup."""
-    instance = ByteLLM.from_name(model_name, beam_params)
-    yield instance
-    # Cleanup code will run after the test has finished
-    asyncio.run(instance.cleanup())
+def byte_llm(llm, beam_params):
+    """Provides a fresh ByteLLM instance for each test."""
+    return ByteLLM(llm, beam_params)
 
 
 @pytest.mark.asyncio
@@ -127,9 +144,8 @@ async def test_bytelm_smc(byte_llm: ByteLLM):
 
 
 @pytest.mark.asyncio
-async def test_cache_size_limit(model_name, beam_params):
+async def test_cache_size_limit(llm, beam_params):
     """Test that cache respects the size limit."""
-    llm = load_model_by_name(model_name)
     cache_size = 5
     byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
 
@@ -148,38 +164,29 @@ async def test_cache_size_limit(model_name, beam_params):
 
 
 @pytest.mark.asyncio
-async def test_cache_lru_eviction(model_name, beam_params):
-    """Test that LRU eviction removes oldest entries."""
-    llm = load_model_by_name(model_name)
+async def test_cache_lru_eviction(llm, beam_params):
+    """Test that LRU eviction removes the least-recently-used entry."""
     cache_size = 3
     byte_llm = ByteLLM(llm, beam_params, cache_size=cache_size)
 
     try:
-        # Create cache entries for "a", "ab", "abc"
-        await byte_llm.prefix([b"a"])
-        await byte_llm.prefix([b"a", b"b"])
-        await byte_llm.prefix([b"a", b"b", b"c"])
+        # Independent contexts: none is a prefix of another.
+        await byte_llm.prefix([b"p"])
+        await byte_llm.prefix([b"q"])
+        await byte_llm.prefix([b"r"])
+        assert set(byte_llm._beam_cache) == {b"p", b"q", b"r"}
 
-        # All three should be cached
+        # Touch "p" again -- an exact cache hit -- making it most-recently-used.
+        await byte_llm.prefix([b"p"])
+
+        # Over the limit: evicts "q", the least-recently-used entry.
+        await byte_llm.prefix([b"s"])
+
         assert len(byte_llm._beam_cache) == cache_size
-
-        # Access "a" to make it recently used
-        await byte_llm.prefix([b"a"])
-
-        # Add a new entry "x" - should evict "ab" (least recently used)
-        byte_llm._beam_cache.clear()  # Reset for cleaner test
-        byte_llm._initial_beam = None
-
-        await byte_llm.prefix([b"x"])
-        await byte_llm.prefix([b"x", b"y"])
-        await byte_llm.prefix([b"x", b"y", b"z"])
-
-        # Cache should be at limit
-        assert len(byte_llm._beam_cache) == cache_size
-
-        # Adding one more should trigger eviction
-        await byte_llm.prefix([b"x", b"y", b"z", b"w"])
-        assert len(byte_llm._beam_cache) <= cache_size
+        assert b"q" not in byte_llm._beam_cache, "LRU entry should have been evicted"
+        assert b"p" in byte_llm._beam_cache, (
+            "recently-accessed entry should survive eviction"
+        )
     finally:
         await byte_llm.cleanup()
 
@@ -207,12 +214,11 @@ async def measure_prefix_reach(byte_llm: ByteLLM, context: list) -> int:
 
 
 @pytest.mark.asyncio
-async def test_healing_disabled_fails(model_name):
+async def test_healing_disabled_fails(llm):
     """Without healing, K=1 beam fails on text requiring alternative tokenization."""
-    llm = load_model_by_name(model_name)
-    beam_params = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False
-    )
+    eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
+    # Explicitly disable healing to test failure mode
+    beam_params = BeamParams(K=1, eos_byte_strings=[eos], heal=False)
     byte_llm = ByteLLM(llm, beam_params)
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
@@ -226,23 +232,19 @@ async def test_healing_disabled_fails(model_name):
 
 
 @pytest.mark.asyncio
-async def test_healing_enabled_succeeds(model_name):
+async def test_healing_enabled_succeeds(llm):
     """With healing enabled, K=1 beam processes more text than without healing."""
-    llm = load_model_by_name(model_name)
+    eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
 
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
     # Test without healing - find how far we get
-    beam_params_no_heal = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=False
-    )
+    beam_params_no_heal = BeamParams(K=1, eos_byte_strings=[eos], heal=False)
     no_heal_len = await measure_prefix_reach(ByteLLM(llm, beam_params_no_heal), context)
 
     # Test with healing - should get further
-    beam_params_heal = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True
-    )
+    beam_params_heal = BeamParams(K=1, eos_byte_strings=[eos], heal=True)
     heal_len = await measure_prefix_reach(ByteLLM(llm, beam_params_heal), context)
 
     assert (
@@ -251,33 +253,38 @@ async def test_healing_enabled_succeeds(model_name):
 
 
 @pytest.mark.asyncio
-async def test_healing_max_backoff(model_name):
-    """Limited backoff constrains healing effectiveness."""
-    llm = load_model_by_name(model_name)
-
+async def test_healing_max_backoff(llm):
+    """heal_max_backoff=0 reaches as far as heal=False, and less far than unlimited backoff."""
+    eos = llm.byte_vocab[llm.tokenizer.eos_token_id].byte_string
     text = ". Boulter starred in the 2011 film Mercenaries directed by Paris Leonti ."
     context = [b.to_bytes(1, "big") for b in text.encode("utf-8")]
 
-    # Unlimited healing
-    beam_params_unlimited = BeamParams(
-        K=1, eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]}, heal=True
+    no_heal_len = await measure_prefix_reach(
+        ByteLLM(llm, BeamParams(K=1, eos_byte_strings=[eos], heal=False)), context
+    )
+    no_backoff_len = await measure_prefix_reach(
+        ByteLLM(
+            llm, BeamParams(K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=0)
+        ),
+        context,
     )
     unlimited_len = await measure_prefix_reach(
-        ByteLLM(llm, beam_params_unlimited), context
+        ByteLLM(
+            llm,
+            BeamParams(K=1, eos_byte_strings=[eos], heal=True, heal_max_backoff=None),
+        ),
+        context,
     )
 
-    # Limited healing
-    beam_params_limited = BeamParams(
-        K=1,
-        eos_tokens={llm.byte_vocab[llm.tokenizer.eos_token_id]},
-        heal=True,
-        heal_max_backoff=2,
+    assert no_backoff_len == no_heal_len, (
+        f"max_backoff=0 ({no_backoff_len}) retries only the boundary the "
+        f"pre-heal extend step already failed at, so it should behave "
+        f"exactly like heal=False ({no_heal_len})"
     )
-    limited_len = await measure_prefix_reach(ByteLLM(llm, beam_params_limited), context)
-
-    assert (
-        limited_len <= unlimited_len
-    ), f"Limited ({limited_len}) should not exceed unlimited ({unlimited_len})"
+    assert no_backoff_len < unlimited_len, (
+        f"heal_max_backoff=0 ({no_backoff_len}) should reach strictly less far "
+        f"than unlimited backoff ({unlimited_len}) -- the knob must constrain healing"
+    )
 
 
 # -------------------------
@@ -286,9 +293,8 @@ async def test_healing_max_backoff(model_name):
 
 
 @pytest.mark.asyncio
-async def test_context_manager_basic(model_name, beam_params):
-    """Test that ByteLLM works as an async context manager."""
-    llm = load_model_by_name(model_name)
+async def test_context_manager_basic(llm, beam_params):
+    """Test that ByteLLM works as an async context manager, including SMC sampling."""
 
     async with ByteLLM(llm, beam_params) as byte_llm:
         # Verify we can use the instance inside the context
@@ -304,6 +310,17 @@ async def test_context_manager_basic(model_name, beam_params):
         # Verify cache was populated
         assert byte_llm._beam_cache or byte_llm._initial_beam is not None
 
+        # SMC sampling inside the context
+        byte_llm.set_prompt_from_str("The answer is:")
+        fsa = BoolFSA.from_regex(r" (yes|no)")
+        sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))
+        sequences = await sampler.smc(
+            n_particles=5, max_tokens=10, ess_threshold=0.5, verbosity=0
+        )
+        assert len(sequences) > 0
+        for seq in sequences.decoded_posterior.keys():
+            assert "yes" in seq or "no" in seq
+
     # After exiting context, cleanup should have been called
     # Cache should be cleared
     assert not byte_llm._beam_cache
@@ -312,9 +329,8 @@ async def test_context_manager_basic(model_name, beam_params):
 
 
 @pytest.mark.asyncio
-async def test_context_manager_cleanup_on_exception(model_name, beam_params):
+async def test_context_manager_cleanup_on_exception(llm, beam_params):
     """Test that cleanup is called even when an exception occurs inside the context."""
-    llm = load_model_by_name(model_name)
 
     class TestException(Exception):
         pass
@@ -338,30 +354,3 @@ async def test_context_manager_cleanup_on_exception(model_name, beam_params):
     assert not byte_llm_ref._beam_cache
     assert byte_llm_ref._last_context is None
     assert byte_llm_ref._last_beam is None
-
-
-@pytest.mark.asyncio
-async def test_context_manager_with_smc(model_name, beam_params):
-    """Test that ByteLLM context manager works correctly with SMC sampling."""
-    llm = load_model_by_name(model_name)
-
-    async with ByteLLM(llm, beam_params) as byte_llm:
-        byte_llm.set_prompt_from_str("The answer is:")
-
-        fsa = BoolFSA.from_regex(r" (yes|no)")
-        sampler = AWRS(byte_llm, fsa.coerce(byte_llm, f=b"".join))
-
-        sequences = await sampler.smc(
-            n_particles=5,
-            max_tokens=10,
-            ess_threshold=0.5,
-            verbosity=0,
-        )
-
-        assert len(sequences) > 0
-        # Verify outputs match the constraint
-        for seq in sequences.decoded_posterior.keys():
-            assert "yes" in seq or "no" in seq
-
-    # Cleanup should have been called
-    assert not byte_llm._beam_cache

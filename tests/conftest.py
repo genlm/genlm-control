@@ -26,6 +26,27 @@ class MockPotential(Potential):
         return self.make_lazy_weights(self.next_token_logws)
 
 
+class ContextSensitiveMockPotential(Potential):
+    """A mock potential whose logw_next depends on context length,
+    simulating different prompt/conditioning lengths."""
+
+    def __init__(self, vocab, base_logws, context_scale=0.5):
+        self.base_logws = np.array(base_logws)
+        self.context_scale = context_scale
+        super().__init__(vocab)
+
+    async def prefix(self, context):
+        return sum(self.base_logws[self.lookup[t]] for t in context)
+
+    async def complete(self, context):
+        return await self.prefix(context) + self.base_logws[-1]
+
+    async def logw_next(self, context):
+        # Scale weights by context length to make them context-dependent
+        scale = 1.0 + self.context_scale * len(context)
+        return self.make_lazy_weights(self.base_logws * scale)
+
+
 @st.composite
 def mock_vocab(draw):
     item_strategy = draw(
@@ -69,10 +90,23 @@ def mock_params(draw, max_w=1e3):
 def iter_item_params(draw, max_iter_w=1e3, max_item_w=1e3):
     iter_vocab, iter_next_token_ws, context = draw(mock_params(max_iter_w))
 
-    item_vocab = set()
-    for items in iter_vocab:
-        item_vocab.update(items)
-    item_vocab = list(item_vocab)
+    # Convert iter_vocab to bytes for trie
+    iter_vocab_bytes = []
+    for item in iter_vocab:
+        if isinstance(item, str):
+            iter_vocab_bytes.append(item.encode("utf-8"))
+        elif isinstance(item, bytes):
+            iter_vocab_bytes.append(item)
+        else:
+            iter_vocab_bytes.append(bytes(item))
+    iter_vocab = iter_vocab_bytes
+
+    # Convert context to bytes
+    context = [
+        item.encode("utf-8") if isinstance(item, str) else item for item in context
+    ]
+    # dict.fromkeys, not set(): set order of str tokens depends on PYTHONHASHSEED.
+    item_vocab = list(dict.fromkeys(item for items in iter_vocab for item in items))
 
     # Sample weights over item vocabulary and EOS.
     item_next_token_ws = draw(
@@ -111,7 +145,9 @@ class WeightedSet(Potential):
             np.log(total_weight) if total_weight != 0 else float("-inf"),
         )
 
-        super().__init__(list(set(t for seq in sequences for t in seq)))
+        # dict.fromkeys, not set(): set order of str tokens depends on PYTHONHASHSEED.
+        vocab = list(dict.fromkeys(t for seq in sequences for t in seq))
+        super().__init__(vocab)
 
     async def complete(self, context):
         return self.complete_logws.get(tuple(context), float("-inf"))
@@ -176,7 +212,9 @@ class Tracer:
         cur = self.cur
 
         if cur.child_masses is None:
-            cur.child_masses = cur.mass * p
+            # float64: the trie hands back float32, in which a branch worth 1e-50
+            # is annihilated by subtraction from a sibling worth 1e-5 and never drawn.
+            cur.child_masses = cur.mass * np.asarray(p, dtype=np.float64)
             cur.context = context
 
         if context != cur.context:

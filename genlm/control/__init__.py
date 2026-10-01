@@ -24,12 +24,15 @@ from .sampler import (
     AWRS,
     ByteEnsembleTokenSampler,
 )
+from .util import set_draw_method, DRAW_METHODS
 from .viz import InferenceVisualizer
 
 __all__ = [
     "EOS",
     "EOT",
     "SMC",
+    "set_draw_method",
+    "DRAW_METHODS",
     "EnsembleSMC",
     "Sequences",
     "SequencesExt",

@@ -11,7 +11,7 @@ Potentials guide text generation by:
 
 ### Vocabulary
 
-Each potential has a **vocabulary** which defines the set of tokens it operates on. Most built-in potentials operate on vocabularies whose tokens are `bytes` or `int` objects (the latter often representing individual bytes).
+Each potential has a **vocabulary** which defines the set of tokens it operates on. Language model potentials (`PromptedLLM`) use `Token` objects (which carry both a `token_id` and `byte_string`). Constraint potentials (FSAs, CFGs) typically operate on `int` objects representing individual bytes.
 
 ### Weight assignment
 
@@ -54,13 +54,20 @@ By default, these methods simply call the corresponding non-batch method for all
 
 ```python
 # Load GPT-2 with temperature 0.5
-llm = PromptedLLM.from_name("gpt2", temperature=0.5)
+llm = PromptedLLM.from_name("openai-community/gpt2", temperature=0.5)
 
 # Set a prompt prefix that all generations will be conditioned on
 llm.set_prompt_from_str("Montreal is")
 ```
 
-`PromptedLLM`s have a vocabulary of `bytes` tokens, obtained from the language model's tokenizer.
+`PromptedLLM`s have a vocabulary of `Token` objects, obtained from the language model's tokenizer. Each `Token` carries a `token_id` and a `byte_string`, and subclasses `bytes` for backwards compatibility. Note that multiple tokens can share the same byte string.
+
+A `PromptedLLM` can forward under a LoRA adapter registered on its backend model:
+
+```python
+llm.model.add_new_lora("/path/to/adapter", "reviewer")
+reviewer_llm = PromptedLLM(llm.model, prompt_ids=llm.prompt_ids, lora_name="reviewer")
+```
 
 ### Finite-state automata
 
@@ -191,7 +198,7 @@ The [`Product`][genlm.control.potential.product] class allows you to combine two
 
 ```python
 # Example: Prompt intersection
-mtl_llm = PromptedLLM.from_name("gpt2")
+mtl_llm = PromptedLLM.from_name("openai-community/gpt2")
 mtl_llm.set_prompt_from_str("Montreal is")
 
 bos_llm = mtl_llm.spawn()
@@ -218,7 +225,7 @@ The [`Coerced`][genlm.control.potential.coerce] class allows you to adapt a pote
 ```python
 # Example: Coercing a byte-level FSA to work with a language model's tokens
 fsa = BoolFSA.from_regex(r"\sthe\s(best|worst).*")  # Works on bytes
-llm = PromptedLLM.from_name("gpt2")  # Works on byte sequences
+llm = PromptedLLM.from_name("openai-community/gpt2")  # Works on byte sequences
 
 # Coerce the FSA to work with the LLM's tokens by joining tokens into bytes
 coerced_fsa = fsa.coerce(llm, f=b''.join)
@@ -233,7 +240,21 @@ Common use cases for coercion include:
 - Implementing constraints that operate on processed versions of the tokens (e.g., lowercase text)
 - Converting between different tokenization schemes
 
+When `f` distributes over concatenation (`f(x + y) == f(x) + f(y)`, as `b"".join` does) and the coerced potential is a `WFSA` or `BoolFSA`, `logw_next` is computed from one walk over a trie of the target vocabulary rather than one call per token. Pass `homomorphic=True` to assert this; the default, `None`, probes `f` at each context and takes the fast path when it holds.
+
 > **Performance Note:** The coercion operation can impact performance, especially when mapping from a coarser token type to a finer token type (e.g., byte sequences to individual bytes). To sample tokens from a coerced product, consider using specialized samplers (e.g., `eager_token_sampler`, `topk_token_sampler`).
+
+### Reweighting potentials
+
+`p ** beta` scales every log-weight of `p` by `beta` ([`Tempered`][genlm.control.potential.tempered.Tempered]). The result is unnormalized, and `-inf` weights stay `-inf`. `p.normalize()` renormalizes each next-token row of `p` to sum to one ([`Normalized`][genlm.control.potential.normalized.Normalized]).
+
+```python
+# The LM at temperature 0.5, locally normalized
+cooled_llm = (llm ** 2).normalize()
+
+# The locally normalized product of an LM and a constraint
+local_product = (llm * coerced_fsa).normalize()
+```
 
 ### Performance optimizations
 

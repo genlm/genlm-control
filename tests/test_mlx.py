@@ -1,7 +1,13 @@
+import importlib.util
+
 import pytest
+
 from genlm.control.potential.built_in.llm import load_model_by_name
 
+_HAS_MLX = importlib.util.find_spec("mlx") is not None
 
+
+@pytest.mark.skipif(not _HAS_MLX, reason="mlx not installed (Apple silicon only)")
 @pytest.mark.asyncio
 async def test_mlx_backend():
     """Test that load_model_by_name correctly loads MLX backend."""

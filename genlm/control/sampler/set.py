@@ -4,13 +4,15 @@ from arsenal.maths import sample_dict
 from arsenal.datastructures import LocatorMaxHeap
 from abc import ABC, abstractmethod
 
+from genlm.control.potential.autobatch import autobatched
 from genlm.control.util import load_async_trie
+from genlm.backend.tokenization import Token
 
 
 class SetSampler(ABC):
     """Base class for set samplers.
 
-    A set sampler samples a weighted set of tokens from a the vocabulary of a `target` potential.
+    A set sampler samples a weighted set of tokens from the vocabulary of a `target` potential.
 
     Given a context of tokens $x_1, \\ldots, x_{n-1}$ in the target potential's vocabulary and a sampled set of tokens $S \\subseteq \\textsf{target.vocab_eos}$,
     the log-weight associated with each token $x_n$ must correspond to:
@@ -29,7 +31,7 @@ class SetSampler(ABC):
         self.target = target
 
     @abstractmethod
-    async def sample_set(self, context):
+    async def sample_set(self, context, draw=None):
         """Sample a weighted set of tokens from the target potential's vocabulary."""
         pass  # pragma: no cover
 
@@ -51,13 +53,16 @@ class TrieSetSampler(SetSampler):
     `TrieSetSampler`s sample tokens from the `iter_potential`'s vocabulary.
     """
 
-    def __init__(self, iter_potential, item_potential):
+    def __init__(self, iter_potential, item_potential, autobatch=True):
         """
         Initialize the `TrieSetSampler`.
 
         Args:
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
+            autobatch (bool): Whether to wrap `iter_potential` in
+                [`AutoBatchedPotential`][genlm.control.potential.autobatch.AutoBatchedPotential].
+                Default True. `item_potential` is never wrapped.
 
         Raises:
             ValueError: If the token type of `iter_potential` is not an iterable of the token type of `item_potential`.
@@ -67,8 +72,11 @@ class TrieSetSampler(SetSampler):
                 "Token type of `iter_potential` must be an iterable of token type of `item_potential`. "
                 f"Got {iter_potential.token_type} and {item_potential.token_type}."
             )
+        if autobatch:
+            iter_potential = autobatched(iter_potential)
         self.iter_potential = iter_potential
         self.item_potential = item_potential
+
         self.f = lambda context: [item for items in context for item in items]
 
         super().__init__(
@@ -80,17 +88,24 @@ class TrieSetSampler(SetSampler):
         )
         self.trie = self.trie_executor.trie
 
+        # Build mappings between trie structure and target vocabulary
         vocab_eos = self.target.vocab_eos
         word2leaf = self.trie.word2leaf
         lookup = self.target.lookup
 
-        common_tokens = set(vocab_eos) & set(word2leaf)
+        # Get word2leaf key for each token
+        def get_word_key(token):
+            if isinstance(token, Token):
+                return (token.byte_string, token.token_id)
+            return token
 
-        self.leaf_to_token_id = dict(
-            (word2leaf[token], lookup[token]) for token in common_tokens
-        )
+        common_tokens = [t for t in vocab_eos if get_word_key(t) in word2leaf]
 
-    async def sample_set(self, context):
+        self.leaf_to_token_id = {
+            word2leaf[get_word_key(token)]: lookup[token] for token in common_tokens
+        }
+
+    async def sample_set(self, context, draw=None):
         """
         Sample a weighted set of tokens given a context.
 
@@ -147,14 +162,20 @@ class EagerSetSampler(TrieSetSampler):
         while True:
             children = self.trie.children[curr]
             item_w_curr = item_ws[curr]
-            item_ws1 = Float.chart(
-                {a: item_ws[c] / item_w_curr for a, c in children.items()}
-            )
 
-            if None in item_ws1:
-                leaf = children[None]
-                token = self.trie.leaf2word[leaf]
-                token_id = self.leaf_to_token_id[leaf]
+            # Build item_ws1, handling (None, token_id) leaf markers
+            item_ws1 = Float.chart()
+            leaf_node = None
+            for a, c in children.items():
+                if isinstance(a, tuple) and a[0] is None:
+                    # Leaf marker - record but don't add to item_ws1
+                    leaf_node = c
+                else:
+                    item_ws1[a] = item_ws[c] / item_w_curr
+
+            if leaf_node is not None:
+                token_id = self.leaf_to_token_id[leaf_node]
+                token = self.target.vocab_eos[token_id]
                 logws[token_id] = iter_logws[token] + logw - logp
 
             item_logws2 = await self.item_potential.logw_next(coerced_ctx + subtokens)
@@ -191,7 +212,7 @@ class TopKSetSampler(TrieSetSampler):
         That is, $\\textsf{item_potential.prefix}(x) \\leq \\textsf{item_potential.prefix}(xy)$ for all sequences of items $x, y$.
     """
 
-    def __init__(self, iter_potential, item_potential, K):
+    def __init__(self, iter_potential, item_potential, K, autobatch=True):
         """
         Initialize the TopKSetSampler.
 
@@ -199,10 +220,11 @@ class TopKSetSampler(TrieSetSampler):
             iter_potential (Potential): The potential defined over a vocabulary of iterables.
             item_potential (Potential): The potential defined over a vocabulary of items.
             K (int|None): The number of top tokens to enumerate. If None, all tokens are enumerated.
+            autobatch (bool): See [`TrieSetSampler`][genlm.control.sampler.set.TrieSetSampler].
         """
         if K is not None and K <= 0:
             raise ValueError("K must be greater than 0 or None")
-        super().__init__(iter_potential, item_potential)
+        super().__init__(iter_potential, item_potential, autobatch=autobatch)
         self.K = K
 
     async def sample_set(self, context, draw=None):
@@ -268,7 +290,7 @@ class TopKSetSampler(TrieSetSampler):
         W = Float.chart()
 
         # initial conditions
-        (token, node) = ((), self.trie.root)
+        token, node = ((), self.trie.root)
         agenda[token, node, False] = max_logws[node]
         W[node] = 0
 
@@ -296,7 +318,8 @@ class TopKSetSampler(TrieSetSampler):
 
             logws = None
             for x, y in children[node].items():
-                if x is None:
+                if isinstance(x, tuple) and x[0] is None:
+                    # Leaf marker (None, token_id)
                     W_y = W[node]
                     W[y] = W_y
                     agenda[token, y, True] = W_y + max_logws[y]

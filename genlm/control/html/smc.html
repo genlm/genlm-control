@@ -185,6 +185,17 @@
                     particle.x = j * particle_xspace
                     particle.y = i * state_yspace + j * particle_yspace
                     particle.relative_weight = Math.exp(particle.logweight - history[i].logweight_total)
+                    // A step records only what it appended, so rebuild the full context from
+                    // this particle's ancestor -- already rebuilt, since i ascends.
+                    particle.parent = i === 0 ? undefined
+                        : (history[i].mode == "resample"
+                            ? history[i - 1].particles[history[i].ancestors[j]]
+                            : history[i - 1].particles[j])
+                    const inherited = particle.parent ? particle.parent.context : ""
+                    particle.context = (inherited && particle.contents_incr)
+                        ? inherited + "|" + particle.contents_incr
+                        : inherited + particle.contents_incr
+                    particle.contents = "<<<>>>" + particle.context
                     particle.prefix = particle.contents.split("<<<")[0]
                     particle.suffix = particle.contents.split(">>>")[1]
                     particle.highlighted = particle.contents.split(">>>")[0].split("<<<")[1]
@@ -194,7 +205,6 @@
                     //     min_posterior = Math.min(min_posterior, particle.posterior)
                     // if (Number.isFinite(particle.prior) && particle.prior > 0)
                     // min_prior = Math.min(min_prior, particle.prior)
-                    particle.parent = undefined
                     particle.children = []
                 }
             }
@@ -219,14 +229,8 @@
             for (let i = 1; i < history.length; i++) {
                 for (let j = 0; j < num_particles; j++) {
                     const particle = history[i].particles[j]
-                    let parent
-                    if (history[i].mode == "resample") {
-                        parent = history[i - 1].particles[history[i].ancestors[j]]
-                    } else {
-                        parent = history[i - 1].particles[j]
-                    }
-                    particle.parent = parent
-                    particle.parent.children.push(particle)
+                    const parent = particle.parent
+                    parent.children.push(particle)
                     particle.parent_line = frame_foreground
                         .append("path")
                         .classed("parentline", true)

@@ -1,5 +1,7 @@
 import asyncio
 import warnings
+import torch
+from genlm.control.constant import EOS
 from genlm.control.potential.base import Potential
 
 
@@ -56,13 +58,19 @@ class Product(Potential):
                 )
             )
 
-        if self.p1.vocab == self.p2.vocab:
+        if self.p1.vocab is self.p2.vocab or self.p1.vocab == self.p2.vocab:
             self._v1_idxs = ...
             self._v2_idxs = ...
-            super().__init__(self.p1.vocab, token_type=token_type)
+            if self.p1.eos is EOS and self.p2.eos is EOS:
+                super().__init__(self.p1.vocab, tables=self.p1.tables)
+            else:
+                super().__init__(self.p1.vocab, token_type=token_type)
 
         else:
-            common_vocab = list(set(self.p1.vocab) & set(self.p2.vocab))
+            # Ordered by p1: set iteration order varies with PYTHONHASHSEED, which
+            # would permute the vocabulary across runs.
+            keep = set(self.p2.vocab)
+            common_vocab = [x for x in dict.fromkeys(self.p1.vocab) if x in keep]
             if not common_vocab:
                 raise ValueError("Potentials in product must share a common vocabulary")
 
@@ -122,24 +130,40 @@ class Product(Potential):
         )
         return W1 + W2
 
+    def _compose(self, w1_full, w2_full):
+        """Sum the operands' weights over the shared vocabulary, for a `[V]` row or an
+        `[N, V]` batch. A numpy operand is lifted onto the other operand's torch device.
+        """
+        w1 = w1_full[self.v1_idxs] if w1_full.ndim == 1 else w1_full[:, self.v1_idxs]
+        w2 = w2_full[self.v2_idxs] if w2_full.ndim == 1 else w2_full[:, self.v2_idxs]
+        t1, t2 = torch.is_tensor(w1), torch.is_tensor(w2)
+        if t1 and t2:
+            if w1.device != w2.device:
+                dev = w1.device if w1.device.type != "cpu" else w2.device
+                w1, w2 = w1.to(dev), w2.to(dev)
+        elif t1:  # dtype is preserved, so promotion matches the both-numpy path
+            w2 = torch.as_tensor(w2, device=w1.device)
+        elif t2:
+            w1 = torch.as_tensor(w1, device=w2.device)
+        return w1 + w2
+
     async def logw_next(self, context):
         W1, W2 = await asyncio.gather(
             self.p1.logw_next(context), self.p2.logw_next(context)
         )
-        return self.make_lazy_weights(
-            W1.weights[self.v1_idxs] + W2.weights[self.v2_idxs]
+        return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
+
+    async def logw_eos(self, context) -> float:
+        e1, e2 = await asyncio.gather(
+            self.p1.logw_eos(context), self.p2.logw_eos(context)
         )
+        return float(e1 + e2)
 
     async def batch_logw_next(self, contexts):
-        Ws1, Ws2 = await asyncio.gather(
+        W1, W2 = await asyncio.gather(
             self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
         )
-        return [
-            self.make_lazy_weights(
-                Ws1[n].weights[self.v1_idxs] + Ws2[n].weights[self.v2_idxs]
-            )
-            for n in range(len(contexts))
-        ]
+        return self.make_lazy_weights(self._compose(W1.weights, W2.weights))
 
     def spawn(self, p1_opts=None, p2_opts=None):
         return Product(
