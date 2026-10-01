@@ -1,12 +1,12 @@
 import asyncio
 import warnings
 import numpy as np
-from typing import Any, Callable, List, Literal, Tuple, Union
-from collections import defaultdict
+from typing import Any, Callable, List, Literal, Tuple
 
 from arsenal.maths import logsumexp
 
 from genlm.control.potential.base import Potential
+from genlm.control.util import to_numpy
 from genlm.bytes import ByteBeamState, BeamParams
 
 
@@ -74,7 +74,7 @@ class Ensemble(Potential):
                 stacklevel=2,
             )
 
-        vocab = list(set(p1.vocab + p2.vocab))
+        vocab = list(dict.fromkeys(p1.vocab + p2.vocab))
         super().__init__(vocabulary=vocab)
 
         self.p1_vocab_idxs = [self.p1.lookup[x] for x in self.vocab_eos]
@@ -133,7 +133,7 @@ class Ensemble(Potential):
         """
         raise NotImplementedError("logw_next is not implemented for Ensemble class.")
 
-    async def batch_logw_next(self, contexts: List[List[str]]) -> List[Any]:
+    async def batch_logw_next(self, contexts: List[List[str]]):
         """Batched version of logw_next for Ensemble.
 
         This enables batching when multiple particles need to be extended during SMC,
@@ -144,8 +144,7 @@ class Ensemble(Potential):
             contexts (List[List[str]]): List of context token sequences
 
         Returns:
-            List[Any]: List of LazyWeights objects, one per context, containing the combined
-                log weights from both potentials
+            LazyWeights: Batched combined log weights, `.weights` of shape `[N, V+1]`
 
         Note:
             This method is only used if the Ensemble is wrapped in AutoBatchedPotential or
@@ -158,74 +157,26 @@ class Ensemble(Potential):
             self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
         )
         # Combine using the ensemble operation
-        return [
-            self.make_lazy_weights(
-                self.op(
-                    Ws1[n].weights[self.p1_vocab_idxs],
-                    Ws2[n].weights[self.p2_vocab_idxs],
-                )
+        return self.make_lazy_weights(
+            self.op(
+                to_numpy(Ws1.weights)[:, self.p1_vocab_idxs],
+                to_numpy(Ws2.weights)[:, self.p2_vocab_idxs],
             )
-            for n in range(len(contexts))
-        ]
+        )
 
+    async def logw_eos(self, context: List[str]) -> float:
+        """Combined log weight of terminating (EOS) after `context`.
 
-def split_with_atomic_tokens(
-    data: bytes, atomic_tokens: list[bytes]
-) -> list[Union[int, bytes]]:
-    """
-    Splits a bytestring into a list of either individual bytes (as integers) or atomic tokens (as bytes),
-    depending on whether the current position matches an atomic token.
+        Args:
+            context (List[str]): The context tokens
 
-    Args:
-        data (bytes): The input byte string to split.
-        atomic_tokens (list[bytes]): A list of byte substrings that are treated as indivisible atomic tokens.
-
-    Returns:
-        list[Union[int, bytes]]: A list where each element is either:
-            - an atomic token (as bytes) if a match is found at that position,
-            - or a single byte (as an int) if no atomic token matches.
-
-    Notes:
-        - Matching is greedy but only left-to-right: at each position, the function checks for atomic token matches
-          starting from length 1 up to the maximum token length.
-        - Only the first match (shortest prefix match) is used; longer overlapping tokens may be missed if a shorter
-          prefix matches first.
-        - If atomic tokens overlap (e.g., b"A" and b"AB"), a warning is raised and only the shortest prefix match
-          will be used.
-
-    Example:
-        >>> split_with_atomic_tokens(b"ABC", [b"A", b"AB"])
-        [b'A', 66, 67]  # b"AB" is not matched because b"A" matched first
-    """
-    # Detect overlapping atomic tokens
-    for i, token1 in enumerate(atomic_tokens):
-        for j, token2 in enumerate(atomic_tokens):
-            if i != j and (token1.startswith(token2) or token2.startswith(token1)):
-                warnings.warn(
-                    f"Overlapping atomic tokens detected: {token1!r} and {token2!r}. "
-                    "Only the shortest matching prefix will be used."
-                )
-                break
-
-    result = []
-    i = 0
-    token_set = set(atomic_tokens)
-    max_len = max(len(t) for t in atomic_tokens) if atomic_tokens else 0
-
-    while i < len(data):
-        matched = False
-        for length in range(1, max_len + 1):
-            fragment = data[i : i + length]
-            if fragment in token_set:
-                result.append(fragment)
-                i += length
-                matched = True
-                break
-        if not matched:
-            result.append(data[i])
-            i += 1
-
-    return result
+        Returns:
+            float: The ensemble operation applied to both potentials' EOS weights
+        """
+        p1_logw, p2_logw = await asyncio.gather(
+            self.p1.logw_eos(context), self.p2.logw_eos(context)
+        )
+        return float(self.op(p1_logw, p2_logw))
 
 
 class ByteEnsemble(Potential):
@@ -242,7 +193,7 @@ class ByteEnsemble(Potential):
         op: A function to combine log-probabilities.
         data_dict_1, data_dict_2: Beam state caches keyed by context (bytes).
         vocabulary: Byte-level vocabulary (list of integers 0-255).
-        eos_tokens: List of EOS tokens from both models.
+        eos_tokens: EOS byte strings of the two models.
 
     Note:
         ByteEnsemble is designed to work with ByteEnsembleTokenSampler for specialized
@@ -256,10 +207,9 @@ class ByteEnsemble(Potential):
         from genlm.bytes import BeamParams
         from genlm.control.potential.built_in import ByteEnsemble
 
-        llm1 = load_model_by_name("gpt2")
-        llm2 = load_model_by_name("gpt2")
+        llm1 = load_model_by_name("openai-community/gpt2")
+        llm2 = load_model_by_name("openai-community/gpt2")
 
-        beam_params = BeamParams(K=5, prune_threshold=0.0)
         ensemble = await ByteEnsemble.create(
             llm1, llm2,
             op="prod",
@@ -323,14 +273,26 @@ class ByteEnsemble(Potential):
             RuntimeError: If beam states become empty after prefill
         """
 
-        beam_params = BeamParams(K=K, prune_threshold=prune_threshold, verbose=verbose)
-        data_dict_1 = defaultdict()
-        data_dict_2 = defaultdict()
+        eos_tokens = [
+            llm1.byte_vocab[llm1.tokenizer.eos_token_id].byte_string,
+            llm2.byte_vocab[llm2.tokenizer.eos_token_id].byte_string,
+        ]
+
+        def beam_params(eos):
+            return BeamParams(
+                K=K,
+                prune_threshold=prune_threshold,
+                verbose=verbose,
+                eos_byte_strings=[eos],
+            )
+
+        data_dict_1 = {}
+        data_dict_2 = {}
 
         async def setup():
             # Initialize beams sequentially to avoid overwhelming vLLM with concurrent requests
-            beam1 = await ByteBeamState.initial(llm1, beam_params)
-            beam2 = await ByteBeamState.initial(llm2, beam_params)
+            beam1 = await ByteBeamState.initial(llm1, beam_params(eos_tokens[0]))
+            beam2 = await ByteBeamState.initial(llm2, beam_params(eos_tokens[1]))
             # Prefill sequentially as well to reduce concurrent load
             beam_state_1 = await beam1.prefill(prompt1)
             beam_state_2 = await beam2.prefill(prompt2)
@@ -351,11 +313,6 @@ class ByteEnsemble(Potential):
         data_dict_1[b""] = beam_state_1
         data_dict_2[b""] = beam_state_2
 
-        eos_tokens = [
-            llm1.byte_vocab[llm1.tokenizer.eos_token_id],
-            llm2.byte_vocab[llm2.tokenizer.eos_token_id],
-        ]
-
         return cls(
             llm1,
             llm2,
@@ -368,13 +325,7 @@ class ByteEnsemble(Potential):
 
     async def _cleanup_cache(self):
         """Remove old entries to avoid cache bloat."""
-        max_len = max(
-            (
-                len(split_with_atomic_tokens(k, self.eos_tokens))
-                for k in self.data_dict_1
-            ),
-            default=0,
-        )
+        max_len = max((len(k) for k in self.data_dict_1), default=0)
         min_len = max_len - 2
         for d in [self.data_dict_1, self.data_dict_2]:
             for k in list(d.keys()):
@@ -399,11 +350,7 @@ class ByteEnsemble(Potential):
             KeyError: If context not found in cache (beam states must be populated
                 by ByteEnsembleTokenSampler during sampling)
         """
-        # Convert context to bytes
-        if context and isinstance(context[0], bytes):
-            ctx_bytes = b"".join(context)
-        else:
-            ctx_bytes = bytes(context)
+        ctx_bytes = bytes(context)
 
         await self._cleanup_cache()
         beam1 = self.data_dict_1[ctx_bytes]

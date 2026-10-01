@@ -12,10 +12,8 @@ from genlm.control import (
     EOS,
 )
 from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt, Sequences
-from genlm.control.potential.built_in.ensemble import (
-    split_with_atomic_tokens,
-    _weighted_extremum,
-)
+from genlm.control.potential.built_in.ensemble import _weighted_extremum
+from genlm.backend.tokenization.token import Token
 from conftest import MockPotential
 
 # ============================================================================
@@ -81,10 +79,7 @@ async def test_ensemble_batch_logw_next(mock_potential_1, mock_potential_2):
     """Test batch_logw_next combines weights from both potentials."""
     ensemble = Ensemble(mock_potential_1, mock_potential_2, op="prod", a=0.5)
     results = await ensemble.batch_logw_next([[], ["a"]])
-    assert len(results) == 2
-    for result in results:
-        assert hasattr(result, "weights")
-        assert len(result.weights) == len(ensemble.vocab_eos)
+    assert results.weights.shape == (2, len(ensemble.vocab_eos))
 
 
 @pytest.mark.asyncio
@@ -163,7 +158,7 @@ async def test_token_ensemble_different_operations():
         idx_ens = ensemble_prod.lookup[tok]
         idx_p1 = p1.lookup[tok]
         expected_val = 0.5 * logws1[idx_p1] + 0.5 * logws2[idx_p1]
-        assert result_prod[0].weights[idx_ens] == pytest.approx(expected_val, abs=1e-6)
+        assert result_prod.weights[0][idx_ens] == pytest.approx(expected_val, abs=1e-6)
 
     # Sum: log(0.5 * exp(log(p1)) + 0.5 * exp(log(p2)))
     ensemble_sum = Ensemble(p1, p2, op="sum", a=0.5)
@@ -175,7 +170,7 @@ async def test_token_ensemble_different_operations():
         expected_val = np.logaddexp(
             np.log(0.5) + logws1[idx_p1], np.log(0.5) + logws2[idx_p1]
         )
-        assert result_sum[0].weights[idx_ens] == pytest.approx(expected_val, abs=1e-6)
+        assert result_sum.weights[0][idx_ens] == pytest.approx(expected_val, abs=1e-6)
 
     # Min: For a=0.5, should be close to actual minimum
     ensemble_min = Ensemble(p1, p2, op="min", a=0.5)
@@ -185,7 +180,7 @@ async def test_token_ensemble_different_operations():
         idx_ens = ensemble_min.lookup[tok]
         idx_p1 = p1.lookup[tok]
         expected_val = np.minimum(logws1[idx_p1], logws2[idx_p1])
-        assert result_min[0].weights[idx_ens] == pytest.approx(expected_val, abs=0.5)
+        assert result_min.weights[0][idx_ens] == pytest.approx(expected_val, abs=0.5)
 
     # Max: For a=0.5, should be close to actual maximum
     ensemble_max = Ensemble(p1, p2, op="max", a=0.5)
@@ -195,7 +190,7 @@ async def test_token_ensemble_different_operations():
         idx_ens = ensemble_max.lookup[tok]
         idx_p1 = p1.lookup[tok]
         expected_val = np.maximum(logws1[idx_p1], logws2[idx_p1])
-        assert result_max[0].weights[idx_ens] == pytest.approx(expected_val, abs=0.5)
+        assert result_max.weights[0][idx_ens] == pytest.approx(expected_val, abs=0.5)
 
 
 @pytest.mark.asyncio
@@ -252,9 +247,9 @@ async def test_ensemble_weighting_affects_output():
     ensemble_20 = Ensemble(p1, p2, op="prod", a=0.2)  # Weight (0.2) on model 2
     result_20 = await ensemble_20.batch_logw_next([[]])
 
-    logws_50 = result_50[0].weights
-    logws_80 = result_80[0].weights
-    logws_20 = result_20[0].weights
+    logws_50 = result_50.weights[0]
+    logws_80 = result_80.weights[0]
+    logws_20 = result_20.weights[0]
     assert not np.allclose(logws_50, logws_80, rtol=1e-5)
     assert not np.allclose(logws_50, logws_20, rtol=1e-5)
     assert not np.allclose(logws_80, logws_20, rtol=1e-5)
@@ -286,8 +281,8 @@ async def test_ensemble_with_differently_conditioned_models():
 
     result_balanced = await ensemble_balanced.batch_logw_next([[]])
     result_favor_p1 = await ensemble_favor_p1.batch_logw_next([[]])
-    combined_balanced = result_balanced[0].weights
-    combined_favor_p1 = result_favor_p1[0].weights
+    combined_balanced = result_balanced.weights[0]
+    combined_favor_p1 = result_favor_p1.weights[0]
 
     select_idx_bal = ensemble_balanced.lookup[
         "SELECT"
@@ -347,7 +342,7 @@ async def test_ensemble_respects_vocab_alignment():
     p2 = MockPotential(vocab=vocab, next_token_logws=logws2)
     ensemble = Ensemble(p1, p2, op="prod", a=0.5)
     result = await ensemble.batch_logw_next([[]])
-    combined = result[0].weights
+    combined = result.weights[0]
 
     # Each token should get correct combined weight
     for tok in ["x", "y", "z"]:
@@ -367,8 +362,8 @@ async def test_ensemble_respects_vocab_alignment():
 @pytest.mark.asyncio
 async def test_token_ensemble_with_different_prompts():
     """Test token-level Ensemble with different prompts - basic functionality check."""
-    llm1 = PromptedLLM.from_name("gpt2")
-    llm2 = PromptedLLM.from_name("gpt2")
+    llm1 = PromptedLLM.from_name("openai-community/gpt2")
+    llm2 = PromptedLLM.from_name("openai-community/gpt2")
     llm1.set_prompt_from_str("Write a SQL query: ")
     llm2.set_prompt_from_str("SQL code: ")
 
@@ -377,7 +372,7 @@ async def test_token_ensemble_with_different_prompts():
     assert ensemble.p2 is llm2
 
     ensemble_result = await ensemble.batch_logw_next([[]])
-    ensemble_logws = ensemble_result[0].weights
+    ensemble_logws = ensemble_result.weights[0]
 
     assert len(ensemble_logws) > 0
     assert np.all(np.isfinite(ensemble_logws))
@@ -389,8 +384,8 @@ async def test_token_ensemble_with_different_prompts():
 @pytest.mark.asyncio
 async def test_token_ensemble_complementary_prompts():
     """Test token-level Ensemble combining complementary prompting strategies."""
-    llm1 = PromptedLLM.from_name("gpt2")
-    llm2 = PromptedLLM.from_name("gpt2")
+    llm1 = PromptedLLM.from_name("openai-community/gpt2")
+    llm2 = PromptedLLM.from_name("openai-community/gpt2")
 
     llm1.set_prompt_from_str("Task: Generate structured SQL.\n")
     llm2.set_prompt_from_str("Task: Generate correct SQL.\n")
@@ -400,12 +395,16 @@ async def test_token_ensemble_complementary_prompts():
     p2_result = await llm2.batch_logw_next([[]])
     ensemble_result = await ensemble.batch_logw_next([[]])
 
-    p1_logws = p1_result[0].weights
-    p2_logws = p2_result[0].weights
-    ensemble_logws = ensemble_result[0].weights
+    p1_logws = p1_result.weights[0]
+    p2_logws = p2_result.weights[0]
+    ensemble_logws = ensemble_result.weights[0]
 
-    assert not np.allclose(ensemble_logws, p1_logws, rtol=0.1)
-    assert not np.allclose(ensemble_logws, p2_logws, rtol=0.1)
+    p1_logws = np.asarray(p1_logws)[ensemble.p1_vocab_idxs]
+    p2_logws = np.asarray(p2_logws)[ensemble.p2_vocab_idxs]
+    assert not np.allclose(p1_logws, p2_logws)
+    np.testing.assert_allclose(
+        ensemble_logws, 0.5 * p1_logws + 0.5 * p2_logws, rtol=1e-5
+    )
     assert np.all(np.isfinite(ensemble_logws))
 
 
@@ -417,8 +416,8 @@ async def test_token_ensemble_complementary_prompts():
 @pytest.mark.asyncio
 async def test_byte_ensemble_creation():
     """Test ByteEnsemble creation with identical prompts."""
-    llm1 = load_model_by_name("gpt2", backend="hf")
-    llm2 = load_model_by_name("gpt2", backend="hf")
+    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
+    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
     prompt = b"Test"
     ensemble = await ByteEnsemble.create(
         llm1, llm2, op="prod", prompt1=prompt, prompt2=prompt, a=0.5
@@ -435,8 +434,8 @@ async def test_byte_ensemble_creation():
 @pytest.mark.asyncio
 async def test_byte_ensemble_different_prompts():
     """Test ByteEnsemble with different prompts - the key use case for ensembling."""
-    llm1 = load_model_by_name("gpt2", backend="hf")
-    llm2 = load_model_by_name("gpt2", backend="hf")
+    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
+    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
 
     prompt1 = b"Write a SQL query to find all users: "
     prompt2 = b"SQL: Find all users in the database: "
@@ -457,8 +456,8 @@ async def test_byte_ensemble_different_prompts():
 @pytest.mark.asyncio
 async def test_byte_ensemble_get_beam_states():
     """Test that ByteEnsemble.get_beam_states() provides access to beams."""
-    llm1 = load_model_by_name("gpt2", backend="hf")
-    llm2 = load_model_by_name("gpt2", backend="hf")
+    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
+    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
     ensemble = await ByteEnsemble.create(
         llm1, llm2, op="prod", prompt1=b"Hi", prompt2=b"Hello", a=0.5
     )
@@ -474,18 +473,13 @@ async def test_byte_ensemble_get_beam_states():
 @pytest.mark.asyncio
 async def test_byte_ensemble_token_sampler_initialization():
     """Test ByteEnsembleTokenSampler initialization with different prompts."""
-    llm1 = load_model_by_name("gpt2", backend="hf")
-    llm2 = load_model_by_name("gpt2", backend="hf")
+    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
+    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
     ensemble = await ByteEnsemble.create(
         llm1, llm2, op="prod", prompt1=b"Answer: ", prompt2=b"Response: ", a=0.5
     )
-    eos_tokens = [llm1.byte_vocab[llm1.tokenizer.eos_token_id]]
-    sampler = ByteEnsembleTokenSampler(
-        ensemble, max_tokens=50, eos_tokens=eos_tokens, n_particles=5
-    )
+    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
     assert sampler.potential is ensemble
-    assert sampler.max_tokens == 50
-    assert sampler.eos_tokens == eos_tokens
     assert sampler.n_particles == 5
     # check caches
     assert () in sampler.prefix_cache_1
@@ -497,16 +491,13 @@ async def test_byte_ensemble_token_sampler_initialization():
 @pytest.mark.asyncio
 async def test_byte_ensemble_sampler_sample():
     """Test ByteEnsembleTokenSampler samples with different prompts."""
-    llm1 = load_model_by_name("gpt2", backend="hf")
-    llm2 = load_model_by_name("gpt2", backend="hf")
+    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
+    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
 
     ensemble = await ByteEnsemble.create(
         llm1, llm2, op="prod", prompt1=b"The cat is ", prompt2=b"A cat is ", a=0.5
     )
-    eos_tokens = [llm1.byte_vocab[llm1.tokenizer.eos_token_id]]
-    sampler = ByteEnsembleTokenSampler(
-        ensemble, max_tokens=10, eos_tokens=eos_tokens, n_particles=3
-    )
+    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=3)
     token, logw, logp = await sampler.sample([])
     assert isinstance(token, (int, bytes))
     assert isinstance(logw, (int, float, np.number))
@@ -525,8 +516,8 @@ async def test_byte_ensemble_sampler_sample():
 @pytest.mark.asyncio
 async def test_byte_ensemble_weighted_different_prompts():
     """Test ByteEnsemble with unequal weights on different prompts."""
-    llm1 = load_model_by_name("gpt2", backend="hf")
-    llm2 = load_model_by_name("gpt2", backend="hf")
+    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
+    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
 
     prompt1 = b"Correct approach: "
     prompt2 = b"Alternative: "
@@ -538,10 +529,7 @@ async def test_byte_ensemble_weighted_different_prompts():
     assert ensemble.p1 is llm1
     assert ensemble.p2 is llm2
 
-    eos_tokens = [llm1.byte_vocab[llm1.tokenizer.eos_token_id]]
-    sampler = ByteEnsembleTokenSampler(
-        ensemble, max_tokens=5, eos_tokens=eos_tokens, n_particles=2
-    )
+    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=2)
     token, logw, logp = await sampler.sample([])
     assert isinstance(token, (int, bytes))
     assert np.isfinite(logw)
@@ -565,7 +553,7 @@ async def test_ensemble_with_different_model_preferences():
     for tok in vocab:
         assert tok in ensemble.vocab
     result = await ensemble.batch_logw_next([[]])
-    combined = result[0].weights
+    combined = result.weights[0]
 
     for tok in vocab:
         ensemble_idx = ensemble.lookup[tok]
@@ -611,7 +599,7 @@ async def test_ensemble_with_complementary_knowledge():
     p2 = MockPotential(vocab=vocab2, next_token_logws=logws2)
     ensemble = Ensemble(p1, p2, op="prod", a=0.5)
     result = await ensemble.batch_logw_next([[]])
-    combined = result[0].weights
+    combined = result.weights[0]
 
     for tok in vocab1:
         idx = ensemble.lookup[tok]
@@ -622,8 +610,8 @@ async def test_ensemble_with_complementary_knowledge():
     p1_result = await p1.batch_logw_next([[]])
     p2_result = await p2.batch_logw_next([[]])
 
-    assert not np.allclose(combined, p1_result[0].weights, rtol=0.1)
-    assert not np.allclose(combined, p2_result[0].weights, rtol=0.1)
+    assert not np.allclose(combined, p1_result.weights[0], rtol=0.1)
+    assert not np.allclose(combined, p2_result.weights[0], rtol=0.1)
 
 
 @pytest.mark.asyncio
@@ -641,13 +629,13 @@ async def test_ensemble_helps_uncertain_model():
     p2 = MockPotential(vocab=mock_vocab, next_token_logws=logws2)
     ensemble = Ensemble(p1, p2, op="prod", a=0.5)
     result = await ensemble.batch_logw_next([[]])
-    combined = result[0].weights
+    combined = result.weights[0]
 
     correct_idx = ensemble.lookup["correct"]
     wrong1_idx = ensemble.lookup["wrong1"]
     # ensemble should favor 'correct' more than model 1 alone
     p1_result = await p1.batch_logw_next([[]])
-    p1_logws = p1_result[0].weights
+    p1_logws = p1_result.weights[0]
     p1_correct = p1_logws[p1.lookup["correct"]]
     p1_wrong1 = p1_logws[p1.lookup["wrong1"]]
     ensemble_correct = combined[correct_idx]
@@ -656,17 +644,17 @@ async def test_ensemble_helps_uncertain_model():
     # Ensemble should have stronger preference for 'correct' than uncertain model 1
     p1_gap = p1_correct - p1_wrong1
     ensemble_gap = ensemble_correct - ensemble_wrong1
-    assert (
-        ensemble_gap > p1_gap
-    ), "Ensemble should be more confident than uncertain model"
+    assert ensemble_gap > p1_gap, (
+        "Ensemble should be more confident than uncertain model"
+    )
 
     # But less confident than model 2 alone
     p2_result = await p2.batch_logw_next([[]])
-    p2_logws = p2_result[0].weights
+    p2_logws = p2_result.weights[0]
     p2_gap = p2_logws[p2.lookup["correct"]] - p2_logws[p2.lookup["wrong1"]]
-    assert (
-        ensemble_gap < p2_gap
-    ), "Ensemble should be less confident than very confident model"
+    assert ensemble_gap < p2_gap, (
+        "Ensemble should be less confident than very confident model"
+    )
 
 
 # ============================================================================
@@ -704,14 +692,11 @@ def test_convert_to_weighted_logop_operations():
 @pytest.mark.asyncio
 async def test_byte_ensemble_token_sampler_start_weight():
     """Test ByteEnsembleTokenSampler.start_weight() returns 0.0."""
-    llm = load_model_by_name("gpt2", backend="hf")
+    llm = load_model_by_name("openai-community/gpt2", backend="hf")
     ensemble = await ByteEnsemble.create(
         llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
     )
-    eos_tokens = [llm.byte_vocab[llm.tokenizer.eos_token_id]]
-    sampler = ByteEnsembleTokenSampler(
-        ensemble, max_tokens=10, eos_tokens=eos_tokens, n_particles=5
-    )
+    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
     start_weight = await sampler.start_weight()
     assert start_weight == 0.0
 
@@ -719,14 +704,11 @@ async def test_byte_ensemble_token_sampler_start_weight():
 @pytest.mark.asyncio
 async def test_byte_ensemble_sampler_eos_handling():
     """Test ByteEnsembleTokenSampler properly handles EOS tokens and max_tokens."""
-    llm = load_model_by_name("gpt2", backend="hf")
+    llm = load_model_by_name("openai-community/gpt2", backend="hf")
     ensemble = await ByteEnsemble.create(
         llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
     )
-    eos_byte = llm.byte_vocab[llm.tokenizer.eos_token_id]
-    sampler = ByteEnsembleTokenSampler(
-        ensemble, max_tokens=5, eos_tokens=[eos_byte], n_particles=5
-    )
+    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
     _, _, _ = await sampler.sample([])
     if len(sampler.particle_prefix_log_prob_1) > 0:
         assert len(sampler.particle_prefix_log_prob_1) >= 0
@@ -737,7 +719,7 @@ async def test_byte_ensemble_sampler_eos_handling():
 async def test_byte_ensemble_empty_beam_error():
     """Test ByteEnsemble raises RuntimeError when beam is empty after prefill."""
     mock_llm = MagicMock()
-    mock_llm.byte_vocab = {0: b"a"}
+    mock_llm.byte_vocab = [Token(0, b"a")]
     mock_llm.tokenizer.eos_token_id = 0
     empty_beam = MagicMock()
     empty_beam.prefill = AsyncMock(return_value=[])
@@ -749,19 +731,6 @@ async def test_byte_ensemble_empty_beam_error():
             await ByteEnsemble.create(
                 mock_llm, mock_llm, op="prod", prompt1=b"test", prompt2=b"test", a=0.5
             )
-
-
-def test_split_with_atomic_tokens_overlapping():
-    """Test split_with_atomic_tokens with overlapping tokens."""
-    with pytest.warns(UserWarning, match="Overlapping atomic tokens detected"):
-        result = split_with_atomic_tokens(b"ABC", [b"A", b"AB"])
-    assert result == [b"A", 66, 67]
-
-
-def test_split_with_atomic_tokens_no_match():
-    """Test split_with_atomic_tokens when no atomic tokens match."""
-    result = split_with_atomic_tokens(b"XYZ", [b"A", b"B"])
-    assert result == [88, 89, 90]
 
 
 def test_weighted_extremum_different_weights():
@@ -854,7 +823,7 @@ def test_sequences_ext_post_init_with_none():
 @pytest.mark.asyncio
 async def test_byte_ensemble_cleanup_cache_deletes_short_keys():
     """Test ByteEnsemble._cleanup_cache() deletes short keys."""
-    gpt2 = load_model_by_name("gpt2")
+    gpt2 = load_model_by_name("openai-community/gpt2")
     prompt1 = b"The capital of France is"
     prompt2 = b"Paris, the capital city of France, is"
     ensemble = await ByteEnsemble.create(
@@ -886,7 +855,7 @@ async def test_byte_ensemble_cleanup_cache_deletes_short_keys():
 
 @pytest.mark.asyncio
 async def test_byte_ensemble_empty_beam_error_covered():
-    gpt2 = load_model_by_name("gpt2")
+    gpt2 = load_model_by_name("openai-community/gpt2")
     prompt1 = b"\xff\xfe\xfd"  # Invalid UTF-8 bytes
     prompt2 = b"Test"
     with pytest.raises(RuntimeError, match="is empty after prefill"):
@@ -897,26 +866,24 @@ async def test_byte_ensemble_empty_beam_error_covered():
 
 @pytest.mark.asyncio
 async def test_byte_ensemble_sampler_stores_particle_weights():
-    """Test ByteEnsembleTokenSampler stores particle weights at EOS."""
-    gpt2 = load_model_by_name("gpt2")
+    """Test ByteEnsembleTokenSampler stores particle weights at forced EOS."""
+    gpt2 = load_model_by_name("openai-community/gpt2")
     prompt1 = b"Hi"
     prompt2 = b"Hi"
 
     ensemble = await ByteEnsemble.create(
         gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
     )
-    sampler = ByteEnsembleTokenSampler(ensemble, max_tokens=1)
-    context = []
-    token, _, _ = await sampler.sample(context)
-    new_ctx_tuple = (token,)
-    assert new_ctx_tuple in sampler.particle_prefix_log_prob_1
-    assert new_ctx_tuple in sampler.particle_prefix_log_prob_2
+    sampler = ByteEnsembleTokenSampler(ensemble)
+    await sampler.logw_eos([])
+    assert (EOS,) in sampler.particle_prefix_log_prob_1
+    assert (EOS,) in sampler.particle_prefix_log_prob_2
 
 
 @pytest.mark.asyncio
 async def test_byte_ensemble_sampler_eos_conversion():
     """Test ByteEnsembleTokenSampler EOS conversion path."""
-    gpt2 = load_model_by_name("gpt2")
+    gpt2 = load_model_by_name("openai-community/gpt2")
     prompt1 = b"Hi"
     prompt2 = b"Hi"
     ensemble = await ByteEnsemble.create(
@@ -931,7 +898,7 @@ async def test_byte_ensemble_sampler_eos_conversion():
 @pytest.mark.asyncio
 async def test_byte_ensemble_sampler_smc_calls_ensemble_smc():
     """Test ByteEnsembleTokenSampler.smc() method invokes EnsembleSMC."""
-    gpt2 = load_model_by_name("gpt2")
+    gpt2 = load_model_by_name("openai-community/gpt2")
     prompt1 = b"Hi"
     prompt2 = b"Hi"
     ensemble = await ByteEnsemble.create(
