@@ -144,7 +144,7 @@ class Ensemble(Potential):
             contexts (List[List[str]]): List of context token sequences
 
         Returns:
-            LazyWeights: Batched combined log weights, `.weights` of shape `[N, V+1]`
+            (LazyWeights): Batched combined log weights, `.weights` of shape `[N, V+1]`
 
         Note:
             This method is only used if the Ensemble is wrapped in AutoBatchedPotential or
