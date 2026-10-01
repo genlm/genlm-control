@@ -24,6 +24,7 @@ dependencies = [
     "torch",
     "json-stream",
     "jsonschema[format-nongpl]",
+    "cachetools",
     "regex"
 ]
 
@@ -52,9 +53,10 @@ docs = [
     "mkdocs-section-index",
 ]
 mlx = [
-    # Mirrors genlm-backend's [mlx] bound.
+    # Mirrors genlm-backend's [mlx] bound. mlx-lm 0.32 removed the
+    # private helper genlm-backend 0.3.0 imports (_left_pad_prompts).
     "mlx>=0.29.2",
-    "mlx-lm>=0.30",
+    "mlx-lm>=0.30,<0.32",
 ]
 
 [tool.setuptools.packages.find]

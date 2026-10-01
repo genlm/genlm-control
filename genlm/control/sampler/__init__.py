@@ -1,6 +1,6 @@
 from .token import DirectTokenSampler, SetTokenSampler, AWRS, TokenSampler
 from .set import EagerSetSampler, TopKSetSampler
-from .sequence import SMC
+from .sequence import SMC, EnsembleSMC, Sequences, SequencesExt
 from .unit import (
     MultiTokenUnitSampler,
     BoundaryPredicate,
@@ -8,6 +8,7 @@ from .unit import (
     FixedLengthBoundary,
     CFGBoundary,
 )
+from .byte_ensemble import ByteEnsembleTokenSampler
 from genlm.control.util import flatten_units
 from genlm.control.potential import Potential
 
@@ -76,10 +77,14 @@ __all__ = [
     "SetTokenSampler",
     "TokenSampler",
     "SMC",
+    "EnsembleSMC",
+    "Sequences",
+    "SequencesExt",
     "MultiTokenUnitSampler",
     "BoundaryPredicate",
     "TokenSetBoundary",
     "FixedLengthBoundary",
     "CFGBoundary",
     "flatten_units",
+    "ByteEnsembleTokenSampler",
 ]

@@ -17,6 +17,9 @@ from .built_in import (
     BoolFSA,
     JsonSchema,
     CanonicalTokenization,
+    Ensemble,
+    convert_to_weighted_logop,
+    ByteEnsemble,
 )
 
 __all__ = [
@@ -31,6 +34,9 @@ __all__ = [
     "WFSA",
     "BoolFSA",
     "CanonicalTokenization",
+    "Ensemble",
+    "convert_to_weighted_logop",
+    "ByteEnsemble",
     "AutoBatchedPotential",
     "MultiProcPotential",
     "Coerced",
