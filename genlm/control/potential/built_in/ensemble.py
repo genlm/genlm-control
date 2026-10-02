@@ -1,7 +1,8 @@
 import asyncio
+import numbers
 import warnings
 import numpy as np
-from typing import Any, Callable, List, Literal, Tuple
+from typing import Any, Callable, List, Tuple, Union
 
 from arsenal.maths import logsumexp
 
@@ -20,7 +21,8 @@ class Ensemble(Potential):
     Args:
         p1 (Potential): First potential (language model)
         p2 (Potential): Second potential (language model)
-        op (str): Operation name (e.g., "sum", "prod", "min", "max", "harmonic", or power means)
+        op (str | float): "sum", "prod", "harmonic", "min", "max", or a power-mean
+            exponent p (see `convert_to_weighted_logop`)
         a (float): Weighting parameter between 0 and 1 (default 0.5 for equal weighting).
             When a=0.5, models are weighted equally. For a != 0.5, the combination
             is weighted: a * model1 + (1-a) * model2
@@ -58,7 +60,7 @@ class Ensemble(Potential):
         self,
         p1: Potential,
         p2: Potential,
-        op: str,
+        op: Union[str, float],
         a: float = 0.5,
     ):
         self.p1 = p1
@@ -245,7 +247,7 @@ class ByteEnsemble(Potential):
         cls,
         llm1: Any,
         llm2: Any,
-        op: str,
+        op: Union[str, float],
         prompt1: bytes,
         prompt2: bytes,
         a: float = 0.5,
@@ -258,7 +260,8 @@ class ByteEnsemble(Potential):
         Args:
             llm1 (Any): First language model (from genlm.backend)
             llm2 (Any): Second language model (from genlm.backend)
-            op (str): Operation name ('sum', 'prod', 'min', 'max', 'harmonic', or power means)
+            op (str | float): 'sum', 'prod', 'harmonic', 'min', 'max', or a power-mean
+                exponent p (see `convert_to_weighted_logop`)
             prompt1 (bytes): Prompt bytes for first model
             prompt2 (bytes): Prompt bytes for second model
             a (float): Weighting parameter between 0 and 1 (default 0.5 for equal weighting)
@@ -386,11 +389,12 @@ class ByteEnsemble(Potential):
         return None  # pragma: no cover
 
 
-def _power_mean(p: float, a: float):
+def _power_mean(p: float, a: float) -> Callable:
     """Create a weighted power mean operator in log space.
 
     M_p(x, y; a) = (a * exp(p*x) + (1-a) * exp(p*y))^(1/p)
     In log space: (1/p) * logsumexp([log(a) + p*x, log(1-a) + p*y])
+    p = 0 is the limit, the weighted geometric mean a*x + (1-a)*y.
 
     Args:
         p (float): Power parameter for the power mean
@@ -399,6 +403,8 @@ def _power_mean(p: float, a: float):
     Returns:
         Callable: Function that computes weighted power mean in log space
     """
+    if p == 0:
+        return lambda x, y: a * x + (1 - a) * y
     log_a, log_1_minus_a = np.log(a), np.log(1 - a)
     return lambda x, y: (1.0 / p) * logsumexp(
         [log_a + p * x, log_1_minus_a + p * y], axis=0
@@ -444,58 +450,27 @@ def _neginf_for_nan(op: Callable):
     return safe
 
 
-_POWER_MEANS = {
-    "pm5": -5.0,
-    "pm2.5": -2.5,
-    "p-2": -2.0,
-    "pm1.5": -1.5,
-    "pm0.5": -0.5,
-    "pm0.25": -0.25,
-    "p0.25": 0.25,
-    "p0.5": 0.5,
-    "p1.5": 1.5,
-    "p2": 2.0,
-    "p2.5": 2.5,
-    "p3": 3.0,
-    "p5": 5.0,
-}
+# Named means, as power-mean exponents.
+_NAMED_POWERS = {"sum": 1.0, "prod": 0.0, "harmonic": -1.0}
 
 
 def convert_to_weighted_logop(
-    op: Literal[
-        "sum",
-        "prod",
-        "min",
-        "max",
-        "harmonic",
-        "pm5",
-        "pm2.5",
-        "p-2",
-        "pm1.5",
-        "pm0.5",
-        "pm0.25",
-        "p0.25",
-        "p0.5",
-        "p1.5",
-        "p2",
-        "p2.5",
-        "p3",
-        "p5",
-    ],
+    op: Union[str, float],
     a: float = 0.5,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Convert a string operation to its weighted log-space equivalent.
+    """Convert an operation to its weighted log-space equivalent.
 
-    This function takes an operation name and a weighting parameter and returns
+    This function takes an operation and a weighting parameter and returns
     a function that combines two log-probability arrays using the specified
     weighted operation.
 
     Args:
-        op (str): Operation name. Supported operations include:
-            - Means: "sum" (arithmetic), "prod" (geometric), "harmonic"
-            - Extrema: "min", "max"
-            - Power means: "pm5", "pm2.5", "p-2", "pm1.5", "pm0.5", "pm0.25",
-                        "p0.25", "p0.5", "p1.5", "p2", "p2.5", "p3", "p5"
+        op (str | float): The operation:
+            - a number p: the weighted power mean
+              M_p(x, y) = (a * x^p + (1-a) * y^p)^(1/p), with p = 0 the geometric mean
+            - "sum" (arithmetic mean), "prod" (geometric mean), "harmonic": the
+              power means with p = 1, 0 and -1
+            - "min", "max": weighted extrema
         a (float): Weighting parameter between 0 and 1. When a=0.5, equal weighting.
             For weighted operations: a * model1 + (1-a) * model2
 
@@ -511,28 +486,21 @@ def convert_to_weighted_logop(
         >>> x = np.log(np.array([0.3, 0.7]))
         >>> y = np.log(np.array([0.6, 0.4]))
         >>> result = op_func(x, y)  # Weighted arithmetic mean in log space
+        >>> result = convert_to_weighted_logop(2.5, a=0.5)(x, y)  # Power mean, p=2.5
     """
     if not 0 < a < 1:
         raise ValueError("variable a should be between 0 and 1")
 
-    log_a, log_1_minus_a = np.log(a), np.log(1 - a)
+    if op == "min":
+        return _neginf_for_nan(_weighted_extremum(np.minimum, a))
+    if op == "max":
+        return _neginf_for_nan(_weighted_extremum(np.maximum, a))
 
-    # Ensemble operations
-    if op in _POWER_MEANS:
-        return _neginf_for_nan(_power_mean(_POWER_MEANS[op], a))
-
-    operations = {
-        "sum": lambda x, y: logsumexp([x + log_a, y + log_1_minus_a], axis=0),
-        "prod": lambda x, y: a * x + (1 - a) * y,
-        "harmonic": lambda x, y: -logsumexp([-x + log_a, -y + log_1_minus_a], axis=0),
-        "min": _weighted_extremum(np.minimum, a),
-        "max": _weighted_extremum(np.maximum, a),
-    }
-
-    if op in operations:
-        return _neginf_for_nan(operations[op])
-
-    valid_ops = list(operations.keys()) + list(_POWER_MEANS.keys())
-    raise ValueError(
-        f"Invalid operation: {op}. Must be one of {', '.join(repr(o) for o in valid_ops)}."
-    )
+    p = _NAMED_POWERS.get(op, op) if isinstance(op, str) else op
+    if not isinstance(p, numbers.Real) or isinstance(p, bool):
+        valid = ", ".join(repr(o) for o in [*_NAMED_POWERS, "min", "max"])
+        raise ValueError(
+            f"Invalid operation: {op!r}. Must be one of {valid}, or a number p "
+            "for the power mean."
+        )
+    return _neginf_for_nan(_power_mean(float(p), a))

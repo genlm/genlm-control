@@ -224,7 +224,7 @@ async def test_token_ensemble_different_operations():
 
 @pytest.mark.asyncio
 async def test_ensemble_all_power_means():
-    """Test all supported power mean operations."""
+    """Test power means across negative and positive exponents."""
     mock_vocab = ["a", "b"]
     logws1 = np.log([0.7, 0.3, 0.001])  # Model 1 prefers 'a'
     logws2 = np.log([0.3, 0.7, 0.001])  # Model 2 prefers 'b'
@@ -232,21 +232,7 @@ async def test_ensemble_all_power_means():
     p1 = MockPotential(vocab=mock_vocab, next_token_logws=logws1)
     p2 = MockPotential(vocab=mock_vocab, next_token_logws=logws2)
 
-    power_means = [
-        "pm5",
-        "pm2.5",
-        "p-2",
-        "pm1.5",
-        "pm0.5",
-        "pm0.25",
-        "p0.25",
-        "p0.5",
-        "p1.5",
-        "p2",
-        "p2.5",
-        "p3",
-        "p5",
-    ]
+    power_means = [-5, -2.5, -2, -1.5, -0.5, -0.25, 0.25, 0.5, 1.5, 2, 2.5, 3, 5]
     for op in power_means:
         ensemble = Ensemble(p1, p2, op=op, a=0.5)
         logw = await ensemble.prefix([])
@@ -701,6 +687,30 @@ def test_convert_to_weighted_logop_invalid_op():
     """Test that invalid operation raises ValueError."""
     with pytest.raises(ValueError, match="Invalid operation"):
         convert_to_weighted_logop("invalid_op", a=0.5)
+    with pytest.raises(ValueError, match="Invalid operation"):
+        convert_to_weighted_logop(True, a=0.5)
+
+
+@pytest.mark.parametrize("name, p", [("sum", 1), ("prod", 0), ("harmonic", -1)])
+@pytest.mark.parametrize("a", [0.3, 0.5])
+def test_named_ops_are_power_means(name, p, a):
+    """Test sum, prod and harmonic are the power means with p = 1, 0 and -1."""
+    x = np.log([0.2, 0.5, 0.3])
+    y = np.log([0.6, 0.1, 0.3])
+    np.testing.assert_allclose(
+        convert_to_weighted_logop(name, a)(x, y),
+        convert_to_weighted_logop(p, a)(x, y),
+        rtol=1e-12,
+    )
+
+
+def test_power_mean_matches_definition():
+    """Test the log-space power mean against (a x^p + (1-a) y^p)^(1/p)."""
+    x, y = np.array([0.2, 0.5]), np.array([0.6, 0.1])
+    for p, a in [(2.5, 0.3), (-1.5, 0.7), (0.5, 0.5)]:
+        expected = (a * x**p + (1 - a) * y**p) ** (1 / p)
+        result = convert_to_weighted_logop(p, a)(np.log(x), np.log(y))
+        np.testing.assert_allclose(np.exp(result), expected, rtol=1e-12)
 
 
 def test_convert_to_weighted_logop_operations():
@@ -980,7 +990,7 @@ async def test_byte_ensemble_smc_records_weights_for_every_particle():
     assert np.all(np.isfinite(result.log_prefix_weights_2))
 
 
-@pytest.mark.parametrize("op", ["sum", "prod", "harmonic", "min", "max", "pm0.5", "p2"])
+@pytest.mark.parametrize("op", ["sum", "prod", "harmonic", "min", "max", -0.5, 2])
 @pytest.mark.parametrize("a", [0.3, 0.5, 0.7])
 def test_ops_zero_weights_give_neginf_not_nan(op, a):
     """Test ops combine -inf (zero weight) entries without producing nan."""
