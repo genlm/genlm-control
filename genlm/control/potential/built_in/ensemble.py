@@ -122,6 +122,32 @@ class Ensemble(Potential):
             W[missing, 1] = to_numpy(W2)
         return W
 
+    async def component_logws(self, context: List[str]) -> Tuple[float, float]:
+        """Each potential's log weight of `context`.
+
+        For a context ending in EOS these are the potentials' `complete` weights of
+        the sequence before it, otherwise their `prefix` weights. Together with the
+        ensemble's own weight, e.g. to record per-model log weights of SMC samples.
+
+        Args:
+            context (List[str]): The context tokens, optionally ending in EOS.
+
+        Returns:
+            Tuple[float, float]: The log weights under `p1` and `p2`.
+        """
+        if context and context[-1] is self.eos:
+            parent = self._rows.get(tuple(context[:-1]))
+            if parent is not None:
+                w1, w2, row1, row2 = parent
+                i = self.lookup[self.eos]
+                return float(w1 + row1[i]), float(w2 + row2[i])
+            w1, w2 = await asyncio.gather(
+                self.p1.complete(context[:-1]), self.p2.complete(context[:-1])
+            )
+            return float(w1), float(w2)
+        ((w1, w2),) = await self._component_prefixes([context])
+        return float(w1), float(w2)
+
     async def prefix(self, context: List[str]) -> float:
         """Compute log weights for the prefix using both potentials.
 

@@ -96,6 +96,40 @@ async def test_ensemble_memo_matches_recomputation():
 
 
 @pytest.mark.asyncio
+async def test_ensemble_component_logws():
+    """Test per-model weights: prefix weights, and complete weights after EOS."""
+    vocab = ["a", "b"]
+    p1 = _normalized_mock(vocab, [0.6, 0.3, 0.1])
+    p2 = _normalized_mock(vocab, [0.2, 0.5, 0.3])
+    for warm in [False, True]:
+        ensemble = Ensemble(p1, p2, op="sum", a=0.4)
+        if warm:
+            await ensemble.batch_logw_next([[], ["a"]])
+        w1, w2 = await ensemble.component_logws(["a", "b"])
+        assert w1 == pytest.approx(await p1.prefix(["a", "b"]), abs=1e-12)
+        assert w2 == pytest.approx(await p2.prefix(["a", "b"]), abs=1e-12)
+        w1, w2 = await ensemble.component_logws(["a", EOS])
+        assert w1 == pytest.approx(await p1.complete(["a"]), abs=1e-12)
+        assert w2 == pytest.approx(await p2.complete(["a"]), abs=1e-12)
+
+
+@pytest.mark.asyncio
+async def test_ensemble_component_logws_after_smc():
+    """Test per-model weights are available for every SMC sample, incl. forced EOS."""
+    vocab = ["a", "b"]
+    p1 = _normalized_mock(vocab, [0.45, 0.45, 0.1])
+    p2 = _normalized_mock(vocab, [0.2, 0.5, 0.3])
+    ensemble = Ensemble(p1, p2, op="sum", a=0.4)
+    sequences = await direct_token_sampler(ensemble).smc(
+        n_particles=5, ess_threshold=0.5, max_tokens=3
+    )
+    for context in sequences.contexts:
+        w1, w2 = await ensemble.component_logws(context)
+        assert w1 == pytest.approx(await p1.complete(context[:-1]), abs=1e-12)
+        assert w2 == pytest.approx(await p2.complete(context[:-1]), abs=1e-12)
+
+
+@pytest.mark.asyncio
 async def test_ensemble_prod_is_local_product():
     """Test the weighted product's next-token weights don't depend on the prefix."""
     vocab = ["a", "b"]
