@@ -57,22 +57,72 @@ async def test_ensemble_initialization(mock_potential_1, mock_potential_2):
     assert len(ensemble.vocab) == 4
 
 
-@pytest.mark.asyncio
-async def test_ensemble_logws_next(mock_potential_1, mock_potential_2):
-    """Test that logws_next returns separate log weights from both potentials."""
-    ensemble = Ensemble(mock_potential_1, mock_potential_2, op="prod", a=0.5)
-    p1_logw, p2_logw = await ensemble.logws_next([])
-    assert hasattr(p1_logw, "weights")
-    assert hasattr(p2_logw, "weights")
-    assert p1_logw.weights.shape == p2_logw.weights.shape
+def _normalized_mock(vocab, probs):
+    """A mock LM whose next-token weights are a normalized distribution."""
+    return MockPotential(vocab=vocab, next_token_logws=np.log(probs))
 
 
 @pytest.mark.asyncio
-async def test_ensemble_logw_next_raises(mock_potential_1, mock_potential_2):
-    """Test that logw_next raises NotImplementedError."""
-    ensemble = Ensemble(mock_potential_1, mock_potential_2, op="prod", a=0.5)
-    with pytest.raises(NotImplementedError):
-        await ensemble.logw_next([])
+@pytest.mark.parametrize("op", ["sum", "prod", "harmonic", "min", "max", 2.5])
+async def test_ensemble_logw_next_matches_prefix(op):
+    """Test logw_next(ctx)[x] == prefix(ctx + [x]) - prefix(ctx), the Potential contract."""
+    vocab = ["a", "b", "c"]
+    p1 = _normalized_mock(vocab, [0.5, 0.2, 0.2, 0.1])
+    p2 = _normalized_mock(vocab, [0.1, 0.3, 0.4, 0.2])
+    ensemble = Ensemble(p1, p2, op=op, a=0.3)
+    for context in [[], ["a"], ["c", "b"]]:
+        logws = await ensemble.logw_next(context)
+        base = await ensemble.prefix(context)
+        for token in vocab:
+            expected = await ensemble.prefix(context + [token]) - base
+            assert logws[token] == pytest.approx(expected, abs=1e-10)
+        expected_eos = await ensemble.complete(context) - base
+        assert logws[ensemble.eos] == pytest.approx(expected_eos, abs=1e-10)
+
+
+@pytest.mark.asyncio
+async def test_ensemble_memo_matches_recomputation():
+    """Test prefix weights read from the memo equal those recomputed without it."""
+    vocab = ["a", "b"]
+    p1 = _normalized_mock(vocab, [0.6, 0.3, 0.1])
+    p2 = _normalized_mock(vocab, [0.2, 0.5, 0.3])
+    warm = Ensemble(p1, p2, op="sum", a=0.4)
+    await warm.batch_logw_next([[], ["a"]])
+    cold = Ensemble(p1, p2, op="sum", a=0.4)
+    for context in [["a"], ["b"], ["a", "b"]]:
+        assert await warm.prefix(context) == pytest.approx(
+            await cold.prefix(context), abs=1e-12
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensemble_prod_is_local_product():
+    """Test the weighted product's next-token weights don't depend on the prefix."""
+    vocab = ["a", "b"]
+    p1 = _normalized_mock(vocab, [0.6, 0.3, 0.1])
+    p2 = _normalized_mock(vocab, [0.2, 0.5, 0.3])
+    ensemble = Ensemble(p1, p2, op="prod", a=0.3)
+    expected = 0.3 * p1.next_token_logws + 0.7 * p2.next_token_logws
+    for context in [[], ["a", "b", "a"]]:
+        np.testing.assert_allclose(
+            (await ensemble.logw_next(context)).weights, expected, atol=1e-12
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensemble_sum_preserves_mass():
+    """Test a sum ensemble of normalized models has every SMC step weight log 1 = 0."""
+    vocab = ["a", "b"]
+    p1 = _normalized_mock(vocab, [0.6, 0.3, 0.1])
+    p2 = _normalized_mock(vocab, [0.2, 0.5, 0.3])
+    sampler = direct_token_sampler(Ensemble(p1, p2, op="sum", a=0.3))
+    context = []
+    for _ in range(10):
+        token, logw, _ = await sampler.sample(context)
+        assert logw == pytest.approx(0.0, abs=1e-12)
+        if token is EOS:
+            break
+        context.append(token)
 
 
 @pytest.mark.asyncio

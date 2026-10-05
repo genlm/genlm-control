@@ -5,6 +5,7 @@ import numpy as np
 from typing import Any, Callable, List, Tuple, Union
 
 from arsenal.maths import logsumexp
+from cachetools import LRUCache
 
 from genlm.control.potential.base import Potential
 from genlm.control.util import to_numpy
@@ -14,9 +15,11 @@ from genlm.bytes import ByteBeamState, BeamParams
 class Ensemble(Potential):
     """An ensemble potential combining two language models using a weighted operation.
 
-    The Ensemble class creates a potential that combines log-probabilities from two
-    base potentials (typically language models) using a specified weighted operation
-    (e.g., weighted geometric mean, arithmetic mean, min, max, etc.).
+    The ensemble's weight of a sequence combines the two potentials' weights of it
+    with a weighted operation (e.g., weighted arithmetic or geometric mean, min, max):
+    `prefix(x) = op(p1.prefix(x), p2.prefix(x))`, and likewise for `complete`.
+    `logw_next` is consistent with `prefix`, so sampling tokens from it (e.g. with
+    `direct_token_sampler`) targets this combined distribution over sequences.
 
     Args:
         p1 (Potential): First potential (language model)
@@ -26,6 +29,9 @@ class Ensemble(Potential):
         a (float): Weighting parameter between 0 and 1 (default 0.5 for equal weighting).
             When a=0.5, models are weighted equally. For a != 0.5, the combination
             is weighted: a * model1 + (1-a) * model2
+        cache_size (int): Number of contexts whose next-token weights are kept, so that
+            the potentials' prefix weights of their extensions need no recomputation.
+            Set it to at least the number of particles. Defaults to 256.
 
     Attributes:
         p1: First potential
@@ -45,15 +51,16 @@ class Ensemble(Potential):
         # Create an ensemble with weighted geometric mean (a=0.5)
         ensemble = Ensemble(p1, p2, op="prod", a=0.5)
 
-        # Use ensemble in sampling
-        logw = await ensemble.prefix(context)
+        # Sample from the ensemble with SMC
+        sequences = await direct_token_sampler(ensemble).smc(
+            n_particles=10, ess_threshold=0.5, max_tokens=20
+        )
         ```
 
     Note:
-        The Ensemble class handles vocabulary alignment automatically. Both potentials
-        must have compatible vocabularies (typically the same tokenizer). The logw_next
-        method is not implemented for Ensemble; instead, use logws_next to get separate
-        log weights from each model, or use batch_logw_next for batched operations.
+        Both potentials must have the same vocabulary (typically the same tokenizer).
+        To ensemble models with different tokenizers, ensemble them at the byte level
+        with `ByteLLM` potentials.
     """
 
     def __init__(
@@ -62,6 +69,7 @@ class Ensemble(Potential):
         p2: Potential,
         op: Union[str, float],
         a: float = 0.5,
+        cache_size: int = 256,
     ):
         self.p1 = p1
         self.p2 = p2
@@ -83,6 +91,37 @@ class Ensemble(Potential):
         self.p2_vocab_idxs = [self.p2.lookup[x] for x in self.vocab_eos]
         assert self.p1_vocab_idxs == self.p2_vocab_idxs
 
+        # context -> (p1 prefix, p2 prefix, p1 next-token row, p2 next-token row)
+        self._rows = LRUCache(maxsize=cache_size)
+
+    async def _component_prefixes(self, contexts):
+        """Each potential's prefix log weight of each context.
+
+        Read off the cached next-token weights of the context's parent when available,
+        and computed with the potentials' `prefix` otherwise.
+
+        Returns:
+            (np.ndarray): Shape `[N, 2]`, the two potentials' prefix log weights.
+        """
+        W = np.empty((len(contexts), 2))
+        missing = []
+        for n, context in enumerate(contexts):
+            parent = self._rows.get(tuple(context[:-1])) if context else None
+            if parent is not None:
+                w1, w2, row1, row2 = parent
+                i = self.lookup[context[-1]]
+                W[n] = w1 + row1[i], w2 + row2[i]
+            else:
+                missing.append(n)
+        if missing:
+            ctxs = [contexts[n] for n in missing]
+            W1, W2 = await asyncio.gather(
+                self.p1.batch_prefix(ctxs), self.p2.batch_prefix(ctxs)
+            )
+            W[missing, 0] = to_numpy(W1)
+            W[missing, 1] = to_numpy(W2)
+        return W
+
     async def prefix(self, context: List[str]) -> float:
         """Compute log weights for the prefix using both potentials.
 
@@ -92,10 +131,8 @@ class Ensemble(Potential):
         Returns:
             float: Combined log weight from both potentials using the ensemble operation
         """
-        p1_logw, p2_logw = await asyncio.gather(
-            self.p1.prefix(context), self.p2.prefix(context)
-        )
-        return self.op(p1_logw, p2_logw)
+        ((w1, w2),) = await self._component_prefixes([context])
+        return self.op(w1, w2)
 
     async def complete(self, context: List[str]) -> float:
         """Compute completion log weights using both potentials.
@@ -111,74 +148,40 @@ class Ensemble(Potential):
         )
         return self.op(p1_logw, p2_logw)
 
-    async def logws_next(self, context: List[str]) -> Tuple[Any, Any]:
-        """Get log weights from both potentials separately.
-
-        This method returns the log weights from both underlying potentials
-        without combining them. Useful for custom combination logic.
+    async def logw_next(self, context: List[str]):
+        """Next-token log weights, `prefix(context + [x]) - prefix(context)`.
 
         Args:
             context (List[str]): The context tokens
 
         Returns:
-            Tuple[Any, Any]: Tuple of (p1_logw_next, p2_logw_next)
+            (LazyWeights): Log weights over `self.vocab_eos`.
         """
-        return await asyncio.gather(
-            self.p1.logw_next(context), self.p2.logw_next(context)
-        )
-
-    async def logw_next(self, context: List[str]):
-        """Not implemented for Ensemble class.
-
-        Raises:
-            NotImplementedError: Always raised. Use logws_next or batch_logw_next instead.
-        """
-        raise NotImplementedError("logw_next is not implemented for Ensemble class.")
+        batch = await self.batch_logw_next([context])
+        return batch.spawn(batch.weights[0])
 
     async def batch_logw_next(self, contexts: List[List[str]]):
         """Batched version of logw_next for Ensemble.
-
-        This enables batching when multiple particles need to be extended during SMC,
-        which can significantly improve performance when using PromptedLLM with
-        batch_logw_next support.
 
         Args:
             contexts (List[List[str]]): List of context token sequences
 
         Returns:
-            (LazyWeights): Batched combined log weights, `.weights` of shape `[N, V+1]`
-
-        Note:
-            This method is only used if the Ensemble is wrapped in AutoBatchedPotential or
-            called directly with multiple contexts. EnsembleTokenSampler calls p1.logw_next()
-            and p2.logw_next() directly, so for batching in EnsembleTokenSampler, wrap p1
-            and p2 in AutoBatchedPotential before creating the Ensemble.
+            (LazyWeights): Batched log weights, `.weights` of shape `[N, V+1]`, row `n`
+                being `prefix(contexts[n] + [x]) - prefix(contexts[n])`.
         """
-        # Get batched log weights from both potentials
-        Ws1, Ws2 = await asyncio.gather(
-            self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
+        (Ws1, Ws2), W = await asyncio.gather(
+            asyncio.gather(
+                self.p1.batch_logw_next(contexts), self.p2.batch_logw_next(contexts)
+            ),
+            self._component_prefixes(contexts),
         )
-        # Combine using the ensemble operation
-        return self.make_lazy_weights(
-            self.op(
-                to_numpy(Ws1.weights)[:, self.p1_vocab_idxs],
-                to_numpy(Ws2.weights)[:, self.p2_vocab_idxs],
-            )
-        )
-
-    async def logw_eos(self, context: List[str]) -> float:
-        """Combined log weight of terminating (EOS) after `context`.
-
-        Args:
-            context (List[str]): The context tokens
-
-        Returns:
-            float: The ensemble operation applied to both potentials' EOS weights
-        """
-        p1_logw, p2_logw = await asyncio.gather(
-            self.p1.logw_eos(context), self.p2.logw_eos(context)
-        )
-        return float(self.op(p1_logw, p2_logw))
+        rows1 = to_numpy(Ws1.weights)[:, self.p1_vocab_idxs]
+        rows2 = to_numpy(Ws2.weights)[:, self.p2_vocab_idxs]
+        for n, context in enumerate(contexts):
+            self._rows[tuple(context)] = (W[n, 0], W[n, 1], rows1[n], rows2[n])
+        W1, W2 = W[:, :1], W[:, 1:]
+        return self.make_lazy_weights(self.op(W1 + rows1, W2 + rows2) - self.op(W1, W2))
 
 
 class ByteEnsemble(Potential):
