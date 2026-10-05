@@ -231,7 +231,7 @@ def _power_mean(p: float, a: float) -> Callable:
     )
 
 
-def _weighted_extremum(func, a: float):
+def _weighted_extremum(func, a: float) -> Callable:
     """Create a weighted min/max operator.
 
     Args:

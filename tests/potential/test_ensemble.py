@@ -1,6 +1,5 @@
 import pytest
 import numpy as np
-from unittest.mock import AsyncMock, patch
 from genlm.backend import load_model_by_name
 from genlm.control import (
     Ensemble,
@@ -11,7 +10,6 @@ from genlm.control import (
     direct_token_sampler,
     EOS,
 )
-from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt, Sequences
 from genlm.control.potential.built_in.ensemble import _weighted_extremum
 from genlm.bytes import BeamParams
 from conftest import MockPotential
@@ -696,79 +694,6 @@ def test_weighted_extremum_different_weights():
     result2 = min_op_favoring_x(x, y)
     expected2 = (1 - 2 * 0.3) * x + 2 * 0.3 * np.minimum(x, y)
     np.testing.assert_allclose(result2, expected2, rtol=1e-5)
-
-
-@pytest.mark.asyncio
-async def test_ensemble_smc_weight_extraction():
-    """Test EnsembleSMC extracts individual model weights correctly."""
-    from genlm.control.sampler.token import TokenSampler
-
-    class MockTokenSampler(TokenSampler):
-        def __init__(self):
-            self.particle_prefix_log_prob_1 = {
-                ("a",): -1.0,
-                ("b",): -2.0,
-            }
-            self.particle_prefix_log_prob_2 = {
-                ("a",): -1.5,
-                ("b",): -2.5,
-            }
-
-        async def start_weight(self):
-            return 0.0
-
-        async def sample(self, context, draw=None):
-            return EOS, 0.0, 0.0
-
-    mock_sampler = MockTokenSampler()
-    smc = EnsembleSMC(mock_sampler, None)
-    mock_sequences = Sequences(
-        contexts=[["a"], ["b"]],
-        log_weights=[-0.5, -0.7],
-    )
-
-    with patch.object(
-        EnsembleSMC.__bases__[0],
-        "__call__",
-        AsyncMock(return_value=mock_sequences),
-    ):
-        result = await smc(n_particles=2, ess_threshold=0.5, max_tokens=10)
-
-    assert isinstance(result, SequencesExt)
-    assert hasattr(result, "log_prefix_weights_1")
-    assert hasattr(result, "log_prefix_weights_2")
-    assert len(result.log_prefix_weights_1) == 2
-    assert len(result.log_prefix_weights_2) == 2
-    assert result.log_prefix_weights_1[0] == -1.0
-    assert result.log_prefix_weights_1[1] == -2.0
-    assert result.log_prefix_weights_2[0] == -1.5
-    assert result.log_prefix_weights_2[1] == -2.5
-
-
-def test_sequences_ext_post_init():
-    """Test SequencesExt.__post_init__ converts lists to numpy arrays."""
-    seq = SequencesExt(
-        contexts=[["a", "b"], ["c", "d"]],
-        log_weights=[0.1, 0.2],
-        log_prefix_weights_1=[0.15, 0.25],
-        log_prefix_weights_2=[0.12, 0.22],
-    )
-    assert isinstance(seq.log_prefix_weights_1, np.ndarray)
-    assert isinstance(seq.log_prefix_weights_2, np.ndarray)
-    seq2 = SequencesExt(contexts=[["a"]], log_weights=[0.1], log_prefix_weights_1=None)
-    assert seq2.log_prefix_weights_1 is None
-
-
-def test_sequences_ext_post_init_with_none():
-    """Test SequencesExt.__post_init__ handles None values correctly."""
-    seq = SequencesExt(
-        contexts=[["a", "b"]],
-        log_weights=[0.1],
-        log_prefix_weights_1=None,
-        log_prefix_weights_2=None,
-    )
-    assert seq.log_prefix_weights_1 is None
-    assert seq.log_prefix_weights_2 is None
 
 
 @pytest.mark.parametrize("op", ["sum", "prod", "harmonic", "min", "max", -0.5, 2])

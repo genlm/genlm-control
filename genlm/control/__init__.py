@@ -14,9 +14,6 @@ from .potential import (
 )
 from .sampler import (
     SMC,
-    EnsembleSMC,
-    Sequences,
-    SequencesExt,
     direct_token_sampler,
     eager_token_sampler,
     topk_token_sampler,
@@ -31,9 +28,6 @@ __all__ = [
     "SMC",
     "set_draw_method",
     "DRAW_METHODS",
-    "EnsembleSMC",
-    "Sequences",
-    "SequencesExt",
     "Potential",
     "PromptedLLM",
     "ByteLLM",
