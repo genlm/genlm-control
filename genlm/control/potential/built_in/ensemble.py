@@ -1,6 +1,5 @@
 import asyncio
 import numbers
-import warnings
 import numpy as np
 from typing import Callable, List, Tuple, Union
 
@@ -74,13 +73,10 @@ class Ensemble(Potential):
         self.p2 = p2
         self.op = convert_to_weighted_logop(op, a)
 
-        # Warn if potentials have different vocabularies
         if set(p1.vocab) != set(p2.vocab):
-            warnings.warn(
-                "Ensemble is being used with potentials that have different vocabularies. "
-                "Consider ensembling ByteLLM potentials instead.",
-                UserWarning,
-                stacklevel=2,
+            raise ValueError(
+                "Ensemble requires potentials with the same vocabulary. "
+                "To ensemble models with different tokenizers, ensemble ByteLLM potentials."
             )
 
         vocab = list(dict.fromkeys(p1.vocab + p2.vocab))
@@ -247,7 +243,7 @@ def _weighted_extremum(func, a: float) -> Callable:
             other, coef, ext = x, 1 - 2 * a, 2 * a * func(x, y)
         else:
             other, coef, ext = y, 2 * a - 1, 2 * (1 - a) * func(x, y)
-        # At a=0.5 the other term vanishes; skip it so 0 * -inf doesn't give nan.
+        # At a=0.5 the other term vanishes. Skip it so 0 * -inf doesn't give nan.
         return ext if coef == 0 else coef * other + ext
 
     return lambda x, y: extremum(x, y, a)

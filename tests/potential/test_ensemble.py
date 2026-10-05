@@ -399,17 +399,16 @@ async def test_ensemble_with_differently_conditioned_models():
 
 
 @pytest.mark.asyncio
-async def test_ensemble_warns_on_different_vocabularies():
-    """Test Ensemble warns when using potentials with different vocabularies."""
+async def test_ensemble_raises_on_different_vocabularies():
+    """Test Ensemble raises when using potentials with different vocabularies."""
     vocab1 = ["a", "b", "c", "d"]
     vocab2 = ["a", "b", "x", "y"]
     logws1 = np.log([0.25, 0.25, 0.25, 0.25, 0.001])
     logws2 = np.log([0.25, 0.25, 0.25, 0.25, 0.001])
     p1 = MockPotential(vocab=vocab1, next_token_logws=logws1)
     p2 = MockPotential(vocab=vocab2, next_token_logws=logws2)
-    with pytest.warns(UserWarning, match="different vocabularies"):
-        with pytest.raises((KeyError, AssertionError)):
-            _ = Ensemble(p1, p2, op="prod", a=0.5)
+    with pytest.raises(ValueError, match="same vocabulary"):
+        Ensemble(p1, p2, op="prod", a=0.5)
 
 
 @pytest.mark.asyncio
