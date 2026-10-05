@@ -2,14 +2,13 @@ import asyncio
 import numbers
 import warnings
 import numpy as np
-from typing import Any, Callable, List, Tuple, Union
+from typing import Callable, List, Tuple, Union
 
 from arsenal.maths import logsumexp
 from cachetools import LRUCache
 
 from genlm.control.potential.base import Potential
 from genlm.control.util import to_numpy
-from genlm.bytes import ByteBeamState, BeamParams
 
 
 class Ensemble(Potential):
@@ -79,7 +78,7 @@ class Ensemble(Potential):
         if set(p1.vocab) != set(p2.vocab):
             warnings.warn(
                 "Ensemble is being used with potentials that have different vocabularies. "
-                "Consider using ByteEnsemble instead.",
+                "Consider ensembling ByteLLM potentials instead.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -208,214 +207,6 @@ class Ensemble(Potential):
             self._rows[tuple(context)] = (W[n, 0], W[n, 1], rows1[n], rows2[n])
         W1, W2 = W[:, :1], W[:, 1:]
         return self.make_lazy_weights(self.op(W1 + rows1, W2 + rows2) - self.op(W1, W2))
-
-
-class ByteEnsemble(Potential):
-    """
-    An ensemble potential combining two language models at the byte level using beam search.
-
-    ByteEnsemble manages synchronized beam states for two language models, enabling efficient
-    byte-level ensemble sampling. Unlike the standard Ensemble class that works with any
-    Potential, ByteEnsemble provides direct access to beam states for specialized sampling
-    strategies like ByteEnsembleTokenSampler.
-
-    Attributes:
-        p1, p2: The base LM objects (not Potentials, but raw model objects).
-        op: A function to combine log-probabilities.
-        data_dict_1, data_dict_2: Beam state caches keyed by context (bytes).
-        vocabulary: Byte-level vocabulary (list of integers 0-255).
-        eos_tokens: EOS byte strings of the two models.
-
-    Note:
-        ByteEnsemble is designed to work with ByteEnsembleTokenSampler for specialized
-        byte-level ensemble sampling. The prefix() and complete() methods are not fully
-        implemented as this class is meant to be used with custom sampling strategies
-        that directly access beam states via get_beam_states().
-
-    Example:
-        ```python
-        from genlm.backend import load_model_by_name
-        from genlm.bytes import BeamParams
-        from genlm.control.potential.built_in import ByteEnsemble
-
-        llm1 = load_model_by_name("openai-community/gpt2")
-        llm2 = load_model_by_name("openai-community/gpt2")
-
-        ensemble = await ByteEnsemble.create(
-            llm1, llm2,
-            op="prod",
-            prompt1=b"Hello ",
-            prompt2=b"Hello ",
-            a=0.5
-        )
-
-        # Use with ByteEnsembleTokenSampler for sampling
-        ```
-    """
-
-    def __init__(
-        self,
-        p1: Any,
-        p2: Any,
-        op: Callable,
-        data_dict_1: dict,
-        data_dict_2: dict,
-        vocab: List[int],
-        eos_tokens: List[bytes],
-    ):
-        self.p1 = p1
-        self.p2 = p2
-        self.op = op
-        self.data_dict_1 = data_dict_1
-        self.data_dict_2 = data_dict_2
-        self.eos_tokens = eos_tokens
-        super().__init__(vocabulary=vocab)
-
-    @classmethod
-    async def create(
-        cls,
-        llm1: Any,
-        llm2: Any,
-        op: Union[str, float],
-        prompt1: bytes,
-        prompt2: bytes,
-        a: float = 0.5,
-        K: int = 5,
-        prune_threshold: float = 0.0,
-        verbose: bool = False,
-    ) -> "ByteEnsemble":
-        """Factory method to initialize beam states from prompts and return a ByteEnsemble instance.
-
-        Args:
-            llm1 (Any): First language model (from genlm.backend)
-            llm2 (Any): Second language model (from genlm.backend)
-            op (str | float): 'sum', 'prod', 'harmonic', 'min', 'max', or a power-mean
-                exponent p (see `convert_to_weighted_logop`)
-            prompt1 (bytes): Prompt bytes for first model
-            prompt2 (bytes): Prompt bytes for second model
-            a (float): Weighting parameter between 0 and 1 (default 0.5 for equal weighting)
-            K (int): Beam width for beam search (default 5)
-            prune_threshold (float): Threshold for pruning low-probability beams (default 0.0)
-            verbose (bool): Whether to print verbose beam search output (default False)
-
-        Returns:
-            ByteEnsemble: Initialized ensemble with beam states ready for sampling
-
-        Raises:
-            RuntimeError: If beam states become empty after prefill
-        """
-
-        eos_tokens = [
-            llm1.byte_vocab[llm1.tokenizer.eos_token_id].byte_string,
-            llm2.byte_vocab[llm2.tokenizer.eos_token_id].byte_string,
-        ]
-
-        def beam_params(eos):
-            return BeamParams(
-                K=K,
-                prune_threshold=prune_threshold,
-                verbose=verbose,
-                eos_byte_strings=[eos],
-            )
-
-        data_dict_1 = {}
-        data_dict_2 = {}
-
-        async def setup():
-            # Initialize beams sequentially to avoid overwhelming vLLM with concurrent requests
-            beam1 = await ByteBeamState.initial(llm1, beam_params(eos_tokens[0]))
-            beam2 = await ByteBeamState.initial(llm2, beam_params(eos_tokens[1]))
-            # Prefill sequentially as well to reduce concurrent load
-            beam_state_1 = await beam1.prefill(prompt1)
-            beam_state_2 = await beam2.prefill(prompt2)
-            return beam_state_1, beam_state_2
-
-        beam_state_1, beam_state_2 = await setup()
-
-        # Check if beams are empty after initialization
-        if len(beam_state_1) == 0:
-            raise RuntimeError(
-                f"Beam1 is empty after prefill with prompt of length {len(prompt1)} bytes"
-            )
-        if len(beam_state_2) == 0:
-            raise RuntimeError(
-                f"Beam2 is empty after prefill with prompt of length {len(prompt2)} bytes"
-            )
-
-        data_dict_1[b""] = beam_state_1
-        data_dict_2[b""] = beam_state_2
-
-        return cls(
-            llm1,
-            llm2,
-            convert_to_weighted_logop(op, a),
-            data_dict_1,
-            data_dict_2,
-            vocab=list(range(256)),
-            eos_tokens=eos_tokens,
-        )
-
-    async def _cleanup_cache(self):
-        """Remove old entries to avoid cache bloat."""
-        max_len = max((len(k) for k in self.data_dict_1), default=0)
-        min_len = max_len - 2
-        for d in [self.data_dict_1, self.data_dict_2]:
-            for k in list(d.keys()):
-                if len(k) < min_len:
-                    del d[k]
-
-    async def get_beam_states(
-        self, context: List[int]
-    ) -> Tuple["ByteBeamState", "ByteBeamState"]:
-        """Fetch beam states for the current context.
-
-        This method provides direct access to the underlying beam states, which
-        is used by ByteEnsembleTokenSampler for synchronized beam advancement.
-
-        Args:
-            context (List[int]): Context as list of byte values
-
-        Returns:
-            Tuple[ByteBeamState, ByteBeamState]: Beam states from both models
-
-        Raises:
-            KeyError: If context not found in cache (beam states must be populated
-                by ByteEnsembleTokenSampler during sampling)
-        """
-        ctx_bytes = bytes(context)
-
-        await self._cleanup_cache()
-        beam1 = self.data_dict_1[ctx_bytes]
-        beam2 = self.data_dict_2[ctx_bytes]
-        return beam1, beam2
-
-    async def prefix(self, context: List[int]) -> None:
-        """Compute prefix weight (not fully implemented).
-
-        ByteEnsemble is designed to be used with ByteEnsembleTokenSampler which
-        manages weights separately. This method is a stub to satisfy the Potential interface.
-
-        Args:
-            context (List[int]): The context as list of byte values
-
-        Returns:
-            None
-        """
-        return None  # pragma: no cover
-
-    async def complete(self, context: List[int]) -> None:
-        """Compute completion weight (not fully implemented).
-
-        ByteEnsemble is designed to be used with ByteEnsembleTokenSampler which
-        manages weights separately. This method is a stub to satisfy the Potential interface.
-
-        Args:
-            context (List[int]): The context as list of byte values
-
-        Returns:
-            None
-        """
-        return None  # pragma: no cover
 
 
 def _power_mean(p: float, a: float) -> Callable:

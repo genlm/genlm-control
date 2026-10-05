@@ -11,7 +11,6 @@ from .potential import (
     CanonicalTokenization,
     Ensemble,
     convert_to_weighted_logop,
-    ByteEnsemble,
 )
 from .sampler import (
     SMC,
@@ -22,7 +21,6 @@ from .sampler import (
     eager_token_sampler,
     topk_token_sampler,
     AWRS,
-    ByteEnsembleTokenSampler,
 )
 from .util import set_draw_method, DRAW_METHODS
 from .viz import InferenceVisualizer
@@ -52,6 +50,4 @@ __all__ = [
     "InferenceVisualizer",
     "Ensemble",
     "convert_to_weighted_logop",
-    "ByteEnsemble",
-    "ByteEnsembleTokenSampler",
 ]

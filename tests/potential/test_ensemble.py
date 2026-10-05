@@ -1,11 +1,10 @@
 import pytest
 import numpy as np
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from genlm.backend import load_model_by_name
 from genlm.control import (
     Ensemble,
-    ByteEnsemble,
-    ByteEnsembleTokenSampler,
+    ByteLLM,
     Potential,
     PromptedLLM,
     convert_to_weighted_logop,
@@ -14,7 +13,7 @@ from genlm.control import (
 )
 from genlm.control.sampler.sequence import EnsembleSMC, SequencesExt, Sequences
 from genlm.control.potential.built_in.ensemble import _weighted_extremum
-from genlm.backend.tokenization.token import Token
+from genlm.bytes import BeamParams
 from conftest import MockPotential
 
 # ============================================================================
@@ -508,130 +507,6 @@ async def test_token_ensemble_complementary_prompts():
 
 
 # ============================================================================
-# Test ByteEnsemble
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_creation():
-    """Test ByteEnsemble creation with identical prompts."""
-    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
-    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
-    prompt = b"Test"
-    ensemble = await ByteEnsemble.create(
-        llm1, llm2, op="prod", prompt1=prompt, prompt2=prompt, a=0.5
-    )
-    assert ensemble.p1 is llm1
-    assert ensemble.p2 is llm2
-    assert len(ensemble.vocab) == 256
-    assert isinstance(ensemble.vocab, list)
-    assert all(isinstance(v, int) and 0 <= v < 256 for v in ensemble.vocab)
-    assert b"" in ensemble.data_dict_1
-    assert b"" in ensemble.data_dict_2
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_different_prompts():
-    """Test ByteEnsemble with different prompts - the key use case for ensembling."""
-    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
-    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
-
-    prompt1 = b"Write a SQL query to find all users: "
-    prompt2 = b"SQL: Find all users in the database: "
-
-    ensemble = await ByteEnsemble.create(
-        llm1, llm2, op="prod", prompt1=prompt1, prompt2=prompt2, a=0.5
-    )
-    assert ensemble.p1 is llm1
-    assert ensemble.p2 is llm2
-    assert len(ensemble.vocab) == 256
-    assert b"" in ensemble.data_dict_1
-    assert b"" in ensemble.data_dict_2
-    beam1, beam2 = await ensemble.get_beam_states([])
-    assert beam1 is not None
-    assert beam2 is not None
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_get_beam_states():
-    """Test that ByteEnsemble.get_beam_states() provides access to beams."""
-    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
-    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
-    ensemble = await ByteEnsemble.create(
-        llm1, llm2, op="prod", prompt1=b"Hi", prompt2=b"Hello", a=0.5
-    )
-    beam1, beam2 = await ensemble.get_beam_states([])
-    assert beam1 is not None
-    assert beam2 is not None
-    assert hasattr(beam1, "states")
-    assert hasattr(beam2, "states")
-    assert len(beam1) > 0
-    assert len(beam2) > 0
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_token_sampler_initialization():
-    """Test ByteEnsembleTokenSampler initialization with different prompts."""
-    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
-    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
-    ensemble = await ByteEnsemble.create(
-        llm1, llm2, op="prod", prompt1=b"Answer: ", prompt2=b"Response: ", a=0.5
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
-    assert sampler.potential is ensemble
-    assert sampler.n_particles == 5
-    # check caches
-    assert () in sampler.prefix_cache_1
-    assert () in sampler.prefix_cache_2
-    assert sampler.prefix_cache_1[()] == 0.0
-    assert sampler.prefix_cache_2[()] == 0.0
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_sampler_sample():
-    """Test ByteEnsembleTokenSampler samples with different prompts."""
-    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
-    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
-
-    ensemble = await ByteEnsemble.create(
-        llm1, llm2, op="prod", prompt1=b"The cat is ", prompt2=b"A cat is ", a=0.5
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=3)
-    token, logw, logp = await sampler.sample([])
-    assert isinstance(token, int) and 0 <= token < 256
-    assert isinstance(logw, (int, float, np.number))
-    assert isinstance(logp, (int, float, np.number))
-    assert np.isfinite(logw)
-    assert np.isfinite(logp)
-    assert bytes([token]) in ensemble.data_dict_1
-    assert bytes([token]) in ensemble.data_dict_2
-    assert (token,) in sampler.prefix_cache_1
-    assert (token,) in sampler.prefix_cache_2
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_weighted_different_prompts():
-    """Test ByteEnsemble with unequal weights on different prompts."""
-    llm1 = load_model_by_name("openai-community/gpt2", backend="hf")
-    llm2 = load_model_by_name("openai-community/gpt2", backend="hf")
-
-    prompt1 = b"Correct approach: "
-    prompt2 = b"Alternative: "
-
-    ensemble = await ByteEnsemble.create(
-        llm1, llm2, op="prod", prompt1=prompt1, prompt2=prompt2, a=0.7
-    )
-
-    assert ensemble.p1 is llm1
-    assert ensemble.p2 is llm2
-
-    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=2)
-    token, logw, logp = await sampler.sample([])
-    assert token is EOS or isinstance(token, int)
-    assert np.isfinite(logw)
-
-
-# ============================================================================
 # Test Realistic Ensemble Applications
 # ============================================================================
 
@@ -809,64 +684,6 @@ def test_convert_to_weighted_logop_operations():
     np.testing.assert_allclose(result_prod, expected_prod, rtol=1e-5)
 
 
-@pytest.mark.asyncio
-async def test_byte_ensemble_token_sampler_start_weight():
-    """Test ByteEnsembleTokenSampler.start_weight() returns 0.0."""
-    llm = load_model_by_name("openai-community/gpt2", backend="hf")
-    ensemble = await ByteEnsemble.create(
-        llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
-    start_weight = await sampler.start_weight()
-    assert start_weight == 0.0
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_sampler_eos_handling():
-    """Test ByteEnsembleTokenSampler.logw_eos weighs and records forced EOS."""
-    llm = load_model_by_name("openai-community/gpt2", backend="hf")
-    ensemble = await ByteEnsemble.create(
-        llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=5)
-    token, _, _ = await sampler.sample([])
-    assert token is not EOS
-    logw = await sampler.logw_eos([token])
-    assert np.isfinite(logw)
-    assert np.isfinite(sampler.particle_prefix_log_prob_1[(token, EOS)])
-    assert np.isfinite(sampler.particle_prefix_log_prob_2[(token, EOS)])
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_sampler_draw_not_supported():
-    """Test ByteEnsembleTokenSampler rejects a custom draw."""
-    llm = load_model_by_name("openai-community/gpt2", backend="hf")
-    ensemble = await ByteEnsemble.create(
-        llm, llm, op="prod", prompt1=b"Hi", prompt2=b"Hi", a=0.5
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble)
-    with pytest.raises(NotImplementedError):
-        await sampler.sample([], draw=lambda probs: 0)
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_empty_beam_error():
-    """Test ByteEnsemble raises RuntimeError when beam is empty after prefill."""
-    mock_llm = MagicMock()
-    mock_llm.byte_vocab = [Token(0, b"a")]
-    mock_llm.tokenizer.eos_token_id = 0
-    empty_beam = MagicMock()
-    empty_beam.prefill = AsyncMock(return_value=[])
-    with patch(
-        "genlm.control.potential.built_in.ensemble.ByteBeamState.initial",
-        AsyncMock(return_value=empty_beam),
-    ):
-        with pytest.raises(RuntimeError, match="Beam1 is empty after prefill"):
-            await ByteEnsemble.create(
-                mock_llm, mock_llm, op="prod", prompt1=b"test", prompt2=b"test", a=0.5
-            )
-
-
 def test_weighted_extremum_different_weights():
     """Test _weighted_extremum with different weight values."""
     x = np.array([-1.0, -2.0, -3.0])
@@ -954,126 +771,6 @@ def test_sequences_ext_post_init_with_none():
     assert seq.log_prefix_weights_2 is None
 
 
-@pytest.mark.asyncio
-async def test_byte_ensemble_cleanup_cache_deletes_short_keys():
-    """Test ByteEnsemble._cleanup_cache() deletes short keys."""
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    prompt1 = b"The capital of France is"
-    prompt2 = b"Paris, the capital city of France, is"
-    ensemble = await ByteEnsemble.create(
-        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
-    )
-    ensemble.data_dict_1 = {
-        (1,): "short1",
-        (1, 2): "short2",
-        (1, 2, 3): "keep3",
-        (1, 2, 3, 4): "keep4",
-        (1, 2, 3, 4, 5): "keep5",
-        (1, 2, 3, 4, 5, 6): "keep6",
-    }
-    ensemble.data_dict_2 = {
-        (10,): "short1",
-        (10, 20): "short2",
-        (10, 20, 30): "keep3",
-        (10, 20, 30, 40): "keep4",
-        (10, 20, 30, 40, 50): "keep5",
-        (10, 20, 30, 40, 50, 60): "keep6",
-    }
-    await ensemble._cleanup_cache()
-    for d in [ensemble.data_dict_1, ensemble.data_dict_2]:
-        for k in d.keys():
-            assert len(k) >= 4, f"Key {k} should have been deleted"
-    assert len(ensemble.data_dict_1) == 3
-    assert len(ensemble.data_dict_2) == 3
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_empty_beam_error_covered():
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    prompt1 = b"\xff\xfe\xfd"  # Invalid UTF-8 bytes
-    prompt2 = b"Test"
-    with pytest.raises(RuntimeError, match="is empty after prefill"):
-        await ByteEnsemble.create(
-            gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=1, prune_threshold=100.0
-        )
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_sampler_stores_particle_weights():
-    """Test ByteEnsembleTokenSampler stores particle weights at forced EOS."""
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    prompt1 = b"Hi"
-    prompt2 = b"Hi"
-
-    ensemble = await ByteEnsemble.create(
-        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble)
-    await sampler.logw_eos([])
-    assert (EOS,) in sampler.particle_prefix_log_prob_1
-    assert (EOS,) in sampler.particle_prefix_log_prob_2
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_sampler_eos_conversion():
-    """Test ByteEnsembleTokenSampler EOS conversion path."""
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    prompt1 = b"Hi"
-    prompt2 = b"Hi"
-    ensemble = await ByteEnsemble.create(
-        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble)
-    context = []
-    token, _, _ = await sampler.sample(context)
-    assert token is not None
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_sampler_smc_calls_ensemble_smc():
-    """Test ByteEnsembleTokenSampler.smc() method invokes EnsembleSMC."""
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    prompt1 = b"Hi"
-    prompt2 = b"Hi"
-    ensemble = await ByteEnsemble.create(
-        gpt2, gpt2, "sum", prompt1, prompt2, a=0.5, K=3
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble)
-    assert hasattr(sampler, "smc")
-    assert callable(sampler.smc)
-    try:
-        result = await sampler.smc(
-            n_particles=1,
-            ess_threshold=0.5,
-            max_tokens=1,
-            critic=None,
-        )
-        assert isinstance(result, SequencesExt)
-    except (AssertionError, KeyError) as e:
-        if "Beam is empty" in str(e) or "not found in cache" in str(e):
-            pass
-        else:
-            raise
-
-
-@pytest.mark.asyncio
-async def test_byte_ensemble_smc_records_weights_for_every_particle():
-    """Test every particle, EOS-sampled or forced at max_tokens, gets model weights."""
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    ensemble = await ByteEnsemble.create(
-        gpt2, gpt2, "prod", b"The cat", b"A dog", a=0.5, K=3
-    )
-    sampler = ByteEnsembleTokenSampler(ensemble, n_particles=3)
-    result = await sampler.smc(n_particles=3, ess_threshold=0.5, max_tokens=4)
-    assert isinstance(result, SequencesExt)
-    for ctx in result.contexts:
-        assert ctx[-1] is EOS
-        assert len(ctx) <= 4
-    assert np.all(np.isfinite(result.log_weights))
-    assert np.all(np.isfinite(result.log_prefix_weights_1))
-    assert np.all(np.isfinite(result.log_prefix_weights_2))
-
-
 @pytest.mark.parametrize("op", ["sum", "prod", "harmonic", "min", "max", -0.5, 2])
 @pytest.mark.parametrize("a", [0.3, 0.5, 0.7])
 def test_ops_zero_weights_give_neginf_not_nan(op, a):
@@ -1093,19 +790,60 @@ def test_weighted_max_equal_weights_ignores_zero_term():
     np.testing.assert_allclose(fn(np.array([-np.inf]), np.array([-1.0])), [-1.0])
 
 
+async def _byte_ensemble(op, prompt1, prompt2, a=0.3):
+    """Ensemble two GPT-2 byte-level potentials with different prompts."""
+    llm = load_model_by_name("openai-community/gpt2", backend="hf")
+    params = BeamParams(K=3, eos_byte_strings=[b"<|endoftext|>"])
+    b1, b2 = ByteLLM(llm, params), ByteLLM(llm, params)
+    b1.set_prompt_from_str(prompt1)
+    b2.set_prompt_from_str(prompt2)
+    return Ensemble(b1, b2, op=op, a=a)
+
+
+async def _walk(ensemble, steps=8):
+    """Sample a single path with the library's direct token sampler; return its weights."""
+    sampler = direct_token_sampler(ensemble)
+    context, weights = [], []
+    for _ in range(steps):
+        token, logw, _ = await sampler.sample(context)
+        weights.append(logw)
+        if token is EOS:
+            break
+        context.append(token)
+    return np.array(weights)
+
+
 @pytest.mark.asyncio
-async def test_byte_ensemble_sum_samples_with_finite_weights():
-    """Test a non-prod byte ensemble samples properly (genlm-bytes' EOT slot is -inf)."""
-    gpt2 = load_model_by_name("openai-community/gpt2")
-    ensemble = await ByteEnsemble.create(
-        gpt2, gpt2, "sum", b"The cat", b"A dog", a=0.5, K=3
+async def test_byte_ensemble_sum_preserves_mass():
+    """A byte-level sum ensemble has every step weight log 1 = 0."""
+    ensemble = await _byte_ensemble(
+        "sum", "My favorite physicist is", "My favorite author is"
     )
-    sampler = ByteEnsembleTokenSampler(ensemble)
-    _, _, _, proposal_weights = (await sampler._next_weights([]))[1:]
-    assert not np.any(np.isnan(proposal_weights))
-    tokens = set()
-    for _ in range(10):
-        token, logw, logp = await sampler.sample([])
-        assert np.isfinite(logw) and np.isfinite(logp)
-        tokens.add(token)
-    assert len(tokens) > 1
+    np.testing.assert_allclose(await _walk(ensemble), 0.0, atol=1e-8)
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_prod_weights_bounded():
+    """Product weights are <= 0 (Hoelder), and 0 when both models agree."""
+    different = await _byte_ensemble(
+        "prod", "My favorite physicist is", "My favorite author is"
+    )
+    assert np.all(await _walk(different) <= 1e-9)
+    same = await _byte_ensemble(
+        "prod", "My favorite author is", "My favorite author is"
+    )
+    np.testing.assert_allclose(await _walk(same), 0.0, atol=1e-8)
+
+
+@pytest.mark.asyncio
+async def test_byte_ensemble_smc_component_logws():
+    """End-to-end byte SMC; every particle gets finite per-model weights."""
+    ensemble = await _byte_ensemble("max", "The cat", "A dog")
+    sequences = await direct_token_sampler(ensemble).smc(
+        n_particles=3, ess_threshold=0.5, max_tokens=6
+    )
+    for context in sequences.contexts:
+        assert context[-1] is EOS and len(context) <= 6
+        w1, w2 = await ensemble.component_logws(context)
+        assert np.isfinite(w1) and np.isfinite(w2)
+    assert np.all(np.isfinite(sequences.log_weights))

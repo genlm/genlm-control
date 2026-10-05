@@ -4,7 +4,7 @@ from .wfsa import WFSA, BoolFSA
 from .json import JsonSchema
 from .canonical import CanonicalTokenization
 from .bytellm import ByteLLM
-from .ensemble import Ensemble, convert_to_weighted_logop, ByteEnsemble
+from .ensemble import Ensemble, convert_to_weighted_logop
 
 __all__ = [
     "PromptedLLM",
@@ -17,5 +17,4 @@ __all__ = [
     "CanonicalTokenization",
     "Ensemble",
     "convert_to_weighted_logop",
-    "ByteEnsemble",
 ]

@@ -19,7 +19,6 @@ from .built_in import (
     CanonicalTokenization,
     Ensemble,
     convert_to_weighted_logop,
-    ByteEnsemble,
 )
 
 __all__ = [
@@ -36,7 +35,6 @@ __all__ = [
     "CanonicalTokenization",
     "Ensemble",
     "convert_to_weighted_logop",
-    "ByteEnsemble",
     "AutoBatchedPotential",
     "MultiProcPotential",
     "Coerced",
