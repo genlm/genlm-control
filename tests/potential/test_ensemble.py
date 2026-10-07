@@ -256,6 +256,50 @@ def test_different_vocabularies_raise():
         Ensemble(p1, p2, op="prod")
 
 
+@pytest.mark.asyncio
+async def test_permuted_vocabularies():
+    """Same tokens in a different order are matched by token, not by position."""
+    probs = {"a": (0.5, 0.1), "b": (0.2, 0.3), "c": (0.2, 0.4), EOS: (0.1, 0.2)}
+    v1, v2 = ["a", "b", "c"], ["c", "a", "b"]
+    p1 = _normalized_mock(v1, [probs[t][0] for t in v1 + [EOS]])
+    p2 = _normalized_mock(v2, [probs[t][1] for t in v2 + [EOS]])
+    ensemble = Ensemble(p1, p2, op="sum", a=0.4)
+    assert ensemble.p1_vocab_idxs != ensemble.p2_vocab_idxs
+    await ensemble.assert_contract([[], ["a"], ["c", "b"]])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", OPS)
+async def test_potential_contract(p1, p2, op):
+    """The library's checks, which also cover batch_prefix and batch_complete."""
+    ensemble = Ensemble(p1, p2, op=op, a=0.3)
+    await ensemble.assert_contract([[], [A], [B], [C], [B, B]])
+
+
+@pytest.mark.asyncio
+async def test_cache_eviction(p1, p2):
+    """A one-entry cache evicts, and cache hits and misses give the same weights."""
+    full = Ensemble(p1, p2, op="prod", a=0.3)
+    tiny = Ensemble(p1, p2, op="prod", a=0.3, cache_size=1)
+    contexts = [[], [A], [A, B], [B, B]]
+    rows_full = (await full.batch_logw_next(contexts)).weights
+    rows_tiny = (await tiny.batch_logw_next(contexts)).weights
+    np.testing.assert_array_equal(rows_full, rows_tiny)
+    assert len(tiny._rows) == 1
+    for context in contexts:
+        want = await full.prefix(context + [C])
+        assert await tiny.prefix(context + [C]) == pytest.approx(want, abs=1e-12)
+
+
+@pytest.mark.asyncio
+async def test_zero_prefix_raises():
+    p1 = MockPotential(["a", "b"], [-np.inf, np.log(0.7), np.log(0.3)])
+    p2 = _normalized_mock(["a", "b"], [0.5, 0.3, 0.2])
+    ensemble = Ensemble(p1, p2, op="prod")
+    with pytest.raises(ValueError, match="weight zero"):
+        await ensemble.logw_next(["a"])
+
+
 # ============================================================================
 # Real model (GPT-2): integration with PromptedLLM and ByteLLM
 # ============================================================================
