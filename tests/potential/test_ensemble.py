@@ -277,6 +277,16 @@ async def test_potential_contract(p1, p2, op):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("op", OPS)
+async def test_batch_complete_matches_complete(p1, p2, op):
+    ensemble = Ensemble(p1, p2, op=op, a=0.3)
+    contexts = [[A, B, C], [B, B, C], [A, B], [C, B, A]]
+    batch = await ensemble.batch_complete(contexts)
+    for context, w in zip(contexts, batch):
+        assert w == pytest.approx(await ensemble.complete(context), abs=1e-12)
+
+
+@pytest.mark.asyncio
 async def test_cache_eviction(p1, p2):
     """A one-entry cache evicts, and cache hits and misses give the same weights."""
     full = Ensemble(p1, p2, op="prod", a=0.3)
@@ -289,6 +299,15 @@ async def test_cache_eviction(p1, p2):
     for context in contexts:
         want = await full.prefix(context + [C])
         assert await tiny.prefix(context + [C]) == pytest.approx(want, abs=1e-12)
+
+
+@pytest.mark.asyncio
+async def test_empty_batch_raises(p1, p2):
+    ensemble = Ensemble(p1, p2, op="sum")
+    with pytest.raises(ValueError, match="non-empty"):
+        await ensemble.batch_prefix([])
+    with pytest.raises(ValueError, match="non-empty"):
+        await ensemble.batch_complete([])
 
 
 @pytest.mark.asyncio
