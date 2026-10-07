@@ -1,13 +1,31 @@
 import asyncio
 import numbers
 import numpy as np
+from collections import OrderedDict
 from typing import Callable, List, Tuple, Union
 
-from arsenal.maths import logsumexp
-from cachetools import LRUCache
-
 from genlm.control.potential.base import Potential
-from genlm.control.util import to_numpy
+from genlm.control.util import logsumexp, to_numpy
+
+
+class _LRU(OrderedDict):
+    """Bounded dict that evicts the least recently used entry."""
+
+    def __init__(self, maxsize):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def get(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
 
 
 class Ensemble(Potential):
@@ -43,8 +61,8 @@ class Ensemble(Potential):
         from genlm.control import PromptedLLM, Ensemble
 
         # Create two language model potentials
-        p1 = PromptedLLM.from_name("gpt2")
-        p2 = PromptedLLM.from_name("gpt2")
+        p1 = PromptedLLM.from_name("openai-community/gpt2")
+        p2 = PromptedLLM.from_name("openai-community/gpt2")
 
         # Create an ensemble with weighted geometric mean (a=0.5)
         ensemble = Ensemble(p1, p2, op="prod", a=0.5)
@@ -84,10 +102,9 @@ class Ensemble(Potential):
 
         self.p1_vocab_idxs = [self.p1.lookup[x] for x in self.vocab_eos]
         self.p2_vocab_idxs = [self.p2.lookup[x] for x in self.vocab_eos]
-        assert self.p1_vocab_idxs == self.p2_vocab_idxs
 
         # context -> (p1 prefix, p2 prefix, p1 next-token row, p2 next-token row)
-        self._rows = LRUCache(maxsize=cache_size)
+        self._rows = _LRU(cache_size)
 
     async def _component_prefixes(self, contexts):
         """Each potential's prefix log weight of each context.
@@ -130,7 +147,7 @@ class Ensemble(Potential):
         Returns:
             Tuple[float, float]: The log weights under `p1` and `p2`.
         """
-        if context and context[-1] is self.eos:
+        if context and context[-1] == self.eos:
             parent = self._rows.get(tuple(context[:-1]))
             if parent is not None:
                 w1, w2, row1, row2 = parent
@@ -169,6 +186,20 @@ class Ensemble(Potential):
         )
         return self.op(p1_logw, p2_logw)
 
+    async def batch_prefix(self, contexts):
+        if not contexts:
+            raise ValueError("Contexts must be non-empty.")
+        W = await self._component_prefixes(contexts)
+        return self.op(W[:, 0], W[:, 1])
+
+    async def batch_complete(self, contexts):
+        if not contexts:
+            raise ValueError("Contexts must be non-empty.")
+        W1, W2 = await asyncio.gather(
+            self.p1.batch_complete(contexts), self.p2.batch_complete(contexts)
+        )
+        return self.op(to_numpy(W1), to_numpy(W2))
+
     async def logw_next(self, context: List[str]):
         """Next-token log weights, `prefix(context + [x]) - prefix(context)`.
 
@@ -197,12 +228,17 @@ class Ensemble(Potential):
             ),
             self._component_prefixes(contexts),
         )
+        W1, W2 = W[:, :1], W[:, 1:]
+        base = self.op(W1, W2)
+        zero = np.isneginf(base[:, 0])
+        if zero.any():
+            context = contexts[int(np.argmax(zero))]
+            raise ValueError(f"Context {context!r} has weight zero under `prefix`.")
         rows1 = to_numpy(Ws1.weights)[:, self.p1_vocab_idxs]
         rows2 = to_numpy(Ws2.weights)[:, self.p2_vocab_idxs]
         for n, context in enumerate(contexts):
             self._rows[tuple(context)] = (W[n, 0], W[n, 1], rows1[n], rows2[n])
-        W1, W2 = W[:, :1], W[:, 1:]
-        return self.make_lazy_weights(self.op(W1 + rows1, W2 + rows2) - self.op(W1, W2))
+        return self.make_lazy_weights(self.op(W1 + rows1, W2 + rows2) - base)
 
 
 def _power_mean(p: float, a: float) -> Callable:

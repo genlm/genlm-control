@@ -24,7 +24,6 @@ dependencies = [
     "torch",
     "json-stream",
     "jsonschema[format-nongpl]",
-    "cachetools",
     "regex"
 ]
 
