@@ -1,7 +1,7 @@
 import asyncio
 import warnings
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 import numpy as np
 import torch
@@ -37,6 +37,26 @@ def stack_weights(arrays):
 def _xp(w):
     """The array module (`torch` or `np`) backing `w`."""
     return torch if torch.is_tensor(w) else np
+
+
+class LRUCache(OrderedDict):
+    """Bounded dict that evicts the least recently used entry; `get` counts as a use."""
+
+    def __init__(self, maxsize):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def get(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
 
 
 class LazyWeights:

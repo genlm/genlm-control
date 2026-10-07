@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 from genlm.control.constant import EOS
-from genlm.control.util import LazyWeights, load_trie, escape
+from genlm.control.util import LazyWeights, LRUCache, load_trie, escape
 
 
 def test_lazy_weights_basic():
@@ -180,7 +180,9 @@ def test_lazy_weights_bytes_fallback():
     weights = np.array([-1.0, -2.0])
     lw = LazyWeights(weights, encode, tokens, log=True)
 
-    with pytest.warns(DeprecationWarning, match="Indexing LazyWeights by bytes is deprecated"):
+    with pytest.warns(
+        DeprecationWarning, match="Indexing LazyWeights by bytes is deprecated"
+    ):
         assert lw[b"hello"] == -1.0
 
     # Missing bytes should return -inf (log mode)
@@ -192,3 +194,13 @@ def test_escape():
     assert escape(b"hello") == "hello"
     assert escape("hello") == "hello"
     assert escape(EOS) == "EOS"
+
+
+def test_lru_cache():
+    cache = LRUCache(2)
+    cache["a"], cache["b"] = 1, 2
+    assert cache.get("a") == 1  # a use: "b" is now the least recent
+    cache["c"] = 3
+    assert list(cache) == ["a", "c"] and cache.get("b") is None
+    cache["a"] = 10  # updating a key keeps the size and refreshes it
+    assert list(cache) == ["c", "a"] and len(cache) == 2

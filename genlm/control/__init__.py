@@ -9,6 +9,8 @@ from .potential import (
     WCFG,
     JsonSchema,
     CanonicalTokenization,
+    Ensemble,
+    convert_to_weighted_logop,
 )
 from .sampler import (
     SMC,
@@ -40,4 +42,6 @@ __all__ = [
     "eager_token_sampler",
     "topk_token_sampler",
     "InferenceVisualizer",
+    "Ensemble",
+    "convert_to_weighted_logop",
 ]
