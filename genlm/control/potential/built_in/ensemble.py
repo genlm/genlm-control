@@ -1,31 +1,10 @@
 import asyncio
 import numbers
 import numpy as np
-from collections import OrderedDict
 from typing import Callable, List, Tuple, Union
 
 from genlm.control.potential.base import Potential
-from genlm.control.util import logsumexp, to_numpy
-
-
-class _LRU(OrderedDict):
-    """Bounded dict that evicts the least recently used entry."""
-
-    def __init__(self, maxsize):
-        super().__init__()
-        self.maxsize = maxsize
-
-    def get(self, key, default=None):
-        if key in self:
-            self.move_to_end(key)
-            return self[key]
-        return default
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        self.move_to_end(key)
-        while len(self) > self.maxsize:
-            self.popitem(last=False)
+from genlm.control.util import LRUCache, logsumexp, to_numpy
 
 
 class Ensemble(Potential):
@@ -104,7 +83,7 @@ class Ensemble(Potential):
         self.p2_vocab_idxs = [self.p2.lookup[x] for x in self.vocab_eos]
 
         # context -> (p1 prefix, p2 prefix, p1 next-token row, p2 next-token row)
-        self._rows = _LRU(cache_size)
+        self._rows = LRUCache(cache_size)
 
     async def _component_prefixes(self, contexts):
         """Each potential's prefix log weight of each context.
