@@ -69,6 +69,22 @@ llm.model.add_new_lora("/path/to/adapter", "reviewer")
 reviewer_llm = PromptedLLM(llm.model, prompt_ids=llm.prompt_ids, lora_name="reviewer")
 ```
 
+### Byte-level language models
+
+[`ByteLLM`][genlm.control.potential.built_in.bytellm.ByteLLM] exposes a language model as a potential over bytes. A beam search from [genlm-bytes](https://github.com/genlm/genlm-bytes) tracks the tokenizations consistent with a byte prefix, so byte-level potentials apply directly and models with different tokenizers share one vocabulary.
+
+```python
+from genlm.bytes import BeamParams
+from genlm.control import ByteLLM
+
+beam_params = BeamParams(K=5, eos_byte_strings=[b"<|endoftext|>"])
+async with ByteLLM.from_name("openai-community/gpt2", beam_params) as byte_llm:
+    byte_llm.set_prompt_from_str("Hello")
+    logp = await byte_llm.prefix([b" ", b"w", b"o", b"r", b"l", b"d"])
+```
+
+The weights are a beam approximation, so the beam width `K` trades accuracy for compute.
+
 ### Finite-state automata
 
 `genlm-control` provides two [FSA implementations][genlm.control.potential.built_in.wfsa]:
@@ -217,6 +233,24 @@ The product potential operates on the intersection of the two potentials' vocabu
 
 > **Warning:** Be careful when taking products of potentials with minimal vocabulary overlap, as the resulting potential will only operate on tokens present in both vocabularies. A warning will be raised if the vocabulary overlap is less than 10% of either potential's vocabulary.
 
+
+### Ensembles of potentials
+
+[`Ensemble`][genlm.control.potential.built_in.ensemble.Ensemble] combines two potentials over the same vocabulary with a weighted operation `op`: the power means `"sum"`, `"prod"`, `"harmonic"` or any exponent `p`, or the weighted extrema `"min"` and `"max"`, with mixing weight `a` (see [`convert_to_weighted_logop`][genlm.control.potential.built_in.ensemble.convert_to_weighted_logop]). Its prefix, complete and next-token weights are mutually consistent, so sampling from it with `direct_token_sampler` targets the combined distribution.
+
+```python
+from genlm.control import Ensemble, direct_token_sampler
+
+mtl_llm = PromptedLLM.from_name("openai-community/gpt2")
+mtl_llm.set_prompt_from_str("Montreal is")
+bos_llm = mtl_llm.spawn()
+bos_llm.set_prompt_from_str("Boston is")
+
+ensemble = Ensemble(mtl_llm, bos_llm, op="sum", a=0.5)  # mixture of the two prompted models
+sequences = await direct_token_sampler(ensemble).smc(n_particles=10, ess_threshold=0.5, max_tokens=20)
+```
+
+To ensemble models with different tokenizers, wrap each in a `ByteLLM` first. [`component_logws`][genlm.control.potential.built_in.ensemble.Ensemble.component_logws] returns each model's weight of a sampled sequence.
 
 ### Coerced potentials
 
